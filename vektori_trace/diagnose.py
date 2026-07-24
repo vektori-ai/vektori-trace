@@ -1,13 +1,5 @@
-"""Capability-deficit diagnosis, implementing the DESIGN.md formulas:
-
-    ER+(c) = LACKING & win  / relevant & win     (noise floor)
-    ER-(c) = LACKING & loss / relevant & loss    (failure rate)
-    Delta(c) = ER-(c) - ER+(c)                   (contrastive gap, causal signal)
-    Cov(c) = (LACKING & loss) / |losses|         (share of failure surface explained)
-
-Ranking is Delta(c) * Cov(c) descending: a deficit only ranks highly if it is both
-causal (Delta) and explains a meaningful share of the observed failures (Cov).
-"""
+"""Capability-deficit diagnosis: label each trace against candidate capabilities,
+then score how much each capability's absence actually separates wins from losses."""
 
 from __future__ import annotations
 
@@ -36,11 +28,11 @@ class TraceLabels:
 @dataclass
 class DeficitScore:
     capability: Capability
-    er_plus: float | None
-    er_minus: float | None
-    delta: float | None
-    coverage: float
-    rank_score: float
+    baseline_rate: float | None
+    incident_rate: float | None
+    gap: float | None
+    prevalence: float
+    priority: float
     lacking_loss_traces: list[Trace] = field(default_factory=list)
 
 
@@ -145,6 +137,7 @@ def label_trace(trace: Trace, capabilities: list[Capability], model: str | None 
 def score_deficits(
     capabilities: list[Capability], trace_labels: list[TraceLabels]
 ) -> list[DeficitScore]:
+    """Score every candidate capability and return them ranked, highest priority first."""
     wins = [tl for tl in trace_labels if tl.trace.outcome == "win"]
     losses = [tl for tl in trace_labels if tl.trace.outcome == "loss"]
     scores = []
@@ -154,24 +147,28 @@ def score_deficits(
         lacking_wins = [tl for tl in relevant_wins if tl.labels.get(cap.id) == "LACKING"]
         lacking_losses = [tl for tl in relevant_losses if tl.labels.get(cap.id) == "LACKING"]
 
-        er_plus = len(lacking_wins) / len(relevant_wins) if relevant_wins else None
-        er_minus = len(lacking_losses) / len(relevant_losses) if relevant_losses else None
-        delta = (er_minus - er_plus) if (er_plus is not None and er_minus is not None) else None
-        coverage = (len(lacking_losses) / len(losses)) if losses else 0.0
-        rank_score = (delta or 0.0) * coverage
+        baseline_rate = len(lacking_wins) / len(relevant_wins) if relevant_wins else None
+        incident_rate = len(lacking_losses) / len(relevant_losses) if relevant_losses else None
+        gap = (
+            (incident_rate - baseline_rate)
+            if (baseline_rate is not None and incident_rate is not None)
+            else None
+        )
+        prevalence = (len(lacking_losses) / len(losses)) if losses else 0.0
+        priority = (gap or 0.0) * prevalence
 
         scores.append(
             DeficitScore(
                 capability=cap,
-                er_plus=er_plus,
-                er_minus=er_minus,
-                delta=delta,
-                coverage=coverage,
-                rank_score=rank_score,
+                baseline_rate=baseline_rate,
+                incident_rate=incident_rate,
+                gap=gap,
+                prevalence=prevalence,
+                priority=priority,
                 lacking_loss_traces=[tl.trace for tl in lacking_losses],
             )
         )
-    return sorted(scores, key=lambda s: s.rank_score, reverse=True)
+    return sorted(scores, key=lambda s: s.priority, reverse=True)
 
 
 def _truncate(s: str, n: int) -> str:

@@ -18,11 +18,11 @@ def build_report(
     def score_dict(s: DeficitScore) -> dict:
         return {
             "capability": asdict(s.capability),
-            "er_plus": s.er_plus,
-            "er_minus": s.er_minus,
-            "delta": s.delta,
-            "coverage": s.coverage,
-            "rank_score": s.rank_score,
+            "baseline_rate": s.baseline_rate,
+            "incident_rate": s.incident_rate,
+            "gap": s.gap,
+            "prevalence": s.prevalence,
+            "priority": s.priority,
             "lacking_loss_run_ids": [t.run_id for t in s.lacking_loss_traces],
         }
 
@@ -57,10 +57,10 @@ def write_report(report: dict, out_dir: Path) -> Path:
     md_lines.append(f"## Diagnosed deficit: {d['capability']['name']}\n")
     md_lines.append(d["capability"]["description"] + "\n")
     md_lines.append(
-        f"- ER+ (noise floor): {_fmt(d['er_plus'])}\n"
-        f"- ER- (failure rate): {_fmt(d['er_minus'])}\n"
-        f"- Delta (causal gap): {_fmt(d['delta'])}\n"
-        f"- Coverage (share of failures explained): {_fmt(d['coverage'])}\n"
+        f"- baseline rate (in wins): {_fmt(d['baseline_rate'])}\n"
+        f"- incident rate (in losses): {_fmt(d['incident_rate'])}\n"
+        f"- gap: {_fmt(d['gap'])}\n"
+        f"- prevalence (share of failures explained): {_fmt(d['prevalence'])}\n"
     )
     md_lines.append(f"\nGenerated task: `{report['task_dir']}`\n")
 
@@ -77,8 +77,8 @@ def write_report(report: dict, out_dir: Path) -> Path:
     md_lines.append("\n## All diagnosed deficits (ranked)\n")
     for s in report["all_deficits_ranked"]:
         md_lines.append(
-            f"- {s['capability']['name']}: rank_score={_fmt(s['rank_score'])}, "
-            f"delta={_fmt(s['delta'])}, coverage={_fmt(s['coverage'])}"
+            f"- {s['capability']['name']}: priority={_fmt(s['priority'])}, "
+            f"gap={_fmt(s['gap'])}, prevalence={_fmt(s['prevalence'])}"
         )
 
     md_path = out_dir / "diagnosis.md"

@@ -4,16 +4,11 @@ Paste in failing/passing agent traces, get out: a diagnosed capability deficit, 
 generated verifiable task (Harbor spec) that isolates it, and a validity proof
 (oracle solution passes, a real agent lacking the capability fails).
 
-This is the *front half* of the Vektori loop:
-
 ```
 ingest traces → diagnose deficit → generate env + verifier → validity proof
 ```
 
 It deliberately stops there — no training run, no regression suite, no redeploy.
-See [vektori-platform](https://github.com/vektori-ai/vektori-platform)'s
-`docs/DESIGN.md` for the full methodology this implements (the ER+/ER-/Δ/Cov
-formulas).
 
 Task generation and execution are built on
 [Harbor](https://github.com/harbor-framework/harbor) — generated tasks are
@@ -39,9 +34,8 @@ export $(cat .env | xargs)
 
 ## Usage
 
-Traces are JSON files matching vektori-platform's `Run`/`Turn` schema
-(`{runId, status, turns: [...]}`). A manifest lists which traces are wins and
-which are losses — the contrastive formulas need both:
+Traces are JSON files (`{runId, status, turns: [...]}`). A manifest lists
+which traces are wins and which are losses — contrastive scoring needs both:
 
 ```bash
 vektori-trace diagnose \
@@ -53,7 +47,7 @@ This will:
 
 1. Propose candidate capabilities from the traces (1 LLM call)
 2. Label each trace NA / PRESENT / LACKING per capability (1 LLM call per trace)
-3. Compute ER+(c), ER-(c), Δ(c), Cov(c) per DESIGN.md and rank deficits
+3. Score each capability by how much its absence separates wins from losses, and rank deficits
 4. Generate a Harbor task isolating the top-ranked deficit (1 LLM call)
 
 Output lands in `./vektori-out/`: `tasks/<deficit-name>/` (the Harbor task) and

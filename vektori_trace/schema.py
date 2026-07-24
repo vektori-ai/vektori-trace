@@ -1,4 +1,4 @@
-"""Trace schema matching vektori-platform's Run/Turn types (src/types.ts)."""
+"""Trace schema: a run made up of turns, each with an optional role, content, and tool calls."""
 
 from __future__ import annotations
 
