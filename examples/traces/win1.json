@@ -1,0 +1,12 @@
+{
+  "runId": "win1",
+  "status": "success",
+  "turns": [
+    {"index": 0, "role": "user", "content": "Upload report.csv to the 'analytics' bucket."},
+    {"index": 1, "role": "assistant", "content": "Uploading now.", "toolCalls": [{"id": "t1", "name": "s3_upload", "args": {"bucket": "analytics", "key": "report.csv"}}]},
+    {"index": 2, "role": "tool", "toolCallId": "t1", "content": "{\"error\": \"AccessDenied: bucket policy requires key prefix 'incoming/'\"}"},
+    {"index": 3, "role": "assistant", "thinking": "The error says the bucket policy requires a prefix. I should retry with the correct key.", "content": "Retrying with required prefix.", "toolCalls": [{"id": "t2", "name": "s3_upload", "args": {"bucket": "analytics", "key": "incoming/report.csv"}}]},
+    {"index": 4, "role": "tool", "toolCallId": "t2", "content": "{\"status\": \"ok\"}"},
+    {"index": 5, "role": "assistant", "content": "Uploaded successfully to analytics/incoming/report.csv."}
+  ]
+}

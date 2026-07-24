@@ -1,0 +1,19 @@
+[project]
+name = "vektori-trace"
+version = "0.1.0"
+description = "Trace in, diagnosis + generated RL env/verifier + validity proof out."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+]
+
+[project.scripts]
+vektori-trace = "vektori_trace.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vektori_trace*"]

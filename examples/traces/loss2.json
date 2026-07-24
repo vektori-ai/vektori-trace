@@ -1,0 +1,14 @@
+{
+  "runId": "loss2",
+  "status": "failure",
+  "turns": [
+    {"index": 0, "role": "user", "content": "Create a webhook subscription for the 'payments' topic."},
+    {"index": 1, "role": "assistant", "content": "Creating the webhook.", "toolCalls": [{"id": "t1", "name": "create_webhook", "args": {"topic": "payments", "url": "https://app/hook"}}]},
+    {"index": 2, "role": "tool", "toolCallId": "t1", "content": "{\"error\": \"ValidationError: url must use https and include a signing secret param\"}"},
+    {"index": 3, "role": "assistant", "content": "Trying again.", "toolCalls": [{"id": "t2", "name": "create_webhook", "args": {"topic": "payments", "url": "https://app/hook"}}]},
+    {"index": 4, "role": "tool", "toolCallId": "t2", "content": "{\"error\": \"ValidationError: url must use https and include a signing secret param\"}"},
+    {"index": 5, "role": "assistant", "content": "One more attempt.", "toolCalls": [{"id": "t3", "name": "create_webhook", "args": {"topic": "payments", "url": "https://app/hook"}}]},
+    {"index": 6, "role": "tool", "toolCallId": "t3", "content": "{\"error\": \"ValidationError: url must use https and include a signing secret param\"}"},
+    {"index": 7, "role": "assistant", "content": "The webhook creation keeps failing; giving up."}
+  ]
+}

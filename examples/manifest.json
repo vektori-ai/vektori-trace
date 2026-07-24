@@ -1,0 +1,6 @@
+[
+  {"path": "traces/win1.json", "outcome": "win"},
+  {"path": "traces/win2.json", "outcome": "win"},
+  {"path": "traces/loss1.json", "outcome": "loss"},
+  {"path": "traces/loss2.json", "outcome": "loss"}
+]
