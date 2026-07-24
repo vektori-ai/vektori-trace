@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .diagnose import label_trace, propose_capabilities, score_deficits
+from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
+from .mining.spec import LLMSpec
 from .report import build_report, write_report
 from .schema import Trace, load_manifest
 from .taskgen import scaffold_task
@@ -72,6 +75,32 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mine(args: argparse.Namespace) -> int:
+    out_dir = Path(args.out)
+    tasks_dir = out_dir / "mined_tasks"
+    traces_dir = out_dir / "mined_traces"
+
+    print(f"Mining {args.repo}'s merged PR history into sandbox-verified tasks...")
+    task_dirs = mine_tasks(
+        args.repo,
+        tasks_dir,
+        llm=LLMSpec(provider=args.llm_provider, model=args.llm_model),
+        user_dockerfile=Path(args.dockerfile) if args.dockerfile else None,
+    )
+    print(f"  {len(task_dirs)} task(s) mined to {tasks_dir}")
+
+    runner = HarborTraceRunner(agent=args.agent, jobs_dir=out_dir / "jobs", model=args.model)
+    print(f"Running {args.agent} against each mined task to collect traces...")
+    manifest = collect_traces(task_dirs, runner, traces_dir)
+
+    manifest_path = out_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    wins = sum(1 for m in manifest if m["outcome"] == "win")
+    print(f"  {wins} win(s), {len(manifest) - wins} loss(es) — manifest written to {manifest_path}")
+    print(f"\nNext: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
+    return 0
+
+
 def cmd_prove(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir)
     validity = prove_validity(
@@ -114,6 +143,37 @@ def main(argv: list[str] | None = None) -> int:
     p_prove.add_argument("--base-agent", default=None)
     p_prove.add_argument("--base-model", default=None)
     p_prove.set_defaults(func=cmd_prove)
+
+    p_mine = sub.add_parser(
+        "mine",
+        help=(
+            "mine a repo's real PR history into sandbox-verified tasks, run an agent "
+            "against each, and write win/loss traces + a manifest for `diagnose`"
+        ),
+    )
+    p_mine.add_argument("--repo", required=True, help="'owner/name' or a full GitHub URL")
+    p_mine.add_argument(
+        "--dockerfile",
+        default=None,
+        help=(
+            "path to the repo's own working Dockerfile (skips the bootstrap agent). "
+            "Omit to let the agent auto-discover the build/test setup instead — needed "
+            "when there's no Dockerfile yet, or a mined PR predates what the current "
+            "one can build."
+        ),
+    )
+    p_mine.add_argument(
+        "--agent", default="claude_code", help="harbor agent name to run against each task"
+    )
+    p_mine.add_argument("--model", default=None, help="model name for --agent")
+    p_mine.add_argument(
+        "--llm-provider", default="openai", help="provider for the bootstrap agent's LLM calls"
+    )
+    p_mine.add_argument(
+        "--llm-model", default="gpt-5-nano", help="model for the bootstrap agent's LLM calls"
+    )
+    p_mine.add_argument("--out", default="./vektori-out", help="output directory")
+    p_mine.set_defaults(func=cmd_mine)
 
     args = parser.parse_args(argv)
     return args.func(args)
