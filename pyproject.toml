@@ -3,10 +3,30 @@ name = "vektori-trace"
 version = "0.1.0"
 description = "Trace in, diagnosis + generated RL env/verifier + validity proof out."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "openai>=1.40",
+    "litellm>=1.83.14",
+    "pydantic>=2.12.5",
+    "tomli-w>=1.2.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "B008", "SIM105", "SIM117", "RUF001", "RUF002", "RUF003"]
 
 [project.scripts]
 vektori-trace = "vektori_trace.cli:main"
