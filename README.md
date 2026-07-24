@@ -39,9 +39,32 @@ export $(cat .env | xargs)
 
 ## Usage
 
-Traces are JSON files matching vektori-platform's `Run`/`Turn` schema
-(`{runId, status, turns: [...]}`). A manifest lists which traces are wins and
-which are losses — the contrastive formulas need both:
+### Getting traces: mine your own repo
+
+If you don't already have win/loss traces, mine them from your repo's real
+merged-PR history — each PR becomes a sandbox-verified task (fail-to-pass
+test transition = deterministic ground truth, not an LLM guess), your agent
+runs against it, and the result becomes a trace:
+
+```bash
+vektori-trace mine \
+  --repo owner/name \
+  --dockerfile ./Dockerfile \
+  --agent claude_code \
+  --out ./vektori-out
+```
+
+Omit `--dockerfile` to let a bootstrap agent auto-discover how to build/test
+the repo instead — useful when there's no working Dockerfile yet, or a mined
+PR's base commit predates what the current build setup can produce. Writes
+`manifest.json` + `mined_traces/*.json`, ready to feed straight into
+`diagnose` below.
+
+### Diagnosing a deficit
+
+Traces are JSON files matching the `Run`/`Turn` schema (`{runId, status,
+turns: [...]}`). A manifest lists which traces are wins and which are
+losses — the contrastive formulas need both:
 
 ```bash
 vektori-trace diagnose \
