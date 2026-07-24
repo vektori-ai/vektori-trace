@@ -4,16 +4,11 @@ Paste in failing/passing agent traces, get out: a diagnosed capability deficit, 
 generated verifiable task (Harbor spec) that isolates it, and a validity proof
 (oracle solution passes, a real agent lacking the capability fails).
 
-This is the *front half* of the Vektori loop:
-
 ```
 ingest traces → diagnose deficit → generate env + verifier → validity proof
 ```
 
 It deliberately stops there — no training run, no regression suite, no redeploy.
-See [vektori-platform](https://github.com/vektori-ai/vektori-platform)'s
-`docs/DESIGN.md` for the full methodology this implements (the ER+/ER-/Δ/Cov
-formulas).
 
 Task generation and execution are built on
 [Harbor](https://github.com/harbor-framework/harbor) — generated tasks are
@@ -39,32 +34,8 @@ export $(cat .env | xargs)
 
 ## Usage
 
-### Getting traces: mine your own repo
-
-If you don't already have win/loss traces, mine them from your repo's real
-merged-PR history — each PR becomes a sandbox-verified task (fail-to-pass
-test transition = deterministic ground truth, not an LLM guess), your agent
-runs against it, and the result becomes a trace:
-
-```bash
-vektori-trace mine \
-  --repo owner/name \
-  --dockerfile ./Dockerfile \
-  --agent claude_code \
-  --out ./vektori-out
-```
-
-Omit `--dockerfile` to let a bootstrap agent auto-discover how to build/test
-the repo instead — useful when there's no working Dockerfile yet, or a mined
-PR's base commit predates what the current build setup can produce. Writes
-`manifest.json` + `mined_traces/*.json`, ready to feed straight into
-`diagnose` below.
-
-### Diagnosing a deficit
-
-Traces are JSON files matching the `Run`/`Turn` schema (`{runId, status,
-turns: [...]}`). A manifest lists which traces are wins and which are
-losses — the contrastive formulas need both:
+Traces are JSON files (`{runId, status, turns: [...]}`). A manifest lists
+which traces are wins and which are losses — contrastive scoring needs both:
 
 ```bash
 vektori-trace diagnose \
@@ -76,7 +47,7 @@ This will:
 
 1. Propose candidate capabilities from the traces (1 LLM call)
 2. Label each trace NA / PRESENT / LACKING per capability (1 LLM call per trace)
-3. Compute ER+(c), ER-(c), Δ(c), Cov(c) per DESIGN.md and rank deficits
+3. Score each capability by how much its absence separates wins from losses, and rank deficits
 4. Generate a Harbor task isolating the top-ranked deficit (1 LLM call)
 
 Output lands in `./vektori-out/`: `tasks/<deficit-name>/` (the Harbor task) and

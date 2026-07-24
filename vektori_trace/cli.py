@@ -26,7 +26,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     if not wins or not losses:
         print(
             "error: need at least one 'win' and one 'loss' trace to compute the "
-            "contrastive deficit formulas (ER+/ER-/Delta/Cov).",
+            "contrastive scoring to work.",
             file=sys.stderr,
         )
         return 1
@@ -44,7 +44,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     top = scores[0]
     print(
         f"\nTop deficit: {top.capability.name} "
-        f"(delta={top.delta}, coverage={top.coverage:.2f})"
+        f"(gap={top.gap}, prevalence={top.prevalence:.2f})"
     )
 
     out_dir = Path(args.out)
