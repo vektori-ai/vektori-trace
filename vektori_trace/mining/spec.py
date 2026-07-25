@@ -14,6 +14,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+_URL_PREFIXES = (
+    ("https://github.com/", "https://github.com/"),
+    ("http://github.com/", "https://github.com/"),
+    ("git@github.com:", "git@github.com:"),
+    ("ssh://git@github.com/", "git@github.com:"),
+)
+
 
 class RepoSpec(BaseModel):
     url: str
@@ -24,20 +31,45 @@ class RepoSpec(BaseModel):
     @field_validator("url")
     @classmethod
     def normalize_url(cls, v: str) -> str:
+        """Canonicalize to the bare repo root, dropping any browser path tail.
+
+        Humans copy URLs out of the address bar, so `.../psf/requests/tree/main`
+        and `.../psf/requests/pull/1234` are the common case, not the exception.
+        Taking the last two path segments reads those as owner=('tree','pull'),
+        so we take the *first* two after the host and discard the rest — which
+        also makes `url` safe to hand straight to `git clone`.
+        """
         v = v.strip()
-        if "/" not in v:
+        if not v:
+            raise ValueError("repo url must not be empty")
+
+        prefix = ""
+        path = v
+        for candidate, canonical in _URL_PREFIXES:
+            if v.startswith(candidate):
+                prefix, path = canonical, v[len(candidate) :]
+                break
+        else:
+            if v.startswith(("http://", "https://", "git@", "ssh://")):
+                raise ValueError(f"only github.com repos are supported, got {v!r}")
+            prefix = "https://github.com/"
+
+        parts = [p for p in path.split("/") if p]
+        if len(parts) < 2:
             raise ValueError(f"repo url must be 'owner/name' or a full GitHub URL, got {v!r}")
-        if not v.startswith(("http://", "https://", "git@")):
-            v = f"https://github.com/{v}"
-        return v.rstrip("/").removesuffix(".git")
+        owner, name = parts[0], parts[1].removesuffix(".git")
+        if not owner or not name:
+            raise ValueError(f"cannot parse owner/name from {v!r}")
+        return f"{prefix}{owner}/{name}"
 
     @property
     def owner_name(self) -> tuple[str, str]:
-        path = self.url.replace("https://github.com/", "").replace("git@github.com:", "")
-        parts = path.rstrip("/").split("/")
-        if len(parts) < 2:
-            raise ValueError(f"cannot parse owner/name from {self.url!r}")
-        return parts[-2], parts[-1]
+        # `url` is canonical after validation: <prefix>owner/name, nothing else.
+        for _, canonical in _URL_PREFIXES:
+            if self.url.startswith(canonical):
+                owner, name = self.url[len(canonical) :].split("/")
+                return owner, name
+        raise ValueError(f"cannot parse owner/name from {self.url!r}")
 
 
 class LLMSpec(BaseModel):

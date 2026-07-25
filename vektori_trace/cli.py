@@ -5,7 +5,14 @@ import json
 import sys
 from pathlib import Path
 
-from .diagnose import label_trace, propose_capabilities, score_deficits
+from .diagnose import (
+    DEFAULT_MIN_GAP,
+    DEFAULT_MIN_SUPPORT,
+    label_trace,
+    propose_capabilities,
+    score_deficits,
+    select_deficit,
+)
 from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
 from .mining.spec import LLMSpec
 from .report import build_report, write_report
@@ -41,13 +48,35 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     trace_labels = [label_trace(t, capabilities, model=args.model) for t in traces]
 
     scores = score_deficits(capabilities, trace_labels)
-    top = scores[0]
+    thresholds = {"min_gap": args.min_gap, "min_support": args.min_support}
+    out_dir = Path(args.out)
+
+    print("\nRanked candidates:")
+    for s in scores:
+        print(
+            f"  {s.capability.name}: priority={_fmt(s.priority)}, gap={_fmt(s.gap)}, "
+            f"prevalence={s.prevalence:.2f}, N={s.n_relevant_wins}w/{s.n_relevant_losses}l"
+        )
+
+    top = select_deficit(scores, min_gap=args.min_gap, min_support=args.min_support)
+    if top is None:
+        # A clean, honest exit — not an error. Nothing here separates wins from
+        # losses well enough to build a task around.
+        print(
+            f"\nNo deficit found: nothing cleared min_gap={args.min_gap} with at least "
+            f"{args.min_support} relevant traces on each side."
+        )
+        report = build_report(None, scores, None, None, thresholds)
+        md_path = write_report(report, out_dir)
+        print(f"Report written to {md_path}")
+        return 0
+
     print(
         f"\nTop deficit: {top.capability.name} "
-        f"(gap={top.gap}, prevalence={top.prevalence:.2f})"
+        f"(gap={_fmt(top.gap)}, prevalence={top.prevalence:.2f}, "
+        f"N={top.n_relevant_wins}w/{top.n_relevant_losses}l)"
     )
 
-    out_dir = Path(args.out)
     tasks_dir = out_dir / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -69,10 +98,14 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             print(f"  {args.base_agent} passed: {validity['base'].passed}")
         print(f"  valid: {validity['valid']}")
 
-    report = build_report(top, scores, task_dir, validity)
+    report = build_report(top, scores, task_dir, validity, thresholds)
     md_path = write_report(report, out_dir)
     print(f"\nReport written to {md_path}")
     return 0
+
+
+def _fmt(x: float | None) -> str:
+    return "n/a" if x is None else f"{x:.2f}"
 
 
 def cmd_mine(args: argparse.Namespace) -> int:
@@ -91,12 +124,16 @@ def cmd_mine(args: argparse.Namespace) -> int:
 
     runner = HarborTraceRunner(agent=args.agent, jobs_dir=out_dir / "jobs", model=args.model)
     print(f"Running {args.agent} against each mined task to collect traces...")
-    manifest = collect_traces(task_dirs, runner, traces_dir)
-
     manifest_path = out_dir / "manifest.json"
+    manifest = collect_traces(task_dirs, runner, traces_dir, manifest_path=manifest_path)
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2))
     wins = sum(1 for m in manifest if m["outcome"] == "win")
+    skipped = len(task_dirs) - len(manifest)
     print(f"  {wins} win(s), {len(manifest) - wins} loss(es) — manifest written to {manifest_path}")
+    if skipped:
+        print(f"  {skipped} task(s) skipped (unjudgeable — see the skip lines above)")
     print(f"\nNext: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
     return 0
 
@@ -135,6 +172,18 @@ def main(argv: list[str] | None = None) -> int:
         help="harbor agent name to run as the 'base' attempt, e.g. codex, claude_code",
     )
     p_diag.add_argument("--base-model", default=None, help="model name for --base-agent")
+    p_diag.add_argument(
+        "--min-gap",
+        type=float,
+        default=DEFAULT_MIN_GAP,
+        help="minimum win/loss gap for a capability to be reported as a deficit (uncalibrated)",
+    )
+    p_diag.add_argument(
+        "--min-support",
+        type=int,
+        default=DEFAULT_MIN_SUPPORT,
+        help="minimum relevant traces on each side of the gap",
+    )
     p_diag.set_defaults(func=cmd_diagnose)
 
     p_prove = sub.add_parser("prove", help="run the validity proof for an already-generated task")

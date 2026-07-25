@@ -10,10 +10,11 @@ from .diagnose import DeficitScore
 
 
 def build_report(
-    deficit: DeficitScore,
+    deficit: DeficitScore | None,
     all_scores: list[DeficitScore],
-    task_dir: Path,
+    task_dir: Path | None,
     validity: dict | None,
+    thresholds: dict | None = None,
 ) -> dict:
     def score_dict(s: DeficitScore) -> dict:
         return {
@@ -23,13 +24,16 @@ def build_report(
             "gap": s.gap,
             "prevalence": s.prevalence,
             "priority": s.priority,
+            "n_relevant_wins": s.n_relevant_wins,
+            "n_relevant_losses": s.n_relevant_losses,
             "lacking_loss_run_ids": [t.run_id for t in s.lacking_loss_traces],
         }
 
     report = {
-        "chosen_deficit": score_dict(deficit),
+        "chosen_deficit": score_dict(deficit) if deficit else None,
         "all_deficits_ranked": [score_dict(s) for s in all_scores],
-        "task_dir": str(task_dir),
+        "task_dir": str(task_dir) if task_dir else None,
+        "thresholds": thresholds or {},
     }
     if validity:
         report["validity"] = {
@@ -54,15 +58,29 @@ def write_report(report: dict, out_dir: Path) -> Path:
 
     md_lines = ["# Vektori-trace diagnosis\n"]
     d = report["chosen_deficit"]
-    md_lines.append(f"## Diagnosed deficit: {d['capability']['name']}\n")
-    md_lines.append(d["capability"]["description"] + "\n")
-    md_lines.append(
-        f"- baseline rate (in wins): {_fmt(d['baseline_rate'])}\n"
-        f"- incident rate (in losses): {_fmt(d['incident_rate'])}\n"
-        f"- gap: {_fmt(d['gap'])}\n"
-        f"- prevalence (share of failures explained): {_fmt(d['prevalence'])}\n"
-    )
-    md_lines.append(f"\nGenerated task: `{report['task_dir']}`\n")
+    if d is None:
+        t = report.get("thresholds") or {}
+        md_lines.append("## No deficit found\n")
+        md_lines.append(
+            "No candidate capability cleared the thresholds "
+            f"(min_gap={t.get('min_gap')}, min_support={t.get('min_support')}). "
+            "That is a result, not a failure: on this evidence nothing separates "
+            "the wins from the losses well enough to be worth training against. "
+            "The ranked list below is reported for inspection only — its top entry "
+            "was rejected.\n"
+        )
+    else:
+        md_lines.append(f"## Diagnosed deficit: {d['capability']['name']}\n")
+        md_lines.append(d["capability"]["description"] + "\n")
+        md_lines.append(
+            f"- baseline rate (in wins): {_fmt(d['baseline_rate'])} "
+            f"(N={d['n_relevant_wins']})\n"
+            f"- incident rate (in losses): {_fmt(d['incident_rate'])} "
+            f"(N={d['n_relevant_losses']})\n"
+            f"- gap: {_fmt(d['gap'])}\n"
+            f"- prevalence (share of failures explained): {_fmt(d['prevalence'])}\n"
+        )
+        md_lines.append(f"\nGenerated task: `{report['task_dir']}`\n")
 
     if "validity" in report:
         v = report["validity"]
@@ -78,7 +96,8 @@ def write_report(report: dict, out_dir: Path) -> Path:
     for s in report["all_deficits_ranked"]:
         md_lines.append(
             f"- {s['capability']['name']}: priority={_fmt(s['priority'])}, "
-            f"gap={_fmt(s['gap'])}, prevalence={_fmt(s['prevalence'])}"
+            f"gap={_fmt(s['gap'])}, prevalence={_fmt(s['prevalence'])}, "
+            f"N={s['n_relevant_wins']}w/{s['n_relevant_losses']}l"
         )
 
     md_path = out_dir / "diagnosis.md"

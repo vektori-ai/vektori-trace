@@ -33,7 +33,19 @@ class DeficitScore:
     gap: float | None
     prevalence: float
     priority: float
+    n_relevant_wins: int = 0
+    n_relevant_losses: int = 0
     lacking_loss_traces: list[Trace] = field(default_factory=list)
+
+
+# Uncalibrated. Our labeller is a blurry ruler and blur shrinks effects toward
+# zero, so a true gap of 0.5 can surface here as 0.18. Step 5 of the v0 plan
+# hand-labels ~50 traces to measure the blur and set this from data; until then
+# we do not know whether 0.20 is strict or loose.
+DEFAULT_MIN_GAP = 0.20
+# A gap computed from two traces is not a gap. This floor is deliberately low —
+# it exists to reject the degenerate case, not to establish significance.
+DEFAULT_MIN_SUPPORT = 3
 
 
 _CAPABILITIES_SCHEMA = {
@@ -60,20 +72,21 @@ _CAPABILITIES_SCHEMA = {
 
 def propose_capabilities(traces: list[Trace], model: str | None = None) -> list[Capability]:
     """One LLM call: read short summaries of every trace, propose 4-8 candidate
-    capabilities that plausibly separate wins from losses."""
+    capabilities the task distribution requires.
+
+    Blind to outcome, like the labeller. Told which runs failed, the model
+    proposes capabilities that describe the *failures it was shown* rather than
+    the task distribution — the separation then comes out of the prompt instead
+    of the data, and every gap downstream is measured against a rigged list."""
     summaries = []
     for t in traces:
         first_user = next((turn.content for turn in t.turns if turn.role == "user"), "")
-        summaries.append(
-            f"- run {t.run_id} [{t.outcome}]: task={_truncate(first_user, 300)!r}, "
-            f"{len(t.turns)} turns"
-        )
+        summaries.append(f"- run {t.run_id}: task={_truncate(first_user, 300)!r}, {len(t.turns)} turns")
     user = (
-        "Here are summaries of agent trajectories, each labeled win (task succeeded) "
-        "or loss (task failed):\n\n" + "\n".join(summaries) + "\n\n"
+        "Here are summaries of agent trajectories:\n\n" + "\n".join(summaries) + "\n\n"
         "Propose 4-8 distinct agent capabilities (skills/behaviors, not vague traits) "
-        "that could plausibly explain the difference between wins and losses here. "
-        "Each id should be a short snake_case slug."
+        "that these tasks require, and on which agents plausibly differ from one "
+        "another. Each id should be a short snake_case slug."
     )
     result = call_json(
         system=(
@@ -112,10 +125,15 @@ def _label_schema(capability_ids: list[str]) -> dict:
 
 
 def label_trace(trace: Trace, capabilities: list[Capability], model: str | None = None) -> TraceLabels:
-    """One LLM call per trace: for each capability, label NA / PRESENT / LACKING."""
+    """One LLM call per trace: for each capability, label NA / PRESENT / LACKING.
+
+    The label must come from the trajectory alone. Handed the outcome, the
+    model reasons backwards from it — a trace it is told is a loss gets its
+    capabilities marked LACKING to justify the ending — and the resulting gap
+    measures the prompt, not the agent."""
     cap_list = "\n".join(f"- {c.id}: {c.name} — {c.description}" for c in capabilities)
     user = (
-        f"Trajectory (outcome: {trace.outcome}):\n\n{trace.condensed()}\n\n"
+        f"Trajectory:\n\n{trace.condensed()}\n\n"
         f"Capabilities to assess:\n{cap_list}\n\n"
         "For each capability: NA if it wasn't relevant/needed for this trajectory; "
         "PRESENT if it was needed and the agent demonstrated it; LACKING if it was "
@@ -142,8 +160,12 @@ def score_deficits(
     losses = [tl for tl in trace_labels if tl.trace.outcome == "loss"]
     scores = []
     for cap in capabilities:
-        relevant_wins = [tl for tl in wins if tl.labels.get(cap.id) != "NA"]
-        relevant_losses = [tl for tl in losses if tl.labels.get(cap.id) != "NA"]
+        # Default NA, not PRESENT. A capability the labeller simply didn't
+        # return a verdict on is unmeasured; counting it as relevant-and-not-
+        # LACKING reads silence as demonstrated competence, which pushes the
+        # baseline rate down and manufactures a gap out of missing data.
+        relevant_wins = [tl for tl in wins if tl.labels.get(cap.id, "NA") != "NA"]
+        relevant_losses = [tl for tl in losses if tl.labels.get(cap.id, "NA") != "NA"]
         lacking_wins = [tl for tl in relevant_wins if tl.labels.get(cap.id) == "LACKING"]
         lacking_losses = [tl for tl in relevant_losses if tl.labels.get(cap.id) == "LACKING"]
 
@@ -165,10 +187,34 @@ def score_deficits(
                 gap=gap,
                 prevalence=prevalence,
                 priority=priority,
+                n_relevant_wins=len(relevant_wins),
+                n_relevant_losses=len(relevant_losses),
                 lacking_loss_traces=[tl.trace for tl in lacking_losses],
             )
         )
     return sorted(scores, key=lambda s: s.priority, reverse=True)
+
+
+def select_deficit(
+    scores: list[DeficitScore],
+    *,
+    min_gap: float = DEFAULT_MIN_GAP,
+    min_support: int = DEFAULT_MIN_SUPPORT,
+) -> DeficitScore | None:
+    """The top-ranked capability that actually clears the bar, or None.
+
+    "No deficit found" is a real answer and has to be reachable. Taking
+    scores[0] unconditionally means an inverted result (gap = -1.0: the
+    capability was *more* present in losses) still comes back as a confident
+    diagnosis, and a capability seen in two traces outranks one seen in forty.
+    """
+    for s in scores:
+        if s.gap is None or s.gap < min_gap:
+            continue
+        if min(s.n_relevant_wins, s.n_relevant_losses) < min_support:
+            continue
+        return s
+    return None
 
 
 def _truncate(s: str, n: int) -> str:

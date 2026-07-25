@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,18 @@ def mine_tasks(
     return [p for p in sorted(out_dir.iterdir()) if p.is_dir() and (p / "task.toml").exists()]
 
 
+class InfraFailure(RuntimeError):
+    """The run never produced a judgeable attempt — Docker died, the harness
+    crashed, the container OOMed, the verifier never emitted a reward.
+
+    This is emphatically *not* a loss. A loss means the agent tried and failed,
+    which is evidence about the agent; an infra failure is evidence about our
+    machine. Recording one as the other feeds diagnosis a trajectory whose
+    ending it must explain, and it obliges by inventing a capability deficit.
+    Excluded from the manifest entirely.
+    """
+
+
 @dataclass
 class MinedRun:
     """What running an agent against one mined task produces."""
@@ -73,7 +86,9 @@ class MinedRun:
 
 class TraceRunner(Protocol):
     """The agent under test. Real implementations shell out to `harbor run`
-    against the mined task dir and parse its trajectory log into Turns."""
+    against the mined task dir and parse its trajectory log into Turns.
+
+    Raises InfraFailure when the attempt couldn't be judged at all."""
 
     def run(self, task_dir: Path) -> MinedRun: ...
 
@@ -89,13 +104,33 @@ def _turn_to_dict(t: Turn) -> dict:
     }
 
 
-def collect_traces(task_dirs: list[Path], runner: TraceRunner, traces_dir: Path) -> list[dict]:
+def collect_traces(
+    task_dirs: list[Path],
+    runner: TraceRunner,
+    traces_dir: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> list[dict]:
     """Run `runner` against every mined task, write each as a Run/Turn trace
-    JSON file, and return manifest entries ready for `load_manifest`."""
+    JSON file, and return manifest entries ready for `load_manifest`.
+
+    Tasks whose run couldn't be judged (InfraFailure, or any unexpected error
+    from the runner) are skipped, not recorded as losses. If `manifest_path` is
+    given the manifest is rewritten after every task, so a crash on task 40 of
+    50 leaves 39 usable traces behind instead of nothing.
+    """
     traces_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict] = []
     for task_dir in task_dirs:
-        result = runner.run(task_dir)
+        try:
+            result = runner.run(task_dir)
+        except InfraFailure as e:
+            print(f"  skip {task_dir.name}: infra failure — {e}", file=sys.stderr)
+            continue
+        except Exception as e:  # a bug in one task's run must not kill the sweep
+            print(f"  skip {task_dir.name}: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+
         run_id = f"{task_dir.name}-{uuid.uuid4().hex[:8]}"
         payload = {
             "runId": run_id,
@@ -105,6 +140,9 @@ def collect_traces(task_dirs: list[Path], runner: TraceRunner, traces_dir: Path)
         trace_path = traces_dir / f"{run_id}.json"
         trace_path.write_text(json.dumps(payload, indent=2))
         manifest.append({"path": str(trace_path), "outcome": "win" if result.passed else "loss"})
+        if manifest_path is not None:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(manifest, indent=2))
     return manifest
 
 
@@ -140,7 +178,11 @@ class HarborTraceRunner:
 
     def run(self, task_dir: Path) -> MinedRun:
         task_dir = task_dir.resolve()
-        job_dir = (self.jobs_dir / f"{task_dir.name}-{self.agent}").resolve()
+        # Unique per invocation: a reused job dir lets a previous run's
+        # result.json be picked up as this run's reward.
+        job_dir = (
+            self.jobs_dir / f"{task_dir.name}-{self.agent}-{uuid.uuid4().hex[:8]}"
+        ).resolve()
         cmd = [
             "harbor",
             "run",
@@ -157,15 +199,31 @@ class HarborTraceRunner:
         if self.model:
             cmd += ["--model", self.model]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_sec)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_sec)
+        except subprocess.TimeoutExpired as e:
+            raise InfraFailure(f"harbor run exceeded {self.timeout_sec}s") from e
+        except OSError as e:
+            raise InfraFailure(f"could not exec harbor: {e}") from e
+
+        if proc.returncode != 0:
+            raise InfraFailure(
+                f"harbor run exited {proc.returncode}: {(proc.stderr or proc.stdout)[-500:]}"
+            )
+
         reward = _find_reward(job_dir)
-        passed = reward is not None and reward >= 1.0
+        if reward is None:
+            # The verifier never emitted a reward, so nothing here says the
+            # agent failed — only that we can't tell.
+            raise InfraFailure(f"no reward found under {job_dir}")
+
         turns = self._parse_turns(job_dir, proc.stdout + proc.stderr)
-        return MinedRun(turns=turns, passed=passed)
+        return MinedRun(turns=turns, passed=reward >= 1.0)
 
 
 __all__ = [
     "HarborTraceRunner",
+    "InfraFailure",
     "MinedRun",
     "TraceRunner",
     "collect_traces",

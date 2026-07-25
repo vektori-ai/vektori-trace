@@ -4,11 +4,11 @@ for a diagnosed capability deficit, isolating it as a concrete, verifiable task.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
 from .diagnose import DeficitScore
 from .llm import call_json
+from .mining.emitter import HarborTask, write_harbor_task
 
 _TASKGEN_SCHEMA = {
     "type": "object",
@@ -87,38 +87,71 @@ def generate_task_files(deficit: DeficitScore, model: str | None = None) -> dict
     return result
 
 
+# Harbor's verifier contract: whatever tests/test.sh leaves in
+# /logs/verifier/reward.txt is the reward. Mined tasks score F2P/P2P via the
+# shipped verifier.py; a synthesized task has no F2P set, so its checks are
+# pass/fail on pytest's exit code.
+_SYNTHETIC_TEST_SH = """#!/bin/bash
+set -uo pipefail
+mkdir -p /logs/verifier
+( cd /workspace && python3 -m pytest -v /tests/test_outputs.py ) \\
+  > /logs/verifier/test_output.log 2>&1
+TEST_EXIT_CODE=$?
+cat /logs/verifier/test_output.log
+[ "$TEST_EXIT_CODE" -eq 0 ] \\
+  && echo "1.0" > /logs/verifier/reward.txt \\
+  || echo "0.0" > /logs/verifier/reward.txt
+exit 0
+"""
+
+
 def scaffold_task(
     deficit: DeficitScore, tasks_dir: Path, org: str = "vektori", model: str | None = None
 ) -> Path:
-    """Scaffold a Harbor task dir via `harbor task init`, then fill it in with
-    LLM-generated content targeting the given deficit. Returns the task dir path."""
+    """Write a Harbor task dir filled with LLM-generated content targeting the
+    given deficit. Returns the task dir path.
+
+    Uses `emitter.write_harbor_task` rather than shelling out to
+    `harbor task init`: that command's `--tasks-dir`/`--description`/`--author`
+    flags don't exist, so the call could only ever fail, and it made the CLI
+    depend on a harbor binary being installed to produce files we already know
+    how to write. The emitter is the one task writer, and mined and synthesized
+    tasks now come out of it identically.
+    """
     name = _slugify(deficit.capability.name)
     generated = generate_task_files(deficit, model=model)
 
-    subprocess.run(
-        [
-            "harbor",
-            "task",
-            "init",
-            f"{org}/{name}",
-            "--tasks-dir",
-            str(tasks_dir),
-            "--description",
-            generated["task_description"],
-            "--author",
-            "vektori-trace",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    task = HarborTask(
+        name=name,
+        org=org,
+        description=generated["task_description"],
+        instruction=generated["instruction_md"],
+        # Synthesized tasks have no gold diff — the oracle is solve.sh, written
+        # below over the emitter's git-apply shim.
+        oracle_diff="",
+        repo2env={
+            "source": "taskgen",
+            "capability_id": deficit.capability.id,
+            "capability_name": deficit.capability.name,
+            "gap": deficit.gap,
+            "prevalence": deficit.prevalence,
+            "n_relevant_wins": deficit.n_relevant_wins,
+            "n_relevant_losses": deficit.n_relevant_losses,
+            "evidence_run_ids": [t.run_id for t in deficit.lacking_loss_traces],
+            "reward_kinds": ["test_execution"],
+        },
+        category="capability_probe",
+        environment_dockerfile=generated["dockerfile"],
+        test_script=_SYNTHETIC_TEST_SH,
+        aux_files={"tests/test_outputs.py": generated["test_outputs_py"]},
     )
+    task_dir = write_harbor_task(task, tasks_dir)
 
-    task_dir = tasks_dir / name
-    (task_dir / "instruction.md").write_text(generated["instruction_md"])
-    (task_dir / "environment" / "Dockerfile").write_text(generated["dockerfile"])
-    (task_dir / "tests" / "test_outputs.py").write_text(generated["test_outputs_py"])
     solve_path = task_dir / "solution" / "solve.sh"
-    solve_path.write_text(generated["solve_sh"])
+    solve_path.write_text(generated["solve_sh"], encoding="utf-8")
     solve_path.chmod(0o755)
+    # The emitter writes an empty patch.diff for the no-gold-diff case; drop it
+    # so nothing downstream mistakes it for a real oracle patch.
+    (task_dir / "solution" / "patch.diff").unlink(missing_ok=True)
 
     return task_dir
