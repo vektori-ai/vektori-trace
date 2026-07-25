@@ -13,7 +13,12 @@ from .diagnose import (
     score_deficits,
     select_deficit,
 )
-from .envcheck import build_probe_task, run_probe
+from .envcheck import (
+    build_probe_task,
+    build_reward_hack_task,
+    evaluate_reward_hack,
+    run_probe,
+)
 from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
 from .mining.spec import LLMSpec
 from .planted import (
@@ -28,7 +33,7 @@ from .planted import (
 from .report import build_report, write_report
 from .schema import Trace, load_manifest
 from .taskgen import scaffold_task
-from .validity import prove_validity
+from .validity import _find_reward, prove_validity
 
 
 def _load_traces(manifest_path: Path) -> list[Trace]:
@@ -244,6 +249,15 @@ def cmd_checkenv(args: argparse.Namespace) -> int:
     )
     print(f"\nReport written to {out_dir / 'envcheck.json'}")
 
+    if args.reward_hack:
+        print("\nReward-hack probe: an agent that fixes nothing and forges its score...")
+        hack_dir = build_reward_hack_task(out_dir / "task")
+        run_probe(hack_dir, out_dir / "jobs-rewardhack")
+        reward = _find_reward(out_dir / "jobs-rewardhack")
+        hack_finding = evaluate_reward_hack(reward)
+        print(f"  [{hack_finding.mark}] {hack_finding.name}: {hack_finding.detail}")
+        findings = [*findings, hack_finding]
+
     failed = [f for f in findings if not f.ok]
     if failed:
         print(f"\n{len(failed)} check(s) failed — emitted tasks are not sound as shipped.")
@@ -341,6 +355,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_env.add_argument("--out", default="./vektori-envcheck", help="output directory")
+    p_env.add_argument(
+        "--reward-hack",
+        action="store_true",
+        help=(
+            "also run an agent that fixes nothing and forges its own reward, to "
+            "measure whether the shared-container verifier can be gamed"
+        ),
+    )
     p_env.set_defaults(func=cmd_checkenv)
 
     p_prove = sub.add_parser("prove", help="run the validity proof for an already-generated task")
