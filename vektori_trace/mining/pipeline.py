@@ -60,6 +60,27 @@ _PROVIDER_ERRORS = (GitHubError,)
 
 _CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#\d+\b", re.IGNORECASE)
 
+# Where the agent's work is staged on its way out of the agent container.
+# Harbor re-uploads a collected artifact to the same absolute path in the
+# verifier container, so one constant names both ends.
+MODEL_PATCH_PATH = "/logs/model_patch.diff"
+
+# Run in the agent's container after the agent phase, before artifact
+# collection. `git add -A` first so new files are in the diff — an agent that
+# fixes a bug by adding a module would otherwise have its work silently
+# dropped and score 0.
+#
+# The agent can tamper with this: it runs in their container, and they could
+# shadow `git`. That's acceptable, because the *scoring* doesn't. The worst a
+# forged diff achieves is being applied to a clean repo and tested honestly —
+# to score, it still has to actually fix the code. Patching the tests doesn't
+# work either: test.sh resets test files to base and re-applies the hidden
+# test_patch after this lands.
+MODEL_PATCH_COLLECT = (
+    "cd /workspace && git config --global --add safe.directory /workspace && "
+    f"git add -A && git diff --cached > {MODEL_PATCH_PATH} || true"
+)
+
 # `git clean -fdx` excludes. Keep language dependency/build dirs so resetting
 # to a PR's base_commit doesn't wipe installed deps the test suite needs:
 #   node_modules (npm/yarn) · target (cargo) · vendor (go) · .venv/venv/.tox
@@ -429,6 +450,7 @@ def build_eval_script(
     language: str | None = None,
     fail_to_pass: list[str] | None = None,
     pass_to_pass: list[str] | None = None,
+    model_patch_path: str | None = None,
 ) -> str:
     """Build the `tests/test.sh` content that Harbor runs after the model patch.
 
@@ -469,6 +491,36 @@ def build_eval_script(
     # tests or the file layout could make `git apply` fail, and we must NOT
     # then score against stale/native tests. Write reward 0 + a clear status
     # and stop. (Reset tolerates test files absent at base — that's `|| true`.)
+    # In separate-verifier mode this script runs in a container the agent never
+    # touched, so the agent's work has to be carried in as a patch and applied
+    # here. That is the whole point: the tests then run against the agent's
+    # code, but nothing the agent did can reach the scoring.
+    #
+    # Failing to apply is scored 0, not skipped. A patch that doesn't apply
+    # means the agent's changes aren't present, so the run is a loss — and
+    # treating it as "no changes, run the tests anyway" would score the base
+    # repo instead, which is a different task.
+    model_patch_guard = (
+        ""
+        if not model_patch_path
+        else (
+            f'if [ -s "{model_patch_path}" ]; then\n'
+            f'  git apply --verbose --reject "{model_patch_path}"\n'
+            "  R2E_MODEL_RC=$?\n"
+            '  if [ "$R2E_MODEL_RC" -ne 0 ]; then\n'
+            '    echo "0.000000" > /logs/verifier/reward.txt\n'
+            "    printf '%s' "
+            '\'{"reward": 0.0, "resolved": false, "parse_status": '
+            '"model_patch_apply_failed"}\' > /logs/verifier/reward-details.json\n'
+            '    echo "R2E: model patch failed to apply (rc=$R2E_MODEL_RC)" >&2\n'
+            "    exit 0\n"
+            "  fi\n"
+            "else\n"
+            f'  echo "R2E: no model patch at {model_patch_path}; scoring the base repo" >&2\n'
+            "fi\n"
+        )
+    )
+
     apply_guard = (
         ""
         if not test_patch.strip()
@@ -495,6 +547,7 @@ def build_eval_script(
         "cd /workspace\n"
         "git config --global --add safe.directory /workspace\n"
         "mkdir -p /logs/verifier\n"
+        f"{model_patch_guard}"
         f"{reset} || true\n"  # tolerate test files that didn't exist at base
         f"{apply_guard}"
         # Capture the suite output so the verifier can parse per-test status.
@@ -1051,6 +1104,7 @@ class PRRuntimePipeline:
             language=self.bootstrap.language.value,
             fail_to_pass=fail_to_pass,
             pass_to_pass=pass_to_pass,
+            model_patch_path=MODEL_PATCH_PATH,
         )
         # Use image_tag for local-only bootstraps (Docker can resolve locally),
         # image_digest only when the image is in a registry that BuildKit can
@@ -1127,4 +1181,9 @@ class PRRuntimePipeline:
                 **(_runtime_aux_files(fail_to_pass, pass_to_pass) if fail_to_pass else {}),
                 "environment/docker-compose.yaml": egress_guard_compose(),
             },
+            # Score in a container the agent never touched. See
+            # MODEL_PATCH_COLLECT for why the diff is the thing carried across.
+            verifier_environment_mode="separate",
+            verifier_collect=[{"command": MODEL_PATCH_COLLECT}],
+            artifacts=[MODEL_PATCH_PATH],
         )

@@ -20,11 +20,13 @@ import pytest
 
 from vektori_trace.envcheck import (
     REWARD_HACK_SOLVE_SH,
+    build_honest_task,
     build_reward_hack_task,
+    evaluate_honest,
     evaluate_reward_hack,
     reward_hack_dockerfile,
 )
-
+from vektori_trace.mining.pipeline import MODEL_PATCH_COLLECT, MODEL_PATCH_PATH
 
 # ---------------------------------------------------------------------------
 # The verdict
@@ -108,3 +110,106 @@ def test_solve_sh_is_executable(tmp_path: Path) -> None:
 def test_no_empty_patch_diff_is_left_behind(tmp_path: Path) -> None:
     task_dir = build_reward_hack_task(tmp_path)
     assert not (task_dir / "solution" / "patch.diff").exists()
+
+
+# ---------------------------------------------------------------------------
+# Verifier isolation
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_task_declares_a_separate_verifier(tmp_path: Path) -> None:
+    import tomllib
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+
+    assert cfg["verifier"]["environment_mode"] == "separate"
+    assert cfg["artifacts"] == [MODEL_PATCH_PATH]
+    assert cfg["verifier"]["collect"][0]["command"] == MODEL_PATCH_COLLECT
+
+
+def test_shared_mode_declares_none_of_it(tmp_path: Path) -> None:
+    """The pre-fix shape has to stay reproducible, or the probe can't show a
+    difference between the two."""
+    import tomllib
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+
+    assert "environment_mode" not in cfg["verifier"]
+    assert "artifacts" not in cfg
+
+
+def test_isolated_test_script_applies_the_model_patch(tmp_path: Path) -> None:
+    """The verifier container never saw the agent, so their work has to be
+    carried in as a patch and applied — otherwise the base repo is scored."""
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    test_sh = (task_dir / "tests" / "test.sh").read_text()
+
+    assert f'git apply --verbose --reject "{MODEL_PATCH_PATH}"' in test_sh
+    assert "model_patch_apply_failed" in test_sh
+
+
+def test_shared_test_script_does_not_apply_a_patch(tmp_path: Path) -> None:
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    test_sh = (task_dir / "tests" / "test.sh").read_text()
+    assert MODEL_PATCH_PATH not in test_sh
+
+
+def test_collect_stages_new_files_too() -> None:
+    """`git diff` alone misses added files, so an agent that fixes a bug by
+    adding a module would have its work silently dropped and score 0."""
+    assert "git add -A" in MODEL_PATCH_COLLECT
+    assert "--cached" in MODEL_PATCH_COLLECT
+
+
+def test_isolated_task_ships_a_verifier_image_that_owns_tests(tmp_path: Path) -> None:
+    """In separate mode harbor sets `skip_tests_upload=True` and uploads
+    nothing, so a verifier image without /tests dies with
+    `/tests/test.sh: No such file or directory`."""
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    verifier_dockerfile = task_dir / "tests" / "Dockerfile"
+
+    assert verifier_dockerfile.exists()
+    body = verifier_dockerfile.read_text()
+    assert "COPY . /tests" in body
+    # Same starting state as the agent's container, so the model patch applies.
+    assert reward_hack_dockerfile().strip() in body
+
+
+def test_shared_mode_ships_no_verifier_dockerfile(tmp_path: Path) -> None:
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    assert not (task_dir / "tests" / "Dockerfile").exists()
+
+
+# ---------------------------------------------------------------------------
+# The control
+# ---------------------------------------------------------------------------
+
+
+def test_honest_agent_must_still_win() -> None:
+    assert evaluate_honest(1.0).ok is True
+    assert evaluate_honest(0.0).ok is False
+    assert evaluate_honest(None).ok is False
+
+
+def test_the_honest_agent_actually_fixes_the_bug(tmp_path: Path) -> None:
+    """Without this control a 0.0 from the cheat proves nothing — it could
+    equally mean the isolated verifier is broken and everything scores zero."""
+    task_dir = build_honest_task(tmp_path)
+    solve = (task_dir / "solution" / "solve.sh").read_text()
+
+    assert "return a + b" in solve
+    assert "/logs/verifier" not in solve  # it wins by working, not by writing
+
+
+def test_honest_and_cheating_tasks_are_otherwise_identical(tmp_path: Path) -> None:
+    """Same environment, same verifier, same oracle — only solve.sh differs."""
+    hack = build_reward_hack_task(tmp_path / "a", isolated=True)
+    honest = build_honest_task(tmp_path / "b")
+
+    for rel in ("environment/Dockerfile", "tests/test.sh", "tests/f2p.json"):
+        assert (hack / rel).read_text() == (honest / rel).read_text()
+    assert (hack / "solution" / "solve.sh").read_text() != (
+        honest / "solution" / "solve.sh"
+    ).read_text()

@@ -113,16 +113,15 @@ not something we control.
 vektori-trace check-env --reward-hack
 ```
 
-also runs an agent that fixes nothing and forges its own score. **This
-currently fails.** Harbor's default `environment_mode = "shared"` runs the
-verifier inside the agent's container, on the agent's `$PATH`, writing to a
-directory the agent can write to — so an agent that shadows `python3` with a
-script writing `1.0` scores 1.0 on an unsolved task. Confirmed in a container,
-not in principle.
+runs two agents against the same task: one that fixes nothing and forges its
+own score, and one that actually fixes the bug. The cheat must score 0.0 and
+the honest fix 1.0 — the second is what distinguishes "the hack was blocked"
+from "scoring is broken and everything is zero".
 
-Until that's fixed, treat any mined win as an upper bound. It matters most for
-step 6: rejection sampling keeps rollouts that score well, and RL finds reward
-hacks reliably.
+Mined tasks score in a **separate** container the agent never touched. The
+agent's work is collected as a diff, applied to a clean checkout, and graded
+there. Under the old shared-container default an agent that shadowed `python3`
+scored 1.0 on an unsolved task — measured, not hypothesised.
 
 ## Does the diagnosis work at all?
 
