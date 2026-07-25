@@ -1,0 +1,4098 @@
+{
+  "planted_capability": {
+    "name": "Reads a failed tool call's error and adjusts the arguments",
+    "description": "When a tool call fails with an informative error, the agent reads the error text and issues a corrected call, instead of repeating the identical call."
+  },
+  "settings": {
+    "model": null,
+    "min_gap": 0.2,
+    "min_support": 3,
+    "seed": 0,
+    "distractor_modes": [
+      "stops_to_ask",
+      "wrong_output_shape",
+      "drops_second_requirement"
+    ]
+  },
+  "cells": [
+    {
+      "config": {
+        "n_wins": 3,
+        "n_losses": 3,
+        "prevalence": 1.0
+      },
+      "repeats": 3,
+      "ceiling_rate": 0.0,
+      "ceiling_verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "recovery_rate": 0.0,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8333333333333334,
+      "verdicts": {
+        "top_ranked_but_below_threshold": 2,
+        "outranked_by_distractor": 1
+      },
+      "runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adapt_call_arguments_based_on_errors",
+            "name": "Adapt tool arguments based on errors"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 3
+          },
+          "ranked": [
+            {
+              "name": "Adapt tool arguments based on errors",
+              "id": "adapt_call_arguments_based_on_errors",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "On-demand namespace creation",
+              "id": "on_demand_namespace_creation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Communicate errors and next steps",
+              "id": "communicate_error_and_next_steps",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Retry on tool failure",
+              "id": "retry_on_failure",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Handle permission and policy constraints",
+              "id": "handle_permission_and_policy_constraints",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "Handle unsupported input formats",
+              "id": "handle_unsupported_input_formats",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Graceful shutdown after persistent failures",
+              "id": "graceful_shutdown_on_persistent_failures",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "outranked_by_distractor",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "bounded_retry_with_progress_reporting",
+            "name": "Bounded retry with progress reporting"
+          },
+          "matched_rank": 3,
+          "selected_capability": null,
+          "label_accuracy": 0.5,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->PRESENT": 3
+          },
+          "ranked": [
+            {
+              "name": "Missing input detection and correction",
+              "id": "missing_input_detection_and_correction",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Dependency conflict detection and adaptation",
+              "id": "dependency_conflict_detection_and_adaptation",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Format compatibility handling",
+              "id": "format_compatibility_handling",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Bounded retry with progress reporting",
+              "id": "bounded_retry_with_progress_reporting",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Clear failure reporting on persistent errors",
+              "id": "failure_reporting_on_persistent_errors",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_driven_input_repair",
+            "name": "Error-driven input repair"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Schema awareness and adaptation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 3
+          },
+          "ranked": [
+            {
+              "name": "Error-driven input repair",
+              "id": "error_driven_input_repair",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Schema awareness and adaptation",
+              "id": "schema_awareness_and_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Failure analysis and next-step planning",
+              "id": "failure_analysis_and_next_step_planning",
+              "gap": 0.6666666666666666,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.4444444444444444,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "near"
+            },
+            {
+              "name": "Retry on failure",
+              "id": "retry_on_failure",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Multi-step workflow execution",
+              "id": "multi_step_workflow_execution",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Explicit completion and status reporting",
+              "id": "explicit_completion_and_status_reporting",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "near"
+            },
+            {
+              "name": "Tool selection and command construction",
+              "id": "tool_selection_and_command_construction",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 3
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 3
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 1,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 3
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 3,
+        "n_losses": 3,
+        "prevalence": 0.6
+      },
+      "repeats": 3,
+      "ceiling_rate": 0.0,
+      "ceiling_verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "recovery_rate": 0.0,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.9444444444444445,
+      "verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_driven_argument_adjustment",
+            "name": "error_driven_argument_adjustment"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "error_driven_argument_adjustment",
+              "id": "error_driven_argument_adjustment",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "multi_step_remediation",
+              "id": "multi_step_remediation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "environment_state_inspection_and_idempotent_execution",
+              "id": "environment_state_inspection_and_idempotent_execution",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "clarification_before_action",
+              "id": "clarification_before_action",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "input_format_validation_and_handling",
+              "id": "input_format_validation_and_handling",
+              "gap": null,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "retry_strategy_and_progressive_backoff",
+              "id": "retry_strategy_and_progressive_backoff",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "payload_adjustment_on_error",
+            "name": "Payload adjustment based on error messages"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Payload adjustment based on error messages",
+              "id": "payload_adjustment_on_error",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Diverse tool proficiency",
+              "id": "diverse_tool_proficiency",
+              "gap": null,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Error detection and recovery",
+              "id": "error_detection_and_recovery",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Bounded retry policy",
+              "id": "bounded_retry_policy",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Explicit confirmation before critical actions",
+              "id": "explicit_confirmation_before_critical_action",
+              "gap": -1.0,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Clear completion reporting",
+              "id": "completion_status_reporting",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Format and compatibility error handling",
+              "id": "format_error_handling",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "near"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_based_payload_revision",
+            "name": "error_driven_payload_correction"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 0.8333333333333334,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->NA": 1,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "error_driven_payload_correction",
+              "id": "error_based_payload_revision",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "completion_status_reporting",
+              "id": "completion_status_reporting",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 3,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "retry_on_failure",
+              "id": "adaptive_retry_policy",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "interpret_error_messages",
+              "id": "error_message_understanding",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "graceful_failure_reporting",
+              "id": "graceful_failure_escalation",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "seek_clarifications_before_action",
+              "id": "clarifying_question_before_action",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 3,
+        "n_losses": 3,
+        "prevalence": 0.3
+      },
+      "repeats": 3,
+      "ceiling_rate": 0.0,
+      "ceiling_verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "recovery_rate": 0.0,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8888888888888888,
+      "verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_interpretation_and_diagnostics",
+            "name": "error_interpretation_and_diagnostics"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 3,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "error_interpretation_and_diagnostics",
+              "id": "error_interpretation_and_diagnostics",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "dynamic_argument_adjustment",
+              "id": "dynamic_argument_adjustment",
+              "gap": 0.5,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.16666666666666666,
+              "n_wins": 3,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "multi_step_tool_execution",
+              "id": "multi_step_tool_execution",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "retry_mechanics",
+              "id": "retry_mechanics",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "output_format_adherence",
+              "id": "output_format_adherence",
+              "gap": null,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "resource_provisioning_to_support_operations",
+              "id": "resource_provisioning_to_support_operations",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "status_reporting_and_clarity",
+              "id": "status_reporting_and_clarity",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "api_error_handling_and_payload_adjustment",
+            "name": "API error handling and payload refinement"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 3,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "API error handling and payload refinement",
+              "id": "api_error_handling_and_payload_adjustment",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Translate and execute data queries",
+              "id": "translate_and_execute_sql_query",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Retry on transient failures",
+              "id": "retry_on_transient_failures",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Dependency conflict resolution",
+              "id": "dependency_conflict_resolution",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Clarify before performing ambiguous actions",
+              "id": "confirmation_before_action",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Image resizing and format conversion",
+              "id": "perform_image_processing_with_format_conversion",
+              "gap": null,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "tool_feedback_driven_debugging",
+            "name": "Tool Feedback Driven Debugging"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 0.6666666666666666,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 2,
+            "LACKING->PRESENT": 1,
+            "NA->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "Tool Feedback Driven Debugging",
+              "id": "tool_feedback_driven_debugging",
+              "gap": 0.5,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Handle API Validation Errors and Correct Payloads",
+              "id": "handle_api_validation_errors",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 0,
+              "match": "strict"
+            },
+            {
+              "name": "Retry Failed Tool Calls",
+              "id": "retry_failed_tool_calls",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Ask Clarifying Questions Before Action",
+              "id": "clarify_before_action",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Execute Shell Commands and Capture Feedback",
+              "id": "shell_command_execution",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Dependency Version Pinning and Install",
+              "id": "dependency_version_pin_and_install",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 3,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 3,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 3,
+            "PRESENT->PRESENT": 2,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 3,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 6,
+        "n_losses": 6,
+        "prevalence": 1.0
+      },
+      "repeats": 3,
+      "ceiling_rate": 1.0,
+      "ceiling_verdicts": {
+        "recovered": 3
+      },
+      "recovery_rate": 0.6666666666666666,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8055555555555555,
+      "verdicts": {
+        "outranked_by_distractor": 1,
+        "recovered": 2
+      },
+      "runs": [
+        {
+          "recovered": false,
+          "verdict": "outranked_by_distractor",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adaptive_error_handling_and_retry",
+            "name": "adaptive_error_handling_and_retry"
+          },
+          "matched_rank": 4,
+          "selected_capability": null,
+          "label_accuracy": 0.5,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->PRESENT": 6
+          },
+          "ranked": [
+            {
+              "name": "dependency_conflict_resolution",
+              "id": "dependency_conflict_resolution",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 1,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "automatic_resource_provisioning",
+              "id": "automatic_resource_provisioning",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 3,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "format_adaptation_and_negotiation",
+              "id": "format_adaptation_and_negotiation",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "idempotent_operation_execution",
+              "id": "idempotent_operation_execution",
+              "gap": -0.6666666666666666,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 3,
+              "n_losses": 6,
+              "match": "near"
+            },
+            {
+              "name": "adaptive_error_handling_and_retry",
+              "id": "adaptive_error_handling_and_retry",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "bounded_retry_and_failure_handling",
+              "id": "bounded_retry_and_failure_handling",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adaptive_error_diagnosis_and_argument_adjustment",
+            "name": "adaptive_error_diagnosis_and_argument_adjustment"
+          },
+          "matched_rank": 0,
+          "selected_capability": "adaptive_error_diagnosis_and_argument_adjustment",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 6
+          },
+          "ranked": [
+            {
+              "name": "adaptive_error_diagnosis_and_argument_adjustment",
+              "id": "adaptive_error_diagnosis_and_argument_adjustment",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "format_negotiation_and_conversion",
+              "id": "format_negotiation_and_conversion",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "required_field_validation_and_correction",
+              "id": "required_field_validation_and_correction",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "tool_call_execution_and_response_handling",
+              "id": "tool_call_execution_and_response_handling",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "retry_policies_and_transient_error_handling",
+              "id": "retry_policies_and_transient_error_handling",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "permission_and_access_error_handling",
+              "id": "permission_and_access_error_handling",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "corrective_retry",
+            "name": "corrective_retry"
+          },
+          "matched_rank": 0,
+          "selected_capability": "corrective_retry",
+          "label_accuracy": 0.9166666666666666,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->PRESENT": 1,
+            "LACKING->LACKING": 5
+          },
+          "ranked": [
+            {
+              "name": "corrective_retry",
+              "id": "corrective_retry",
+              "gap": 0.8333333333333334,
+              "prevalence": 0.8333333333333334,
+              "priority": 0.6944444444444445,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "schema_adaptation",
+              "id": "schema_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "dependency_resolution",
+              "id": "dependency_resolution",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "infer_missing_required_fields",
+              "id": "infer_missing_required_fields",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "environment_state_retry",
+              "id": "environment_state_retry",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "io_error_handling",
+              "id": "io_error_handling",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "strict"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 6
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 6
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 2,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 6
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 4,
+              "n_losses": 6,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 6,
+        "n_losses": 6,
+        "prevalence": 0.6
+      },
+      "repeats": 3,
+      "ceiling_rate": 1.0,
+      "ceiling_verdicts": {
+        "recovered": 3
+      },
+      "recovery_rate": 0.6666666666666666,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8611111111111112,
+      "verdicts": {
+        "recovered": 2,
+        "top_ranked_but_below_threshold": 1
+      },
+      "runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "actionable_error_message_parsing_and_next_steps",
+            "name": "Actionable error parsing and next-step planning"
+          },
+          "matched_rank": 3,
+          "selected_capability": "Actionable error parsing and next-step planning",
+          "label_accuracy": 0.8333333333333334,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 2,
+            "LACKING->PRESENT": 2
+          },
+          "ranked": [
+            {
+              "name": "Format negotiation and conversion",
+              "id": "format_negotiation_and_conversion",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Automatic resource provisioning on missing requirements",
+              "id": "automatic_resource_provisioning_on_missing_requirements",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 3,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Dependency conflict resolution and pinning resolution",
+              "id": "dependency_conflict_resolution_and_version_pinning",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Actionable error parsing and next-step planning",
+              "id": "actionable_error_message_parsing_and_next_steps",
+              "gap": 0.5,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.16666666666666666,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Adaptive error handling and argument adjustment",
+              "id": "adaptive_error_handling_and_argument_adjustment",
+              "gap": 0.2,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.03333333333333333,
+              "n_wins": 4,
+              "n_losses": 5,
+              "match": "strict"
+            },
+            {
+              "name": "Bounded retry logic with fall back",
+              "id": "retry_logic_with_limit_and_fall_back",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Clear completion status reporting",
+              "id": "completion_status_report_and_status_updates",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 5,
+              "match": "near"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "parameter_error_recovery_and_argument_correction",
+            "name": "Parameter error recovery and argument correction"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 0.75,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->NA": 3,
+            "LACKING->LACKING": 1
+          },
+          "ranked": [
+            {
+              "name": "Parameter error recovery and argument correction",
+              "id": "parameter_error_recovery_and_argument_correction",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 4,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Unsupported input format negotiation and conversion",
+              "id": "unsupported_input_format_negotiation_and_conversion",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Dependency conflict resolution during installations",
+              "id": "dependency_conflict_resolution_during_installations",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "User confirmation before execution",
+              "id": "user_confirmation_before_execution",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Transient error retry and status reporting",
+              "id": "transient_error_retry_and_status_reporting",
+              "gap": -0.5,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 2,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Error reporting and graceful failure logging",
+              "id": "error_reporting_and_graceful_failure_logging",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "File IO error handling and retry",
+              "id": "file_io_error_handling_and_retry",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_message_based_argument_correction",
+            "name": "Error message based argument correction"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Error message based argument correction",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Error message based argument correction",
+              "id": "error_message_based_argument_correction",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Schema and query robustness",
+              "id": "schema_and_query_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Dependency version resolution",
+              "id": "dependency_version_resolution",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Retry with error-driven retries",
+              "id": "retry_with_error_handling",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Access error handling and retry",
+              "id": "access_error_handling_and_retry",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Completion acknowledgement and validation",
+              "id": "operation_completion_acknowgement",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 6,
+              "n_losses": 5,
+              "match": "none"
+            },
+            {
+              "name": "Explicit confirmation for impactful actions",
+              "id": "confirm_before_critical_action",
+              "gap": -0.33333333333333337,
+              "prevalence": 0.3333333333333333,
+              "priority": -0.11111111111111112,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.6666666666666666,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 6,
+        "n_losses": 6,
+        "prevalence": 0.3
+      },
+      "repeats": 3,
+      "ceiling_rate": 0.0,
+      "ceiling_verdicts": {
+        "top_ranked_but_below_threshold": 3
+      },
+      "recovery_rate": 0.0,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.9166666666666666,
+      "verdicts": {
+        "top_ranked_but_below_threshold": 1,
+        "outranked_by_distractor": 2
+      },
+      "runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adaptive_argument_fixing_on_tool_error",
+            "name": "Adaptive argument correction on tool errors"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Precondition detection and action augmentation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adaptive argument correction on tool errors",
+              "id": "adaptive_argument_fixing_on_tool_error",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Dependency resolution and adaptive installation",
+              "id": "dependency_resolution_and_installation",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Input/output format negotiation and conversion",
+              "id": "format_negotiation_and_conversion",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Idempotent action execution",
+              "id": "idempotent_action_execution",
+              "gap": 0.25,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Precondition detection and action augmentation",
+              "id": "precondition_detection_and_action_augmentation",
+              "gap": 0.25,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.041666666666666664,
+              "n_wins": 6,
+              "n_losses": 4,
+              "match": "none"
+            },
+            {
+              "name": "User confirmation before risky actions",
+              "id": "confirmation_before_risky_actions",
+              "gap": -1.0,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Iterative retry with error feedback",
+              "id": "iterative_retry_and_error_feedback",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "outranked_by_distractor",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_driven_correction",
+            "name": "Error-driven correction"
+          },
+          "matched_rank": 2,
+          "selected_capability": null,
+          "label_accuracy": 0.8333333333333334,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->PRESENT": 2
+          },
+          "ranked": [
+            {
+              "name": "Validate and fix tool inputs",
+              "id": "validate_and_fix_tool_inputs",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 3,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Input format conversion",
+              "id": "input_format_conversion",
+              "gap": 0.5,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.08333333333333333,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Error-driven correction",
+              "id": "error_driven_correction",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Retry on failure",
+              "id": "retry_on_failure",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Guardrails and confirmation",
+              "id": "guardrails_and_confirmation",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Respect output format",
+              "id": "respect_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "outranked_by_distractor",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_detection_and_correction",
+            "name": "Error detection and remediation"
+          },
+          "matched_rank": 2,
+          "selected_capability": null,
+          "label_accuracy": 0.9166666666666666,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 1,
+            "LACKING->PRESENT": 1
+          },
+          "ranked": [
+            {
+              "name": "Adaptive retry and command refinement",
+              "id": "retry_with_alternative_command",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Dependency pin and version resolution",
+              "id": "dependency_resolution",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Error detection and remediation",
+              "id": "error_detection_and_correction",
+              "gap": 0.5,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.08333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "File I/O error handling and retry",
+              "id": "file_io_error_retry",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Consent handling for critical actions",
+              "id": "consent_for_critical_actions",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Output format adherence",
+              "id": "formatting_and_output_constraints",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Proceeds without asking for confirmation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 6,
+            "PRESENT->PRESENT": 4,
+            "LACKING->LACKING": 2
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 4,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.3333333333333333,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.1111111111111111,
+              "n_wins": 6,
+              "n_losses": 6,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 12,
+        "n_losses": 12,
+        "prevalence": 1.0
+      },
+      "repeats": 3,
+      "ceiling_rate": 1.0,
+      "ceiling_verdicts": {
+        "recovered": 3
+      },
+      "recovery_rate": 0.6666666666666666,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8194444444444445,
+      "verdicts": {
+        "recovered": 2,
+        "outranked_by_distractor": 1
+      },
+      "runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_handling_and_argument_adaptation",
+            "name": "Error handling and argument adaptation"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Error handling and argument adaptation",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 12
+          },
+          "ranked": [
+            {
+              "name": "Error handling and argument adaptation",
+              "id": "error_handling_and_argument_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Domain error context understanding",
+              "id": "domain_error_context_understanding",
+              "gap": 0.6666666666666666,
+              "prevalence": 0.6666666666666666,
+              "priority": 0.4444444444444444,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Dependency version resolution",
+              "id": "dependency_version_resolution",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 3,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Preflight state synchronization",
+              "id": "preflight_state_synchronization",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Input format conversion",
+              "id": "input_format_conversion",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Directory creation on write",
+              "id": "mkdirs_on_write_operations",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Retry and backoff strategy",
+              "id": "retry_and_backoff_strategy",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "near"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "outranked_by_distractor",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_detection_and_recovery",
+            "name": "Error detection and recovery"
+          },
+          "matched_rank": 3,
+          "selected_capability": "Adaptive tool calling",
+          "label_accuracy": 0.5,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->PRESENT": 12
+          },
+          "ranked": [
+            {
+              "name": "Adaptive tool calling",
+              "id": "adaptive_tool_calling",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "near"
+            },
+            {
+              "name": "Environment preparation and precondition handling",
+              "id": "environment_preparation_and_precondition_handling",
+              "gap": 1.0,
+              "prevalence": 0.8333333333333334,
+              "priority": 0.8333333333333334,
+              "n_wins": 3,
+              "n_losses": 10,
+              "match": "none"
+            },
+            {
+              "name": "Format negotiation and conversion",
+              "id": "format_negotiation_and_conversion",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 4,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Error detection and recovery",
+              "id": "error_detection_and_recovery",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Result verification and confirmation",
+              "id": "result_verification",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Bounded retries and graceful termination",
+              "id": "bounded_retries_and_termination",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "near"
+            },
+            {
+              "name": "Explicit planning and status updates",
+              "id": "explicit_planning_and_status_updates",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_handling_and_query_fixing",
+            "name": "Error handling and query fixing"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Error handling and query fixing",
+          "label_accuracy": 0.9583333333333334,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 11,
+            "LACKING->PRESENT": 1
+          },
+          "ranked": [
+            {
+              "name": "Error handling and query fixing",
+              "id": "error_handling_and_query_fixing",
+              "gap": 0.9166666666666666,
+              "prevalence": 0.9166666666666666,
+              "priority": 0.8402777777777777,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Dynamic resource provisioning",
+              "id": "dynamic_resource_provisioning_on_missing_target",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Policy-based call adjustment",
+              "id": "policy_based_call_adjustment_and_retry",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Dependency resolution and flexible installation",
+              "id": "dependency_resolution_and_flexible_installation",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Retry on transient failures",
+              "id": "retry_on_transient_failures",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Automatic directory creation on write",
+              "id": "automatic_directory_creation_on_write",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "Input format validation and retry",
+              "id": "input_format_validation_and_retry",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "strict"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 12
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 12
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 4,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 12
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 1.0,
+              "priority": 1.0,
+              "n_wins": 8,
+              "n_losses": 12,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 0,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 12,
+        "n_losses": 12,
+        "prevalence": 0.6
+      },
+      "repeats": 3,
+      "ceiling_rate": 1.0,
+      "ceiling_verdicts": {
+        "recovered": 3
+      },
+      "recovery_rate": 0.6666666666666666,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 0.8333333333333334,
+      "verdicts": {
+        "recovered": 2,
+        "top_ranked_but_below_threshold": 1
+      },
+      "runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adaptive_error_analysis_and_retry",
+            "name": "Adaptive error analysis and retry"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adaptive error analysis and retry",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 7
+          },
+          "ranked": [
+            {
+              "name": "Adaptive error analysis and retry",
+              "id": "adaptive_error_analysis_and_retry",
+              "gap": 1.0,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.5833333333333334,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Schema-aware query execution",
+              "id": "schema_aware_query_execution",
+              "gap": 1.0,
+              "prevalence": 0.25,
+              "priority": 0.25,
+              "n_wins": 1,
+              "n_losses": 3,
+              "match": "near"
+            },
+            {
+              "name": "Payload field validation and completion",
+              "id": "payload_field_validation_and_completion",
+              "gap": 1.0,
+              "prevalence": 0.25,
+              "priority": 0.25,
+              "n_wins": 4,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Input format conversion and negotiation",
+              "id": "input_format_conversion_and_negotiation",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Git push error handling with pull/rebase",
+              "id": "git_push_error_handling_with_pull_or_rebase",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "Create parent directories on write",
+              "id": "ensure_parent_directories_on_write",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "API validation error handling and retry",
+              "id": "api_validation_error_handling_retry",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "strict"
+            },
+            {
+              "name": "Confirmation before destructive actions",
+              "id": "confirmation_gathering_for_destructive_actions",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": false,
+          "verdict": "top_ranked_but_below_threshold",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "provision_missing_namespace_on_failure",
+            "name": "Provision missing namespace on deployment failure"
+          },
+          "matched_rank": 0,
+          "selected_capability": null,
+          "label_accuracy": 0.5,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->NA": 7,
+            "PRESENT->PRESENT": 1,
+            "LACKING->LACKING": 2,
+            "LACKING->NA": 5
+          },
+          "ranked": [
+            {
+              "name": "Provision missing namespace on deployment failure",
+              "id": "provision_missing_namespace_on_failure",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Auto fix unsupported input formats and retry",
+              "id": "auto_fix_unsupported_input_format_and_retry",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 4,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Fill missing required fields on API calls",
+              "id": "fill_missing_required_fields_on_api_calls",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Create parent directories on file write failure",
+              "id": "mkdirs_on_file_write_failure",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "Retry on transient errors",
+              "id": "retry_on_transient_errors",
+              "gap": -0.6666666666666666,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 3,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Stop and report when retries are exhausted",
+              "id": "graceful_failure_after_retries_exhausted",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 7,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_recovery_and_query_adjustment",
+            "name": "Error recovery and query adjustment"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Error recovery and query adjustment",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 7
+          },
+          "ranked": [
+            {
+              "name": "Error recovery and query adjustment",
+              "id": "error_recovery_and_query_adjustment",
+              "gap": 1.0,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.5833333333333334,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Adaptive policy/permission error handling",
+              "id": "adaptive_policy_error_handling",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 2,
+              "match": "strict"
+            },
+            {
+              "name": "Auto-create parent directories on write",
+              "id": "auto_create_parent_directories_on_write",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Retry failed tool calls",
+              "id": "retry_failed_tool_calls",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Automatic namespace creation on deployment",
+              "id": "auto_create_namespace_on_deploy",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Confirmation before sensitive actions",
+              "id": "request_user_confirmation_before_sensitive_actions",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 4,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 7
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.5833333333333334,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 7
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.5833333333333334,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 9,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 7
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.5833333333333334,
+              "n_wins": 8,
+              "n_losses": 7,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.16666666666666666,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.027777777777777776,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "config": {
+        "n_wins": 12,
+        "n_losses": 12,
+        "prevalence": 0.3
+      },
+      "repeats": 3,
+      "ceiling_rate": 1.0,
+      "ceiling_verdicts": {
+        "recovered": 3
+      },
+      "recovery_rate": 1.0,
+      "proposed_rate": 1.0,
+      "mean_label_accuracy": 1.0,
+      "verdicts": {
+        "recovered": 3
+      },
+      "runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_based_argument_correction",
+            "name": "error_based_argument_correction"
+          },
+          "matched_rank": 0,
+          "selected_capability": "error_based_argument_correction",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "error_based_argument_correction",
+              "id": "error_based_argument_correction",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "remote_sync_before_push",
+              "id": "remote_sync_before_push",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "input_format_adaptation_and_conversion",
+              "id": "input_format_adaptation_and_conversion",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "mkdirs_before_write",
+              "id": "mkdirs_before_write",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "none"
+            },
+            {
+              "name": "missing_field_autofill_and_retry",
+              "id": "missing_field_autofill_and_retry",
+              "gap": null,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 1,
+              "match": "strict"
+            },
+            {
+              "name": "confirm_before_sensitive_actions",
+              "id": "confirm_before_sensitive_actions",
+              "gap": -1.0,
+              "prevalence": 0.0,
+              "priority": -0.0,
+              "n_wins": 2,
+              "n_losses": 3,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_aware_argument_adjustment",
+            "name": "Error-aware argument adjustment and retry"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Error-aware argument adjustment and retry",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Error-aware argument adjustment and retry",
+              "id": "error_aware_argument_adjustment",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "On-demand namespace/resource provisioning for deployments",
+              "id": "on_demand_namespace_provisioning",
+              "gap": 1.0,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.16666666666666666,
+              "n_wins": 1,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Policy constraint awareness and adjustment",
+              "id": "policy_constraint_awareness_and_adjustment",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 3,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Missing field detection and payload correction",
+              "id": "missing_field_recovery",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 0,
+              "match": "near"
+            },
+            {
+              "name": "Automatic directory creation for file writes",
+              "id": "mkdirs_on_write_operations",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 1,
+              "n_losses": 1,
+              "match": "near"
+            },
+            {
+              "name": "Request confirmation for potentially destructive actions",
+              "id": "confirmation_before_destructive_actions",
+              "gap": null,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Retry on deployment failures and report status",
+              "id": "deployment_failure_retry_and_status_reporting",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 4,
+              "n_losses": 4,
+              "match": "strict"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "adaptive_error_fixups",
+            "name": "Adaptive error fixups"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adaptive error fixups",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adaptive error fixups",
+              "id": "adaptive_error_fixups",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Storage path prefix validation",
+              "id": "storage_path_prefix_validation",
+              "gap": 1.0,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.08333333333333333,
+              "n_wins": 2,
+              "n_losses": 1,
+              "match": "none"
+            },
+            {
+              "name": "Auto-create missing resources",
+              "id": "auto_resource_creation_on_missing",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 3,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Image resize and format conversion",
+              "id": "image_resize_and_format_conversion",
+              "gap": null,
+              "prevalence": 0.08333333333333333,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "near"
+            },
+            {
+              "name": "Retry on transient errors",
+              "id": "retry_on_transient_errors",
+              "gap": 0.0,
+              "prevalence": 0.0,
+              "priority": 0.0,
+              "n_wins": 7,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Output constraint adherence",
+              "id": "constraint_adherence_mechanism",
+              "gap": null,
+              "prevalence": 0.5833333333333334,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 7,
+              "match": "none"
+            },
+            {
+              "name": "Confirm before critical actions",
+              "id": "confirm_before_critical_actions",
+              "gap": -0.75,
+              "prevalence": 0.08333333333333333,
+              "priority": -0.0625,
+              "n_wins": 1,
+              "n_losses": 4,
+              "match": "none"
+            }
+          ]
+        }
+      ],
+      "ceiling_runs": [
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.25,
+              "prevalence": 0.25,
+              "priority": 0.0625,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.25,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.25,
+              "prevalence": 0.25,
+              "priority": 0.0625,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.25,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            }
+          ]
+        },
+        {
+          "recovered": true,
+          "verdict": "recovered",
+          "match_kind": "strict",
+          "matched_capability": {
+            "id": "error_adaptation",
+            "name": "Adapts after a failed tool call"
+          },
+          "matched_rank": 0,
+          "selected_capability": "Adapts after a failed tool call",
+          "label_accuracy": 1.0,
+          "label_confusion": {
+            "NA->NA": 12,
+            "PRESENT->PRESENT": 8,
+            "LACKING->LACKING": 4
+          },
+          "ranked": [
+            {
+              "name": "Adapts after a failed tool call",
+              "id": "error_adaptation",
+              "gap": 1.0,
+              "prevalence": 0.3333333333333333,
+              "priority": 0.3333333333333333,
+              "n_wins": 8,
+              "n_losses": 4,
+              "match": "strict"
+            },
+            {
+              "name": "Proceeds without asking for confirmation",
+              "id": "proceeds_without_confirmation",
+              "gap": 0.25,
+              "prevalence": 0.25,
+              "priority": 0.0625,
+              "n_wins": 12,
+              "n_losses": 12,
+              "match": "none"
+            },
+            {
+              "name": "Follows the requested output format",
+              "id": "follows_output_format",
+              "gap": null,
+              "prevalence": 0.25,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 3,
+              "match": "none"
+            },
+            {
+              "name": "Completes every part of the task",
+              "id": "completes_all_requirements",
+              "gap": null,
+              "prevalence": 0.16666666666666666,
+              "priority": 0.0,
+              "n_wins": 0,
+              "n_losses": 2,
+              "match": "none"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
