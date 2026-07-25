@@ -41,6 +41,11 @@ from typing import Any
 
 import tomli_w
 
+# The Harbor task-schema version these files are written against. Bumping it
+# is a claim that the emitted layout matches that schema, so it moves only
+# alongside a check that it still loads.
+TASK_SCHEMA_VERSION = "1.3"
+
 
 @dataclass(slots=True)
 class HarborTask:
@@ -118,15 +123,22 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
     # task.toml so harbor accepts the task.
     qualified_name = f"{task.org}/{task.name}"
     payload: dict[str, Any] = {
-        "version": "1.0",
+        # `schema_version`, not `version`. Harbor still accepts the old key
+        # through a `handle_version_rename` back-compat shim, so this was never
+        # a live failure — but it is a deprecation shim, and the value we were
+        # declaring (1.0) was not the schema we actually conform to.
+        "schema_version": TASK_SCHEMA_VERSION,
         "task": {
             "name": qualified_name,
             "description": task.description,
+            # Keywords belong to [task] (Harbor's PackageInfo). Under
+            # [metadata] they parsed fine and were simply never read, so every
+            # emitted task had `task.keywords == []`.
+            "keywords": task.keywords,
         },
         "metadata": {
             "difficulty": task.difficulty,
             "category": task.category,
-            "keywords": task.keywords,
             "repo2env": repo2env,
         },
         "agent": {"timeout_sec": 1800.0},
