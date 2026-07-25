@@ -5,3 +5,7 @@ __pycache__/
 vektori-out/
 jobs/
 .env
+selftest-run/
+envcheck-run/
+vektori-selftest/
+vektori-envcheck/

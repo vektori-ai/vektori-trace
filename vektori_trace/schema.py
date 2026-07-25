@@ -27,7 +27,7 @@ class Turn:
     tool_call_id: str | None = None
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Turn":
+    def from_dict(cls, d: dict) -> Turn:
         return cls(
             index=d.get("index", 0),
             role=d.get("role", "unknown"),
@@ -50,7 +50,7 @@ class Trace:
     source_path: Path
 
     @classmethod
-    def load(cls, path: Path, outcome: Outcome | None = None) -> "Trace":
+    def load(cls, path: Path, outcome: Outcome | None = None) -> Trace:
         data = json.loads(path.read_text())
         status = data.get("status", "unknown")
         resolved_outcome = outcome or ("win" if status == "success" else "loss")
