@@ -89,6 +89,26 @@ You can also run the proof separately against an already-generated task:
 vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude_code
 ```
 
+## Is the environment sound?
+
+Mined tasks ship two files that have to both take effect: a `Dockerfile` that
+resets the repo to the PR's base commit and scrubs `.git` of everything after
+it, and a `docker-compose.yaml` that blackholes the hosts serving the published
+fix. If only one applied, agents would read the answer out of `.git` or
+`pip download` it, and every "win" would be contamination.
+
+```bash
+vektori-trace check-env      # needs Docker + harbor
+```
+
+It builds a probe task from the *real* guard functions — a throwaway repo whose
+history contains a sentinel "fix" — runs it through harbor, and inspects the
+container: base commit, pruned objects, removed remote, per-host resolution in
+both address families, and whether HTTPS to the fix sources actually fails.
+
+Worth re-running after any harbor upgrade: the runtime's compose-merge order is
+not something we control.
+
 ## Does the diagnosis work at all?
 
 Before trusting a diagnosis on real traces, check the ranker can recover a
