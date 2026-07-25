@@ -89,6 +89,45 @@ You can also run the proof separately against an already-generated task:
 vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude_code
 ```
 
+## Does the diagnosis work at all?
+
+Before trusting a diagnosis on real traces, check the ranker can recover a
+deficit we planted ourselves:
+
+```bash
+vektori-trace selftest --ceiling-only     # free, offline, no API key
+vektori-trace selftest --quick            # one config, ~13 LLM calls
+vektori-trace selftest                    # full sweep, ~250 LLM calls
+```
+
+It generates synthetic traces carrying a known capability deficit, runs the
+real diagnosis over them, and reports how often the planted capability comes
+back on top — swept across trace count and prevalence, repeated per cell
+because the proposer and labeller are both sampled.
+
+Two things make it a test rather than a demo. **Losses that don't carry the
+planted deficit fail for unrelated reasons**, so the ranker has to choose
+between real competing explanations instead of the only one on offer. And
+**ground truth is known per trace**, so the report also states how often the
+labeller reproduced the label we know to be correct — the blur that shrinks
+every gap downstream toward zero.
+
+Failures are split by cause, because they call for different fixes:
+`not_proposed` (prompt), `outranked_by_distractor` (labeller),
+`top_ranked_but_below_threshold` (calibration).
+
+Every cell also reports a **ceiling**: what a perfect proposer and a perfect
+labeller would recover from the same corpus. It costs nothing to compute and no
+real run can exceed it, so `--ceiling-only` is worth running first — where the
+ceiling is 0% the config is unrecoverable by construction and a live run there
+measures the thresholds rather than the ranker.
+
+At the defaults (`min_gap=0.20`, `min_support=3`), the binding constraint is
+support, not gap. Configs below roughly **3 wins that exercise the capability
+and 3 losses that lack it** are rejected with a perfect gap of 1.0 at rank 1 —
+so `n_losses × prevalence ≥ 3` is the floor worth quoting when asking for more
+traces.
+
 ## Model
 
 Diagnosis and task generation use `gpt-5-nano` by default (cheapest current

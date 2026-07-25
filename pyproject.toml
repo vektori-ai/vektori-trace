@@ -19,6 +19,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "llm: hits a real LLM API; needs OPENAI_API_KEY and costs money",
+]
 
 [tool.ruff]
 line-length = 100

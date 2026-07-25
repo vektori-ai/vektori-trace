@@ -15,6 +15,15 @@ from .diagnose import (
 )
 from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
 from .mining.spec import LLMSpec
+from .planted import (
+    DEFAULT_SWEEP,
+    DISTRACTOR_MODES,
+    PLANTED_NAME,
+    SweepConfig,
+    estimate_calls,
+    run_sweep,
+    write_sweep_report,
+)
 from .report import build_report, write_report
 from .schema import Trace, load_manifest
 from .taskgen import scaffold_task
@@ -138,6 +147,75 @@ def cmd_mine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Plant a deficit in synthetic traces and measure whether we recover it."""
+    configs = DEFAULT_SWEEP
+    if args.quick:
+        configs = (SweepConfig(n_wins=6, n_losses=6, prevalence=1.0),)
+
+    out_dir = Path(args.out)
+    calls = 0 if args.ceiling_only else estimate_calls(configs, args.repeats)
+    print(
+        f"Planted-deficit self-test: {len(configs)} config(s) × {args.repeats} repeat(s) "
+        f"≈ {calls} LLM calls to {args.model or 'the default model'}."
+    )
+    print(f"Planted capability: {PLANTED_NAME}")
+    print(f"Distractor failure modes: {', '.join(DISTRACTOR_MODES)}\n")
+
+    def report_cell(cell) -> None:
+        acc = cell.mean_label_accuracy
+        ceiling = cell.ceiling_rate
+        line = f"  {cell.config.label:>20}  ceiling {'n/a' if ceiling is None else f'{ceiling:.0%}'}"
+        if cell.results:
+            line += (
+                f"  recovered {cell.recovery_rate:.0%}"
+                f"  proposed {cell.proposed_rate:.0%}"
+                f"  label acc {'n/a' if acc is None else f'{acc:.0%}'}"
+                f"  ({', '.join(f'{k}×{v}' for k, v in sorted(cell.verdicts.items()))})"
+            )
+        else:
+            line += f"  ({', '.join(f'{k}×{v}' for k, v in sorted(cell.ceiling_verdicts.items()))})"
+        print(line)
+
+    cells = run_sweep(
+        configs,
+        out_dir,
+        repeats=args.repeats,
+        model=args.model,
+        min_gap=args.min_gap,
+        min_support=args.min_support,
+        seed=args.seed,
+        ceiling_only=args.ceiling_only,
+        on_cell=report_cell,
+    )
+
+    md_path = write_sweep_report(
+        cells,
+        out_dir,
+        model=args.model,
+        min_gap=args.min_gap,
+        min_support=args.min_support,
+        seed=args.seed,
+    )
+    ceiling = sum(c.ceiling_rate or 0.0 for c in cells) / len(cells)
+    print(f"\nMean ceiling (perfect labeller) across configs: {ceiling:.0%}")
+    if args.ceiling_only:
+        print(f"Report written to {md_path}")
+        return 0
+
+    overall = sum(c.recovery_rate for c in cells) / len(cells)
+    print(f"Mean recovery rate across configs:              {overall:.0%}")
+    print(f"Report written to {md_path}")
+    # Non-zero only when the ranker recovered nothing anywhere *that the
+    # ceiling says was recoverable* — configs the thresholds rule out by
+    # construction are not the ranker's failure.
+    recoverable = [c for c in cells if (c.ceiling_rate or 0.0) > 0]
+    if not recoverable:
+        print("No config was recoverable even in principle — check the thresholds.")
+        return 1
+    return 0 if any(c.recovery_rate > 0 for c in recoverable) else 1
+
+
 def cmd_prove(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir)
     validity = prove_validity(
@@ -185,6 +263,39 @@ def main(argv: list[str] | None = None) -> int:
         help="minimum relevant traces on each side of the gap",
     )
     p_diag.set_defaults(func=cmd_diagnose)
+
+    p_self = sub.add_parser(
+        "selftest",
+        help=(
+            "plant a known capability deficit in synthetic traces and measure how "
+            "often the ranker recovers it, across trace counts and prevalences"
+        ),
+    )
+    p_self.add_argument("--out", default="./vektori-selftest", help="output directory")
+    p_self.add_argument("--model", default=None, help="OpenAI model override")
+    p_self.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="runs per config; the proposer and labeller are sampled, so one run is one draw",
+    )
+    p_self.add_argument(
+        "--quick",
+        action="store_true",
+        help="a single easy config (6w/6l, prevalence 1.0) instead of the full sweep",
+    )
+    p_self.add_argument(
+        "--ceiling-only",
+        action="store_true",
+        help=(
+            "skip the LLM entirely and report only what a perfect proposer and "
+            "labeller would recover — free, offline, and an upper bound on any real run"
+        ),
+    )
+    p_self.add_argument("--min-gap", type=float, default=DEFAULT_MIN_GAP)
+    p_self.add_argument("--min-support", type=int, default=DEFAULT_MIN_SUPPORT)
+    p_self.add_argument("--seed", type=int, default=0)
+    p_self.set_defaults(func=cmd_selftest)
 
     p_prove = sub.add_parser("prove", help="run the validity proof for an already-generated task")
     p_prove.add_argument("task_dir")
