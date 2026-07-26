@@ -81,3 +81,47 @@ def test_selftest_thresholds_are_validated_too() -> None:
         parser.parse_args(["selftest", "--min-gap", "nan"])
     with pytest.raises(SystemExit):
         parser.parse_args(["selftest", "--min-support", "0"])
+
+
+def test_replay_requires_tasks_dir_and_both_models() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["replay", "--frontier-model", "gpt-5", "--candidate-model", "small"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["replay", "--tasks-dir", "t", "--candidate-model", "small"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["replay", "--tasks-dir", "t", "--frontier-model", "gpt-5"])
+
+
+def test_replay_agent_defaults_to_claude_code() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["replay", "--tasks-dir", "t", "--frontier-model", "gpt-5", "--candidate-model", "small"]
+    )
+    assert args.agent == "claude-code"
+
+
+def test_replay_rejects_identical_frontier_and_candidate_model(tmp_path) -> None:
+    """A gap between a model and itself isn't a gap — cheap to reject before
+    burning a real replay run to discover it."""
+    from vektori_trace.cli import cmd_replay
+
+    task = tmp_path / "tasks" / "t1"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text("x = 1")
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "replay",
+            "--tasks-dir",
+            str(tmp_path / "tasks"),
+            "--frontier-model",
+            "same-model",
+            "--candidate-model",
+            "same-model",
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+    assert cmd_replay(args) == 2

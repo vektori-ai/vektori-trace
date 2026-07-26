@@ -24,8 +24,15 @@ from .envcheck import (
     evaluate_reward_hack,
     run_probe,
 )
+from .gap import compute_gap, write_gap_report
 from .mining.inspect import audit_tasks, failure_histogram
-from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
+from .mining.miner import (
+    HarborTraceRunner,
+    collect_paired_traces,
+    collect_traces,
+    discover_tasks,
+    mine_tasks,
+)
 from .mining.spec import LLMSpec, PRRuntimeOptions
 from .planted import (
     DEFAULT_SWEEP,
@@ -284,6 +291,62 @@ def cmd_mine(args: argparse.Namespace) -> int:
     if skipped:
         print(f"  {skipped} task(s) skipped (unjudgeable — see the skip lines above)")
     print(f"\nNext: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Run a frontier and a candidate model over the same mined tasks, on one
+    pinned scaffold, and report the gap number — before any diagnosis runs."""
+    if args.frontier_model == args.candidate_model:
+        print(
+            "error: --frontier-model and --candidate-model are the same "
+            f"({args.frontier_model!r}) — there is no gap to measure between a "
+            "model and itself.",
+            file=sys.stderr,
+        )
+        return 2
+
+    tasks_dir = Path(args.tasks_dir)
+    task_dirs = discover_tasks(tasks_dir)
+    if not task_dirs:
+        print(f"error: no task.toml found under {tasks_dir}", file=sys.stderr)
+        return 2
+    print(f"Replaying {len(task_dirs)} mined task(s) from {tasks_dir}")
+    print(f"Scaffold (pinned across both arms): {args.agent}")
+
+    out_dir = Path(args.out)
+    jobs_dir = out_dir / "jobs"
+    arms = [
+        (args.frontier_model, HarborTraceRunner(agent=args.agent, jobs_dir=jobs_dir, model=args.frontier_model)),
+        (args.candidate_model, HarborTraceRunner(agent=args.agent, jobs_dir=jobs_dir, model=args.candidate_model)),
+    ]
+
+    traces_dir = out_dir / "replay_traces"
+    manifest_path = out_dir / "replay-manifest.json"
+    print(f"Running frontier ({args.frontier_model}) and candidate ({args.candidate_model}) against each task...")
+    manifest = collect_paired_traces(task_dirs, arms, traces_dir, manifest_path=manifest_path)
+
+    traces = [
+        Trace.load(Path(m["path"]), outcome=m["outcome"], model=m["model"], task=m["task"])
+        for m in manifest
+    ]
+    result = compute_gap(
+        traces, frontier_model=args.frontier_model, candidate_model=args.candidate_model, agent=args.agent
+    )
+
+    print(
+        f"\nfrontier ({args.frontier_model}): {_fmt(result.frontier_rate)} "
+        f"({result.frontier_wins}/{result.frontier_n})"
+    )
+    print(
+        f"candidate ({args.candidate_model}): {_fmt(result.candidate_rate)} "
+        f"({result.candidate_wins}/{result.candidate_n})"
+    )
+    print(f"gap: {_fmt(result.gap)}  (paired tasks: {result.paired_n})")
+
+    md_path = write_gap_report(result, out_dir)
+    print(f"\nGap report written to {md_path}")
+    print(f"Next: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
     return 0
 
 
@@ -605,6 +668,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="mine, audit and stop, without running an agent to collect traces",
     )
     p_mine.set_defaults(func=cmd_mine)
+
+    p_replay = sub.add_parser(
+        "replay",
+        help=(
+            "run a frontier and a candidate model over the same already-mined tasks, "
+            "on one pinned scaffold, and report the pass-rate gap number"
+        ),
+    )
+    p_replay.add_argument(
+        "--tasks-dir", required=True, help="a previously-mined tasks dir (e.g. from `mine --no-replay`)"
+    )
+    p_replay.add_argument(
+        "--agent",
+        default="claude-code",
+        help=(
+            "harbor agent name — the ONE scaffold shared by both arms, since the gap is a "
+            "property of model x scaffold, not just the model (Harbor's names are hyphenated: "
+            "claude-code, codex, terminus-2; underscores are normalised)"
+        ),
+    )
+    p_replay.add_argument("--frontier-model", required=True, help="the frontier model, e.g. gpt-5")
+    p_replay.add_argument(
+        "--candidate-model", required=True, help="the candidate model under test, e.g. a 4B-8B open model"
+    )
+    p_replay.add_argument("--out", default="./vektori-out", help="output directory")
+    p_replay.set_defaults(func=cmd_replay)
 
     return parser
 
