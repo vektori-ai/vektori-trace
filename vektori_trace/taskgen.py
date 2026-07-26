@@ -144,14 +144,11 @@ def scaffold_task(
         environment_dockerfile=generated["dockerfile"],
         test_script=_SYNTHETIC_TEST_SH,
         aux_files={"tests/test_outputs.py": generated["test_outputs_py"]},
+        # Handed to the emitter rather than written over its output, so the
+        # generated oracle is inside `content_hash`. With an empty oracle_diff
+        # the instruction alone was the whole fingerprint, and two tasks with
+        # the same instruction but different LLM-written oracles hashed
+        # identically — the hash is how downstream tells tasks apart.
+        oracle_solve_sh=generated["solve_sh"],
     )
-    task_dir = write_harbor_task(task, tasks_dir)
-
-    solve_path = task_dir / "solution" / "solve.sh"
-    solve_path.write_text(generated["solve_sh"], encoding="utf-8")
-    solve_path.chmod(0o755)
-    # The emitter writes an empty patch.diff for the no-gold-diff case; drop it
-    # so nothing downstream mistakes it for a real oracle patch.
-    (task_dir / "solution" / "patch.diff").unlink(missing_ok=True)
-
-    return task_dir
+    return write_harbor_task(task, tasks_dir)
