@@ -115,15 +115,29 @@ not something we control.
 vektori-trace check-env --reward-hack
 ```
 
-runs two agents against the same task: one that fixes nothing and forges its
-own score, and one that actually fixes the bug. The cheat must score 0.0 and
-the honest fix 1.0 — the second is what distinguishes "the hack was blocked"
-from "scoring is broken and everything is zero".
+runs three agents against the same task, same environment, same verifier —
+only `solve.sh` differs:
+
+| agent | must score | what a wrong answer would mean |
+|---|---|---|
+| forges its own score, fixes nothing | 0.0 | the reward is forgeable |
+| actually fixes the bug | 1.0 | scoring is broken and everything is zero |
+| fixes the bug **and commits** | 1.0 | correct work is being collected as a loss |
+
+The second and third are controls, and they're the point: a 0.0 from the cheat
+proves nothing on its own, and the two honest agents differ only in where they
+left their changes — which is not something the task asked about.
 
 Mined tasks score in a **separate** container the agent never touched. The
-agent's work is collected as a diff, applied to a clean checkout, and graded
-there. Under the old shared-container default an agent that shadowed `python3`
-scored 1.0 on an unsolved task — measured, not hypothesised.
+agent's work is collected as a diff against the task's base commit, applied to
+a clean checkout, and graded there. Under the old shared-container default an
+agent that shadowed `python3` scored 1.0 on an unsolved task — measured, not
+hypothesised.
+
+If the diff never arrives, the verifier refuses rather than running the suite
+against the base repo: that would score a different task, and the 0.0 would be
+indistinguishable from an agent that tried and failed. The run leaves the
+dataset instead.
 
 ## Does the diagnosis work at all?
 

@@ -291,3 +291,60 @@ def test_each_run_gets_its_own_job_dir(tmp_path: Path, monkeypatch) -> None:
     runner.run(tmp_path)
 
     assert len(set(seen)) == 2
+
+
+def test_a_disclaimed_reward_is_an_infra_failure_not_a_loss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The separate verifier writes 0.0 when the agent's diff never arrived,
+    because it has to write something — and says so in parse_status. Reading
+    that 0.0 as a loss puts a trace in the corpus that the diagnosis then has
+    to explain, and it will invent a capability to do it."""
+
+    def fake_run(cmd, **kwargs):
+        job_dir = Path(cmd[cmd.index("-o") + 1])
+        (job_dir / "verifier").mkdir(parents=True, exist_ok=True)
+        (job_dir / "result.json").write_text(
+            json.dumps({"verifier_result": {"rewards": {"reward": 0.0}}})
+        )
+        (job_dir / "verifier" / "reward-details.json").write_text(
+            json.dumps({"reward": 0.0, "resolved": False, "parse_status": "no_model_patch"})
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="out", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        HarborTraceRunner,
+        "_parse_turns",
+        lambda self, *a, **k: [Turn(index=0, role="assistant", content="did a thing")],
+    )
+    runner = HarborTraceRunner(agent="codex", jobs_dir=tmp_path / "jobs")
+
+    with pytest.raises(InfraFailure, match="could not judge"):
+        runner.run(tmp_path)
+
+
+def test_an_ordinary_zero_is_still_a_loss(tmp_path: Path, monkeypatch) -> None:
+    """The mirror image: parse_status="ok" with reward 0.0 is a real agent
+    failure, and dropping those would empty the loss half of the corpus."""
+
+    def fake_run(cmd, **kwargs):
+        job_dir = Path(cmd[cmd.index("-o") + 1])
+        (job_dir / "verifier").mkdir(parents=True, exist_ok=True)
+        (job_dir / "result.json").write_text(
+            json.dumps({"verifier_result": {"rewards": {"reward": 0.0}}})
+        )
+        (job_dir / "verifier" / "reward-details.json").write_text(
+            json.dumps({"reward": 0.0, "resolved": False, "parse_status": "ok"})
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="out", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        HarborTraceRunner,
+        "_parse_turns",
+        lambda self, *a, **k: [Turn(index=0, role="assistant", content="did a thing")],
+    )
+    runner = HarborTraceRunner(agent="codex", jobs_dir=tmp_path / "jobs")
+
+    assert runner.run(tmp_path).passed is False

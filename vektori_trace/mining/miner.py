@@ -31,7 +31,7 @@ from vektori_trace.mining import (
 )
 from vektori_trace.mining.atif import TrajectoryParseError, parse_job_trajectory
 from vektori_trace.schema import Turn
-from vektori_trace.validity import _find_reward
+from vektori_trace.validity import UNJUDGEABLE_STATUSES, _find_parse_status, _find_reward
 
 
 def mine_tasks(
@@ -213,6 +213,17 @@ class HarborTraceRunner:
             # The verifier never emitted a reward, so nothing here says the
             # agent failed — only that we can't tell.
             raise InfraFailure(f"no reward found under {job_dir}")
+
+        # A reward the verifier itself disclaims. In separate-verifier mode the
+        # agent's work travels as a collected diff, and collection is a step
+        # that can fail on its own — an agent shadowing `git`, an unwritable
+        # /logs, a failed artifact upload. The verifier writes 0.0 because it
+        # must write something, and says in parse_status that the number means
+        # nothing. Same rule as a Docker OOM: not knowing what happened is not
+        # the agent failing.
+        status = _find_parse_status(job_dir)
+        if status in UNJUDGEABLE_STATUSES:
+            raise InfraFailure(f"verifier could not judge this run ({status})")
 
         turns = self._parse_turns(job_dir)
         return MinedRun(turns=turns, passed=reward >= 1.0)

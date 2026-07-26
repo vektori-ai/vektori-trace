@@ -65,21 +65,34 @@ _CLOSES_RE = re.compile(r"\b(?:closes|fixes|resolves)\s+#\d+\b", re.IGNORECASE)
 # verifier container, so one constant names both ends.
 MODEL_PATCH_PATH = "/logs/model_patch.diff"
 
-# Run in the agent's container after the agent phase, before artifact
-# collection. `git add -A` first so new files are in the diff — an agent that
-# fixes a bug by adding a module would otherwise have its work silently
-# dropped and score 0.
-#
-# The agent can tamper with this: it runs in their container, and they could
-# shadow `git`. That's acceptable, because the *scoring* doesn't. The worst a
-# forged diff achieves is being applied to a clean repo and tested honestly —
-# to score, it still has to actually fix the code. Patching the tests doesn't
-# work either: test.sh resets test files to base and re-applies the hidden
-# test_patch after this lands.
-MODEL_PATCH_COLLECT = (
-    "cd /workspace && git config --global --add safe.directory /workspace && "
-    f"git add -A && git diff --cached > {MODEL_PATCH_PATH} || true"
-)
+def model_patch_collect(base_ref: str) -> str:
+    """Command run in the agent's container after the agent phase, before
+    artifact collection — how the agent's work gets out of the container it is
+    scored from.
+
+    Diffed against `base_ref`, not the index. `git diff --cached` is
+    staged-vs-HEAD, and agents commit: Claude Code and Codex both run
+    `git commit` unprompted on a bugfix. Once they do, HEAD moves, the diff
+    comes out empty, and a correct solution is scored as a loss — then handed
+    to the diagnosis as a losing trace to explain, which is the failure mode
+    the ATIF and infra-failure work exists to eliminate. Against a fixed base
+    ref, committed, staged and unstaged work all appear alike.
+
+    `git add -A` still runs first: untracked files are invisible to `git diff`
+    at any ref, so an agent that fixes a bug by adding a module would have its
+    work silently dropped.
+
+    The agent can tamper with this: it runs in their container, and they could
+    shadow `git`. That's acceptable, because the *scoring* doesn't. The worst a
+    forged diff achieves is being applied to a clean repo and tested honestly —
+    to score, it still has to actually fix the code. Patching the tests doesn't
+    work either: test.sh resets test files to base and re-applies the hidden
+    test_patch after this lands.
+    """
+    return (
+        "cd /workspace && git config --global --add safe.directory /workspace && "
+        f"git add -A && git diff --cached {base_ref} > {MODEL_PATCH_PATH} || true"
+    )
 
 # `git clean -fdx` excludes. Keep language dependency/build dirs so resetting
 # to a PR's base_commit doesn't wipe installed deps the test suite needs:
@@ -505,7 +518,11 @@ def build_eval_script(
         if not model_patch_path
         else (
             f'if [ -s "{model_patch_path}" ]; then\n'
-            f'  git apply --verbose --reject "{model_patch_path}"\n'
+            # No --reject: a base-relative diff applied to a checkout at that
+            # same base either applies whole or doesn't apply at all. --reject
+            # would leave a half-patched tree behind and still report failure,
+            # so the tests would run against a state neither side chose.
+            f'  git apply --verbose "{model_patch_path}"\n'
             "  R2E_MODEL_RC=$?\n"
             '  if [ "$R2E_MODEL_RC" -ne 0 ]; then\n'
             '    echo "0.000000" > /logs/verifier/reward.txt\n'
@@ -516,7 +533,20 @@ def build_eval_script(
             "    exit 0\n"
             "  fi\n"
             "else\n"
-            f'  echo "R2E: no model patch at {model_patch_path}; scoring the base repo" >&2\n'
+            # Fail closed and say why. There is no patch, so the agent's work
+            # never reached this container — and running the suite anyway
+            # scores the base repo, i.e. a different task, with the 0.0 landing
+            # in the corpus as a genuine agent loss. Collection is a step that
+            # can break on its own (an agent shadowing `git`, an unwritable
+            # /logs, a failed artifact upload); when it does, the honest
+            # statement is that we cannot tell, not that the agent failed.
+            '  echo "0.000000" > /logs/verifier/reward.txt\n'
+            "  printf '%s' "
+            '\'{"reward": 0.0, "resolved": false, "parse_status": '
+            '"no_model_patch"}\' > /logs/verifier/reward-details.json\n'
+            f'  echo "R2E: no model patch at {model_patch_path}; '
+            'refusing to score the base repo" >&2\n'
+            "  exit 0\n"
             "fi\n"
         )
     )
@@ -1182,8 +1212,10 @@ class PRRuntimePipeline:
                 "environment/docker-compose.yaml": egress_guard_compose(),
             },
             # Score in a container the agent never touched. See
-            # MODEL_PATCH_COLLECT for why the diff is the thing carried across.
+            # `model_patch_collect` for why the diff is the thing carried
+            # across, and why it is taken against the base commit rather than
+            # the index.
             verifier_environment_mode="separate",
-            verifier_collect=[{"command": MODEL_PATCH_COLLECT}],
+            verifier_collect=[{"command": model_patch_collect(pr.base_sha)}],
             artifacts=[MODEL_PATCH_PATH],
         )

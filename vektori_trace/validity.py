@@ -53,6 +53,26 @@ def _find_reward(jobs_dir: Path) -> float | None:
     return None
 
 
+# Statuses the graded verifier writes when it could not evaluate the agent's
+# work at all. The 0.0 beside them is a placeholder for "no verdict", not a
+# measurement of the agent — reading it as a loss puts a trace in the corpus
+# that the diagnosis then has to explain, and it will.
+UNJUDGEABLE_STATUSES = frozenset({"no_model_patch"})
+
+
+def _find_parse_status(jobs_dir: Path) -> str | None:
+    """The graded verifier's own account of whether its 0.0 means anything."""
+    for details in _newest_first(list(jobs_dir.rglob("reward-details.json"))):
+        try:
+            data = json.loads(details.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        status = data.get("parse_status")
+        if isinstance(status, str):
+            return status
+    return None
+
+
 def run_trial(
     task_dir: Path,
     agent: str,
