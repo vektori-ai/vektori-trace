@@ -26,40 +26,47 @@ def _trace(model: str, outcome: str, task: str) -> Trace:
     )
 
 
-def test_pass_rates_and_gap() -> None:
+def test_pass_rates_are_computed_over_the_paired_set_only() -> None:
+    """Task 'c' was only attempted by the frontier — it must not inflate or
+    deflate either rate. If a task's absence from the other arm silently
+    widened the denominator on one side, comparing two different task sets
+    would be exactly the bias Step 4 exists to avoid."""
     traces = [
         _trace("gpt-5", "win", "a"),
         _trace("gpt-5", "win", "b"),
-        _trace("gpt-5", "loss", "c"),
+        _trace("gpt-5", "loss", "c"),  # candidate never judged 'c'
         _trace("small", "loss", "a"),
         _trace("small", "win", "b"),
     ]
 
     result = compute_gap(traces, frontier_model="gpt-5", candidate_model="small", agent="claude-code")
 
-    assert result.frontier_n == 3
-    assert result.frontier_wins == 2
-    assert result.candidate_n == 2
+    assert result.paired_n == 2  # only a, b
+    assert result.frontier_wins == 2  # wins among {a, b} only, 'c' excluded
     assert result.candidate_wins == 1
-    assert result.frontier_rate == 2 / 3
+    assert result.frontier_rate == 2 / 2
     assert result.candidate_rate == 1 / 2
-    assert result.gap == 2 / 3 - 1 / 2
+    assert result.gap == 2 / 2 - 1 / 2
+    # attempted counts still show the unpaired attempt, for visibility
+    assert result.frontier_attempted == 3
+    assert result.candidate_attempted == 2
 
 
-def test_paired_n_only_counts_tasks_both_arms_judged() -> None:
-    """Task 'c' was only attempted by the frontier (the candidate's attempt was
-    presumably excluded upstream as an InfraFailure) — it must not count as paired."""
-    traces = [
-        _trace("gpt-5", "win", "a"),
-        _trace("gpt-5", "win", "b"),
-        _trace("gpt-5", "loss", "c"),
-        _trace("small", "loss", "a"),
-        _trace("small", "win", "b"),
-    ]
+def test_lopsided_infra_attrition_does_not_bias_the_rate() -> None:
+    """The frontier attempted 10 tasks and won all of them; the candidate only
+    got a trace on 2 of those 10 (the other 8 excluded upstream as
+    InfraFailure) and lost both. The reported rate must reflect only the 2
+    tasks both arms actually judged, not 10 frontier wins against 2 candidate
+    losses."""
+    traces = [_trace("gpt-5", "win", f"t{i}") for i in range(10)]
+    traces += [_trace("small", "loss", "t0"), _trace("small", "loss", "t1")]
 
     result = compute_gap(traces, frontier_model="gpt-5", candidate_model="small", agent="claude-code")
 
     assert result.paired_n == 2
+    assert result.frontier_wins == 2  # not 10
+    assert result.frontier_rate == 1.0
+    assert result.candidate_rate == 0.0
 
 
 def test_empty_arm_yields_none_rate_not_a_crash() -> None:
@@ -67,7 +74,9 @@ def test_empty_arm_yields_none_rate_not_a_crash() -> None:
 
     result = compute_gap(traces, frontier_model="gpt-5", candidate_model="small", agent="claude-code")
 
-    assert result.candidate_n == 0
+    assert result.paired_n == 0
+    assert result.candidate_attempted == 0
+    assert result.frontier_rate is None
     assert result.candidate_rate is None
     assert result.gap is None
 
@@ -93,11 +102,11 @@ def test_write_gap_report_flags_small_gap() -> None:
         agent="claude-code",
         frontier_model="gpt-5",
         candidate_model="small",
-        frontier_wins=55,
-        frontier_n=100,
-        candidate_wins=50,
-        candidate_n=100,
+        frontier_attempted=100,
+        candidate_attempted=100,
         paired_n=100,
+        frontier_wins=55,
+        candidate_wins=50,
     )
     assert abs(result.gap) < MIN_MEANINGFUL_GAP
 

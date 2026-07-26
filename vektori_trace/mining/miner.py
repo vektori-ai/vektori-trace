@@ -208,7 +208,12 @@ def collect_paired_traces(
                 "status": "success" if result.passed else "failure",
                 "turns": [_turn_to_dict(t) for t in result.turns],
             }
-            trace_path = traces_dir / f"{run_id}.json"
+            # Absolute: manifest.json and traces_dir don't have to share a
+            # parent (replay's traces_dir and manifest_path do, but nothing
+            # requires it), and a relative path here plus load_manifest's
+            # own "resolve relative to the manifest's dir" rule can double
+            # up the prefix and point at a path that doesn't exist.
+            trace_path = (traces_dir / f"{run_id}.json").resolve()
             trace_path.write_text(json.dumps(payload, indent=2))
             manifest.append(
                 {

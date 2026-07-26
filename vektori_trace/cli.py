@@ -24,7 +24,7 @@ from .envcheck import (
     evaluate_reward_hack,
     run_probe,
 )
-from .gap import compute_gap, write_gap_report
+from .gap import compute_gap, format_rate, write_gap_report
 from .mining.inspect import audit_tasks, failure_histogram
 from .mining.miner import (
     HarborTraceRunner,
@@ -307,6 +307,9 @@ def cmd_replay(args: argparse.Namespace) -> int:
         return 2
 
     tasks_dir = Path(args.tasks_dir)
+    if not tasks_dir.is_dir():
+        print(f"error: --tasks-dir {tasks_dir} does not exist or is not a directory", file=sys.stderr)
+        return 2
     task_dirs = discover_tasks(tasks_dir)
     if not task_dirs:
         print(f"error: no task.toml found under {tasks_dir}", file=sys.stderr)
@@ -334,18 +337,31 @@ def cmd_replay(args: argparse.Namespace) -> int:
         traces, frontier_model=args.frontier_model, candidate_model=args.candidate_model, agent=args.agent
     )
 
+    frontier_skipped = len(task_dirs) - result.frontier_attempted
+    candidate_skipped = len(task_dirs) - result.candidate_attempted
     print(
-        f"\nfrontier ({args.frontier_model}): {_fmt(result.frontier_rate)} "
-        f"({result.frontier_wins}/{result.frontier_n})"
+        f"\nfrontier ({args.frontier_model}): {format_rate(result.frontier_rate)} "
+        f"({result.frontier_wins}/{result.paired_n} paired; "
+        f"{result.frontier_attempted} attempted, {frontier_skipped} skipped)"
     )
     print(
-        f"candidate ({args.candidate_model}): {_fmt(result.candidate_rate)} "
-        f"({result.candidate_wins}/{result.candidate_n})"
+        f"candidate ({args.candidate_model}): {format_rate(result.candidate_rate)} "
+        f"({result.candidate_wins}/{result.paired_n} paired; "
+        f"{result.candidate_attempted} attempted, {candidate_skipped} skipped)"
     )
-    print(f"gap: {_fmt(result.gap)}  (paired tasks: {result.paired_n})")
+    print(f"gap: {format_rate(result.gap)}  (paired tasks: {result.paired_n})")
 
     md_path = write_gap_report(result, out_dir)
     print(f"\nGap report written to {md_path}")
+
+    if result.paired_n == 0:
+        print(
+            "\nerror: no task was judged by both arms — nothing to compare. Check the "
+            "skip lines above for why each arm's attempts were excluded.",
+            file=sys.stderr,
+        )
+        return 1
+
     print(f"Next: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
     return 0
 
