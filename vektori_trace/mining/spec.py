@@ -50,7 +50,12 @@ class RepoSpec(BaseModel):
                 prefix, path = canonical, v[len(candidate) :]
                 break
         else:
-            if v.startswith(("http://", "https://", "git@", "ssh://")):
+            # Anything carrying a scheme is a URL we don't support, not a bare
+            # `owner/name`. Enumerating the four schemes we happen to know lets
+            # `ftp://github.com/psf/requests` fall through to the bare branch,
+            # where splitting on "/" yields owner='ftp:' — canonicalized to
+            # `https://github.com/ftp:/github.com` and handed to `git clone`.
+            if "://" in v or v.startswith("git@"):
                 raise ValueError(f"only github.com repos are supported, got {v!r}")
             prefix = "https://github.com/"
 
