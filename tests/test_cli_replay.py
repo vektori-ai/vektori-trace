@@ -151,6 +151,52 @@ def test_replay_exits_nonzero_when_no_task_was_judged_by_both_arms(tmp_path, mon
     assert rc == 1
 
 
+def test_replay_rerun_against_the_same_out_dir_makes_no_new_harbor_calls(tmp_path, monkeypatch) -> None:
+    """Simulates the scenario the resume fix exists for: the sweep already
+    finished once (or was interrupted after finishing), and gets invoked again
+    against the same --out. Nothing already in the manifest should cost a
+    second harbor run."""
+    tasks_dir = _task_dirs(tmp_path, "t1", "t2")
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["n"] += 1
+        job_dir = Path(cmd[cmd.index("-o") + 1])
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "result.json").write_text(
+            json.dumps({"verifier_result": {"rewards": {"reward": 1.0}}})
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="out", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        HarborTraceRunner,
+        "_parse_turns",
+        lambda self, *a, **k: [Turn(index=0, role="assistant", content="did a thing")],
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "replay",
+            "--tasks-dir",
+            str(tasks_dir),
+            "--frontier-model",
+            "gpt-5",
+            "--candidate-model",
+            "small",
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert calls["n"] == 4  # 2 tasks x 2 arms
+
+    assert args.func(args) == 0  # rerun against the identical --out
+    assert calls["n"] == 4  # no new harbor invocations at all
+
+
 def test_replay_rejects_a_nonexistent_tasks_dir(tmp_path) -> None:
     parser = build_parser()
     args = parser.parse_args(

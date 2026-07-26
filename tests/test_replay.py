@@ -118,6 +118,59 @@ def test_one_bad_arm_does_not_kill_the_sweep(tmp_path: Path) -> None:
     assert len(manifest) == 3
 
 
+def test_resumes_from_an_existing_manifest_without_rerunning_completed_pairs(tmp_path: Path) -> None:
+    """A replay sweep costs two harbor runs per task across two model APIs —
+    if the process dies partway through, resuming must not redo work already
+    recorded in the manifest from a prior call."""
+    t1, t2 = _tasks(tmp_path, "t1", "t2")
+    manifest_path = tmp_path / "manifest.json"
+    traces_dir = tmp_path / "traces"
+
+    frontier_first = FakeTraceRunner({"t1": _run("f1", True), "t2": _run("f2", True)})
+    candidate_first = FakeTraceRunner({"t1": _run("c1", False)})  # t2 not reached this run
+    collect_paired_traces(
+        [t1, t2],
+        [("gpt-5", frontier_first), ("small-model", candidate_first)],
+        traces_dir,
+        manifest_path=manifest_path,
+    )
+    first_manifest = json.loads(manifest_path.read_text())
+    assert len(first_manifest) == 3  # frontier x2, candidate x1 (t2 "crashed")
+
+    # Resume: frontier would blow up if asked to redo t1/t2, candidate only
+    # needs to do t2. If resume works, neither FakeTraceRunner is asked for
+    # anything it already did.
+    frontier_second = FakeTraceRunner({})  # must not be called at all
+    candidate_second = FakeTraceRunner({"t2": _run("c2", True)})
+    manifest = collect_paired_traces(
+        [t1, t2],
+        [("gpt-5", frontier_second), ("small-model", candidate_second)],
+        traces_dir,
+        manifest_path=manifest_path,
+    )
+
+    assert frontier_second.seen == []
+    assert candidate_second.seen == ["t2"]
+    assert len(manifest) == 4
+    pairs = {(m["task"], m["model"]) for m in manifest}
+    assert pairs == {("t1", "gpt-5"), ("t2", "gpt-5"), ("t1", "small-model"), ("t2", "small-model")}
+    # the original three entries must survive untouched, not just four total
+    original_paths = {m["path"] for m in first_manifest}
+    assert original_paths <= {m["path"] for m in manifest}
+
+
+def test_resume_ignores_a_corrupt_manifest_instead_of_crashing(tmp_path: Path) -> None:
+    (t1,) = _tasks(tmp_path, "t1")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("not valid json{{{")
+
+    runner = FakeTraceRunner({"t1": _run("f", True)})
+    manifest = collect_paired_traces([t1], [("gpt-5", runner)], tmp_path / "traces", manifest_path=manifest_path)
+
+    assert len(manifest) == 1
+    assert runner.seen == ["t1"]
+
+
 def test_manifest_is_written_after_every_arm(tmp_path: Path) -> None:
     (t1,) = _tasks(tmp_path, "t1")
     manifest_path = tmp_path / "manifest.json"

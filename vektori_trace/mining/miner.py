@@ -188,11 +188,32 @@ def collect_paired_traces(
     attempt at a task does not exclude the candidate's attempt at that same
     task. Manifest entries carry `model` and `task` so Step 5 can pair rows by
     task (cross-model and within-model contrasts) and filter by model.
+
+    Resumable: a replay sweep costs two `harbor run`s per task across two
+    model APIs, so a process kill (Ctrl-C, a reboot, an OOM-killed process —
+    not just one bad arm, which is already isolated above) at task 80 of 100
+    would otherwise mean redoing all 80. If `manifest_path` already holds
+    entries from a prior run, every (task, model) pair already recorded there
+    is skipped rather than re-run, and the prior entries are kept in the
+    returned/rewritten manifest.
     """
     traces_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict] = []
+    done: set[tuple[str, str]] = set()
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  ignoring unreadable manifest {manifest_path}: {e}", file=sys.stderr)
+            manifest = []
+        done = {(m["task"], m["model"]) for m in manifest if m.get("task") and m.get("model")}
+        if done:
+            print(f"Resuming: {len(done)} (task, model) pair(s) already in the manifest, skipping.", file=sys.stderr)
+
     for task_dir in task_dirs:
         for model_name, runner in arms:
+            if (task_dir.name, model_name) in done:
+                continue
             try:
                 result = runner.run(task_dir)
             except InfraFailure as e:
