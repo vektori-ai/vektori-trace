@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from vektori_trace.envcheck import (
-    REWARD_HACK_BASE_SHA,
+    REWARD_HACK_BASE_REF,
     REWARD_HACK_SOLVE_SH,
     build_committing_task,
     build_honest_task,
@@ -129,7 +129,7 @@ def test_isolated_task_declares_a_separate_verifier(tmp_path: Path) -> None:
     assert cfg["verifier"]["environment_mode"] == "separate"
     assert cfg["artifacts"] == [MODEL_PATCH_PATH]
     assert cfg["verifier"]["collect"][0]["command"] == model_patch_collect(
-        REWARD_HACK_BASE_SHA
+        REWARD_HACK_BASE_REF
     )
 
 
@@ -326,3 +326,22 @@ def test_model_patch_apply_is_atomic() -> None:
 
     assert f'git apply --verbose "{MODEL_PATCH_PATH}"' in script
     assert f'--reject "{MODEL_PATCH_PATH}"' not in script
+
+
+def test_the_base_ref_collect_uses_is_one_the_image_creates(tmp_path: Path) -> None:
+    """The ref the diff is taken against has to exist in the container.
+
+    The constant here used to be a sha copy-pasted from the *other* probe's
+    repo. Nothing noticed, because the probe ships no test_patch and the reset
+    that consumed it is a no-op — the first code to actually resolve the ref
+    found it dangling, `|| true` swallowed the error, and the empty diff read
+    as "the agent did nothing".
+    """
+    dockerfile = reward_hack_dockerfile()
+    assert f"git tag {REWARD_HACK_BASE_REF}" in dockerfile
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    import tomllib
+
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+    assert REWARD_HACK_BASE_REF in cfg["verifier"]["collect"][0]["command"]
