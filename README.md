@@ -25,7 +25,9 @@ pip install -e .
 ```
 
 Requires the [`harbor`](https://github.com/harbor-framework/harbor) CLI and
-Docker for the `--prove` step (`uv tool install harbor` or see Harbor's docs).
+Docker for the `--prove` and `mine` steps (`uv tool install harbor` or see
+Harbor's docs). Diagnosis and task generation need neither — task files are
+written directly, not via the `harbor` binary.
 
 ```bash
 cp .env.example .env   # fill in OPENAI_API_KEY
@@ -50,8 +52,22 @@ This will:
 3. Score each capability by how much its absence separates wins from losses, and rank deficits
 4. Generate a Harbor task isolating the top-ranked deficit (1 LLM call)
 
-Output lands in `./vektori-out/`: `tasks/<deficit-name>/` (the Harbor task) and
-`diagnosis.{json,md}` (the ranked deficits + report).
+Steps 1 and 2 are blind to outcome: the manifest's win/loss labels are used
+only in step 3's arithmetic. Told which traces failed, the labeller reasons
+backwards from the ending and marks capabilities LACKING to justify it, and the
+gap then measures the prompt rather than the agent.
+
+A capability is reported only if it clears `--min-gap` (default 0.20) with at
+least `--min-support` (default 3) relevant traces on each side. **"No deficit
+found" is a normal result and exits 0** — it writes the ranked list and no task.
+The 0.20 threshold is uncalibrated; the labeller is a blurry ruler and blur
+shrinks effects toward zero, so treat it as a placeholder until it's set from
+hand-labelled data.
+
+Output lands in `./vektori-out/`. `diagnosis.{json,md}` (the ranked deficits +
+report, with N beside every rate) is always written; `tasks/<deficit-name>/`
+(the Harbor task) only when a capability clears both thresholds — a "no deficit
+found" run writes the ranked list and no task dir.
 
 Add `--prove` to also run the validity proof via `harbor run`:
 

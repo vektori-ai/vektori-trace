@@ -19,11 +19,25 @@ class TrialResult:
     raw_stdout: str
 
 
+def _newest_first(paths: list[Path]) -> list[Path]:
+    """Most recently modified first, so a stale artifact from an earlier run in
+    the same directory never shadows this run's result. `rglob` returns
+    directory order, which has already handed us a stale 0.0 over a fresh 1.0."""
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(paths, key=mtime, reverse=True)
+
+
 def _find_reward(jobs_dir: Path) -> float | None:
     """Harbor writes a per-trial result.json with verifier_result.rewards.reward,
     nested under jobs_dir/<timestamp>/<trial_name>/result.json. Fall back to the
     raw verifier/reward.txt if the JSON shape doesn't match."""
-    for result_file in jobs_dir.rglob("result.json"):
+    for result_file in _newest_first(list(jobs_dir.rglob("result.json"))):
         try:
             data = json.loads(result_file.read_text())
         except (json.JSONDecodeError, OSError):
@@ -31,7 +45,7 @@ def _find_reward(jobs_dir: Path) -> float | None:
         rewards = (data.get("verifier_result") or {}).get("rewards") or {}
         if "reward" in rewards:
             return float(rewards["reward"])
-    for reward_file in jobs_dir.rglob("reward.txt"):
+    for reward_file in _newest_first(list(jobs_dir.rglob("reward.txt"))):
         try:
             return float(reward_file.read_text().strip())
         except (ValueError, OSError):
