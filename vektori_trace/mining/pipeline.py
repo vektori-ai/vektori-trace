@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -153,7 +154,15 @@ _LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Cross-repo issue refs without a closes keyword (`gorilla#739`).
     # Distinct from owner/repo#N (which has a slash) — that's already
     # covered by the closes pattern above when paired with a keyword.
-    re.compile(r"\b[a-zA-Z][\w.-]*#\d+\b"),
+    #
+    # Deliberately narrow: lowercase prefix, at least 3 characters. `\w+#\d+`
+    # matched any `word#number` text at all, so the stripper cut `C#9`,
+    # `F#5`, `RFC#7231` and `ES2020#3` straight out of the middle of a
+    # sentence — language versions and spec references, not links to the fix.
+    # GitHub repo names in this position are written lowercase in practice
+    # (`gorilla#739`), and anything uppercase paired with a closes/see/refs
+    # keyword is still caught by the pattern above.
+    re.compile(r"\b[a-z][a-z0-9._-]{2,}#\d+\b"),
 )
 
 
@@ -221,8 +230,11 @@ def _path_is_test(path: str) -> bool:
          NEVER test files, even if their name contains "test".
       2. Files inside a test directory component (any path part in
          `_TEST_DIR_NAMES`) are test files.
-      3. Files with a pytest-style basename (`test_*.py`, `*_test.py`,
-         `*_test.go`) are test files.
+      3. Files with a runner-convention basename are test files: pytest
+         (`test_*.py`, `*_test.py`, and `conftest.py` — a fixture file IS test
+         infrastructure, including the common root-level one that no test
+         directory component covers), Go (`*_test.go`), JS/TS (`*.test.ts`,
+         `*.spec.js`, ...).
     """
     if not path:
         return False
@@ -240,14 +252,46 @@ def _path_is_test(path: str) -> bool:
     # Rule 3: filename-level test markers
     basename = parts[-1]
     return (
-        (basename.startswith("test_") and basename.endswith((".py", ".js", ".ts")))
+        basename == "conftest.py"  # pytest fixtures — test infrastructure
+        or (basename.startswith("test_") and basename.endswith((".py", ".js", ".ts")))
         or basename.endswith(("_test.py", "_test.go", ".test.ts", ".test.js"))
         or basename.endswith((".spec.ts", ".spec.js"))
     )
 
 
-# Match `diff --git a/<path> b/<path>` block boundaries to split a unified diff
-_DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
+# Match `diff --git a/<path> b/<path>` block boundaries to split a unified diff.
+#
+# Paths are NOT `\S+`: git writes spaces literally (`a/my file.py b/my file.py`)
+# and only wraps a path in double quotes when it holds a character that needs
+# C-escaping (quotes, control chars, non-ASCII under core.quotepath). `\S+`
+# matched neither form, so every PR touching a spaced path parsed as zero files
+# and was dropped as `empty_source_patch`.
+_DIFF_HEADER_RE = re.compile(
+    r'^diff --git (?:"a/((?:[^"\\]|\\.)+)"|a/(.+?)) (?:"b/((?:[^"\\]|\\.)+)"|b/(.+?))$',
+    re.MULTILINE,
+)
+
+
+def _unquote_diff_path(path: str) -> str:
+    """Undo git's C-style quoting of a path (`na\\303\\257ve` → `naïve`)."""
+    if "\\" not in path:
+        return path
+    try:
+        return (
+            path.encode("utf-8")
+            .decode("unicode_escape")
+            .encode("latin-1")
+            .decode("utf-8")
+        )
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return path
+
+
+def _diff_header_paths(m: re.Match[str]) -> tuple[str, str]:
+    """The (a-side, b-side) paths of one `diff --git` header, unquoted."""
+    a = m.group(1) if m.group(1) is not None else m.group(2)
+    b = m.group(3) if m.group(3) is not None else m.group(4)
+    return _unquote_diff_path(a), _unquote_diff_path(b)
 
 
 def split_patch_and_test_patch(unified_diff: str) -> tuple[str, str]:
@@ -274,8 +318,7 @@ def split_patch_and_test_patch(unified_diff: str) -> tuple[str, str]:
         start = m.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(unified_diff)
         block = unified_diff[start:end]
-        path_a = m.group(1)
-        path_b = m.group(2)
+        path_a, path_b = _diff_header_paths(m)
         # If EITHER path looks like a test file (covers renames, new files), it's a test
         if _path_is_test(path_a) or _path_is_test(path_b):
             test_parts.append(block)
@@ -491,8 +534,10 @@ def build_eval_script(
     """
     test_files = _files_in_patch(test_patch)
     heredoc = "EOF_R2E_TEST_PATCH"
+    # Shell-quoted: a path with a space is one argument, not two. These paths
+    # reach here verbatim from the diff header.
     reset = (
-        f"git checkout {base_commit} -- {' '.join(test_files)}"
+        f"git checkout {base_commit} -- {' '.join(shlex.quote(f) for f in test_files)}"
         if test_files
         else "echo 'no test files to reset'"
     )
@@ -654,7 +699,7 @@ def _files_in_patch(unified_diff: str) -> list[str]:
         return []
     seen: list[str] = []
     for m in _DIFF_HEADER_RE.finditer(unified_diff):
-        b = m.group(2)
+        _, b = _diff_header_paths(m)
         if b not in seen:
             seen.append(b)
     return seen
@@ -835,7 +880,7 @@ def targeted_test_cmds_for_pr(test_cmds: list[str], test_files: list[str]) -> li
                     not t.startswith("-") and (t.endswith(".py") or "/" in t) for t in tail
                 )
                 if not has_path_arg:
-                    cmd = cmd.rstrip() + " " + " ".join(py_files)
+                    cmd = cmd.rstrip() + " " + " ".join(shlex.quote(f) for f in py_files)
 
         # --- go test ---
         elif re.search(r"\bgo\s+test\b", cmd) and go_pkgs:
@@ -855,7 +900,7 @@ def targeted_test_cmds_for_pr(test_cmds: list[str], test_files: list[str]) -> li
                 for t in tokens[1:]
             )
             if not has_path:
-                cmd = cmd.rstrip() + " " + " ".join(js_files)
+                cmd = cmd.rstrip() + " " + " ".join(shlex.quote(f) for f in js_files)
 
         out.append(cmd)
     return out
