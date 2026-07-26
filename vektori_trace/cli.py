@@ -81,7 +81,7 @@ def _min_support_arg(value: str) -> int:
 
 def _load_traces(manifest_path: Path) -> list[Trace]:
     entries = load_manifest(manifest_path)
-    return [Trace.load(e.path, outcome=e.outcome) for e in entries]
+    return [Trace.load(e.path, outcome=e.outcome, model=e.model) for e in entries]
 
 
 def cmd_diagnose(args: argparse.Namespace) -> int:

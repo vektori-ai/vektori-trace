@@ -48,9 +48,10 @@ class Trace:
     turns: list[Turn]
     outcome: Outcome
     source_path: Path
+    model: str | None = None  # which model produced this trace, for paired replay
 
     @classmethod
-    def load(cls, path: Path, outcome: Outcome | None = None) -> Trace:
+    def load(cls, path: Path, outcome: Outcome | None = None, model: str | None = None) -> Trace:
         data = json.loads(path.read_text())
         status = data.get("status", "unknown")
         resolved_outcome = outcome or ("win" if status == "success" else "loss")
@@ -60,6 +61,7 @@ class Trace:
             turns=[Turn.from_dict(t) for t in data.get("turns", [])],
             outcome=resolved_outcome,
             source_path=path,
+            model=model,
         )
 
     def condensed(self, max_turns: int = 60, max_field_chars: int = 400) -> str:
@@ -95,6 +97,8 @@ def _truncate(s: str, n: int) -> str:
 class ManifestEntry:
     path: Path
     outcome: Outcome | None = None
+    model: str | None = None  # which model produced this trace, for paired replay
+    task: str | None = None  # mined task dir name, the pairing key across models
 
 
 def load_manifest(manifest_path: Path) -> list[ManifestEntry]:
@@ -105,5 +109,12 @@ def load_manifest(manifest_path: Path) -> list[ManifestEntry]:
         p = Path(item["path"])
         if not p.is_absolute():
             p = base / p
-        entries.append(ManifestEntry(path=p, outcome=item.get("outcome")))
+        entries.append(
+            ManifestEntry(
+                path=p,
+                outcome=item.get("outcome"),
+                model=item.get("model"),
+                task=item.get("task"),
+            )
+        )
     return entries
