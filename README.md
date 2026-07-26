@@ -115,16 +115,29 @@ not something we control.
 vektori-trace check-env --reward-hack
 ```
 
-also runs an agent that fixes nothing and forges its own score. **This
-currently fails.** Harbor's default `environment_mode = "shared"` runs the
-verifier inside the agent's container, on the agent's `$PATH`, writing to a
-directory the agent can write to — so an agent that shadows `python3` with a
-script writing `1.0` scores 1.0 on an unsolved task. Confirmed in a container,
-not in principle.
+runs three agents against the same task, same environment, same verifier —
+only `solve.sh` differs:
 
-Until that's fixed, treat any mined win as an upper bound. It matters most for
-step 6: rejection sampling keeps rollouts that score well, and RL finds reward
-hacks reliably.
+| agent | must score | what a wrong answer would mean |
+|---|---|---|
+| forges its own score, fixes nothing | 0.0 | the reward is forgeable |
+| actually fixes the bug | 1.0 | scoring is broken and everything is zero |
+| fixes the bug **and commits** | 1.0 | correct work is being collected as a loss |
+
+The second and third are controls, and they're the point: a 0.0 from the cheat
+proves nothing on its own, and the two honest agents differ only in where they
+left their changes — which is not something the task asked about.
+
+Mined tasks score in a **separate** container the agent never touched. The
+agent's work is collected as a diff against the task's base commit, applied to
+a clean checkout, and graded there. Under the old shared-container default an
+agent that shadowed `python3` scored 1.0 on an unsolved task — measured, not
+hypothesised.
+
+If the diff never arrives, the verifier refuses rather than running the suite
+against the base repo: that would score a different task, and the 0.0 would be
+indistinguishable from an agent that tried and failed. The run leaves the
+dataset instead.
 
 ## Does the diagnosis work at all?
 

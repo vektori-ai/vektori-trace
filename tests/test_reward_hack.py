@@ -19,12 +19,17 @@ from pathlib import Path
 import pytest
 
 from vektori_trace.envcheck import (
+    REWARD_HACK_BASE_REF,
     REWARD_HACK_SOLVE_SH,
+    build_committing_task,
+    build_honest_task,
     build_reward_hack_task,
+    evaluate_committing,
+    evaluate_honest,
     evaluate_reward_hack,
     reward_hack_dockerfile,
 )
-
+from vektori_trace.mining.pipeline import MODEL_PATCH_PATH, model_patch_collect
 
 # ---------------------------------------------------------------------------
 # The verdict
@@ -108,3 +113,235 @@ def test_solve_sh_is_executable(tmp_path: Path) -> None:
 def test_no_empty_patch_diff_is_left_behind(tmp_path: Path) -> None:
     task_dir = build_reward_hack_task(tmp_path)
     assert not (task_dir / "solution" / "patch.diff").exists()
+
+
+# ---------------------------------------------------------------------------
+# Verifier isolation
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_task_declares_a_separate_verifier(tmp_path: Path) -> None:
+    import tomllib
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+
+    assert cfg["verifier"]["environment_mode"] == "separate"
+    assert cfg["artifacts"] == [MODEL_PATCH_PATH]
+    assert cfg["verifier"]["collect"][0]["command"] == model_patch_collect(
+        REWARD_HACK_BASE_REF
+    )
+
+
+def test_shared_mode_declares_none_of_it(tmp_path: Path) -> None:
+    """The pre-fix shape has to stay reproducible, or the probe can't show a
+    difference between the two."""
+    import tomllib
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+
+    assert "environment_mode" not in cfg["verifier"]
+    assert "artifacts" not in cfg
+
+
+def test_isolated_test_script_applies_the_model_patch(tmp_path: Path) -> None:
+    """The verifier container never saw the agent, so their work has to be
+    carried in as a patch and applied — otherwise the base repo is scored."""
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    test_sh = (task_dir / "tests" / "test.sh").read_text()
+
+    assert f'git apply --verbose "{MODEL_PATCH_PATH}"' in test_sh
+    assert "model_patch_apply_failed" in test_sh
+
+
+def test_shared_test_script_does_not_apply_a_patch(tmp_path: Path) -> None:
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    test_sh = (task_dir / "tests" / "test.sh").read_text()
+    assert MODEL_PATCH_PATH not in test_sh
+
+
+def test_collect_stages_new_files_too() -> None:
+    """`git diff` alone misses added files, so an agent that fixes a bug by
+    adding a module would have its work silently dropped and score 0."""
+    assert "git add -A" in model_patch_collect("abc123")
+
+
+def test_isolated_task_ships_a_verifier_image_that_owns_tests(tmp_path: Path) -> None:
+    """In separate mode harbor sets `skip_tests_upload=True` and uploads
+    nothing, so a verifier image without /tests dies with
+    `/tests/test.sh: No such file or directory`."""
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    verifier_dockerfile = task_dir / "tests" / "Dockerfile"
+
+    assert verifier_dockerfile.exists()
+    body = verifier_dockerfile.read_text()
+    assert "COPY . /tests" in body
+    # Same starting state as the agent's container, so the model patch applies.
+    assert reward_hack_dockerfile().strip() in body
+
+
+def test_shared_mode_ships_no_verifier_dockerfile(tmp_path: Path) -> None:
+    task_dir = build_reward_hack_task(tmp_path, isolated=False, name="shared-probe")
+    assert not (task_dir / "tests" / "Dockerfile").exists()
+
+
+# ---------------------------------------------------------------------------
+# The control
+# ---------------------------------------------------------------------------
+
+
+def test_honest_agent_must_still_win() -> None:
+    assert evaluate_honest(1.0).ok is True
+    assert evaluate_honest(0.0).ok is False
+    assert evaluate_honest(None).ok is False
+
+
+def test_the_honest_agent_actually_fixes_the_bug(tmp_path: Path) -> None:
+    """Without this control a 0.0 from the cheat proves nothing — it could
+    equally mean the isolated verifier is broken and everything scores zero."""
+    task_dir = build_honest_task(tmp_path)
+    solve = (task_dir / "solution" / "solve.sh").read_text()
+
+    assert "return a + b" in solve
+    assert "/logs/verifier" not in solve  # it wins by working, not by writing
+
+
+def test_honest_and_cheating_tasks_are_otherwise_identical(tmp_path: Path) -> None:
+    """Same environment, same verifier, same oracle — only solve.sh differs."""
+    hack = build_reward_hack_task(tmp_path / "a", isolated=True)
+    honest = build_honest_task(tmp_path / "b")
+
+    for rel in ("environment/Dockerfile", "tests/test.sh", "tests/f2p.json"):
+        assert (hack / rel).read_text() == (honest / rel).read_text()
+    assert (hack / "solution" / "solve.sh").read_text() != (
+        honest / "solution" / "solve.sh"
+    ).read_text()
+
+
+# ---------------------------------------------------------------------------
+# Collection: committed work is work
+# ---------------------------------------------------------------------------
+
+
+def test_collect_diffs_against_the_base_not_the_index() -> None:
+    """`git diff --cached` is staged-vs-HEAD. Agents commit — Claude Code and
+    Codex both do it unprompted on a bugfix — and once they do, HEAD moves and
+    the diff is empty. A correct solution then scores 0 and enters the corpus
+    as a loss for the diagnosis to explain."""
+    cmd = model_patch_collect("abc123")
+
+    assert "git diff --cached abc123" in cmd
+    # The bare form is what drops committed work.
+    assert "git diff --cached >" not in cmd
+
+
+def test_collect_is_anchored_to_the_task_s_own_base_commit() -> None:
+    """A shared constant can't carry a per-task base commit, which is why this
+    is a function."""
+    assert model_patch_collect("aaa") != model_patch_collect("bbb")
+
+
+def test_the_committing_probe_actually_commits(tmp_path: Path) -> None:
+    """The other two probes leave their work in the worktree, so neither one
+    covers the path a real agent takes."""
+    task_dir = build_committing_task(tmp_path)
+    solve = (task_dir / "solution" / "solve.sh").read_text()
+
+    assert "commit -qm" in solve
+    assert "return a + b" in solve  # it still has to really fix the bug
+    assert "/logs/verifier" not in solve  # and win by working, not by writing
+
+
+def test_committed_work_must_score_like_uncommitted_work() -> None:
+    assert evaluate_committing(1.0).ok is True
+    assert evaluate_committing(0.0).ok is False
+    assert evaluate_committing(None).ok is False
+
+
+def test_all_three_probes_share_everything_but_solve_sh(tmp_path: Path) -> None:
+    """Same task, environment, verifier and oracle — otherwise the three
+    scores aren't comparable and none of them proves anything."""
+    hack = build_reward_hack_task(tmp_path / "a", isolated=True)
+    honest = build_honest_task(tmp_path / "b")
+    committing = build_committing_task(tmp_path / "c")
+
+    for rel in ("environment/Dockerfile", "tests/test.sh", "tests/f2p.json"):
+        assert (hack / rel).read_text() == (honest / rel).read_text()
+        assert (hack / rel).read_text() == (committing / rel).read_text()
+
+    scripts = {
+        (d / "solution" / "solve.sh").read_text()
+        for d in (hack, honest, committing)
+    }
+    assert len(scripts) == 3
+
+
+# ---------------------------------------------------------------------------
+# A missing patch is not a loss
+# ---------------------------------------------------------------------------
+
+
+def test_no_model_patch_refuses_rather_than_scoring_the_base_repo() -> None:
+    """Collection can fail on its own — an agent shadowing `git`, an
+    unwritable /logs, a failed artifact upload. Running the suite anyway
+    scores the base repo, i.e. a different task, and the resulting 0.0 is
+    indistinguishable from an agent that tried and failed."""
+    from vektori_trace.mining.pipeline import build_eval_script
+
+    script = build_eval_script(
+        "abc123",
+        test_patch="",
+        test_cmds=["pytest"],
+        fail_to_pass=["tests/test_x.py::test_y"],
+        model_patch_path=MODEL_PATCH_PATH,
+    )
+
+    assert "no_model_patch" in script
+    assert "scoring the base repo" not in script
+
+
+def test_no_model_patch_status_is_treated_as_unjudgeable() -> None:
+    """...and the miner has to act on it, or the refusal is just a 0.0 with a
+    nicer log line."""
+    from vektori_trace.validity import UNJUDGEABLE_STATUSES
+
+    assert "no_model_patch" in UNJUDGEABLE_STATUSES
+
+
+def test_model_patch_apply_is_atomic() -> None:
+    """A base-relative diff applied to a checkout at that same base applies
+    whole or not at all. `--reject` would leave a half-patched tree and still
+    report failure, so the suite would run against a state neither side
+    chose."""
+    from vektori_trace.mining.pipeline import build_eval_script
+
+    script = build_eval_script(
+        "abc123",
+        test_patch="",
+        test_cmds=["pytest"],
+        fail_to_pass=["tests/test_x.py::test_y"],
+        model_patch_path=MODEL_PATCH_PATH,
+    )
+
+    assert f'git apply --verbose "{MODEL_PATCH_PATH}"' in script
+    assert f'--reject "{MODEL_PATCH_PATH}"' not in script
+
+
+def test_the_base_ref_collect_uses_is_one_the_image_creates(tmp_path: Path) -> None:
+    """The ref the diff is taken against has to exist in the container.
+
+    The constant here used to be a sha copy-pasted from the *other* probe's
+    repo. Nothing noticed, because the probe ships no test_patch and the reset
+    that consumed it is a no-op — the first code to actually resolve the ref
+    found it dangling, `|| true` swallowed the error, and the empty diff read
+    as "the agent did nothing".
+    """
+    dockerfile = reward_hack_dockerfile()
+    assert f"git tag {REWARD_HACK_BASE_REF}" in dockerfile
+
+    task_dir = build_reward_hack_task(tmp_path, isolated=True)
+    import tomllib
+
+    cfg = tomllib.loads((task_dir / "task.toml").read_text())
+    assert REWARD_HACK_BASE_REF in cfg["verifier"]["collect"][0]["command"]

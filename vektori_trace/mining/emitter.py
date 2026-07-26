@@ -67,6 +67,19 @@ class HarborTask:
     # {"tests/verifier.py": ..., "tests/f2p.json": ...}. Harbor exposes tests/
     # at /tests in the container so test.sh can read them.
     aux_files: dict[str, str] = field(default_factory=dict)
+    # Verifier isolation. In Harbor's default "shared" mode the verifier runs
+    # inside the agent's container, on the agent's PATH, writing to a directory
+    # the agent can write to — an agent that shadows `python3` scores 1.0 on an
+    # unsolved task (measured; see `vektori-trace check-env --reward-hack`).
+    # "separate" runs it in a fresh container the agent never touched.
+    verifier_environment_mode: str | None = None
+    # Commands run in the agent's container after the agent phase and before
+    # artifact collection — how the agent's work gets out of the container it
+    # is scored from.
+    verifier_collect: list[dict[str, Any]] = field(default_factory=list)
+    # Paths collected from the agent environment and re-uploaded to the
+    # verifier environment at the same absolute path.
+    artifacts: list[str] = field(default_factory=list)
     # Synthesized tasks have no gold diff — their oracle *is* the script. Set
     # this and the emitter writes it as solution/solve.sh (and skips the empty
     # patch.diff) instead of the git-apply shim. It must go through the emitter
@@ -157,6 +170,12 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         "agent": {"timeout_sec": 1800.0},
         "verifier": {"timeout_sec": 300.0},
     }
+    if task.verifier_environment_mode:
+        payload["verifier"]["environment_mode"] = task.verifier_environment_mode
+    if task.verifier_collect:
+        payload["verifier"]["collect"] = task.verifier_collect
+    if task.artifacts:
+        payload["artifacts"] = task.artifacts
     (task_path / "task.toml").write_bytes(tomli_w.dumps(payload).encode("utf-8"))
 
     # instruction.md
@@ -203,6 +222,28 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         (tests_dir / "test.sh").write_text(task.test_script, encoding="utf-8")
         # mark executable; harbor expects test.sh to be runnable
         (tests_dir / "test.sh").chmod(0o755)
+
+        # A separate verifier is built from the task's *tests/* directory —
+        # `Trial._verifier_env_build_context` returns `tests_dir`, not
+        # `environment/` — so without a definition there the trial dies with
+        # "no environment definition" before the verifier ever runs. The
+        # verifier needs exactly the agent's starting state (repo at base
+        # commit, dependencies installed) to apply the model patch onto, so it
+        # gets the same Dockerfile rather than a guess at a base image.
+        #
+        # It must also *contain* /tests: in separate mode harbor constructs the
+        # Verifier with `skip_tests_upload=True` ("the verifier image already
+        # owns /tests/test.sh") and uploads nothing, so a Dockerfile that only
+        # sets up the repo yields `/tests/test.sh: No such file or directory`.
+        # The build context is this directory, hence `COPY . /tests`.
+        if task.verifier_environment_mode == "separate" and task.environment_dockerfile:
+            (tests_dir / "Dockerfile").write_text(
+                task.environment_dockerfile
+                + "\n# The separate verifier runs /tests/test.sh from its own image.\n"
+                "COPY . /tests\n"
+                "RUN chmod -R a+rX /tests && chmod +x /tests/*.sh 2>/dev/null || true\n",
+                encoding="utf-8",
+            )
 
     # Auxiliary task files (relative paths under the task dir). Harbor mounts
     # the task's tests/ dir into the container at /tests, so a pipeline can

@@ -15,8 +15,12 @@ from .diagnose import (
     select_deficit,
 )
 from .envcheck import (
+    build_committing_task,
+    build_honest_task,
     build_probe_task,
     build_reward_hack_task,
+    evaluate_committing,
+    evaluate_honest,
     evaluate_reward_hack,
     run_probe,
 )
@@ -294,7 +298,23 @@ def cmd_checkenv(args: argparse.Namespace) -> int:
         reward = _find_reward(out_dir / "jobs-rewardhack")
         hack_finding = evaluate_reward_hack(reward)
         print(f"  [{hack_finding.mark}] {hack_finding.name}: {hack_finding.detail}")
-        findings = [*findings, hack_finding]
+
+        # The control: a blocked hack means nothing if honest work also scores
+        # zero, which is what a broken isolated verifier would look like.
+        print("Control: an agent that actually fixes the bug...")
+        honest_dir = build_honest_task(out_dir / "task")
+        run_probe(honest_dir, out_dir / "jobs-honest")
+        honest_finding = evaluate_honest(_find_reward(out_dir / "jobs-honest"))
+        print(f"  [{honest_finding.mark}] {honest_finding.name}: {honest_finding.detail}")
+        # The collection control. Both probes above leave their work in the
+        # worktree, so neither exercises the path a real agent takes when it
+        # commits — and a diff taken against the index comes out empty there.
+        print("Control: an agent that commits its fix...")
+        committing_dir = build_committing_task(out_dir / "task")
+        run_probe(committing_dir, out_dir / "jobs-committing")
+        committing_finding = evaluate_committing(_find_reward(out_dir / "jobs-committing"))
+        print(f"  [{committing_finding.mark}] {committing_finding.name}: {committing_finding.detail}")
+        findings = [*findings, hack_finding, honest_finding, committing_finding]
 
     failed = [f for f in findings if not f.ok]
     if failed:
