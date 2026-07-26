@@ -64,8 +64,10 @@ The 0.20 threshold is uncalibrated; the labeller is a blurry ruler and blur
 shrinks effects toward zero, so treat it as a placeholder until it's set from
 hand-labelled data.
 
-Output lands in `./vektori-out/`: `tasks/<deficit-name>/` (the Harbor task) and
-`diagnosis.{json,md}` (the ranked deficits + report, with N beside every rate).
+Output lands in `./vektori-out/`. `diagnosis.{json,md}` (the ranked deficits +
+report, with N beside every rate) is always written; `tasks/<deficit-name>/`
+(the Harbor task) only when a capability clears both thresholds — a "no deficit
+found" run writes the ranked list and no task dir.
 
 Add `--prove` to also run the validity proof via `harbor run`:
 
