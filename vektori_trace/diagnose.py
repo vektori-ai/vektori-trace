@@ -70,23 +70,61 @@ _CAPABILITIES_SCHEMA = {
 }
 
 
-def propose_capabilities(traces: list[Trace], model: str | None = None) -> list[Capability]:
-    """One LLM call: read short summaries of every trace, propose 4-8 candidate
-    capabilities the task distribution requires.
+def _sample_evenly(traces: list[Trace], k: int) -> list[Trace]:
+    """Up to k traces, evenly spaced. Deterministic, and because manifests tend
+    to arrive grouped by outcome, a stride covers both groups where taking the
+    first k would show the proposer only wins."""
+    if len(traces) <= k:
+        return list(traces)
+    stride = len(traces) / k
+    return [traces[int(i * stride)] for i in range(k)]
+
+
+def propose_capabilities(
+    traces: list[Trace],
+    model: str | None = None,
+    *,
+    max_traces: int = 20,
+    max_turns_per_trace: int = 24,
+    max_field_chars: int = 240,
+) -> list[Capability]:
+    """One LLM call: read trajectory excerpts, propose 4-8 candidate capabilities.
 
     Blind to outcome, like the labeller. Told which runs failed, the model
     proposes capabilities that describe the *failures it was shown* rather than
     the task distribution — the separation then comes out of the prompt instead
-    of the data, and every gap downstream is measured against a rigged list."""
-    summaries = []
-    for t in traces:
-        first_user = next((turn.content for turn in t.turns if turn.role == "user"), "")
-        summaries.append(f"- run {t.run_id}: task={_truncate(first_user, 300)!r}, {len(t.turns)} turns")
+    of the data, and every gap downstream is measured against a rigged list.
+
+    It sees actual turns, not one-line summaries. Given only the opening
+    request and a turn count there is nothing behavioural in the prompt to
+    reason about, and the model does the only thing the input supports: it
+    groups traces by subject matter and proposes task domains — "Cloud Object
+    Storage Upload", "Release Branch Push". Those aren't capabilities, they
+    can't be lacking, and the planted-deficit self-test recovers nothing
+    against them. Capabilities are behaviours, so proposing them requires
+    seeing behaviour.
+    """
+    sample = _sample_evenly(traces, max_traces)
+    excerpts = "\n\n".join(
+        f"--- {t.run_id} ({len(t.turns)} turns) ---\n"
+        + t.condensed(max_turns=max_turns_per_trace, max_field_chars=max_field_chars)
+        for t in sample
+    )
+    omitted = len(traces) - len(sample)
+    header = f"Here are {len(sample)} agent trajectories"
+    header += f" (sampled from {len(traces)}):" if omitted else ":"
     user = (
-        "Here are summaries of agent trajectories:\n\n" + "\n".join(summaries) + "\n\n"
-        "Propose 4-8 distinct agent capabilities (skills/behaviors, not vague traits) "
-        "that these tasks require, and on which agents plausibly differ from one "
-        "another. Each id should be a short snake_case slug."
+        f"{header}\n\n{excerpts}\n\n"
+        "Propose 4-8 distinct agent capabilities on which these trajectories "
+        "differ or could differ — concrete behaviours the agent either exercises "
+        "competently or fails to.\n\n"
+        "A capability is something an agent DOES, not a topic it does it to. "
+        "'Recovers from a failed tool call by changing its arguments' is a "
+        "capability. 'Cloud storage uploads', 'database queries', 'deployment' "
+        "are task domains, not capabilities — do not propose those. The test: if "
+        "you cannot sensibly say an agent LACKS it in one trajectory and "
+        "DEMONSTRATES it in another, it is not a capability.\n\n"
+        "Each id should be a short snake_case slug."
     )
     result = call_json(
         system=(
