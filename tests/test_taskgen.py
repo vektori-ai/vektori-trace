@@ -83,3 +83,42 @@ def test_task_toml_records_the_diagnosis_it_came_from(
     assert provenance["capability_id"] == "reads_traceback"
     assert provenance["gap"] == 0.7
     assert provenance["n_relevant_losses"] == 8
+
+
+def test_the_fingerprint_covers_the_generated_oracle(
+    tmp_path: Path, deficit: DeficitScore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two synthesized tasks with the same instruction and different oracles
+    must not share a content_hash.
+
+    A synthesized task has no gold diff, so oracle_diff is empty and the
+    instruction was the entire fingerprint. solve.sh — the only thing that
+    actually differs between them — was written over the emitter's output
+    *after* the hash was computed, so it couldn't reach it.
+    """
+
+    def hash_for(solve_sh: str, dest: Path) -> str:
+        monkeypatch.setattr(
+            taskgen,
+            "generate_task_files",
+            lambda *a, **k: {**GENERATED, "solve_sh": solve_sh},
+        )
+        task_dir = taskgen.scaffold_task(deficit, dest)
+        cfg = tomllib.loads((task_dir / "task.toml").read_text())
+        return cfg["metadata"]["repo2env"]["content_hash"]
+
+    a = hash_for("#!/bin/bash\necho one\n", tmp_path / "a")
+    b = hash_for("#!/bin/bash\necho two\n", tmp_path / "b")
+    same = hash_for("#!/bin/bash\necho one\n", tmp_path / "c")
+
+    assert a != b
+    assert a == same  # still deterministic for identical input
+
+
+def test_synthesized_tasks_ship_no_empty_patch_diff(
+    tmp_path: Path, deficit: DeficitScore
+) -> None:
+    """There is no gold diff; an empty patch.diff is something downstream
+    could mistake for one."""
+    task_dir = taskgen.scaffold_task(deficit, tmp_path)
+    assert not (task_dir / "solution" / "patch.diff").exists()
