@@ -861,6 +861,45 @@ def targeted_test_cmds_for_pr(test_cmds: list[str], test_files: list[str]) -> li
     return out
 
 
+# Per-run resume state, written next to the emitted tasks. A mining sweep is
+# hours of Docker work over hundreds of PRs; without this, any crash (or a
+# Ctrl-C) meant restarting from PR #1 and re-validating everything already
+# decided. Same reasoning as `collect_traces`'s incremental manifest: a crash
+# on PR 250 of 400 must leave the first 249 recorded.
+CHECKPOINT_FILENAME = "mine-checkpoint.json"
+
+
+def _load_checkpoint(out_dir: Path) -> dict[str, str]:
+    """Read `{pr_number: outcome}` from a prior run, or {} if there is none.
+
+    A corrupt/unreadable checkpoint is treated as absent: losing resume state
+    costs time, refusing to mine costs the whole run.
+    """
+    path = out_dir / CHECKPOINT_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("ignoring unreadable checkpoint %s: %s", path, exc)
+        return {}
+    processed = data.get("processed") if isinstance(data, dict) else None
+    if not isinstance(processed, dict):
+        return {}
+    return {str(k): str(v) for k, v in processed.items()}
+
+
+def _write_checkpoint(out_dir: Path, processed: dict[str, str]) -> None:
+    """Persist the checkpoint. Written after every PR, never batched."""
+    path = out_dir / CHECKPOINT_FILENAME
+    try:
+        path.write_text(
+            json.dumps({"version": 1, "processed": processed}, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:  # a failed checkpoint must not kill the sweep
+        logger.warning("could not write checkpoint %s: %s", path, exc)
+
+
 class PRRuntimePipeline:
     """Sandbox-verified PR mining against a GitHub repo."""
 
@@ -878,6 +917,7 @@ class PRRuntimePipeline:
         self.options = options
         self.bootstrap = bootstrap
         self._progress_cb = None
+        self._sandbox = None
 
     def set_progress_callback(self, cb) -> None:
         self._progress_cb = cb
@@ -919,110 +959,47 @@ class PRRuntimePipeline:
 
         skip_reasons: dict[str, int] = {}
         emitted = 0
-        sandbox = None  # lazy-init for the validation loop
+        self._sandbox = None  # lazy-init for the validation loop
+        # Resume: PR numbers already decided by an earlier run against this
+        # out_dir are not re-fetched or re-validated.
+        checkpoint = _load_checkpoint(out_dir)
 
         try:
             for pr in prs:
                 pr_label = f"{owner}/{name}#{pr.number}"
 
-                # Pre-validation skip filters
-                reason = self._pre_filter(pr)
-                if reason:
-                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-                    self._emit_progress(pr_label, "skip", reason)
+                if str(pr.number) in checkpoint:
+                    skip_reasons["already_processed"] = (
+                        skip_reasons.get("already_processed", 0) + 1
+                    )
+                    self._emit_progress(pr_label, "skip", "already_processed")
                     continue
 
-                # Fetch diff
                 try:
-                    diff = self._provider.fetch_pr_diff(owner, name, pr.number, token=token)
-                except _PROVIDER_ERRORS as exc:
-                    logger.warning("PR #%d: diff fetch failed: %s", pr.number, exc)
-                    skip_reasons["diff_fetch_failed"] = skip_reasons.get("diff_fetch_failed", 0) + 1
-                    self._emit_progress(pr_label, "error", "diff_fetch_failed")
-                    continue
-
-                patch, test_patch = split_patch_and_test_patch(diff)
-                if not patch.strip():
-                    skip_reasons["empty_source_patch"] = (
-                        skip_reasons.get("empty_source_patch", 0) + 1
+                    kind, key, message = self._process_pr(pr, owner, name, token, out_dir)
+                except Exception as exc:
+                    # One Docker hiccup, network blip or timeout must not cost
+                    # the remaining PRs — the tasks already on disk stay, this
+                    # PR is recorded as skipped, and the sweep continues.
+                    key = f"unexpected_error:{type(exc).__name__}"
+                    logger.warning(
+                        "PR #%d: unexpected error, skipping: %s: %s", pr.number, type(exc).__name__, exc
                     )
-                    self._emit_progress(pr_label, "skip", "empty_source_patch")
-                    continue
-                if not test_patch.strip():
-                    skip_reasons["no_test_patch"] = skip_reasons.get("no_test_patch", 0) + 1
-                    self._emit_progress(pr_label, "skip", "no_test_patch")
-                    continue
+                    kind, message = "error", key
 
-                # Structural quality filters (cheap, run before validation):
-                # - CI-only PRs: source patch is 100% under .github/
-                # - No new test functions: test_patch only edits comments/docstrings
-                structural_reason = self._structural_quality_filter(patch, test_patch)
-                if structural_reason:
-                    skip_reasons[structural_reason] = skip_reasons.get(structural_reason, 0) + 1
-                    self._emit_progress(pr_label, "skip", structural_reason)
-                    continue
+                if kind == "emit":
+                    emitted += 1
+                    self._emit_progress(message, "emit")
+                else:
+                    skip_reasons[key] = skip_reasons.get(key, 0) + 1
+                    self._emit_progress(pr_label, kind, message)
 
-                # Lite-style structural filters
-                lite_reason = self._lite_filter(pr, patch)
-                if lite_reason:
-                    skip_reasons[lite_reason] = skip_reasons.get(lite_reason, 0) + 1
-                    self._emit_progress(pr_label, "skip", lite_reason)
-                    continue
-
-                # Validation (optional via skip_validation)
-                fail_to_pass: list[str] = []
-                pass_to_pass: list[str] = []
-                validation_status = "skipped"
-                if not self.options.skip_validation:
-                    if sandbox is None:
-                        sandbox = self._start_validation_sandbox()
-                    from vektori_trace.mining.validate import validate_pr
-
-                    targeted_cmds = targeted_test_cmds_for_pr(
-                        normalize_test_cmds_for_runtime(self.bootstrap.test_cmds),
-                        _files_in_patch(test_patch),
-                    )
-                    outcome = validate_pr(
-                        sandbox=sandbox,
-                        base_commit=pr.base_sha,
-                        patch=patch,
-                        test_patch=test_patch,
-                        test_cmds=targeted_cmds,
-                        language=self.bootstrap.language.value,
-                        timeout=self.options.validation_timeout_sec,
-                    )
-                    fail_to_pass = outcome.fail_to_pass
-                    pass_to_pass = outcome.pass_to_pass
-                    validation_status = outcome.status
-                    if (
-                        self.options.require_fail_to_pass
-                        and len(fail_to_pass) < self.options.min_fail_to_pass
-                    ):
-                        skip_reasons["no_fail_to_pass"] = skip_reasons.get("no_fail_to_pass", 0) + 1
-                        self._emit_progress(pr_label, "skip", outcome.reason or "no_fail_to_pass")
-                        continue
-
-                # Emit the Harbor task
-                task = self._build_task(
-                    pr,
-                    patch,
-                    test_patch,
-                    fail_to_pass=fail_to_pass,
-                    pass_to_pass=pass_to_pass,
-                    validation_status=validation_status,
-                )
-                write_harbor_task(task, out_dir)
-                emitted += 1
-                logger.info(
-                    "emitted task %s (F2P=%d, P2P=%d)",
-                    task.name,
-                    len(fail_to_pass),
-                    len(pass_to_pass),
-                )
-                self._emit_progress(task.name, "emit")
+                checkpoint[str(pr.number)] = "emitted" if kind == "emit" else key
+                _write_checkpoint(out_dir, checkpoint)
         finally:
-            if sandbox is not None:
-                sandbox.cleanup()
+            if self._sandbox is not None:
+                self._sandbox.cleanup()
+                self._sandbox = None
 
         return PipelineResult(
             candidates=len(prs),
@@ -1031,6 +1008,100 @@ class PRRuntimePipeline:
             out_dir=out_dir,
             skip_reasons=skip_reasons,
         )
+
+    def _process_pr(
+        self,
+        pr: PullRequestSummary,
+        owner: str,
+        name: str,
+        token: str | None,
+        out_dir: Path,
+    ) -> tuple[str, str, str]:
+        """Filter, validate and (if it survives) emit one PR.
+
+        Returns `(kind, key, message)` where kind is "emit" | "skip" | "error",
+        `key` is the counter key for `skip_reasons` and `message` is what the
+        progress callback shows. Raising is allowed — `run` treats any escaped
+        exception as this PR's skip, never the sweep's end.
+        """
+        # Pre-validation skip filters
+        reason = self._pre_filter(pr)
+        if reason:
+            return "skip", reason, reason
+
+        # Fetch diff
+        try:
+            diff = self._provider.fetch_pr_diff(owner, name, pr.number, token=token)
+        except _PROVIDER_ERRORS as exc:
+            logger.warning("PR #%d: diff fetch failed: %s", pr.number, exc)
+            return "error", "diff_fetch_failed", "diff_fetch_failed"
+
+        patch, test_patch = split_patch_and_test_patch(diff)
+        if not patch.strip():
+            return "skip", "empty_source_patch", "empty_source_patch"
+        if not test_patch.strip():
+            return "skip", "no_test_patch", "no_test_patch"
+
+        # Structural quality filters (cheap, run before validation):
+        # - CI-only PRs: source patch is 100% under .github/
+        # - No new test functions: test_patch only edits comments/docstrings
+        structural_reason = self._structural_quality_filter(patch, test_patch)
+        if structural_reason:
+            return "skip", structural_reason, structural_reason
+
+        # Lite-style structural filters
+        lite_reason = self._lite_filter(pr, patch)
+        if lite_reason:
+            return "skip", lite_reason, lite_reason
+
+        # Validation (optional via skip_validation)
+        fail_to_pass: list[str] = []
+        pass_to_pass: list[str] = []
+        validation_status = "skipped"
+        if not self.options.skip_validation:
+            if self._sandbox is None:
+                self._sandbox = self._start_validation_sandbox()
+            from vektori_trace.mining.validate import validate_pr
+
+            targeted_cmds = targeted_test_cmds_for_pr(
+                normalize_test_cmds_for_runtime(self.bootstrap.test_cmds),
+                _files_in_patch(test_patch),
+            )
+            outcome = validate_pr(
+                sandbox=self._sandbox,
+                base_commit=pr.base_sha,
+                patch=patch,
+                test_patch=test_patch,
+                test_cmds=targeted_cmds,
+                language=self.bootstrap.language.value,
+                timeout=self.options.validation_timeout_sec,
+            )
+            fail_to_pass = outcome.fail_to_pass
+            pass_to_pass = outcome.pass_to_pass
+            validation_status = outcome.status
+            if (
+                self.options.require_fail_to_pass
+                and len(fail_to_pass) < self.options.min_fail_to_pass
+            ):
+                return "skip", "no_fail_to_pass", outcome.reason or "no_fail_to_pass"
+
+        # Emit the Harbor task
+        task = self._build_task(
+            pr,
+            patch,
+            test_patch,
+            fail_to_pass=fail_to_pass,
+            pass_to_pass=pass_to_pass,
+            validation_status=validation_status,
+        )
+        write_harbor_task(task, out_dir)
+        logger.info(
+            "emitted task %s (F2P=%d, P2P=%d)",
+            task.name,
+            len(fail_to_pass),
+            len(pass_to_pass),
+        )
+        return "emit", "emitted", task.name
 
     # ----- filters ------------------------------------------------------------
 
