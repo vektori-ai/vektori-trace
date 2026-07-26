@@ -412,7 +412,10 @@ def cmd_checkenv(args: argparse.Namespace) -> int:
     if failed:
         print(f"\n{len(failed)} check(s) failed — emitted tasks are not sound as shipped.")
         return 1
-    print("\nAll checks passed: the Dockerfile and the compose overlay both take effect.")
+    print(
+        "\nAll checks passed: the image build, the history scrub and the network "
+        "policy all take effect."
+    )
     return 0
 
 

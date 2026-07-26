@@ -29,6 +29,19 @@ Docker for the `--prove` and `mine` steps (`uv tool install harbor` or see
 Harbor's docs). Diagnosis and task generation need neither — task files are
 written directly, not via the `harbor` binary.
 
+Mined tasks also need **`docker buildx`**, which harbor uses to build the
+egress-control sidecar that enforces their network policy. Without it the trial
+dies at `unknown flag: --file` before any container starts:
+
+```bash
+docker buildx version || {
+  mkdir -p ~/.docker/cli-plugins
+  curl -sSL -o ~/.docker/cli-plugins/docker-buildx \
+    https://github.com/docker/buildx/releases/latest/download/buildx-v0.35.0.linux-amd64
+  chmod +x ~/.docker/cli-plugins/docker-buildx
+}
+```
+
 ```bash
 cp .env.example .env   # fill in OPENAI_API_KEY
 export $(cat .env | xargs)
@@ -94,23 +107,52 @@ vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude-code
 
 ## Is the environment sound?
 
-Mined tasks ship two files that have to both take effect: a `Dockerfile` that
-resets the repo to the PR's base commit and scrubs `.git` of everything after
-it, and a `docker-compose.yaml` that blackholes the hosts serving the published
-fix. If only one applied, agents would read the answer out of `.git` or
-`pip download` it, and every "win" would be contamination.
+Two independent leaks have to stay closed. The `Dockerfile` resets the repo to
+the PR's base commit and scrubs `.git` of everything after it — otherwise
+`git diff origin/main` reads the answer with no network at all. And the task
+declares a **default-deny network policy**, because the published fix lives on
+PyPI and GitHub: an agent blocked from `.git` will fall back to
+`pip download <pkg>==<fixed>` and read the fix out of the wheel. That is
+observed behaviour, not a hypothetical. If either guard slips, every "win" is
+contamination.
 
 ```bash
 vektori-trace check-env      # needs Docker + harbor
 ```
 
-It builds a probe task from the *real* guard functions — a throwaway repo whose
-history contains a sentinel "fix" — runs it through harbor, and inspects the
-container: base commit, pruned objects, removed remote, per-host resolution in
-both address families, and whether HTTPS to the fix sources actually fails.
+It builds a probe task from the *real* guards — a throwaway repo whose history
+contains a sentinel "fix" — runs it through harbor, and inspects the container:
+base commit, pruned objects, removed remote, whether HTTPS to each fix source
+actually fails, and whether an allowed host still answers.
 
-Worth re-running after any harbor upgrade: the runtime's compose-merge order is
-not something we control.
+```text
+[PASS] dockerfile_ran: HEAD=db711bf3... (expected db711bf3...)
+[PASS] fix_sources_unreachable: all 8 fix-source host(s) unreachable
+[PASS] allowed_host_reachable: api.openai.com -> 401
+[PASS] future_commits_pruned: fix object reachable: no
+[PASS] sentinel_unreachable: git log -SSECRET_FIX: <no hits>
+[PASS] remote_removed: git remote -v: <none>
+```
+
+Those last two network findings only mean something together. "Everything is
+unreachable" passes the first and breaks every installed agent, which
+npm-installs itself into the container and calls its model API from there.
+
+**Network policy is per phase**, which is what makes a default-deny allowlist
+usable at all:
+
+| phase | policy | why |
+|---|---|---|
+| `[environment]` / `[agent]` | `allowlist` | the model API and the agent's own registry, and nothing else — never PyPI or GitHub |
+| `[verifier]` | `no-network` | dependencies are in the image and the suite runs offline, and this is the container that decides the reward |
+
+Harbor enforces this with a default-deny sidecar proxy, so a host nobody
+thought of is blocked too — the thing a denylist can never do. It needs
+`docker buildx` installed (harbor builds the sidecar image with it) and refuses
+the task outright on a provider that can't enforce the policy, rather than
+silently downgrading.
+
+Worth re-running after any harbor upgrade.
 
 ```bash
 vektori-trace check-env --reward-hack
