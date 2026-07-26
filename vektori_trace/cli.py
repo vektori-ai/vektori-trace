@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -36,6 +37,43 @@ from .report import build_report, write_report
 from .schema import Trace, load_manifest
 from .taskgen import scaffold_task
 from .validity import _find_reward, prove_validity
+
+
+def _min_gap_arg(value: str) -> float:
+    """`--min-gap` as a threshold that can actually reject something.
+
+    `float("nan")` parses fine, and every `gap < nan` comparison in
+    `select_deficit` is then False — so a NaN threshold doesn't loosen the
+    filter, it *removes* it, and inverted evidence (gap = -1.0) gets reported
+    as a confident diagnosis again. That is the exact failure this flag was
+    added to prevent, so it's rejected at the boundary rather than downstream.
+    """
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number, got {value!r} (a non-finite threshold rejects nothing)"
+        )
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 0, got {parsed} (a negative gap is evidence against the hypothesis)"
+        )
+    return parsed
+
+
+def _min_support_arg(value: str) -> int:
+    """`--min-support` below 1 would admit capabilities with no evidence at all."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 1, got {parsed} (0 admits capabilities backed by no traces)"
+        )
+    return parsed
 
 
 def _load_traces(manifest_path: Path) -> list[Trace]:
@@ -291,7 +329,9 @@ def cmd_prove(args: argparse.Namespace) -> int:
     return 0 if validity["valid"] else 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from running it so argument parsing —
+    notably the threshold validators — is testable without dispatching."""
     parser = argparse.ArgumentParser(prog="vektori-trace")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -312,13 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     p_diag.add_argument("--base-model", default=None, help="model name for --base-agent")
     p_diag.add_argument(
         "--min-gap",
-        type=float,
+        type=_min_gap_arg,
         default=DEFAULT_MIN_GAP,
         help="minimum win/loss gap for a capability to be reported as a deficit (uncalibrated)",
     )
     p_diag.add_argument(
         "--min-support",
-        type=int,
+        type=_min_support_arg,
         default=DEFAULT_MIN_SUPPORT,
         help="minimum relevant traces on each side of the gap",
     )
@@ -352,8 +392,10 @@ def main(argv: list[str] | None = None) -> int:
             "labeller would recover — free, offline, and an upper bound on any real run"
         ),
     )
-    p_self.add_argument("--min-gap", type=float, default=DEFAULT_MIN_GAP)
-    p_self.add_argument("--min-support", type=int, default=DEFAULT_MIN_SUPPORT)
+    # Same validators as `diagnose` — the sweep scores recovery against these
+    # thresholds, so a NaN here silently reports 100% recovery.
+    p_self.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
+    p_self.add_argument("--min-support", type=_min_support_arg, default=DEFAULT_MIN_SUPPORT)
     p_self.add_argument("--seed", type=int, default=0)
     p_self.set_defaults(func=cmd_selftest)
 
@@ -413,7 +455,11 @@ def main(argv: list[str] | None = None) -> int:
     p_mine.add_argument("--out", default="./vektori-out", help="output directory")
     p_mine.set_defaults(func=cmd_mine)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 
