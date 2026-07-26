@@ -29,6 +29,7 @@ from vektori_trace.mining import (
     RepoSpec,
     ensure_bootstrap,
 )
+from vektori_trace.mining.atif import TrajectoryParseError, parse_job_trajectory
 from vektori_trace.schema import Turn
 from vektori_trace.validity import _find_reward
 
@@ -149,13 +150,13 @@ def collect_traces(
 class HarborTraceRunner:
     """Runs `harbor run` against a mined task and parses the resulting turns.
 
-    Harbor's per-harness trajectory log format isn't standardized across
-    agents (codex/claude_code/aider/...), so this does a best-effort parse:
-    any `trajectory.json` under the job dir (a turn-shaped array, same shape
-    as our own `Turn`) is used directly; otherwise falls back to a single
-    condensed Turn built from raw stdout, so a harness we can't parse still
-    produces a usable (if coarse) trace instead of failing outright. Passed
-    comes from `_find_reward` — the task's own verifier, never LLM-judged.
+    Harbor writes ATIF, which `mining.atif` parses using Harbor's own models.
+    There is no best-effort fallback: a trajectory we cannot parse is an infra
+    failure and the task leaves the dataset. The previous fallback — the last
+    4,000 characters of stdout as one Turn — produced traces that looked
+    ordinary on disk and were a stderr tail, and every label derived from one
+    was fiction. Passed comes from `_find_reward`, the task's own verifier,
+    never LLM-judged.
     """
 
     def __init__(
@@ -166,15 +167,11 @@ class HarborTraceRunner:
         self.model = model
         self.timeout_sec = timeout_sec
 
-    def _parse_turns(self, job_dir: Path, raw_stdout: str) -> list[Turn]:
-        for traj_file in job_dir.rglob("trajectory.json"):
-            try:
-                raw_turns = json.loads(traj_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            if isinstance(raw_turns, list):
-                return [Turn.from_dict(t) for t in raw_turns]
-        return [Turn(index=0, role="assistant", content=raw_stdout[-4000:])]
+    def _parse_turns(self, job_dir: Path) -> list[Turn]:
+        try:
+            return parse_job_trajectory(job_dir)
+        except TrajectoryParseError as e:
+            raise InfraFailure(f"could not parse trajectory: {e}") from e
 
     def run(self, task_dir: Path) -> MinedRun:
         task_dir = task_dir.resolve()
@@ -217,7 +214,7 @@ class HarborTraceRunner:
             # agent failed — only that we can't tell.
             raise InfraFailure(f"no reward found under {job_dir}")
 
-        turns = self._parse_turns(job_dir, proc.stdout + proc.stderr)
+        turns = self._parse_turns(job_dir)
         return MinedRun(turns=turns, passed=reward >= 1.0)
 
 

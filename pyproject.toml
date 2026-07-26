@@ -11,10 +11,18 @@ dependencies = [
     "tomli-w>=1.2.0",
 ]
 
+[project.optional-dependencies]
+# Parsing ATIF trajectories uses Harbor's own Pydantic models rather than a
+# copy of the spec that could drift. Harbor is what produces those files, so
+# anything reading them already has it; it stays optional so `diagnose` on
+# pasted traces needs neither Harbor nor Docker.
+harbor = ["harbor>=0.20"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.12",
+    "harbor>=0.20",
 ]
 
 [tool.pytest.ini_options]

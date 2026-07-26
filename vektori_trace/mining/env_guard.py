@@ -18,10 +18,29 @@ This is a *denylist*, which is the realistic control at the docker-compose
 layer (`extra_hosts` can add host->ip pins but cannot default-deny). It closes
 the obvious, observed leak paths and, crucially, keeps a hosted agent like
 claude-code runnable (a full `allow_internet=false` block breaks the agent's
-own install + API access). The stricter, more robust form is a default-deny
-egress allowlist proxy (allow only the package manager + model API), or a
-PyPI mirror frozen to the task's base date so even the index lacks the fix.
-See docs/pipelines/README.md and plans/reward_hacking_writeups.md.
+own install + API access).
+
+Harbor's `network_mode = "allowlist"` supersedes this — migration pending
+-------------------------------------------------------------------------
+A default-deny allowlist is strictly better than a denylist, and the v0 plan
+calls for switching to it and deleting this module. As of harbor 0.20 that is
+available on local Docker: `DockerEnvironment` sets `network_allowlist` from
+`_enable_egress_control`, which is on for a non-Windows container on Linux
+whenever the task actually requests egress control. (It was *not* available on
+0.14, which is what the plan was written against — worth knowing, because
+`BaseEnvironment.validate_network_policy_support` raises rather than silently
+downgrading, so on an older harbor the switch fails loudly instead of leaving
+tasks unprotected.)
+
+This module therefore stays only until the switch is made and verified in a
+container: an allowlist that blocks the fix sources but also blocks the
+agent's own installer or model API breaks every run, and that trade-off is
+what needs measuring before the denylist comes out. `test_env_guard.py` pins
+the support fact so the migration is driven by the suite rather than by
+memory.
+
+The stricter forms remain beyond that: a default-deny egress proxy, or a PyPI
+mirror frozen to the task's base date so even the index lacks the fix.
 """
 
 from __future__ import annotations
