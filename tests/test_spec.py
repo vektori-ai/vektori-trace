@@ -63,3 +63,22 @@ def test_ssh_urls_keep_their_scheme(url: str, expected: str) -> None:
 def test_unparseable_urls_raise(url: str) -> None:
     with pytest.raises(ValueError):
         RepoSpec(url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://github.com/psf/requests",
+        "file:///etc/passwd",
+        "svn+ssh://github.com/psf/requests",
+        "git://github.com/psf/requests",
+    ],
+)
+def test_unsupported_schemes_are_rejected_not_reinterpreted(url: str) -> None:
+    """Any scheme we don't handle used to fall through to the bare
+    `owner/name` branch, where splitting on "/" made the scheme the owner:
+    `ftp://github.com/psf/requests` canonicalized to
+    `https://github.com/ftp:/github.com` — and `url` is documented as safe to
+    hand straight to `git clone`."""
+    with pytest.raises(ValueError, match=r"only github\.com repos are supported"):
+        RepoSpec(url=url)
