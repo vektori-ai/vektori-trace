@@ -1058,10 +1058,11 @@ class PRRuntimePipeline:
         fail_to_pass: list[str] = []
         pass_to_pass: list[str] = []
         validation_status = "skipped"
+        dependency_drift = False
         if not self.options.skip_validation:
             if self._sandbox is None:
                 self._sandbox = self._start_validation_sandbox()
-            from vektori_trace.mining.validate import validate_pr
+            from vektori_trace.mining.validate import detect_dependency_drift, validate_pr
 
             targeted_cmds = targeted_test_cmds_for_pr(
                 normalize_test_cmds_for_runtime(self.bootstrap.test_cmds),
@@ -1085,6 +1086,17 @@ class PRRuntimePipeline:
             ):
                 return "skip", "no_fail_to_pass", outcome.reason or "no_fail_to_pass"
 
+            # The sandbox holds the dependencies installed at bootstrap HEAD,
+            # but this PR's stages ran at `pr.base_sha`. If the manifest moved
+            # between the two, F2P/P2P may reflect the wrong dependency set —
+            # a caveat for whoever consumes the task, not a hard exclusion.
+            dependency_drift = detect_dependency_drift(
+                self._sandbox,
+                bootstrap_ref=self.bootstrap.ref,
+                base_commit=pr.base_sha,
+                language=self.bootstrap.language.value,
+            )
+
         # Emit the Harbor task
         task = self._build_task(
             pr,
@@ -1093,6 +1105,7 @@ class PRRuntimePipeline:
             fail_to_pass=fail_to_pass,
             pass_to_pass=pass_to_pass,
             validation_status=validation_status,
+            dependency_drift_detected=dependency_drift,
         )
         write_harbor_task(task, out_dir)
         logger.info(
@@ -1213,6 +1226,7 @@ class PRRuntimePipeline:
         fail_to_pass: list[str],
         pass_to_pass: list[str],
         validation_status: str,
+        dependency_drift_detected: bool = False,
     ) -> HarborTask:
         owner, name = self.input.repo.owner_name
         task_id = f"{owner}__{name}-{pr.number}"
@@ -1261,6 +1275,11 @@ class PRRuntimePipeline:
                 "pass_to_pass": pass_to_pass,
                 "validation_status": validation_status,
                 "bootstrap_image": self.bootstrap.image_digest,
+                # True when the dependency manifest at this PR's base commit
+                # differs from the one the shared validation sandbox was
+                # provisioned against (bootstrap HEAD) — the F2P/P2P oracle was
+                # computed with possibly-wrong dependency versions.
+                "dependency_drift_detected": dependency_drift_detected,
                 # Graded reward: reward.txt carries f2p_rate*p2p_rate (training
                 # signal); the strict SWE-bench `resolved` bool + full breakdown
                 # go to reward-details.json (eval signal — Harbor's reward.json

@@ -216,6 +216,92 @@ def _timed_out(
     )
 
 
+# ----- dependency drift ------------------------------------------------------
+#
+# The validation sandbox is provisioned ONCE, at bootstrap HEAD, and reused for
+# every candidate PR — but each PR's stages run at that PR's own `base_sha`. If
+# the dependency manifest moved between the two commits, the installed packages
+# are not what the base commit asks for, and F2P/P2P can come out wrong with no
+# signal that it happened. Re-provisioning per PR is far too expensive, so we
+# DETECT the condition and record it on the emitted task as a caveat.
+#
+# Per language, the file that declares dependencies. Lock files are included
+# where they're the thing that actually pins installed versions.
+_DEPENDENCY_MANIFESTS: dict[str, tuple[str, ...]] = {
+    "python": ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"),
+    "node": ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"),
+    "go": ("go.mod", "go.sum"),
+    "rust": ("Cargo.toml", "Cargo.lock"),
+    "java": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    "c_cpp": ("CMakeLists.txt", "conanfile.txt"),
+}
+
+
+def dependency_manifests_for(language: str | None) -> tuple[str, ...]:
+    """Manifest paths worth comparing for `language` (empty if unknown)."""
+    return _DEPENDENCY_MANIFESTS.get((language or "").lower(), ())
+
+
+def manifests_differ(
+    bootstrap_manifests: dict[str, str | None],
+    base_manifests: dict[str, str | None],
+) -> bool:
+    """True if any manifest's content differs between the two commits.
+
+    A manifest missing at *both* commits says nothing and is ignored; a
+    manifest present at one and absent at the other is drift (a dependency
+    file was added or removed between the commits).
+    """
+    for path in set(bootstrap_manifests) | set(base_manifests):
+        left = bootstrap_manifests.get(path)
+        right = base_manifests.get(path)
+        if left is None and right is None:
+            continue
+        if left != right:
+            logger.info("dependency drift: %s differs between bootstrap HEAD and base commit", path)
+            return True
+    return False
+
+
+def _read_manifests(
+    sandbox: DockerSandbox, ref: str, paths: tuple[str, ...], *, timeout: int = 30
+) -> dict[str, str | None]:
+    """`git show <ref>:<path>` for each path. None when the file isn't there."""
+    out: dict[str, str | None] = {}
+    for path in paths:
+        r = sandbox.exec(f"git -C /workspace show {ref}:{path}", timeout=timeout)
+        out[path] = r.stdout if r.ok else None
+    return out
+
+
+def detect_dependency_drift(
+    sandbox: DockerSandbox,
+    *,
+    bootstrap_ref: str,
+    base_commit: str,
+    language: str | None,
+) -> bool:
+    """Did the dependency manifest move between the sandbox's installed state
+    (bootstrap HEAD) and this PR's base commit?
+
+    Best-effort: any failure to read either side returns False. This is a
+    caveat recorded on the task, never a reason to lose a candidate, so an
+    unreadable manifest must not be louder than the task itself.
+    """
+    paths = dependency_manifests_for(language)
+    if not paths or not bootstrap_ref or not base_commit:
+        return False
+    if bootstrap_ref == base_commit:
+        return False
+    try:
+        at_bootstrap = _read_manifests(sandbox, bootstrap_ref, paths)
+        at_base = _read_manifests(sandbox, base_commit, paths)
+    except Exception as exc:
+        logger.warning("dependency-drift check failed (%s); assuming no drift", exc)
+        return False
+    return manifests_differ(at_bootstrap, at_base)
+
+
 def validate_pr(
     *,
     sandbox: DockerSandbox,
