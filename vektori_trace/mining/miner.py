@@ -35,6 +35,15 @@ from vektori_trace.schema import Turn
 from vektori_trace.validity import UNJUDGEABLE_STATUSES, _find_parse_status, _find_reward
 
 
+def discover_tasks(tasks_dir: Path) -> list[Path]:
+    """Task dirs already mined under `tasks_dir` (each has a task.toml).
+
+    Shared by `mine_tasks` (right after mining) and `replay` (loading a
+    previously-mined tasks_dir without re-mining).
+    """
+    return [p for p in sorted(tasks_dir.iterdir()) if p.is_dir() and (p / "task.toml").exists()]
+
+
 def mine_tasks(
     repo: str,
     out_dir: Path,
@@ -75,8 +84,7 @@ def mine_tasks(
     bootstrap = ensure_bootstrap(pipeline_input.repo, pipeline_input.bootstrap, llm)
     pipeline = PRRuntimePipeline(pipeline_input, options or PRRuntimeOptions(), bootstrap=bootstrap)
     result = pipeline.run(out_dir)
-    task_dirs = [p for p in sorted(out_dir.iterdir()) if p.is_dir() and (p / "task.toml").exists()]
-    return task_dirs, result
+    return discover_tasks(out_dir), result
 
 
 class InfraFailure(RuntimeError):
@@ -158,6 +166,87 @@ def collect_traces(
         if manifest_path is not None:
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(json.dumps(manifest, indent=2))
+    return manifest
+
+
+def _slugify_model(model: str) -> str:
+    """A model name safe to embed in a filename (`openai/gpt-5` -> `openai_gpt-5`)."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in model)
+
+
+def collect_paired_traces(
+    task_dirs: list[Path],
+    arms: list[tuple[str, TraceRunner]],
+    traces_dir: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> list[dict]:
+    """Run every arm — `(model_name, runner)` pairs sharing one pinned scaffold —
+    against every mined task, so the same task is attempted by both models.
+
+    Each arm's InfraFailure is independent: a Docker OOM on the frontier's
+    attempt at a task does not exclude the candidate's attempt at that same
+    task. Manifest entries carry `model` and `task` so Step 5 can pair rows by
+    task (cross-model and within-model contrasts) and filter by model.
+
+    Resumable: a replay sweep costs two `harbor run`s per task across two
+    model APIs, so a process kill (Ctrl-C, a reboot, an OOM-killed process —
+    not just one bad arm, which is already isolated above) at task 80 of 100
+    would otherwise mean redoing all 80. If `manifest_path` already holds
+    entries from a prior run, every (task, model) pair already recorded there
+    is skipped rather than re-run, and the prior entries are kept in the
+    returned/rewritten manifest.
+    """
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict] = []
+    done: set[tuple[str, str]] = set()
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  ignoring unreadable manifest {manifest_path}: {e}", file=sys.stderr)
+            manifest = []
+        done = {(m["task"], m["model"]) for m in manifest if m.get("task") and m.get("model")}
+        if done:
+            print(f"Resuming: {len(done)} (task, model) pair(s) already in the manifest, skipping.", file=sys.stderr)
+
+    for task_dir in task_dirs:
+        for model_name, runner in arms:
+            if (task_dir.name, model_name) in done:
+                continue
+            try:
+                result = runner.run(task_dir)
+            except InfraFailure as e:
+                print(f"  skip {task_dir.name} [{model_name}]: infra failure — {e}", file=sys.stderr)
+                continue
+            except Exception as e:  # a bug in one arm's run must not kill the sweep
+                print(f"  skip {task_dir.name} [{model_name}]: {type(e).__name__}: {e}", file=sys.stderr)
+                continue
+
+            run_id = f"{task_dir.name}-{_slugify_model(model_name)}-{uuid.uuid4().hex[:8]}"
+            payload = {
+                "runId": run_id,
+                "status": "success" if result.passed else "failure",
+                "turns": [_turn_to_dict(t) for t in result.turns],
+            }
+            # Absolute: manifest.json and traces_dir don't have to share a
+            # parent (replay's traces_dir and manifest_path do, but nothing
+            # requires it), and a relative path here plus load_manifest's
+            # own "resolve relative to the manifest's dir" rule can double
+            # up the prefix and point at a path that doesn't exist.
+            trace_path = (traces_dir / f"{run_id}.json").resolve()
+            trace_path.write_text(json.dumps(payload, indent=2))
+            manifest.append(
+                {
+                    "path": str(trace_path),
+                    "outcome": "win" if result.passed else "loss",
+                    "model": model_name,
+                    "task": task_dir.name,
+                }
+            )
+            if manifest_path is not None:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                manifest_path.write_text(json.dumps(manifest, indent=2))
     return manifest
 
 
@@ -255,6 +344,8 @@ __all__ = [
     "InfraFailure",
     "MinedRun",
     "TraceRunner",
+    "collect_paired_traces",
     "collect_traces",
+    "discover_tasks",
     "mine_tasks",
 ]
