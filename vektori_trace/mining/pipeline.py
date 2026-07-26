@@ -48,7 +48,7 @@ from vektori_trace.mining import github
 from vektori_trace.mining.auth import resolve_repo_token
 from vektori_trace.mining.bootstrap.spec import BootstrapResult
 from vektori_trace.mining.emitter import HarborTask, write_harbor_task
-from vektori_trace.mining.env_guard import egress_guard_compose, git_history_scrub
+from vektori_trace.mining.env_guard import AGENT_ALLOWED_HOSTS, git_history_scrub
 from vektori_trace.mining.github import GitHubError, PullRequestSummary
 from vektori_trace.mining.result import PipelineResult
 from vektori_trace.mining.spec import PipelineInput, PRRuntimeOptions
@@ -1221,12 +1221,19 @@ class PRRuntimePipeline:
             test_script=eval_script,
             # Ship verifier.py + f2p.json + p2p.json as plain, inspectable task
             # artifacts that test.sh reads from /tests (no base64 in test.sh).
-            # The egress guard blackholes the hosts that serve this PR's merged
-            # diff so the agent cannot fetch the gold patch at run time.
-            aux_files={
-                **(_runtime_aux_files(fail_to_pass, pass_to_pass) if fail_to_pass else {}),
-                "environment/docker-compose.yaml": egress_guard_compose(),
-            },
+            aux_files=(
+                _runtime_aux_files(fail_to_pass, pass_to_pass) if fail_to_pass else {}
+            ),
+            # Default-deny egress. Everything not named is blocked, including
+            # the hosts serving this PR's merged diff — which is why there is no
+            # longer a list of things to block. The verifier gets nothing at
+            # all: its dependencies are in the image and the suite runs offline,
+            # and it is the container that decides the reward.
+            environment_network_mode="allowlist",
+            environment_allowed_hosts=list(AGENT_ALLOWED_HOSTS),
+            agent_network_mode="allowlist",
+            agent_allowed_hosts=list(AGENT_ALLOWED_HOSTS),
+            verifier_network_mode="no-network",
             # Score in a container the agent never touched. See
             # `model_patch_collect` for why the diff is the thing carried
             # across, and why it is taken against the base commit rather than

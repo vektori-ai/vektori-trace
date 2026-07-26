@@ -86,6 +86,18 @@ class HarborTask:
     # rather than being written over the top afterwards, because the caller
     # can't retrofit it into the content hash without rewriting task.toml.
     oracle_solve_sh: str | None = None
+    # Network policy, per phase. Harbor takes `network_mode` separately on
+    # [environment], [agent] and [verifier], and the two phases have completely
+    # different needs — the verifier's dependencies are baked into the image, so
+    # it needs no egress at all, while an installed agent has to reach its own
+    # registry and model API. One policy for both would have to be the looser of
+    # the two, which is how a denylist ends up being the only option.
+    environment_network_mode: str | None = None
+    environment_allowed_hosts: list[str] = field(default_factory=list)
+    agent_network_mode: str | None = None
+    agent_allowed_hosts: list[str] = field(default_factory=list)
+    verifier_network_mode: str | None = None
+    verifier_allowed_hosts: list[str] = field(default_factory=list)
 
 
 def _content_hash(task: HarborTask) -> str:
@@ -170,6 +182,24 @@ def write_harbor_task(task: HarborTask, dest_dir: Path) -> Path:
         "agent": {"timeout_sec": 1800.0},
         "verifier": {"timeout_sec": 300.0},
     }
+    # Network policy. `allowed_hosts` is only valid alongside
+    # `network_mode = "allowlist"` — harbor's own validator rejects the pair
+    # otherwise, so emitting it unconditionally would make every task
+    # unloadable.
+    if task.environment_network_mode:
+        env_table: dict[str, Any] = {"network_mode": task.environment_network_mode}
+        if task.environment_network_mode == "allowlist" and task.environment_allowed_hosts:
+            env_table["allowed_hosts"] = list(task.environment_allowed_hosts)
+        payload["environment"] = env_table
+    if task.agent_network_mode:
+        payload["agent"]["network_mode"] = task.agent_network_mode
+        if task.agent_network_mode == "allowlist" and task.agent_allowed_hosts:
+            payload["agent"]["allowed_hosts"] = list(task.agent_allowed_hosts)
+    if task.verifier_network_mode:
+        payload["verifier"]["network_mode"] = task.verifier_network_mode
+        if task.verifier_network_mode == "allowlist" and task.verifier_allowed_hosts:
+            payload["verifier"]["allowed_hosts"] = list(task.verifier_allowed_hosts)
+
     if task.verifier_environment_mode:
         payload["verifier"]["environment_mode"] = task.verifier_environment_mode
     if task.verifier_collect:

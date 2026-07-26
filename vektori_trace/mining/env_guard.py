@@ -1,52 +1,88 @@
-"""Anti-contamination egress guard for sandbox-verified tasks.
+"""Anti-contamination guards for sandbox-verified tasks.
 
-A published fix lives on the package index and the code host, so an agent with
-open network egress can fetch the gold patch (and often the hidden test) for the
-very repo it is being asked to fix. We saw this empirically: an agent blocked
-from the web fell back to `git diff origin/main` (closed by the git-history
-scrub in `build_environment_dockerfile`), and when that was closed it ran
-`pip download <pkg>==<fixed>` and read the fix straight out of the wheel.
+Two independent leaks, closed two different ways.
 
-This module ships a per-task `environment/docker-compose.yaml` overlay that
-Harbor merges into its compose chain. It blackholes the fix-bearing hosts
-(PyPI + GitHub + their CDNs) by mapping them to 0.0.0.0, so `pip download`,
-`git fetch github.com`, `curl raw.githubusercontent...` and WebFetch against
-those hosts all fail, while general internet (the model API, the agent's own
-installer, apt) stays reachable.
+**The repo's own history.** The working tree sits at the base commit, but `.git`
+still holds the future: `origin/main`, tags, the fix commit, the hidden test.
+Reading the answer out of it needs no network at all. `git_history_scrub` prunes
+it at image-build time.
 
-This is a *denylist*, which is the realistic control at the docker-compose
-layer (`extra_hosts` can add host->ip pins but cannot default-deny). It closes
-the obvious, observed leak paths and, crucially, keeps a hosted agent like
-claude-code runnable (a full `allow_internet=false` block breaks the agent's
-own install + API access).
+**The network.** A published fix lives on the package index and the code host, so
+an agent with open egress can fetch the gold patch — and often the hidden test —
+for the very repo it is being asked to fix. Observed empirically: an agent
+blocked from `git diff origin/main` fell back to `pip download <pkg>==<fixed>`
+and read the fix straight out of the wheel.
 
-Harbor's `network_mode = "allowlist"` supersedes this — migration pending
--------------------------------------------------------------------------
-A default-deny allowlist is strictly better than a denylist, and the v0 plan
-calls for switching to it and deleting this module. As of harbor 0.20 that is
-available on local Docker: `DockerEnvironment` sets `network_allowlist` from
-`_enable_egress_control`, which is on for a non-Windows container on Linux
-whenever the task actually requests egress control. (It was *not* available on
-0.14, which is what the plan was written against — worth knowing, because
-`BaseEnvironment.validate_network_policy_support` raises rather than silently
-downgrading, so on an older harbor the switch fails loudly instead of leaving
-tasks unprotected.)
+Network policy is Harbor's, not ours
+------------------------------------
+This used to ship a per-task `docker-compose.yaml` mapping the fix-bearing hosts
+to `0.0.0.0` and `::`. That was a *denylist*, which is what `extra_hosts` can
+express, and a denylist is only ever as good as its enumeration — every CDN
+alias, mirror and IP literal not on the list was a hole, and the list could only
+be extended by thinking of things.
 
-This module therefore stays only until the switch is made and verified in a
-container: an allowlist that blocks the fix sources but also blocks the
-agent's own installer or model API breaks every run, and that trade-off is
-what needs measuring before the denylist comes out. `test_env_guard.py` pins
-the support fact so the migration is driven by the suite rather than by
-memory.
+Harbor 0.20 enforces `network_mode = "allowlist"` on local Docker with a
+default-deny sidecar proxy that eligible services route through
+(`network_mode: service:<sidecar>`). Everything not named is blocked, including
+hosts nobody thought of. `BaseEnvironment.validate_network_policy_support`
+raises rather than silently downgrading, so on a provider that can't enforce it
+the task fails loudly instead of running unprotected.
 
-The stricter forms remain beyond that: a default-deny egress proxy, or a PyPI
-mirror frozen to the task's base date so even the index lacks the fix.
+What made the migration look blocked, and why it wasn't
+-------------------------------------------------------
+The open question was: an allowlist that blocks the fix sources but also blocks
+the agent's own installer or model API breaks every run. It dissolves once you
+notice policy is settable **per phase** — `[environment]`, `[agent]` and
+`[verifier]` each take their own — and that the two phases have completely
+different needs:
+
+* The **verifier** needs nothing. Dependencies are installed into the image at
+  build time and the suite runs offline, so it gets `no-network`. This is the
+  container that decides the reward, which makes it the one worth hardening
+  most, and it costs nothing to harden.
+* The **agent** depends on its class. Harbor's own scaffolds (`terminus-2`) call
+  the model from the harness process on the host and send the container only
+  shell commands, so that container needs no egress either. Installed agents
+  (`claude-code`, `codex`) install a CLI *inside* the container and call the API
+  from there, so they need the registry and the model endpoint — and an
+  allowlist can grant exactly those two without ever granting PyPI or GitHub,
+  which is precisely what a denylist could not do safely.
+
+So the trade-off that needed measuring turned out not to be a trade-off. What
+still needs measuring is that the policy actually holds in a container, which is
+`vektori-trace check-env`'s job.
+
+The stricter forms remain beyond this: a PyPI mirror frozen to the task's base
+date, so even the index lacks the fix.
 """
 
 from __future__ import annotations
 
-# Hosts that serve the published fix / hidden tests for an open-source repo.
-# Blackholed to 0.0.0.0 in the agent's container at run time.
+# Hosts an agent must reach to function, and nothing else. Under
+# `network_mode = "allowlist"` everything absent from this list is blocked by
+# default — including the fix sources, which is the point: we no longer have to
+# enumerate what to block, only what to permit.
+#
+# Deliberately absent, and never to be added: pypi.org, files.pythonhosted.org,
+# github.com and their CDNs. Those serve the published fix.
+AGENT_ALLOWED_HOSTS: tuple[str, ...] = (
+    # Model APIs, for agents that call them from inside the container.
+    "api.anthropic.com",
+    "api.openai.com",
+    "*.openai.azure.com",
+    # Installer registries for the `installed` agent family, which npm/pip
+    # themselves into the container at run time.
+    "registry.npmjs.org",
+    "*.registry.npmjs.org",
+    # Telemetry/auth endpoints those CLIs refuse to start without.
+    "statsig.anthropic.com",
+    "sentry.io",
+)
+
+# The hosts a contamination check must prove are unreachable. Not a denylist —
+# nothing consumes this to *build* a policy. It is the assertion side of
+# `check-env`: under a correct allowlist every one of these must fail, and this
+# list is what "every one" means.
 FIX_SOURCE_HOSTS: tuple[str, ...] = (
     "pypi.org",
     "pypi.python.org",
@@ -84,37 +120,3 @@ def git_history_scrub(base_commit: str) -> str:
         f"    && git reflog expire --expire=now --all 2>/dev/null || true \\\n"
         f"    && git gc --prune=now 2>/dev/null || true\n"
     )
-
-
-def egress_guard_compose(hosts: tuple[str, ...] = FIX_SOURCE_HOSTS) -> str:
-    """Return `environment/docker-compose.yaml` content blackholing `hosts`.
-
-    Harbor includes a task's `environment/docker-compose.yaml` in its compose
-    `-f` chain, so the `extra_hosts` entries land on the agent's `main` service.
-    (Verified in a container by `vektori-trace check-env`, not assumed: the
-    Dockerfile still builds and this file is merged as an overlay on top.)
-
-    Each host is mapped twice, to `0.0.0.0` and to `::`. A single IPv4 mapping
-    leaves the AAAA record untouched, and every host here has one — `pypi.org`,
-    `files.pythonhosted.org` and `raw.githubusercontent.com` all resolved to
-    routable IPv6 addresses through a guard that looked like it was working.
-    Whether that leak is exploitable depends on whether the Docker network has
-    IPv6 egress, which is a property of whoever's machine this runs on; a
-    contamination control that holds only on hosts without IPv6 is not a
-    control.
-    """
-    lines = [
-        "# Auto-generated by Repo2RLEnv: anti-contamination egress guard.",
-        "# Blackholes the hosts that serve this repo's published fix and hidden",
-        "# tests, so an agent cannot fetch the answer (pip download / git fetch /",
-        "# WebFetch against these fail). General internet stays up so the agent",
-        "# can install itself and reach its model API. See pipelines/_env_guard.py.",
-        "# Both families are mapped: an IPv4-only blackhole leaves AAAA intact.",
-        "services:",
-        "  main:",
-        "    extra_hosts:",
-    ]
-    for h in hosts:
-        lines.append(f'      - "{h}:0.0.0.0"')
-        lines.append(f'      - "{h}:::"')
-    return "\n".join(lines) + "\n"

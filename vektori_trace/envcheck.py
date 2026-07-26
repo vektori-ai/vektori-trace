@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .mining.emitter import HarborTask, write_harbor_task
-from .mining.env_guard import FIX_SOURCE_HOSTS, egress_guard_compose, git_history_scrub
+from .mining.env_guard import AGENT_ALLOWED_HOSTS, FIX_SOURCE_HOSTS, git_history_scrub
 
 # Commits are built with pinned author/committer identity and dates, so the
 # SHAs are reproducible and can be asserted against literals.
@@ -52,7 +52,10 @@ PROBE_FIX_SHA = "6872f93641f1d443ed5313ba4220b7285ab2c390"
 PROBE_SENTINEL = "SECRET_FIX"
 
 # Addresses that mean "goes nowhere", in both families.
-BLACKHOLE_IPS = ("0.0.0.0", "::")
+# The control host: something the allowlist *permits*. Proving the fix
+# sources are blocked means nothing on its own — it reads identically to a
+# policy that blocks everything, which would break every installed agent.
+PROBE_ALLOWED_HOST = "api.openai.com"
 
 _GUARDED_HOSTS_SH = " ".join(FIX_SOURCE_HOSTS)
 
@@ -98,12 +101,10 @@ _PROBE_KEYS = (
     "remotes",
     "sentinel_hit",
     "fix_object_present",
-    "github_ip",
-    "pypi_ip",
     "etc_hosts",
     "host_resolution",
-    "pypi_http_code",
-    "github_http_code",
+    "fix_source_http",
+    "allowed_http_code",
 )
 
 # Values are passed to python through the environment rather than interpolated
@@ -124,18 +125,22 @@ if git cat-file -e {PROBE_FIX_SHA} 2>/dev/null; then
 else
   export fix_object_present=no
 fi
-export github_ip="$(getent hosts github.com 2>/dev/null | awk '{{print $1}}' | head -1)"
-export pypi_ip="$(getent hosts pypi.org 2>/dev/null | awk '{{print $1}}' | head -1)"
 export etc_hosts="$(cat /etc/hosts 2>/dev/null || true)"
-# Per-host resolution for every guarded host, so a partial guard is visible
-# rather than averaged away by whichever host happened to be sampled.
+# Kept for the report, not for a verdict. Under an allowlist the sidecar blocks
+# the connection, so a guarded host may well still resolve — resolution says
+# nothing either way now, which is exactly why the findings below ask the
+# network instead of the resolver.
 export host_resolution="$(for h in {_GUARDED_HOSTS_SH}; do \\
   echo "$h -> $(getent hosts "$h" 2>/dev/null | awk '{{print $1}}' | tr '\\n' ',' | sed 's/,$//')"; \\
 done)"
-# Resolution is not reachability. What matters is whether the fix can still be
-# fetched, so ask the network, not the resolver.
-export pypi_http_code="$(curl -s -m 10 -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/ 2>/dev/null)"
-export github_http_code="$(curl -s -m 10 -o /dev/null -w '%{{http_code}}' https://github.com 2>/dev/null)"
+# Every guarded host, individually. A partial policy is a different bug from an
+# absent one, and sampling two hosts averages the difference away.
+export fix_source_http="$(for h in {_GUARDED_HOSTS_SH}; do \\
+  echo "$h -> $(curl -s -m 10 -o /dev/null -w '%{{http_code}}' "https://$h" 2>/dev/null)"; \\
+done)"
+# The control. If this is blocked too then the policy is "block everything",
+# which passes the contamination check and breaks every installed agent.
+export allowed_http_code="$(curl -s -m 10 -o /dev/null -w '%{{http_code}}' https://{PROBE_ALLOWED_HOST}/v1/models 2>/dev/null)"
 
 python3 -c 'import json, os, sys; print(json.dumps({{k: os.environ.get(k, "").strip() for k in sys.argv[1:]}}, indent=2))' \\
   {" ".join(_PROBE_KEYS)} > /logs/verifier/probe.json
@@ -161,8 +166,12 @@ def build_probe_task(dest_dir: Path, org: str = "vektori") -> Path:
         category="diagnostic",
         environment_dockerfile=probe_dockerfile(),
         test_script=PROBE_TEST_SH,
-        # The real egress guard, byte for byte.
-        aux_files={"environment/docker-compose.yaml": egress_guard_compose()},
+        # The real policy, from the same constant mined tasks use — not a copy
+        # that can drift from what ships.
+        environment_network_mode="allowlist",
+        environment_allowed_hosts=list(AGENT_ALLOWED_HOSTS),
+        agent_network_mode="allowlist",
+        agent_allowed_hosts=list(AGENT_ALLOWED_HOSTS),
     )
     task_dir = write_harbor_task(task, dest_dir)
     solve = task_dir / "solution" / "solve.sh"
@@ -183,73 +192,78 @@ class Finding:
         return "PASS" if self.ok else "FAIL"
 
 
-def _parse_resolution(raw: str) -> dict[str, list[str]]:
-    """`host -> ip,ip` lines into {host: [ips]}."""
-    out: dict[str, list[str]] = {}
+def _parse_pairs(raw: str) -> dict[str, str]:
+    """`host -> value` lines into {host: value}."""
+    out: dict[str, str] = {}
     for line in (raw or "").splitlines():
         if "->" not in line:
             continue
-        host, _, ips = line.partition("->")
-        out[host.strip()] = [ip for ip in (i.strip() for i in ips.split(",")) if ip]
+        host, _, value = line.partition("->")
+        out[host.strip()] = value.strip()
     return out
 
 
-def _all_blackholed(raw: str) -> bool:
-    resolution = _parse_resolution(raw)
-    if not resolution:
-        return False
-    # Unresolvable is fine — that's blocked too. What is not fine is resolving
-    # to anything routable.
-    return all(all(ip in BLACKHOLE_IPS for ip in ips) for ips in resolution.values())
-
-
-def _resolution_detail(raw: str) -> str:
-    leaking = {
-        host: ips
-        for host, ips in _parse_resolution(raw).items()
-        if any(ip not in BLACKHOLE_IPS for ip in ips)
-    }
-    if not leaking:
-        return "every guarded host resolves to the blackhole"
-    return "still routable: " + "; ".join(f"{h}={','.join(ips)}" for h, ips in leaking.items())
-
-
 def _blocked(http_code: str | None) -> bool:
-    """A guarded host is blocked if the request did not reach a real server."""
-    return http_code in (None, "", "000", "curl_failed")
+    """Blocked means the request never reached a real server.
+
+    curl reports 000 when the connection itself failed, which is what a
+    default-deny proxy produces. Any real status — including 403 and 404 — means
+    a server answered, and a server that answers can serve a wheel.
+
+    Matched by prefix, not equality. `curl -w '%{http_code}'` prints `000` *and*
+    exits non-zero on a refused connection, so an `|| echo ...` fallback in the
+    probe concatenated onto it and produced `000curl_failed` — a real container
+    reporting a correctly blocked host as reachable. The shell no longer does
+    that, and this no longer depends on it not doing it.
+    """
+    code = (http_code or "").strip()
+    return not code or code.startswith("000") or code.startswith("curl_failed")
+
+
+def _reachable(http_code: str | None) -> bool:
+    return not _blocked(http_code)
+
+
+def _unreachable_detail(raw: str) -> str:
+    codes = _parse_pairs(raw)
+    if not codes:
+        return "the probe reported no per-host results"
+    leaking = {h: c for h, c in codes.items() if _reachable(c)}
+    if not leaking:
+        return f"all {len(codes)} fix-source host(s) unreachable"
+    return "still reachable: " + "; ".join(f"{h}={c}" for h, c in leaking.items())
 
 
 def evaluate_probe(probe: dict) -> list[Finding]:
     """Turn the container's self-report into pass/fail findings."""
     head = probe.get("head_sha", "")
-    github_ip = probe.get("github_ip", "")
+    fix_http = probe.get("fix_source_http", "")
+    codes = _parse_pairs(fix_http)
+    allowed = probe.get("allowed_http_code")
     return [
         Finding(
             "dockerfile_ran",
             head == PROBE_BASE_SHA,
             f"HEAD={head or '<none>'} (expected {PROBE_BASE_SHA})",
         ),
-        # Any host mapped to the blackhole proves the overlay was merged at all;
-        # whether it actually blocks anything is the separate finding below.
-        Finding(
-            "compose_overlay_applied",
-            github_ip in BLACKHOLE_IPS,
-            f"github.com -> {github_ip or '<unresolved>'}",
-        ),
-        Finding(
-            "all_guarded_hosts_blackholed",
-            _all_blackholed(probe.get("host_resolution", "")),
-            _resolution_detail(probe.get("host_resolution", "")),
-        ),
-        # The finding that actually matters: can the published fix still be
-        # fetched? A host mapped to 0.0.0.0 for IPv4 while its AAAA record
-        # still resolves is not blocked, and `pip download` reads the fix out
-        # of the wheel exactly as before.
+        # The contamination question, asked of the network rather than the
+        # resolver. Under an allowlist a guarded host may still resolve — the
+        # sidecar refuses the connection — so resolution proves nothing in
+        # either direction now.
         Finding(
             "fix_sources_unreachable",
-            _blocked(probe.get("pypi_http_code")) and _blocked(probe.get("github_http_code")),
-            f"HTTPS pypi.org -> {probe.get('pypi_http_code')}, "
-            f"github.com -> {probe.get('github_http_code')}",
+            bool(codes) and all(_blocked(c) for c in codes.values()),
+            _unreachable_detail(fix_http),
+        ),
+        # The control, and the reason this is an allowlist rather than a
+        # blanket block. "Everything is unreachable" passes the finding above
+        # and breaks every installed agent, which npm-installs itself into the
+        # container and calls its model API from there. The two findings only
+        # mean something together.
+        Finding(
+            "allowed_host_reachable",
+            _reachable(allowed),
+            f"{PROBE_ALLOWED_HOST} -> {allowed or '<no result>'}",
         ),
         Finding(
             "future_commits_pruned",
