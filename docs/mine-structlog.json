@@ -1,0 +1,110 @@
+{
+  "repo": "hynek/structlog",
+  "candidates": 40,
+  "emitted": 4,
+  "skipped": 36,
+  "skip_reasons": {
+    "no_test_patch": 20,
+    "non_bug_pr": 6,
+    "no_fail_to_pass": 4,
+    "no_new_test_funcs": 6
+  },
+  "audits": [
+    {
+      "task": "hynek__structlog-786",
+      "ok": true,
+      "checks": {
+        "base_commit_declared": true,
+        "dockerfile_resets_to_base_commit": true,
+        "git_history_scrubbed": true,
+        "f2p_declared": true,
+        "f2p_files_in_test_patch": true,
+        "shipped_f2p_matches_task_toml": true,
+        "oracle_patch_present": true,
+        "oracle_excludes_test_files": true
+      },
+      "details": {
+        "base_commit_declared": "2796b22ee1b5eed48cf1d25113d43bcf971711a4",
+        "dockerfile_resets_to_base_commit": "reset to 2796b22ee1b5 present in Dockerfile",
+        "git_history_scrubbed": "all scrub steps present",
+        "f2p_declared": "34 F2P test(s)",
+        "f2p_files_in_test_patch": "every F2P file appears in the test patch",
+        "shipped_f2p_matches_task_toml": "tests/f2p.json agrees with task.toml",
+        "oracle_patch_present": "137 line(s)",
+        "oracle_excludes_test_files": "oracle touches no graded test file"
+      }
+    },
+    {
+      "task": "hynek__structlog-794",
+      "ok": true,
+      "checks": {
+        "base_commit_declared": true,
+        "dockerfile_resets_to_base_commit": true,
+        "git_history_scrubbed": true,
+        "f2p_declared": true,
+        "f2p_files_in_test_patch": true,
+        "shipped_f2p_matches_task_toml": true,
+        "oracle_patch_present": true,
+        "oracle_excludes_test_files": true
+      },
+      "details": {
+        "base_commit_declared": "b2f3daf0b59c4ef7813b8ae99f380d2194856064",
+        "dockerfile_resets_to_base_commit": "reset to b2f3daf0b59c present in Dockerfile",
+        "git_history_scrubbed": "all scrub steps present",
+        "f2p_declared": "1 F2P test(s)",
+        "f2p_files_in_test_patch": "every F2P file appears in the test patch",
+        "shipped_f2p_matches_task_toml": "tests/f2p.json agrees with task.toml",
+        "oracle_patch_present": "169 line(s)",
+        "oracle_excludes_test_files": "oracle touches no graded test file"
+      }
+    },
+    {
+      "task": "hynek__structlog-807",
+      "ok": true,
+      "checks": {
+        "base_commit_declared": true,
+        "dockerfile_resets_to_base_commit": true,
+        "git_history_scrubbed": true,
+        "f2p_declared": true,
+        "f2p_files_in_test_patch": true,
+        "shipped_f2p_matches_task_toml": true,
+        "oracle_patch_present": true,
+        "oracle_excludes_test_files": true
+      },
+      "details": {
+        "base_commit_declared": "92fd882817a8e6aae192cfe6266fded2d597f522",
+        "dockerfile_resets_to_base_commit": "reset to 92fd882817a8 present in Dockerfile",
+        "git_history_scrubbed": "all scrub steps present",
+        "f2p_declared": "3 F2P test(s)",
+        "f2p_files_in_test_patch": "every F2P file appears in the test patch",
+        "shipped_f2p_matches_task_toml": "tests/f2p.json agrees with task.toml",
+        "oracle_patch_present": "40 line(s)",
+        "oracle_excludes_test_files": "oracle touches no graded test file"
+      }
+    },
+    {
+      "task": "hynek__structlog-818",
+      "ok": true,
+      "checks": {
+        "base_commit_declared": true,
+        "dockerfile_resets_to_base_commit": true,
+        "git_history_scrubbed": true,
+        "f2p_declared": true,
+        "f2p_files_in_test_patch": true,
+        "shipped_f2p_matches_task_toml": true,
+        "oracle_patch_present": true,
+        "oracle_excludes_test_files": true
+      },
+      "details": {
+        "base_commit_declared": "f194271d998edb9662c825adeca155e685345595",
+        "dockerfile_resets_to_base_commit": "reset to f194271d998e present in Dockerfile",
+        "git_history_scrubbed": "all scrub steps present",
+        "f2p_declared": "2 F2P test(s)",
+        "f2p_files_in_test_patch": "every F2P file appears in the test patch",
+        "shipped_f2p_matches_task_toml": "tests/f2p.json agrees with task.toml",
+        "oracle_patch_present": "64 line(s)",
+        "oracle_excludes_test_files": "oracle touches no graded test file"
+      }
+    }
+  ]
+}

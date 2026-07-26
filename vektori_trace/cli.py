@@ -24,8 +24,9 @@ from .envcheck import (
     evaluate_reward_hack,
     run_probe,
 )
+from .mining.inspect import audit_tasks, failure_histogram
 from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
-from .mining.spec import LLMSpec
+from .mining.spec import LLMSpec, PRRuntimeOptions
 from .planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
@@ -170,14 +171,105 @@ def cmd_mine(args: argparse.Namespace) -> int:
     tasks_dir = out_dir / "mined_tasks"
     traces_dir = out_dir / "mined_traces"
 
+    # Fail before the bootstrap, not after every PR has been silently
+    # discarded. A supplied Dockerfile skips the agent that discovers the test
+    # command, and F2P/P2P are derived by *running* the suite — so without one
+    # validation can't derive anything and every candidate skips as
+    # `no_fail_to_pass`, which reads as "this repo has no minable PRs".
+    if args.dockerfile and not [c for c in (args.test_cmd or []) if c.strip()]:
+        print(
+            "error: --dockerfile needs --test-cmd. Supplying a Dockerfile skips the "
+            "bootstrap agent, so nothing discovers how to run the suite, and F2P/P2P "
+            "come from running it. Without one every PR skips as no_fail_to_pass.\n"
+            "  e.g. --test-cmd 'python -m pytest -q'",
+            file=sys.stderr,
+        )
+        return 2
+
+    options = PRRuntimeOptions(
+        limit=args.limit,
+        require_linked_issue=not args.no_require_linked_issue,
+        skip_validation=args.skip_validation,
+    )
     print(f"Mining {args.repo}'s merged PR history into sandbox-verified tasks...")
-    task_dirs = mine_tasks(
+    print(
+        f"  limit={options.limit}  require_linked_issue={options.require_linked_issue}  "
+        f"skip_validation={options.skip_validation}"
+    )
+    task_dirs, result = mine_tasks(
         args.repo,
         tasks_dir,
         llm=LLMSpec(provider=args.llm_provider, model=args.llm_model),
         user_dockerfile=Path(args.dockerfile) if args.dockerfile else None,
+        test_cmds=args.test_cmd or None,
+        language=args.language,
+        options=options,
     )
     print(f"  {len(task_dirs)} task(s) mined to {tasks_dir}")
+
+    # The yield alone can't say whether a small number means the repo is
+    # unsuitable or a filter is wrong, and those call for opposite responses.
+    print(f"\nWhere the {result.candidates} candidate PR(s) went:")
+    print(f"  {'emitted':<28} {result.emitted}")
+    for reason, n in sorted(result.skip_reasons.items(), key=lambda kv: -kv[1]):
+        print(f"  {reason:<28} {n}")
+
+    audits = audit_tasks(task_dirs)
+    if audits:
+        bad = [a for a in audits if not a.ok]
+        print(f"\nStatic audit of {len(audits)} emitted task(s):")
+        hist = failure_histogram(audits)
+        if not hist:
+            print("  every task agrees with itself on all checks")
+        for check, n in sorted(hist.items(), key=lambda kv: -kv[1]):
+            print(f"  [FAIL] {check:<34} {n}/{len(audits)} task(s)")
+        for a in bad[:3]:
+            print(f"\n  {a.task}:")
+            for name in a.failures:
+                print(f"    [FAIL] {name}: {a.details[name]}")
+
+    (out_dir / "mine-report.json").write_text(
+        json.dumps(
+            {
+                "repo": args.repo,
+                "candidates": result.candidates,
+                "emitted": result.emitted,
+                "skipped": result.skipped,
+                "skip_reasons": result.skip_reasons,
+                "audits": [
+                    {"task": a.task, "ok": a.ok, "checks": a.checks, "details": a.details}
+                    for a in audits
+                ],
+            },
+            indent=2,
+        )
+    )
+    print(f"\nMine report written to {out_dir / 'mine-report.json'}")
+
+    # A failed audit stops the replay, not just --no-replay's exit code.
+    # `git_history_scrubbed=False` means an agent can read the fix out of
+    # `.git`, so every trace collected from that task is contaminated — and a
+    # contaminated win is worse than no win, because nothing downstream can
+    # tell it apart from a real one. The other checks mean the task is
+    # unwinnable, which poisons the loss half just as effectively.
+    bad_audits = [a for a in audits if not a.ok]
+    if bad_audits:
+        print(
+            f"\nerror: {len(bad_audits)} of {len(audits)} task(s) failed the audit. "
+            "Not running an agent against them — traces collected from a task that "
+            "fails these checks are contaminated or unwinnable, and neither is "
+            "distinguishable from the real thing once written to disk.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.no_replay:
+        print(
+            "\n--no-replay: stopping before the agent runs. "
+            f"Next: vektori-trace mine --repo {args.repo} (without --no-replay), "
+            "or inspect the tasks above."
+        )
+        return 0
 
     runner = HarborTraceRunner(agent=args.agent, jobs_dir=out_dir / "jobs", model=args.model)
     print(f"Running {args.agent} against each mined task to collect traces...")
@@ -357,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_diag.add_argument(
         "--base-agent",
         default=None,
-        help="harbor agent name to run as the 'base' attempt, e.g. codex, claude_code",
+        help="harbor agent name to run as the 'base' attempt, e.g. codex, claude-code",
     )
     p_diag.add_argument("--base-model", default=None, help="model name for --base-agent")
     p_diag.add_argument(
@@ -453,7 +545,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mine.add_argument(
-        "--agent", default="claude_code", help="harbor agent name to run against each task"
+        "--agent",
+        default="claude-code",
+        help=(
+            "harbor agent name to run against each task. Harbor's names are hyphenated "
+            "(claude-code, codex, terminus-2); underscores are normalised"
+        ),
     )
     p_mine.add_argument("--model", default=None, help="model name for --agent")
     p_mine.add_argument(
@@ -463,6 +560,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-model", default="gpt-5-nano", help="model for the bootstrap agent's LLM calls"
     )
     p_mine.add_argument("--out", default="./vektori-out", help="output directory")
+    p_mine.add_argument(
+        "--limit", type=int, default=50, help="how many merged PRs to consider (default 50)"
+    )
+    p_mine.add_argument(
+        "--test-cmd",
+        action="append",
+        default=[],
+        help=(
+            "how to run the suite, repeatable. Required with --dockerfile: skipping the "
+            "bootstrap agent means nothing discovers the test command, and F2P/P2P are derived "
+            "by running the suite, so without it every PR skips as no_fail_to_pass"
+        ),
+    )
+    p_mine.add_argument(
+        "--language",
+        default=None,
+        choices=["python", "node", "go", "rust", "java", "c_cpp"],
+        help="language hint for --dockerfile runs (selects the toolchain PATH prelude)",
+    )
+    p_mine.add_argument(
+        "--no-require-linked-issue",
+        action="store_true",
+        help=(
+            "keep PRs with no 'Fixes #N' trailer. The linked issue is what gives the task a "
+            "problem statement written before the fix existed; without one the PR body is the "
+            "only source and it describes the solution"
+        ),
+    )
+    p_mine.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help=(
+            "emit tasks without running the suite twice to derive F2P/P2P. Fast, and the result "
+            "is an UNVERIFIED task graded on exit code alone — never train on these"
+        ),
+    )
+    p_mine.add_argument(
+        "--no-replay",
+        action="store_true",
+        help="mine, audit and stop, without running an agent to collect traces",
+    )
     p_mine.set_defaults(func=cmd_mine)
 
     return parser

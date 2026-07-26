@@ -80,15 +80,16 @@ vektori-trace diagnose \
   --base-model gpt-5-nano
 ```
 
-`--base-agent` accepts any Harbor agent name — `codex`, `claude_code`,
-`aider`, `opencode`, etc. Without `--base-agent`, only the oracle solution is
+`--base-agent` accepts any Harbor agent name — `codex`, `claude-code`,
+`aider`, `opencode`, etc. (Harbor's names are hyphenated; underscores are
+normalised, since it rejects them outright before any container starts.) Without `--base-agent`, only the oracle solution is
 run (proves the task is solvable at all, not that a real agent lacks the
 capability).
 
 You can also run the proof separately against an already-generated task:
 
 ```bash
-vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude_code
+vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude-code
 ```
 
 ## Is the environment sound?
@@ -134,10 +135,19 @@ a clean checkout, and graded there. Under the old shared-container default an
 agent that shadowed `python3` scored 1.0 on an unsolved task — measured, not
 hypothesised.
 
-If the diff never arrives, the verifier refuses rather than running the suite
-against the base repo: that would score a different task, and the 0.0 would be
-indistinguishable from an agent that tried and failed. The run leaves the
-dataset instead.
+Absent and empty are different facts about that diff, and they are handled
+differently:
+
+| the patch file is | means | what happens |
+|---|---|---|
+| **absent** | collection never ran | refused — running the suite anyway scores the base repo, a different task, and the 0.0 would be indistinguishable from an agent that tried and failed. The run leaves the dataset. |
+| **empty** | collection ran, the agent changed nothing | scored — the base repo *is* the state that agent produced, so 0.0 is the honest result |
+
+The second case is not hypothetical: on the first live agent run the model
+created a branch, read the base commit's own diff, mistook it for its own work
+and declared completion having edited no file. Treating that as unjudgeable
+would drop the *clearest* losses out of the corpus — "declares success without
+verifying" is exactly the deficit worth finding.
 
 ## Does the diagnosis work at all?
 
@@ -177,6 +187,55 @@ support, not gap. Configs below roughly **3 wins that exercise the capability
 and 3 losses that lack it** are rejected with a perfect gap of 1.0 at rank 1 —
 so `n_losses × prevalence ≥ 3` is the floor worth quoting when asking for more
 traces.
+
+## Mining a repo
+
+```bash
+vektori-trace mine --repo hynek/structlog \
+  --dockerfile examples/dockerfiles/structlog.Dockerfile \
+  --test-cmd 'python -m pytest -p no:randomly -q' --language python \
+  --limit 40 --no-replay
+```
+
+One task per merged PR, with a verifier derived by running the repo's own suite
+twice — once with only the test diff applied (what fails pre-fix), once with the
+gold patch too (what now passes). The fail→pass set is the oracle.
+
+`--dockerfile` skips the bootstrap agent, which makes a run deterministic and
+free. It then needs `--test-cmd`, because F2P/P2P come from *running* the suite
+and nothing has inspected the repo to find out how.
+
+`--no-replay` stops after mining and auditing, before any agent runs.
+
+Every run prints where the candidates went and audits what came out:
+
+```text
+Where the 40 candidate PR(s) went:
+  emitted                       4
+  no_test_patch                20
+  non_bug_pr                    6
+  no_new_test_funcs             6
+  no_fail_to_pass               4
+
+Static audit of 4 emitted task(s):
+  every task agrees with itself on all checks
+```
+
+The histogram matters because the task count alone can't say whether a small
+yield means the repo is unsuitable or a filter is wrong, and those call for
+opposite responses. Here `no_test_patch` at 20/40 is PRs that changed source
+without touching tests — unminable by construction, since the test diff *is* the
+verifier.
+
+The audit is static and cheap: it re-reads each emitted task and checks it agrees
+with itself — the Dockerfile resets to the base commit `task.toml` declares,
+`.git` is scrubbed of everything past it, and every F2P test name actually
+appears in the hidden test patch. That last one fails silently otherwise: a name
+the test patch never adds is never collected, never runs, never passes, so the
+task scores 0 for everyone forever and reads as merely hard.
+
+Results from the first real run, including two defects it found:
+[`docs/mine-results.md`](docs/mine-results.md).
 
 ## Model
 

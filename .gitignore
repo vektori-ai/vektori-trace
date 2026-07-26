@@ -9,3 +9,5 @@ selftest-run/
 envcheck-run/
 vektori-selftest/
 vektori-envcheck/
+# Bootstrap image cache (R2E_CACHE_DIR default) — per-machine build state
+workspace/

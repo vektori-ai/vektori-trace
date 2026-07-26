@@ -103,6 +103,14 @@ class BootstrapSpec(BaseModel):
     max_seconds: int = 1800
     base_image: str | None = None
     user_dockerfile: Path | None = None
+    # Only meaningful alongside `user_dockerfile`. The agent-driven path
+    # discovers how to run the suite and reports it in `test_cmds`; a supplied
+    # Dockerfile skips the agent, so nothing discovers anything and the field
+    # came back empty — which silently made every PR fail validation with
+    # `no_fail_to_pass`, since F2P is derived by *running* the suite. If you
+    # own the image you have to say how to test it.
+    user_test_cmds: list[str] = []
+    user_language: Literal["python", "node", "go", "rust", "java", "c_cpp"] | None = None
     cache_dir: Path = Field(
         default_factory=lambda: Path(os.environ.get("R2E_CACHE_DIR", "./workspace/bootstrap"))
     )

@@ -80,8 +80,15 @@ def run_trial(
     model: str | None = None,
     timeout_sec: int = 1800,
 ) -> TrialResult:
-    """Invoke `harbor run` for a single agent against a task and parse the reward."""
+    """Invoke `harbor run` for a single agent against a task and parse the reward.
+
+    Harbor's agent names are hyphenated and it rejects an underscore outright,
+    before any container starts — so `claude_code` never runs at all. Normalised
+    here as well as in `HarborTraceRunner`, since `--base-agent` reaches this
+    function without passing through that one.
+    """
     task_dir = task_dir.resolve()
+    agent = agent.replace("_", "-")
     job_dir = (jobs_dir / f"{task_dir.name}-{agent}").resolve()
     cmd = [
         "harbor",

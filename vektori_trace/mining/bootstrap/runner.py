@@ -67,6 +67,12 @@ def _cache_options(spec: BootstrapSpec) -> dict[str, object]:
         "user_dockerfile": str(spec.user_dockerfile) if spec.user_dockerfile else None,
         "image_registry": spec.image_registry,
         "languages_hint": spec.languages_hint,
+        # Not image identity, but *result* identity: they land in the cached
+        # BootstrapResult and drive every emitted eval script, so a cache hit
+        # carrying the old ones would silently mine against the wrong test
+        # command.
+        "user_test_cmds": spec.user_test_cmds,
+        "user_language": spec.user_language,
     }
 
 
@@ -388,11 +394,17 @@ def _bootstrap_from_user_dockerfile(
         result = BootstrapResult(
             image_digest=image_digest,
             image_tag=tag,
-            language=LanguageHint.UNKNOWN,  # we didn't detect — the user owns the image
+            # The user owns the image, so they also own these two: nothing here
+            # inspected the repo. Both feed the eval script — an empty
+            # test_cmds emits `echo 'no test_cmds configured'` and makes F2P
+            # derivation impossible, so every PR would skip as no_fail_to_pass.
+            language=(
+                LanguageHint(spec.user_language) if spec.user_language else LanguageHint.UNKNOWN
+            ),
             repo=owner_name,
             ref=ref_sha,
             rebuild_cmds=[],  # caller supplied a Dockerfile; rebuild is up to them
-            test_cmds=[],
+            test_cmds=list(spec.user_test_cmds),
             smoke_passed=True,  # no agent ran a smoke; trust the user
             iterations=0,
             build_time_sec=round(time.monotonic() - start, 2),

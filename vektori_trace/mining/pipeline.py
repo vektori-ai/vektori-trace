@@ -517,7 +517,38 @@ def build_eval_script(
         ""
         if not model_patch_path
         else (
-            f'if [ -s "{model_patch_path}" ]; then\n'
+            # Absent and empty are different facts and must not share a branch.
+            # `[ -s ]` is false for both, which is what conflated them:
+            #
+            #   file absent  -> collection never ran. The agent's work, if any,
+            #                   never reached this container, so no statement
+            #                   about the agent is available. Refuse.
+            #   file empty   -> collection ran and the agent changed nothing.
+            #                   That is a real, common and diagnostically rich
+            #                   loss: observed on the first live agent run,
+            #                   where the model created a branch, read the base
+            #                   commit's own diff, mistook it for its own work
+            #                   and declared completion having edited no file.
+            #                   Applying an empty diff and running the suite is
+            #                   exactly right — the agent's work *is* nothing,
+            #                   so the base repo is the state it produced.
+            #
+            # Treating empty as unjudgeable would drop precisely the clearest
+            # losses out of the corpus, which is a selection bias pointed the
+            # wrong way: "declares success without verifying" is a capability
+            # deficit, and it is the one we would stop being able to see.
+            f'if [ ! -f "{model_patch_path}" ]; then\n'
+            '  echo "0.000000" > /logs/verifier/reward.txt\n'
+            "  printf '%s' "
+            '\'{"reward": 0.0, "resolved": false, "parse_status": '
+            '"no_model_patch"}\' > /logs/verifier/reward-details.json\n'
+            f'  echo "R2E: no model patch at {model_patch_path} (collection did not run); '
+            'refusing to score the base repo" >&2\n'
+            "  exit 0\n"
+            f'elif [ ! -s "{model_patch_path}" ]; then\n'
+            f'  echo "R2E: model patch at {model_patch_path} is empty; the agent changed '
+            'nothing. Scoring its actual result." >&2\n'
+            "else\n"
             # No --reject: a base-relative diff applied to a checkout at that
             # same base either applies whole or doesn't apply at all. --reject
             # would leave a half-patched tree behind and still report failure,
@@ -532,21 +563,6 @@ def build_eval_script(
             '    echo "R2E: model patch failed to apply (rc=$R2E_MODEL_RC)" >&2\n'
             "    exit 0\n"
             "  fi\n"
-            "else\n"
-            # Fail closed and say why. There is no patch, so the agent's work
-            # never reached this container — and running the suite anyway
-            # scores the base repo, i.e. a different task, with the 0.0 landing
-            # in the corpus as a genuine agent loss. Collection is a step that
-            # can break on its own (an agent shadowing `git`, an unwritable
-            # /logs, a failed artifact upload); when it does, the honest
-            # statement is that we cannot tell, not that the agent failed.
-            '  echo "0.000000" > /logs/verifier/reward.txt\n'
-            "  printf '%s' "
-            '\'{"reward": 0.0, "resolved": false, "parse_status": '
-            '"no_model_patch"}\' > /logs/verifier/reward-details.json\n'
-            f'  echo "R2E: no model patch at {model_patch_path}; '
-            'refusing to score the base repo" >&2\n'
-            "  exit 0\n"
             "fi\n"
         )
     )
