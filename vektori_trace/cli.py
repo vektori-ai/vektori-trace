@@ -14,6 +14,7 @@ from .diagnose import (
     score_deficits,
     select_deficit,
 )
+from .envcheck import build_probe_task, run_probe
 from .mining.miner import HarborTraceRunner, collect_traces, mine_tasks
 from .mining.spec import LLMSpec
 from .planted import (
@@ -254,6 +255,41 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if any(c.recovery_rate > 0 for c in recoverable) else 1
 
 
+def cmd_checkenv(args: argparse.Namespace) -> int:
+    """Verify inside a real container that an emitted task's environment holds."""
+    out_dir = Path(args.out)
+    task_dir = build_probe_task(out_dir / "task")
+    print(f"Probe task written to {task_dir}")
+    print("Running it through harbor (builds an image; first run is slow)...\n")
+
+    findings, probe, output = run_probe(task_dir, out_dir / "jobs")
+    if probe is None:
+        print("error: the probe produced no report — harbor output follows.", file=sys.stderr)
+        print(output[-3000:], file=sys.stderr)
+        return 2
+
+    for f in findings:
+        print(f"  [{f.mark}] {f.name}: {f.detail}")
+
+    (out_dir / "envcheck.json").write_text(
+        json.dumps(
+            {
+                "probe": probe,
+                "findings": [{"name": f.name, "ok": f.ok, "detail": f.detail} for f in findings],
+            },
+            indent=2,
+        )
+    )
+    print(f"\nReport written to {out_dir / 'envcheck.json'}")
+
+    failed = [f for f in findings if not f.ok]
+    if failed:
+        print(f"\n{len(failed)} check(s) failed — emitted tasks are not sound as shipped.")
+        return 1
+    print("\nAll checks passed: the Dockerfile and the compose overlay both take effect.")
+    return 0
+
+
 def cmd_prove(args: argparse.Namespace) -> int:
     task_dir = Path(args.task_dir)
     validity = prove_validity(
@@ -338,6 +374,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.add_argument("--min-support", type=_min_support_arg, default=DEFAULT_MIN_SUPPORT)
     p_self.add_argument("--seed", type=int, default=0)
     p_self.set_defaults(func=cmd_selftest)
+
+    p_env = sub.add_parser(
+        "check-env",
+        help=(
+            "verify inside a real container that an emitted task's Dockerfile "
+            "(base commit + git scrub) and compose overlay (egress guard) both take effect"
+        ),
+    )
+    p_env.add_argument("--out", default="./vektori-envcheck", help="output directory")
+    p_env.set_defaults(func=cmd_checkenv)
 
     p_prove = sub.add_parser("prove", help="run the validity proof for an already-generated task")
     p_prove.add_argument("task_dir")
