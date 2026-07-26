@@ -3,6 +3,7 @@ then score how much each capability's absence actually separates wins from losse
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from .llm import call_json
@@ -46,6 +47,13 @@ DEFAULT_MIN_GAP = 0.20
 # A gap computed from two traces is not a gap. This floor is deliberately low —
 # it exists to reject the degenerate case, not to establish significance.
 DEFAULT_MIN_SUPPORT = 3
+# Exact McNemar on n discordant pairs can never go below 2 * 0.5**n, so under 6
+# pairs nothing reaches p<0.05 whatever the data; under 9, only a *perfectly*
+# one-sided split does (n=8 with one pair the other way gives p=0.07). The v0
+# plan's "~8" is that floor: below it the test has essentially no power.
+# Reported as an advisory, never a gate — "the test couldn't have detected this"
+# is a different statement from "there is no difference".
+MIN_DISCORDANT_PAIRS = 8
 
 
 _CAPABILITIES_SCHEMA = {
@@ -253,6 +261,180 @@ def select_deficit(
             continue
         return s
     return None
+
+
+def cross_model_trace_labels(
+    trace_labels: list[TraceLabels], frontier_model: str, candidate_model: str
+) -> list[TraceLabels]:
+    """The frontier's wins and the candidate's losses, and nothing else.
+
+    `score_deficits` splits whatever it's given on `outcome`, so pre-filtering
+    the input this way makes its own win/loss split *be* the cross-model
+    contrast — "what's worth fixing" — with no change to its scoring at all.
+    A replay manifest fed in unfiltered mixes both models into one win/loss set
+    and averages exactly the contrast away.
+    """
+    return [
+        tl
+        for tl in trace_labels
+        if (tl.trace.model == frontier_model and tl.trace.outcome == "win")
+        or (tl.trace.model == candidate_model and tl.trace.outcome == "loss")
+    ]
+
+
+def within_model_trace_labels(trace_labels: list[TraceLabels], model: str) -> list[TraceLabels]:
+    """One model's traces only, so `score_deficits`'s split becomes that model's
+    wins vs its own losses — "is there anything here to train from"."""
+    return [tl for tl in trace_labels if tl.trace.model == model]
+
+
+@dataclass
+class McNemarResult:
+    capability_id: str
+    frontier_only: int  # b: frontier PRESENT, candidate not — same task
+    candidate_only: int  # c: candidate PRESENT, frontier not — same task
+    concordant: int  # both PRESENT or neither — same task
+    discordant_n: int  # b + c: the pairs the test is actually computed from
+    p_value: float | None  # None when there are no discordant pairs to test
+
+    @property
+    def underpowered(self) -> bool:
+        return self.discordant_n < MIN_DISCORDANT_PAIRS
+
+
+def _exact_mcnemar_p(b: int, c: int) -> float:
+    """Two-sided exact McNemar: under H0 each discordant pair is a coin flip, so
+    the count is Binomial(n, 0.5) and the p-value is twice the smaller tail.
+
+    Exact rather than the chi-square approximation because the discordant counts
+    here are single digits, which is precisely where the approximation is wrong.
+    Pure stdlib — this project has no scipy/numpy dependency and needs none.
+    """
+    n = b + c
+    if n == 0:
+        raise ValueError("no discordant pairs — there is nothing to test")
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) * 0.5**n
+    return min(1.0, 2 * tail)
+
+
+def mcnemar_test(
+    trace_labels: list[TraceLabels],
+    capability_id: str,
+    frontier_model: str,
+    candidate_model: str,
+) -> McNemarResult:
+    """Compare the two models on the SAME task, not on average.
+
+    Frontier wins come from easier tasks and candidate losses from harder ones,
+    so an averaged rate mixes capability with difficulty. Pairing by task (the
+    same key `gap.compute_gap` pairs on) cancels difficulty: each pair asks
+    whether one model demonstrated the capability where the other didn't.
+
+    A pair is dropped when either side is NA or unlabelled — not relevant on one
+    side means the two sides aren't comparable, and counting that as agreement
+    would inflate `concordant` with pairs that were never measured. Tasks only
+    one model has a trace for are dropped for the same reason.
+    """
+    frontier = {
+        tl.trace.task: tl
+        for tl in trace_labels
+        if tl.trace.model == frontier_model and tl.trace.task is not None
+    }
+    candidate = {
+        tl.trace.task: tl
+        for tl in trace_labels
+        if tl.trace.model == candidate_model and tl.trace.task is not None
+    }
+
+    b = c = concordant = 0
+    for task in sorted(frontier.keys() & candidate.keys()):
+        f_label = frontier[task].labels.get(capability_id, "NA")
+        c_label = candidate[task].labels.get(capability_id, "NA")
+        if f_label == "NA" or c_label == "NA":
+            continue
+        f_present = f_label == "PRESENT"
+        c_present = c_label == "PRESENT"
+        if f_present == c_present:
+            concordant += 1
+        elif f_present:
+            b += 1
+        else:
+            c += 1
+
+    return McNemarResult(
+        capability_id=capability_id,
+        frontier_only=b,
+        candidate_only=c,
+        concordant=concordant,
+        discordant_n=b + c,
+        p_value=_exact_mcnemar_p(b, c) if b + c else None,
+    )
+
+
+@dataclass
+class ReplayDiagnosis:
+    frontier_model: str
+    candidate_model: str
+    cross_model_scores: list[DeficitScore]  # ranked, same shape as the plain path
+    chosen: DeficitScore | None  # top cross-model deficit clearing the thresholds
+    within_model_score: DeficitScore | None  # the same capability, candidate-only
+    mcnemar: McNemarResult | None
+    trainable: bool | None  # None exactly when `chosen` is None
+
+
+def diagnose_replay(
+    trace_labels: list[TraceLabels],
+    capabilities: list[Capability],
+    frontier_model: str,
+    candidate_model: str,
+    *,
+    min_gap: float = DEFAULT_MIN_GAP,
+    min_support: int = DEFAULT_MIN_SUPPORT,
+) -> ReplayDiagnosis:
+    """The two contrasts out of one replay run: cross-model says what is worth
+    fixing, within-model says whether there is anything to train from.
+
+    A cross-model deficit with no within-model signal is "identified, not
+    trainable": rejection sampling keeps only rollouts that pass, so if the
+    candidate has never once demonstrated the capability there is nothing for it
+    to keep, and generating a task against that deficit produces an empty
+    dataset rather than a bad one.
+    """
+    cross = score_deficits(
+        capabilities, cross_model_trace_labels(trace_labels, frontier_model, candidate_model)
+    )
+    chosen = select_deficit(cross, min_gap=min_gap, min_support=min_support)
+    if chosen is None:
+        return ReplayDiagnosis(
+            frontier_model=frontier_model,
+            candidate_model=candidate_model,
+            cross_model_scores=cross,
+            chosen=None,
+            within_model_score=None,
+            mcnemar=None,
+            trainable=None,
+        )
+
+    within = score_deficits(capabilities, within_model_trace_labels(trace_labels, candidate_model))
+    within_score = next(s for s in within if s.capability.id == chosen.capability.id)
+    # `baseline_rate` is the LACKING rate among the candidate's own relevant
+    # wins, so < 1.0 means it did demonstrate the capability at least once —
+    # and `n_relevant_wins` says on how many traces that verdict rests.
+    trainable = (
+        within_score.baseline_rate is not None
+        and within_score.baseline_rate < 1.0
+        and within_score.n_relevant_wins >= min_support
+    )
+    return ReplayDiagnosis(
+        frontier_model=frontier_model,
+        candidate_model=candidate_model,
+        cross_model_scores=cross,
+        chosen=chosen,
+        within_model_score=within_score,
+        mcnemar=mcnemar_test(trace_labels, chosen.capability.id, frontier_model, candidate_model),
+        trainable=trainable,
+    )
 
 
 def _truncate(s: str, n: int) -> str:
