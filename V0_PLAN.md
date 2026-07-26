@@ -1,7 +1,7 @@
 Vektori — v0 and v1 Plan
 ========================
 
-**Date:** 2026-07-25 · **Tree:** `master` @ `c0f190b`
+**Date:** 2026-07-25 · **Tree:** `main` @ `c0f190b`
 
 `docs/AUDIT.md` = the bug list. `docs/CLAIMS.md` = evidence for every fact and
 number cited here; all code claims were reproduced by executing the code, all
