@@ -213,6 +213,23 @@ Three corrections worth making, and no more:
   rejected. Hand-label ~50 traces once to measure how blurry, then adjust the
   threshold. Until then we don't know if 0.20 is strict or loose. (In v0 the
   win/loss ruler is sharp: it's execution.)
+- **Decide whether to fix the ruler before calibrating it.** Adjusting the
+  threshold compensates for attenuation; it does not recover the *power* blur
+  costs, and past some blur a real deficit is unrecoverable at any threshold.
+  `selftest` already measures this against planted ground truth — it read **87.8%
+  (min 50%, max 100%)** on the first sweep, and the floor is the part that matters,
+  because a config that labels at chance contributes noise to the ranking no matter
+  what the threshold is. **Decision rule: if per-config label accuracy has a floor
+  below ~70%, fix the labeller before touching `min_gap`.**
+  The cheap structural fix first, since it needs no training: `label_trace` is a
+  single ungrounded pass, which is the architecture AgentV-RL (Findings of ACL
+  2026) argues is unreliable, and we already store per-label `evidence` and throw
+  it away. A second pass re-checking each LACKING verdict against its own cited
+  evidence is one extra call per trace. Their forward/backward split is compatible
+  with our outcome-blinding — their backward agent reasons backward through the
+  *solution's logic*, and never sees the ground-truth verdict. Their train-free
+  variant got ~2.6 points from structure alone, before any training, which is the
+  order of gain to expect and the reason to try it before anything expensive.
 - **Print N beside every number.** Don't rank a capability measured on 3 traces
   next to one measured on 40. And when we report the top of a ranked list of 4–8
   capabilities, remember the top of a noisy list looks good even when nothing is
@@ -239,6 +256,14 @@ still reshuffling at the budget cap, the answer is "not enough data," not a repo
 - Vendor TRACE's training code. v0 uses rejection-sampling SFT + LoRA only (LoRA
   also *is* the non-regression mechanism — base weights untouched). Their GRPO path
   is v1.
+- **Mask tool output out of the loss.** Our training data is agent trajectories on
+  SWE tasks, so most tokens are *environment observations* — pytest logs, file
+  contents, tracebacks — not the agent's own decisions. Training to predict those
+  teaches the model to memorise this repo's test output, which is both useless and
+  a contamination path into the held-out slice. Compute the loss on the agent's
+  turns only. (AgentV-RL, Findings of ACL 2026, does the same and names the reason:
+  "to mitigate the risk of memorizing environment observations".) Cheap to get
+  wrong silently — the run trains fine and the number just doesn't move.
 - Pilot on ~10 tasks before any full run: does it execute, do metrics compute, is
   the cost sane.
 
@@ -292,6 +317,8 @@ Done when
 - A container check confirms base commit, scrubbed `.git`, no remote; a
   shadow-`python3` reward hack scores 0.0.
 - A gap number exists on ≥50 mined tasks at a pinned, named scaffold.
+- Labeller accuracy is stated with its per-config **floor**, not just its mean, and
+  either clears ~70% or was fixed before `min_gap` was calibrated.
 - A3 vs A2 measured on a held-out slice, task-by-task, with the resolvable effect
   size stated up front.
 - Non-regression check inside a pre-declared tolerance.
