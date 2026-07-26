@@ -387,3 +387,63 @@ def test_harbor_runner_turns_a_parse_failure_into_an_infra_failure(tmp_path: Pat
     runner = HarborTraceRunner(agent="claude_code", jobs_dir=tmp_path)
     with pytest.raises(InfraFailure):
         runner._parse_turns(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# The golden file
+#
+# Every other fixture here is hand-built. Harbor's own Pydantic models validate
+# them, which is stronger than an unvalidated blob but still not the same as
+# output harbor actually produced — a hand-built fixture can only contain the
+# shapes we already thought of. This one is a real `agent/trajectory.json` from
+# `harbor run -a terminus-2` against a task mined from hynek/structlog.
+#
+# It is what keeps the original bug dead. `miner.py:137` checked
+# `isinstance(raw_turns, list)` while harbor writes an object with `steps[]`, so
+# no real trajectory ever matched and every one degraded to a 4,000-char stdout
+# tail. Only a real file can fail that check.
+# ---------------------------------------------------------------------------
+
+REAL_JOB_DIR = Path(__file__).parent / "fixtures" / "atif" / "real-terminus2-structlog"
+
+
+def test_a_real_harbor_trajectory_parses() -> None:
+    turns = parse_job_trajectory(REAL_JOB_DIR)
+
+    assert turns, "a real harbor trajectory produced no turns"
+    # More turns than steps: observations become their own turns, which is the
+    # whole point — the tool call says what was tried, the observation says what
+    # happened, and the traceback lives in the second.
+    assert len(turns) > 4
+
+
+def test_the_real_trajectory_is_not_a_stdout_tail() -> None:
+    """The original bug's signature: one 4,000-char assistant turn holding a
+    stderr tail. Structure is the thing that proves it parsed."""
+    turns = parse_job_trajectory(REAL_JOB_DIR)
+
+    assert len(turns) > 1
+    assert any(t.tool_calls for t in turns), "no tool calls survived the parse"
+    assert {t.role for t in turns} >= {"assistant", "tool"}
+
+
+def test_the_real_trajectory_keeps_its_observations() -> None:
+    """Keeping calls and dropping observations yields trajectories in which
+    nothing ever fails — exactly backwards for diagnosing failure."""
+    turns = parse_job_trajectory(REAL_JOB_DIR)
+    tool_turns = [t for t in turns if t.role == "tool"]
+
+    assert tool_turns
+    assert any(t.content and t.content.strip() for t in tool_turns)
+
+
+def test_the_real_fixture_still_validates_against_harbors_models() -> None:
+    """If a harbor upgrade changes the schema out from under us, this fails here
+    rather than silently in a mining run."""
+    raw = json.loads((REAL_JOB_DIR / "agent" / "trajectory.json").read_text())
+
+    assert raw["schema_version"].startswith("ATIF")
+    assert isinstance(raw["steps"], list)
+    # The shape the original check got wrong: an object with steps[], never a
+    # bare JSON array.
+    assert not isinstance(raw, list)

@@ -178,6 +178,55 @@ and 3 losses that lack it** are rejected with a perfect gap of 1.0 at rank 1 —
 so `n_losses × prevalence ≥ 3` is the floor worth quoting when asking for more
 traces.
 
+## Mining a repo
+
+```bash
+vektori-trace mine --repo hynek/structlog \
+  --dockerfile examples/dockerfiles/structlog.Dockerfile \
+  --test-cmd 'python -m pytest -p no:randomly -q' --language python \
+  --limit 40 --no-replay
+```
+
+One task per merged PR, with a verifier derived by running the repo's own suite
+twice — once with only the test diff applied (what fails pre-fix), once with the
+gold patch too (what now passes). The fail→pass set is the oracle.
+
+`--dockerfile` skips the bootstrap agent, which makes a run deterministic and
+free. It then needs `--test-cmd`, because F2P/P2P come from *running* the suite
+and nothing has inspected the repo to find out how.
+
+`--no-replay` stops after mining and auditing, before any agent runs.
+
+Every run prints where the candidates went and audits what came out:
+
+```
+Where the 40 candidate PR(s) went:
+  emitted                       4
+  no_test_patch                20
+  non_bug_pr                    6
+  no_new_test_funcs             6
+  no_fail_to_pass               4
+
+Static audit of 4 emitted task(s):
+  every task agrees with itself on all checks
+```
+
+The histogram matters because the task count alone can't say whether a small
+yield means the repo is unsuitable or a filter is wrong, and those call for
+opposite responses. Here `no_test_patch` at 20/40 is PRs that changed source
+without touching tests — unminable by construction, since the test diff *is* the
+verifier.
+
+The audit is static and cheap: it re-reads each emitted task and checks it agrees
+with itself — the Dockerfile resets to the base commit `task.toml` declares,
+`.git` is scrubbed of everything past it, and every F2P test name actually
+appears in the hidden test patch. That last one fails silently otherwise: a name
+the test patch never adds is never collected, never runs, never passes, so the
+task scores 0 for everyone forever and reads as merely hard.
+
+Results from the first real run, including two defects it found:
+[`docs/mine-results.md`](docs/mine-results.md).
+
 ## Model
 
 Diagnosis and task generation use `gpt-5-nano` by default (cheapest current

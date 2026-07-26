@@ -348,3 +348,18 @@ def test_an_ordinary_zero_is_still_a_loss(tmp_path: Path, monkeypatch) -> None:
     runner = HarborTraceRunner(agent="codex", jobs_dir=tmp_path / "jobs")
 
     assert runner.run(tmp_path).passed is False
+
+
+def test_underscored_agent_names_are_normalised(tmp_path: Path) -> None:
+    """Harbor's AgentName values are hyphenated and it rejects an underscore
+    before any container starts. `claude_code` — this CLI's own former default
+    — therefore ran nothing: the non-zero exit read as an InfraFailure, every
+    task in the sweep was excluded, and the manifest came back empty with no
+    indication why."""
+    runner = HarborTraceRunner(agent="claude_code", jobs_dir=tmp_path)
+    assert runner.agent == "claude-code"
+
+    assert HarborTraceRunner(agent="mini_swe_agent", jobs_dir=tmp_path).agent == "mini-swe-agent"
+    # Already-correct names must survive untouched.
+    assert HarborTraceRunner(agent="terminus-2", jobs_dir=tmp_path).agent == "terminus-2"
+    assert HarborTraceRunner(agent="codex", jobs_dir=tmp_path).agent == "codex"

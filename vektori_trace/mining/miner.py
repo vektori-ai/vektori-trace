@@ -30,6 +30,7 @@ from vektori_trace.mining import (
     ensure_bootstrap,
 )
 from vektori_trace.mining.atif import TrajectoryParseError, parse_job_trajectory
+from vektori_trace.mining.result import PipelineResult
 from vektori_trace.schema import Turn
 from vektori_trace.validity import UNJUDGEABLE_STATUSES, _find_parse_status, _find_reward
 
@@ -40,11 +41,19 @@ def mine_tasks(
     *,
     llm: LLMSpec,
     user_dockerfile: Path | None = None,
+    test_cmds: list[str] | None = None,
+    language: str | None = None,
     org: str = "vektori",
     options: PRRuntimeOptions | None = None,
-) -> list[Path]:
+) -> tuple[list[Path], PipelineResult]:
     """Mine `repo`'s merged PR history into sandbox-verified Harbor tasks
-    under out_dir. Returns the per-task directories written.
+    under out_dir.
+
+    Returns the per-task directories written *and* the pipeline result. The
+    result carries the per-reason skip counts, which is the only thing that
+    says whether a small yield means the repo is unsuitable or a filter is
+    wrong — the two call for opposite responses, and the number of tasks alone
+    can't tell them apart.
 
     If `user_dockerfile` is given, the sandbox is built directly from it (no
     LLM involved). Otherwise `ensure_bootstrap` runs its ReAct agent loop to
@@ -57,12 +66,17 @@ def mine_tasks(
         llm=llm,
         output=OutputSpec(org=org),
         auth=AuthSpec(),
-        bootstrap=BootstrapSpec(user_dockerfile=user_dockerfile),
+        bootstrap=BootstrapSpec(
+            user_dockerfile=user_dockerfile,
+            user_test_cmds=test_cmds or [],
+            user_language=language,
+        ),
     )
     bootstrap = ensure_bootstrap(pipeline_input.repo, pipeline_input.bootstrap, llm)
     pipeline = PRRuntimePipeline(pipeline_input, options or PRRuntimeOptions(), bootstrap=bootstrap)
-    pipeline.run(out_dir)
-    return [p for p in sorted(out_dir.iterdir()) if p.is_dir() and (p / "task.toml").exists()]
+    result = pipeline.run(out_dir)
+    task_dirs = [p for p in sorted(out_dir.iterdir()) if p.is_dir() and (p / "task.toml").exists()]
+    return task_dirs, result
 
 
 class InfraFailure(RuntimeError):
@@ -162,7 +176,14 @@ class HarborTraceRunner:
     def __init__(
         self, agent: str, jobs_dir: Path, model: str | None = None, timeout_sec: int = 1800
     ):
-        self.agent = agent
+        # Harbor's AgentName values are hyphenated (`claude-code`, `terminus-2`,
+        # `mini-swe-agent`). An underscore is rejected outright — the run dies
+        # with "Agent name X is not valid" before any container starts, which
+        # `run` reads as a non-zero exit and reports as an InfraFailure, so
+        # every task in the sweep is silently excluded and the manifest comes
+        # back empty. The underscore form is the natural thing to type and was
+        # this CLI's own default, so accept it and normalise.
+        self.agent = agent.replace("_", "-")
         self.jobs_dir = jobs_dir
         self.model = model
         self.timeout_sec = timeout_sec

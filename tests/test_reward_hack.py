@@ -282,14 +282,10 @@ def test_all_three_probes_share_everything_but_solve_sh(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_model_patch_refuses_rather_than_scoring_the_base_repo() -> None:
-    """Collection can fail on its own — an agent shadowing `git`, an
-    unwritable /logs, a failed artifact upload. Running the suite anyway
-    scores the base repo, i.e. a different task, and the resulting 0.0 is
-    indistinguishable from an agent that tried and failed."""
+def _isolated_eval_script() -> str:
     from vektori_trace.mining.pipeline import build_eval_script
 
-    script = build_eval_script(
+    return build_eval_script(
         "abc123",
         test_patch="",
         test_cmds=["pytest"],
@@ -297,8 +293,35 @@ def test_no_model_patch_refuses_rather_than_scoring_the_base_repo() -> None:
         model_patch_path=MODEL_PATCH_PATH,
     )
 
+
+def test_an_absent_patch_refuses_rather_than_scoring_the_base_repo() -> None:
+    """Collection never ran, so nothing here says anything about the agent."""
+    script = _isolated_eval_script()
+
+    assert f'if [ ! -f "{MODEL_PATCH_PATH}" ]' in script
     assert "no_model_patch" in script
-    assert "scoring the base repo" not in script
+    assert "collection did not run" in script
+
+
+def test_an_empty_patch_is_scored_as_the_loss_it_is() -> None:
+    """Absent and empty are different facts, and `[ -s ]` is false for both —
+    which is what conflated them.
+
+    An empty diff means collection ran and the agent changed nothing. Observed
+    on the first live agent run: the model made a branch, read the base commit's
+    own diff, mistook it for its own work and declared completion having edited
+    no file. That is a real loss and a rich one — "declares success without
+    verifying" is exactly the sort of deficit this pipeline exists to find.
+    Routing it to unjudgeable would drop the clearest losses out of the corpus.
+    """
+    script = _isolated_eval_script()
+
+    assert f'elif [ ! -s "{MODEL_PATCH_PATH}" ]' in script
+    assert "the agent changed nothing" in script
+    # It must fall through to the suite, not exit early like the absent branch.
+    empty_branch = script.split(f'elif [ ! -s "{MODEL_PATCH_PATH}" ]')[1].split("else")[0]
+    assert "exit 0" not in empty_branch
+    assert "no_model_patch" not in empty_branch
 
 
 def test_no_model_patch_status_is_treated_as_unjudgeable() -> None:
