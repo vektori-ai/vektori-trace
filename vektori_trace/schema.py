@@ -68,7 +68,7 @@ class Trace:
         if len(turns) > max_turns:
             head = turns[: max_turns // 2]
             tail = turns[-max_turns // 2 :]
-            turns = head + [None] + tail  # type: ignore[list-item]
+            turns = [*head, None, *tail]  # type: ignore[list-item]
 
         lines: list[str] = []
         for t in turns:

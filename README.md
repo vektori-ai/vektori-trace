@@ -111,6 +111,21 @@ both address families, and whether HTTPS to the fix sources actually fails.
 Worth re-running after any harbor upgrade: the runtime's compose-merge order is
 not something we control.
 
+```bash
+vektori-trace check-env --reward-hack
+```
+
+also runs an agent that fixes nothing and forges its own score. **This
+currently fails.** Harbor's default `environment_mode = "shared"` runs the
+verifier inside the agent's container, on the agent's `$PATH`, writing to a
+directory the agent can write to — so an agent that shadows `python3` with a
+script writing `1.0` scores 1.0 on an unsolved task. Confirmed in a container,
+not in principle.
+
+Until that's fixed, treat any mined win as an upper bound. It matters most for
+step 6: rejection sampling keeps rollouts that score well, and RL finds reward
+hacks reliably.
+
 ## Does the diagnosis work at all?
 
 Before trusting a diagnosis on real traces, check the ranker can recover a

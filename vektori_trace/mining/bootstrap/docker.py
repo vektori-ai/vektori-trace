@@ -22,16 +22,24 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+# GNU convention: `timeout` exits 124 when it kills its child. We reuse it so
+# exit codes read naturally, but it cannot be *tested* for — a script inside the
+# container may run `timeout` itself and legitimately exit 124 without our
+# having killed anything. `timed_out` is set only by us and is unambiguous.
+TIMEOUT_EXIT_CODE = 124
+
+
 @dataclass(slots=True)
 class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
     duration_sec: float
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0
+        return self.exit_code == 0 and not self.timed_out
 
     def truncated(self, max_chars: int = 4000) -> str:
         """Combined stdout+stderr, truncated for putting in an LLM prompt."""
@@ -62,12 +70,13 @@ def _run(args: list[str], *, timeout: int = 600, input_text: str | None = None) 
         )
     except subprocess.TimeoutExpired as exc:
         return ExecResult(
-            exit_code=124,
+            exit_code=TIMEOUT_EXIT_CODE,
             stdout=(exc.stdout or b"").decode(errors="replace")
             if isinstance(exc.stdout, (bytes, bytearray))
             else (exc.stdout or ""),
             stderr=f"[timeout after {timeout}s]",
             duration_sec=time.monotonic() - start,
+            timed_out=True,
         )
     return ExecResult(
         exit_code=proc.returncode,
@@ -165,10 +174,11 @@ def pull_image_streaming(
         proc.kill()
         pump_thread.join(timeout=2)
         return ExecResult(
-            exit_code=124,
+            exit_code=TIMEOUT_EXIT_CODE,
             stdout="".join(out_buf),
             stderr=f"[timeout after {timeout}s]",
             duration_sec=time.monotonic() - start,
+            timed_out=True,
         )
     pump_thread.join(timeout=2)
     full = "".join(out_buf)

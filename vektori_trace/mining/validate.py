@@ -190,6 +190,32 @@ def _slice_test_output(output: str) -> str:
     return chunk[nl + 1 :] if nl != -1 else chunk
 
 
+def _timed_out(
+    stage: str, timeout: int, *, pre_log: str = "", post_log: str = ""
+) -> ValidationOutcome:
+    """A timed-out stage cannot produce a task, only a plausible-looking one.
+
+    `sandbox.exec` returns whatever the suite managed to print before it was
+    killed, and `parse_logs` reads that partial log perfectly happily. The two
+    stages then cover different, wall-clock-determined subsets of the suite, so
+    the F2P/P2P sets are computed from a comparison that never happened: a test
+    that passed in a complete pre-run and was never reached in a truncated
+    post-run silently drops out of P2P, and the resulting task ships with a
+    regression guard missing. Nothing downstream can detect this — the task
+    looks well-formed, and the verifier agrees with it.
+
+    So the candidate is dropped. Losing a PR to a slow suite is cheap; shipping
+    a task whose oracle is wrong is not.
+    """
+    logger.warning("validate_pr: %s stage timed out after %ss — dropping candidate", stage, timeout)
+    return ValidationOutcome(
+        status="failed",
+        reason=f"{stage} stage timed out after {timeout}s (partial test log is not comparable)",
+        pre_log=pre_log,
+        post_log=post_log,
+    )
+
+
 def validate_pr(
     *,
     sandbox: DockerSandbox,
@@ -233,6 +259,8 @@ def validate_pr(
     )
     logger.info("validate_pr: running pre-fix stage at %s", base_commit[:12])
     pre = sandbox.exec(pre_script, timeout=timeout)
+    if pre.timed_out:
+        return _timed_out("pre-fix", timeout, pre_log=pre.truncated(max_chars=5_000_000))
     # Parse the FULL output — a real suite emits 100k+ chars of per-test lines;
     # truncating to 20k elided the test section and zeroed F2P detection.
     pre_log = pre.truncated(max_chars=5_000_000)
@@ -255,6 +283,13 @@ def validate_pr(
     )
     logger.info("validate_pr: running post-fix stage")
     post = sandbox.exec(post_script, timeout=timeout)
+    if post.timed_out:
+        return _timed_out(
+            "post-fix",
+            timeout,
+            pre_log=pre_log,
+            post_log=post.truncated(max_chars=5_000_000),
+        )
     post_log = post.truncated(max_chars=5_000_000)
     post_status = parse_logs(test_cmds, _slice_test_output(post_log), language=language)
 
