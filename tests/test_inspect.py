@@ -292,3 +292,194 @@ def test_blank_test_cmds_do_not_satisfy_the_guard(
     )
 
     assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# Provenance for the languages `--language` accepts, not just Python
+# ---------------------------------------------------------------------------
+
+GO_TEST_PATCH = """diff --git a/calc_test.go b/calc_test.go
+--- a/calc_test.go
++++ b/calc_test.go
+@@ -1,2 +1,6 @@
+ package calc
++
++func TestAddNegatives(t *testing.T) {
++	if Add(-1, -2) != -3 { t.Fail() }
++}
+"""
+
+RUST_TEST_PATCH = """diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,6 @@
+ pub fn add(a: i32, b: i32) -> i32 { a - b }
++#[cfg(test)]
++mod tests {
++    #[test]
++    fn add_negatives() { assert_eq!(super::add(-1, -2), -3); }
++}
+"""
+
+
+def test_a_go_f2p_absent_from_the_patch_is_caught(tmp_path: Path) -> None:
+    """Go node ids carry no file path, so the file check can say nothing about
+    them. The old `.py`-only regex made `f2p_files` empty and the provenance
+    check passed by default — silently, for exactly the runners least likely to
+    have been eyeballed."""
+    audit = audit_task(
+        _write_task(tmp_path, f2p=["TestGhost"], test_patch=GO_TEST_PATCH)
+    )
+
+    assert "f2p_names_in_test_patch" in audit.failures
+    assert "TestGhost" in audit.details["f2p_names_in_test_patch"]
+
+
+def test_a_go_f2p_present_in_the_patch_passes(tmp_path: Path) -> None:
+    audit = audit_task(
+        _write_task(tmp_path, f2p=["TestAddNegatives"], test_patch=GO_TEST_PATCH)
+    )
+
+    assert audit.checks["f2p_names_in_test_patch"], audit.details
+
+
+def test_a_rust_module_path_f2p_is_checked_by_symbol(tmp_path: Path) -> None:
+    """`mod::tests::case` — no path, `::` separators."""
+    good = audit_task(
+        _write_task(tmp_path / "a", f2p=["tests::add_negatives"], test_patch=RUST_TEST_PATCH)
+    )
+    bad = audit_task(
+        _write_task(tmp_path / "b", f2p=["tests::never_written"], test_patch=RUST_TEST_PATCH)
+    )
+
+    assert good.checks["f2p_names_in_test_patch"], good.details
+    assert "f2p_names_in_test_patch" in bad.failures
+
+
+def test_a_junit_style_f2p_is_checked_by_symbol(tmp_path: Path) -> None:
+    """JUnit's `com.foo.BarTest#testBaz` separates with `#` and `.`."""
+    patch = GO_TEST_PATCH.replace("TestAddNegatives", "testAddNegatives")
+    audit = audit_task(
+        _write_task(tmp_path, f2p=["com.foo.BarTest#testAddNegatives"], test_patch=patch)
+    )
+
+    assert audit.checks["f2p_names_in_test_patch"], audit.details
+
+
+def test_python_f2p_is_still_checked_by_file_and_by_name(tmp_path: Path) -> None:
+    audit = audit_task(_write_task(tmp_path))
+
+    assert audit.checks["f2p_files_in_test_patch"]
+    assert audit.checks["f2p_names_in_test_patch"]
+
+
+def test_no_test_patch_at_all_is_not_a_silent_pass(tmp_path: Path) -> None:
+    """Unverifiable is not the same as verified."""
+    audit = audit_task(_write_task(tmp_path, test_patch=""))
+
+    assert "f2p_names_in_test_patch" in audit.failures
+    assert "unverifiable" in audit.details["f2p_names_in_test_patch"]
+
+
+# ---------------------------------------------------------------------------
+# Malformed metadata
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_table_repo2env_does_not_abort_the_corpus(tmp_path: Path) -> None:
+    """`repo2env = "bad"` is valid TOML, and a chained .get() on the string
+    raises — which would take the whole histogram down with one bad task."""
+    d = tmp_path / "weird"
+    d.mkdir()
+    (d / "task.toml").write_text('schema_version = "1.3"\n[metadata]\nrepo2env = "bad"\n')
+
+    audit = audit_task(d)
+
+    assert not audit.ok
+    assert "metadata_well_formed" in audit.failures
+
+
+def test_a_non_list_fail_to_pass_does_not_raise(tmp_path: Path) -> None:
+    d = tmp_path / "weird2"
+    d.mkdir()
+    (d / "task.toml").write_text(
+        'schema_version = "1.3"\n[metadata.repo2env.pr_runtime]\n'
+        'base_commit = 12345\nfail_to_pass = "not-a-list"\n'
+    )
+
+    audit = audit_task(d)
+
+    assert not audit.ok
+    assert "base_commit_declared" in audit.failures
+
+
+def test_malformed_metadata_still_lets_the_rest_of_the_corpus_audit(tmp_path: Path) -> None:
+    good = _write_task(tmp_path / "g", name="good")
+    weird = tmp_path / "w"
+    weird.mkdir()
+    (weird / "task.toml").write_text("[metadata]\nrepo2env = 42\n")
+
+    audits = audit_tasks([good, weird, _write_task(tmp_path / "g2", name="good2")])
+
+    assert len(audits) == 3
+    assert audits[0].ok and audits[2].ok
+    assert not audits[1].ok
+
+
+# ---------------------------------------------------------------------------
+# Two false positives the first real corpus taught us
+# ---------------------------------------------------------------------------
+
+MODIFIED_TEST_PATCH = """diff --git a/tests/test_calc.py b/tests/test_calc.py
+--- a/tests/test_calc.py
++++ b/tests/test_calc.py
+@@ -10,7 +10,7 @@ class TestThing:
+     def test_repr(self):
+-        assert repr(x) == "old"
++        assert repr(x) == "new"
+"""
+
+
+def test_a_parametrised_f2p_id_is_not_a_false_positive(tmp_path: Path) -> None:
+    """`test_pickle[0-None]` is generated at run time from one `def test_pickle`
+    in the source, so searching the patch for the expanded id can only ever
+    miss. Keeping the suffix flagged 2 of 4 sound structlog tasks."""
+    audit = audit_task(
+        _write_task(tmp_path, f2p=["tests/test_calc.py::test_add_negatives[0-None]"])
+    )
+
+    assert audit.checks["f2p_names_in_test_patch"], audit.details
+
+
+def test_a_go_subtest_id_is_not_a_false_positive(tmp_path: Path) -> None:
+    audit = audit_task(
+        _write_task(tmp_path, f2p=["TestAddNegatives/negative_case"], test_patch=GO_TEST_PATCH)
+    )
+
+    assert audit.checks["f2p_names_in_test_patch"], audit.details
+
+
+def test_a_modified_test_counts_as_provenance(tmp_path: Path) -> None:
+    """A PR that *modifies* an existing test moves it fail->pass just as
+    legitimately as one that adds a new test — and the modified test's `def`
+    line then appears only as a context line, never as an added one.
+    `structlog-786`'s `test_repr` is exactly that case."""
+    audit = audit_task(
+        _write_task(
+            tmp_path, f2p=["tests/test_calc.py::test_repr"], test_patch=MODIFIED_TEST_PATCH
+        )
+    )
+
+    assert audit.checks["f2p_names_in_test_patch"], audit.details
+
+
+def test_a_genuinely_absent_name_is_still_caught(tmp_path: Path) -> None:
+    """The loosening must not cost the check its teeth."""
+    audit = audit_task(
+        _write_task(
+            tmp_path, f2p=["tests/test_calc.py::test_never_written"],
+            test_patch=MODIFIED_TEST_PATCH,
+        )
+    )
+
+    assert "f2p_names_in_test_patch" in audit.failures

@@ -28,8 +28,72 @@ from pathlib import Path
 # `+++ b/path/to/test_x.py` — the post-image path of each file a patch touches.
 _PATCH_TARGET_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 
-# A pytest node id: `path/to/test_x.py::TestCls::test_y` → the path part.
-_NODE_PATH_RE = re.compile(r"^([^:]+?\.py)(?:::|$)")
+# Test-file extensions across the runners `--language` advertises. A node id
+# that names a file lets us check the *file* appears in the hidden test patch.
+_TEST_FILE_EXTS = (
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".scala",
+    ".rb",
+    ".php",
+    ".cs",
+    ".c",
+    ".cc",
+    ".cpp",
+)
+
+# The path part of an identifier that starts with one: pytest's
+# `path/to/test_x.py::TestCls::test_y`, jest's `path/to/x.test.ts > suite > case`.
+_NODE_PATH_RE = re.compile(
+    r"^([^\s:>#]+?(?:" + "|".join(re.escape(e) for e in _TEST_FILE_EXTS) + r"))(?:[:>#]|$)"
+)
+
+# Everything that separates a test's name from its container across runners:
+# pytest `::`, JUnit `#`, Rust/C++ `::`, Go/Java `.`, jest `>`.
+_NODE_SEP_RE = re.compile(r"::|[#>.]")
+
+# The body of the embedded test patch — added, removed and context lines
+# alike. Restricting this to added lines is wrong: a PR that *modifies* an
+# existing test moves it fail->pass just as legitimately as one that adds a new
+# one, and the modified test's `def` line then appears only as context. Measured
+# against the first real corpus, where `structlog-786`'s `test_repr` is exactly
+# that case.
+_PATCH_BODY_RE = re.compile(r"^[-+ ].*$", re.MULTILINE)
+
+
+def _node_file(node_id: str) -> str | None:
+    """The file an F2P identifier names, when it names one."""
+    m = _NODE_PATH_RE.match(node_id.strip())
+    return m.group(1) if m else None
+
+
+def _node_symbol(node_id: str) -> str:
+    """The test's own name — the last segment, whatever the separator.
+
+    Go (`TestFoo`), Rust (`mod::tests::case`) and JUnit (`Cls#method`) node ids
+    carry no path at all, so the file check can say nothing about them. The
+    symbol is the one part every runner has, which makes it the only provenance
+    check that works for every language `--language` accepts.
+
+    The parametrisation suffix is dropped: pytest's `test_pickle[0-None]` and
+    Go's `TestFoo/sub_case` are *generated at run time* from one `def
+    test_pickle` / `func TestFoo` in the source, so searching the patch for the
+    expanded id can only ever miss. Measured against the first real corpus —
+    keeping it flagged 2 of 4 sound structlog tasks, and a check that fires on
+    half a clean corpus is worse than no check.
+    """
+    parts = [p for p in _NODE_SEP_RE.split(node_id.strip()) if p]
+    symbol = parts[-1] if parts else ""
+    symbol = symbol.split("[", 1)[0]  # pytest parametrisation
+    symbol = symbol.split("/", 1)[0]  # go subtests
+    return symbol.strip()
 
 
 @dataclass
@@ -70,11 +134,32 @@ def audit_task(task_dir: Path) -> TaskAudit:
         _record(audit, "task_toml_parses", False, f"{type(e).__name__}: {e}")
         return audit
 
-    pr_meta = (
-        (cfg.get("metadata") or {}).get("repo2env", {}).get("pr_runtime", {})
-    )
+    # Walk the metadata defensively. `[metadata]` with `repo2env = "bad"` is
+    # syntactically valid TOML, and a chained `.get()` on the string raises —
+    # which would abort `audit_tasks` and take the whole corpus histogram with
+    # it. One malformed task must not stop the audit of the rest; that is the
+    # entire reason these are findings and not exceptions.
+    def _table(parent: object, key: str) -> dict:
+        if not isinstance(parent, dict):
+            return {}
+        value = parent.get(key)
+        return value if isinstance(value, dict) else {}
+
+    pr_meta = _table(_table(_table(cfg, "metadata"), "repo2env"), "pr_runtime")
+    if not pr_meta and isinstance(cfg.get("metadata"), dict):
+        _record(
+            audit,
+            "metadata_well_formed",
+            False,
+            "no readable [metadata.repo2env.pr_runtime] table",
+        )
     base_commit = pr_meta.get("base_commit", "")
+    if not isinstance(base_commit, str):
+        base_commit = ""
     declared_f2p = pr_meta.get("fail_to_pass") or []
+    if not isinstance(declared_f2p, list):
+        declared_f2p = []
+    declared_f2p = [f for f in declared_f2p if isinstance(f, str)]
 
     dockerfile = _read(task_dir / "environment" / "Dockerfile")
     test_sh = _read(task_dir / "tests" / "test.sh")
@@ -126,32 +211,62 @@ def audit_task(task_dir: Path) -> TaskAudit:
     # never passes — the task scores 0 for everyone, forever, and reads as
     # merely hard.
     patch_files = set(_PATCH_TARGET_RE.findall(test_sh))
-    f2p_files = {m.group(1) for f in declared_f2p if (m := _NODE_PATH_RE.match(f))}
+    patch_body = "\n".join(_PATCH_BODY_RE.findall(test_sh))
+    f2p_files = {f for node in declared_f2p if (f := _node_file(node))}
     _record(
         audit,
         "f2p_declared",
         bool(declared_f2p),
         f"{len(declared_f2p)} F2P test(s)" if declared_f2p else "no F2P tests declared",
     )
-    if f2p_files and patch_files:
+
+    # File-level provenance, when the identifiers name files at all. pytest and
+    # jest ids do; Go, Rust and JUnit ids do not.
+    if f2p_files:
         orphans = sorted(f2p_files - patch_files)
         _record(
             audit,
             "f2p_files_in_test_patch",
-            not orphans,
+            not orphans and bool(patch_files),
             "every F2P file appears in the test patch"
-            if not orphans
-            else f"F2P files absent from the test patch: {', '.join(orphans)}",
+            if not orphans and patch_files
+            else (
+                "no test patch embedded in test.sh to check against"
+                if not patch_files
+                else f"F2P files absent from the test patch: {', '.join(orphans)}"
+            ),
         )
-    else:
-        # No embedded test_patch to compare against (e.g. the test file already
-        # existed at base). Not a pass — state that the check couldn't run
-        # rather than quietly counting it as one.
+
+    # Symbol-level provenance, which every runner supports. This is the check
+    # that catches the failure that matters: a name the hidden test patch never
+    # adds is never collected, never runs, never passes, so the task scores 0
+    # for everyone forever and reads as merely hard. Previously the file regex
+    # accepted only `.py`, so for every other language `f2p_files` came back
+    # empty and the check passed by default — silently, for exactly the runners
+    # least likely to have been eyeballed.
+    #
+    # "In the patch" means anywhere in it, not just its added lines: a PR that
+    # modifies an existing test moves it fail->pass just as legitimately as one
+    # that adds a new test.
+    if declared_f2p:
+        missing = sorted(
+            {
+                node
+                for node in declared_f2p
+                if (sym := _node_symbol(node)) and sym not in patch_body
+            }
+        )
         _record(
             audit,
-            "f2p_files_in_test_patch",
-            not f2p_files or bool(patch_files),
-            "no test_patch embedded in test.sh; F2P provenance unchecked",
+            "f2p_names_in_test_patch",
+            not missing and bool(patch_body.strip()),
+            "every F2P test name is added by the test patch"
+            if not missing and patch_body.strip()
+            else (
+                "no test patch embedded in test.sh; F2P provenance unverifiable"
+                if not patch_body.strip()
+                else f"F2P names the test patch never adds: {', '.join(missing[:3])}"
+            ),
         )
 
     # --- the shipped-artifact checks ------------------------------------------

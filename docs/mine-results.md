@@ -151,12 +151,30 @@ Re-run after the fix, same agent, same model:
 A clean loss: the fix tests fail, all 139 regression guards hold, and nothing
 claims the run was unjudgeable.
 
+## What the corpus taught the audit
+
+The symbol-level provenance check was written strict and then **measured against
+these four tasks**, which is the only reason it isn't wrong today. Two rounds of
+false positives, both real:
+
+| flagged | why it was wrong |
+|---|---|
+| `test_pickle[0-None]`, `test_write_locks_released_on_gc[BytesLogger-wb]` | pytest expands parametrised ids at run time from one `def` in the source, so searching the patch for the expanded id can only ever miss |
+| `test_repr` | the PR **modified** an existing test rather than adding one, so its `def` line appears only as a context line — and a modified test moves fail→pass just as legitimately |
+
+Both would have fired on **2 of 4 sound tasks**, and with `mine` now refusing to
+replay against a failed audit, that would have blocked the whole corpus. A check
+that fires on half a clean corpus is worse than no check. Parametrisation and
+subtest suffixes are stripped, and "in the test patch" means anywhere in it.
+
 ## Still open
 
 - **`network_mode = "allowlist"`** and deleting `env_guard.py` — the last step-3
   item. Blocked on the same question its docstring raises: an allowlist that
   blocks the fix sources also blocks whatever the suite needs at runtime.
 - **The 34-F2P task** (`-786`) is worth a look before it enters a training set;
-  one PR flipping 34 tests is more likely a refactor than a bug fix.
+  one PR flipping 34 tests is more likely a refactor than a bug fix. (It does
+  pass the audit — its F2P names are all reachable in the test patch, several
+  as modified rather than added tests.)
 - **Yield**: 10% here. Step 4 wants ≥50 tasks, so either ~400 PRs of history or
   a second repo.
