@@ -1118,6 +1118,13 @@ class PRRuntimePipeline:
             # bumps aren't real fix tasks, and their bodies leak commit SHAs
             # and fix-PR links. Drop them up front.
             return "non_bug_pr"
+        if self.options.require_linked_issue and _linked_issue_number(pr.body or "") is None:
+            # The linked issue is the problem statement written *before* the
+            # fix existed. Without one, the only text available is the PR body
+            # — written by the fixer, describing the solution. The option is
+            # named for this gate; until now nothing enforced it and the
+            # linked-issue number was only used to prefer issue text.
+            return "no_linked_issue"
         if (
             self.options.min_problem_statement_words > 0
             and _word_count(pr.body or "") < self.options.min_problem_statement_words
