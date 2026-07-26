@@ -71,3 +71,13 @@ def test_defaults_still_parse() -> None:
     args = build_parser().parse_args(["diagnose", "--manifest", "m.json"])
     assert args.min_gap > 0
     assert args.min_support >= 1
+
+
+def test_selftest_thresholds_are_validated_too() -> None:
+    """The sweep scores recovery *against* these thresholds, so a NaN here
+    doesn't just weaken the report — it makes every cell recover."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["selftest", "--min-gap", "nan"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["selftest", "--min-support", "0"])

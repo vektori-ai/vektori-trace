@@ -332,8 +332,10 @@ def build_parser() -> argparse.ArgumentParser:
             "labeller would recover — free, offline, and an upper bound on any real run"
         ),
     )
-    p_self.add_argument("--min-gap", type=float, default=DEFAULT_MIN_GAP)
-    p_self.add_argument("--min-support", type=int, default=DEFAULT_MIN_SUPPORT)
+    # Same validators as `diagnose` — the sweep scores recovery against these
+    # thresholds, so a NaN here silently reports 100% recovery.
+    p_self.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
+    p_self.add_argument("--min-support", type=_min_support_arg, default=DEFAULT_MIN_SUPPORT)
     p_self.add_argument("--seed", type=int, default=0)
     p_self.set_defaults(func=cmd_selftest)
 
