@@ -49,9 +49,16 @@ class Trace:
     outcome: Outcome
     source_path: Path
     model: str | None = None  # which model produced this trace, for paired replay
+    task: str | None = None  # mined task dir name, the pairing key across models
 
     @classmethod
-    def load(cls, path: Path, outcome: Outcome | None = None, model: str | None = None) -> Trace:
+    def load(
+        cls,
+        path: Path,
+        outcome: Outcome | None = None,
+        model: str | None = None,
+        task: str | None = None,
+    ) -> Trace:
         data = json.loads(path.read_text())
         status = data.get("status", "unknown")
         resolved_outcome = outcome or ("win" if status == "success" else "loss")
@@ -62,6 +69,7 @@ class Trace:
             outcome=resolved_outcome,
             source_path=path,
             model=model,
+            task=task,
         )
 
     def condensed(self, max_turns: int = 60, max_field_chars: int = 400) -> str:
