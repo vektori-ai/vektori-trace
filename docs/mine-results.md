@@ -28,7 +28,7 @@ spending a bootstrap on a repo.
 
 ## Where 40 candidate PRs went
 
-```
+```text
 emitted                       4
 no_test_patch                20
 non_bug_pr                    6
@@ -61,7 +61,7 @@ All four declare `verifier.environment_mode = "separate"` and
 
 ## The oracle passes on real mined code
 
-```
+```console
 $ vektori-trace prove .../hynek__structlog-794
 oracle passed: True
 valid: True
@@ -118,7 +118,7 @@ that started all of this.
 with `parse_status: "no_model_patch"` — but it had not been wronged. Reading its
 keystrokes:
 
-```
+```shell
 git checkout -b fix/monochrome-console-renderer
 git show --stat --summary
 git diff --name-only HEAD~2 HEAD

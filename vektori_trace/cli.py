@@ -171,6 +171,21 @@ def cmd_mine(args: argparse.Namespace) -> int:
     tasks_dir = out_dir / "mined_tasks"
     traces_dir = out_dir / "mined_traces"
 
+    # Fail before the bootstrap, not after every PR has been silently
+    # discarded. A supplied Dockerfile skips the agent that discovers the test
+    # command, and F2P/P2P are derived by *running* the suite — so without one
+    # validation can't derive anything and every candidate skips as
+    # `no_fail_to_pass`, which reads as "this repo has no minable PRs".
+    if args.dockerfile and not [c for c in (args.test_cmd or []) if c.strip()]:
+        print(
+            "error: --dockerfile needs --test-cmd. Supplying a Dockerfile skips the "
+            "bootstrap agent, so nothing discovers how to run the suite, and F2P/P2P "
+            "come from running it. Without one every PR skips as no_fail_to_pass.\n"
+            "  e.g. --test-cmd 'python -m pytest -q'",
+            file=sys.stderr,
+        )
+        return 2
+
     options = PRRuntimeOptions(
         limit=args.limit,
         require_linked_issue=not args.no_require_linked_issue,
@@ -231,13 +246,30 @@ def cmd_mine(args: argparse.Namespace) -> int:
     )
     print(f"\nMine report written to {out_dir / 'mine-report.json'}")
 
+    # A failed audit stops the replay, not just --no-replay's exit code.
+    # `git_history_scrubbed=False` means an agent can read the fix out of
+    # `.git`, so every trace collected from that task is contaminated — and a
+    # contaminated win is worse than no win, because nothing downstream can
+    # tell it apart from a real one. The other checks mean the task is
+    # unwinnable, which poisons the loss half just as effectively.
+    bad_audits = [a for a in audits if not a.ok]
+    if bad_audits:
+        print(
+            f"\nerror: {len(bad_audits)} of {len(audits)} task(s) failed the audit. "
+            "Not running an agent against them — traces collected from a task that "
+            "fails these checks are contaminated or unwinnable, and neither is "
+            "distinguishable from the real thing once written to disk.",
+            file=sys.stderr,
+        )
+        return 1
+
     if args.no_replay:
         print(
             "\n--no-replay: stopping before the agent runs. "
             f"Next: vektori-trace mine --repo {args.repo} (without --no-replay), "
             "or inspect the tasks above."
         )
-        return 0 if all(a.ok for a in audits) else 1
+        return 0
 
     runner = HarborTraceRunner(agent=args.agent, jobs_dir=out_dir / "jobs", model=args.model)
     print(f"Running {args.agent} against each mined task to collect traces...")

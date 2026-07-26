@@ -80,15 +80,16 @@ vektori-trace diagnose \
   --base-model gpt-5-nano
 ```
 
-`--base-agent` accepts any Harbor agent name — `codex`, `claude_code`,
-`aider`, `opencode`, etc. Without `--base-agent`, only the oracle solution is
+`--base-agent` accepts any Harbor agent name — `codex`, `claude-code`,
+`aider`, `opencode`, etc. (Harbor's names are hyphenated; underscores are
+normalised, since it rejects them outright before any container starts.) Without `--base-agent`, only the oracle solution is
 run (proves the task is solvable at all, not that a real agent lacks the
 capability).
 
 You can also run the proof separately against an already-generated task:
 
 ```bash
-vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude_code
+vektori-trace prove ./vektori-out/tasks/<deficit-name> --base-agent claude-code
 ```
 
 ## Is the environment sound?
@@ -134,10 +135,19 @@ a clean checkout, and graded there. Under the old shared-container default an
 agent that shadowed `python3` scored 1.0 on an unsolved task — measured, not
 hypothesised.
 
-If the diff never arrives, the verifier refuses rather than running the suite
-against the base repo: that would score a different task, and the 0.0 would be
-indistinguishable from an agent that tried and failed. The run leaves the
-dataset instead.
+Absent and empty are different facts about that diff, and they are handled
+differently:
+
+| the patch file is | means | what happens |
+|---|---|---|
+| **absent** | collection never ran | refused — running the suite anyway scores the base repo, a different task, and the 0.0 would be indistinguishable from an agent that tried and failed. The run leaves the dataset. |
+| **empty** | collection ran, the agent changed nothing | scored — the base repo *is* the state that agent produced, so 0.0 is the honest result |
+
+The second case is not hypothetical: on the first live agent run the model
+created a branch, read the base commit's own diff, mistook it for its own work
+and declared completion having edited no file. Treating that as unjudgeable
+would drop the *clearest* losses out of the corpus — "declares success without
+verifying" is exactly the deficit worth finding.
 
 ## Does the diagnosis work at all?
 
@@ -199,7 +209,7 @@ and nothing has inspected the repo to find out how.
 
 Every run prints where the candidates went and audits what came out:
 
-```
+```text
 Where the 40 candidate PR(s) went:
   emitted                       4
   no_test_patch                20

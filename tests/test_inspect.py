@@ -254,3 +254,41 @@ def test_node_id_forms_all_resolve_to_their_file(
     audit = audit_task(_write_task(tmp_path, f2p=[node_id]))
 
     assert audit.checks["f2p_files_in_test_patch"], audit.details
+
+
+# ---------------------------------------------------------------------------
+# The CLI guards these checks exist to drive
+# ---------------------------------------------------------------------------
+
+
+def test_dockerfile_without_test_cmd_fails_before_the_bootstrap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Otherwise it fails *after* every PR has been silently discarded: the
+    supplied Dockerfile skips the agent that discovers the test command, F2P
+    comes from running the suite, so every candidate skips as no_fail_to_pass
+    and it reads as "this repo has no minable PRs"."""
+    from vektori_trace.cli import main
+
+    df = tmp_path / "Dockerfile"
+    df.write_text("FROM python:3.12-slim\n")
+
+    rc = main(["mine", "--repo", "o/n", "--dockerfile", str(df), "--out", str(tmp_path)])
+
+    assert rc == 2
+    assert "--dockerfile needs --test-cmd" in capsys.readouterr().err
+
+
+def test_blank_test_cmds_do_not_satisfy_the_guard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from vektori_trace.cli import main
+
+    df = tmp_path / "Dockerfile"
+    df.write_text("FROM python:3.12-slim\n")
+
+    rc = main(
+        ["mine", "--repo", "o/n", "--dockerfile", str(df), "--test-cmd", "  ", "--out", str(tmp_path)]
+    )
+
+    assert rc == 2
