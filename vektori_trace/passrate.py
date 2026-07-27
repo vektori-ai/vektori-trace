@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .validity import run_trial
 
@@ -42,6 +43,16 @@ class PassRate:
         lo, hi = band
         return self.rate is not None and lo <= self.rate <= hi
 
+    def majority_pass(self) -> bool:
+        """Pre-declared McNemar binarization for A0–A4 (V0 Step 6).
+
+        `measure_pass_rates` yields 8–16 Bernoulli trials per task; McNemar needs
+        one bit per task per arm. Rule: strict majority of judgeable rollouts
+        passed (`passed * 2 > n`). Ties count as fail. Declared before any arm
+        runs — not chosen after seeing p-values.
+        """
+        return self.n > 0 and self.passed * 2 > self.n
+
 
 def compute_pass_rates(results: list[RolloutResult]) -> dict[str, PassRate]:
     """Group rollout outcomes by task into a rate + N. A task with zero
@@ -61,6 +72,11 @@ def measure_pass_rates(
     model: str,
     jobs_dir: Path,
     rollouts: int = DEFAULT_ROLLOUTS,
+    *,
+    api_base: str | None = None,
+    model_info: dict[str, Any] | None = None,
+    agent_kwargs: dict[str, Any] | None = None,
+    extra_instruction_path: Path | None = None,
 ) -> dict[str, PassRate]:
     """Drive `rollouts` real `harbor run` trials per task and aggregate. The I/O
     boundary `compute_pass_rates` is deliberately kept clear of: this function is
@@ -69,7 +85,16 @@ def measure_pass_rates(
     results: list[RolloutResult] = []
     for task_dir in task_dirs:
         for _ in range(rollouts):
-            trial = run_trial(task_dir, agent=agent, jobs_dir=jobs_dir, model=model)
+            trial = run_trial(
+                task_dir,
+                agent=agent,
+                jobs_dir=jobs_dir,
+                model=model,
+                api_base=api_base,
+                model_info=model_info,
+                agent_kwargs=agent_kwargs,
+                extra_instruction_path=extra_instruction_path,
+            )
             if trial.passed is None:
                 continue  # unjudgeable trial; not a pass, not a fail, not counted
             results.append(RolloutResult(task=task_dir.name, passed=trial.passed))

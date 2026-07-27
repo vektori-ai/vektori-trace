@@ -37,6 +37,10 @@ class DeficitScore:
     n_relevant_wins: int = 0
     n_relevant_losses: int = 0
     lacking_loss_traces: list[Trace] = field(default_factory=list)
+    # run_id -> one-line labeller evidence for this capability on that loss.
+    # Persisted into diagnosis.json so A1 can template a prompt without
+    # re-labelling (previously thrown away after scoring).
+    lacking_loss_evidence: dict[str, str] = field(default_factory=dict)
 
 
 # Uncalibrated. Our labeller is a blurry ruler and blur shrinks effects toward
@@ -236,6 +240,11 @@ def score_deficits(
                 n_relevant_wins=len(relevant_wins),
                 n_relevant_losses=len(relevant_losses),
                 lacking_loss_traces=[tl.trace for tl in lacking_losses],
+                lacking_loss_evidence={
+                    tl.trace.run_id: tl.evidence.get(cap.id, "")
+                    for tl in lacking_losses
+                    if tl.evidence.get(cap.id)
+                },
             )
         )
     return sorted(scores, key=lambda s: s.priority, reverse=True)
