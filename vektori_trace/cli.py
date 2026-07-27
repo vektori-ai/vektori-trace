@@ -9,6 +9,7 @@ from pathlib import Path
 from .diagnose import (
     DEFAULT_MIN_GAP,
     DEFAULT_MIN_SUPPORT,
+    diagnose_replay,
     label_trace,
     propose_capabilities,
     score_deficits,
@@ -43,7 +44,7 @@ from .planted import (
     run_sweep,
     write_sweep_report,
 )
-from .report import build_report, write_report
+from .report import build_replay_report, build_report, write_report
 from .schema import Trace, load_manifest
 from .taskgen import scaffold_task
 from .validity import _find_reward, prove_validity
@@ -91,6 +92,40 @@ def _load_traces(manifest_path: Path) -> list[Trace]:
     return [Trace.load(e.path, outcome=e.outcome, model=e.model, task=e.task) for e in entries]
 
 
+def _check_replay_models(args: argparse.Namespace, traces: list[Trace]) -> str | None:
+    """Validate `--frontier-model`/`--candidate-model`, or None if they're fine.
+
+    Checked before the proposer runs: every failure here is knowable from the
+    manifest alone, and discovering one after labelling has cost an LLM call per
+    trace is pure waste.
+    """
+    frontier, candidate = args.frontier_model, args.candidate_model
+    if (frontier is None) != (candidate is None):
+        missing = "--candidate-model" if frontier else "--frontier-model"
+        return (
+            f"{missing} is required alongside the other — the two contrasts are "
+            "defined by which model produced which trace, so one name on its own "
+            "names nothing."
+        )
+    if frontier is None:
+        return None
+    if frontier == candidate:
+        return (
+            f"--frontier-model and --candidate-model are the same ({frontier!r}) — "
+            "there is no cross-model contrast between a model and itself."
+        )
+    present = {t.model for t in traces}
+    for flag, model in (("--frontier-model", frontier), ("--candidate-model", candidate)):
+        if model not in present:
+            known = ", ".join(sorted(m for m in present if m)) or "none (no 'model' field set)"
+            return (
+                f"{flag} {model!r} has no traces in the manifest. Models present: {known}. "
+                "A manifest without models is a `mine` manifest; the two-contrast path "
+                "needs one from `replay`."
+            )
+    return None
+
+
 def cmd_diagnose(args: argparse.Namespace) -> int:
     traces = _load_traces(Path(args.manifest))
     wins = [t for t in traces if t.outcome == "win"]
@@ -103,7 +138,18 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         )
         return 1
 
+    problem = _check_replay_models(args, traces)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    replay_mode = args.frontier_model is not None
+
     print(f"Loaded {len(wins)} win(s) and {len(losses)} loss(es).")
+    if replay_mode:
+        print(
+            f"Two contrasts: cross-model (frontier {args.frontier_model} wins vs "
+            f"candidate {args.candidate_model} losses) and within-model ({args.candidate_model})."
+        )
     print("Proposing candidate capabilities...")
     capabilities = propose_capabilities(traces, model=args.model)
     for c in capabilities:
@@ -112,9 +158,31 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     print("Labeling each trace against candidate capabilities...")
     trace_labels = [label_trace(t, capabilities, model=args.model) for t in traces]
 
-    scores = score_deficits(capabilities, trace_labels)
+    diagnosis = None
+    if replay_mode:
+        diagnosis = diagnose_replay(
+            trace_labels,
+            capabilities,
+            frontier_model=args.frontier_model,
+            candidate_model=args.candidate_model,
+            min_gap=args.min_gap,
+            min_support=args.min_support,
+        )
+        scores, top = diagnosis.cross_model_scores, diagnosis.chosen
+    else:
+        scores = score_deficits(capabilities, trace_labels)
+        top = select_deficit(scores, min_gap=args.min_gap, min_support=args.min_support)
+
     thresholds = {"min_gap": args.min_gap, "min_support": args.min_support}
     out_dir = Path(args.out)
+
+    def write(task_dir: Path | None, validity: dict | None) -> Path:
+        report = (
+            build_replay_report(diagnosis, task_dir, validity, thresholds)
+            if diagnosis is not None
+            else build_report(top, scores, task_dir, validity, thresholds)
+        )
+        return write_report(report, out_dir)
 
     print("\nRanked candidates:")
     for s in scores:
@@ -123,7 +191,6 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             f"prevalence={s.prevalence:.2f}, N={s.n_relevant_wins}w/{s.n_relevant_losses}l"
         )
 
-    top = select_deficit(scores, min_gap=args.min_gap, min_support=args.min_support)
     if top is None:
         # A clean, honest exit — not an error. Nothing here separates wins from
         # losses well enough to build a task around.
@@ -131,9 +198,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             f"\nNo deficit found: nothing cleared min_gap={args.min_gap} with at least "
             f"{args.min_support} relevant traces on each side."
         )
-        report = build_report(None, scores, None, None, thresholds)
-        md_path = write_report(report, out_dir)
-        print(f"Report written to {md_path}")
+        print(f"Report written to {write(None, None)}")
         return 0
 
     print(
@@ -141,6 +206,31 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         f"(gap={_fmt(top.gap)}, prevalence={top.prevalence:.2f}, "
         f"N={top.n_relevant_wins}w/{top.n_relevant_losses}l)"
     )
+
+    if diagnosis is not None:
+        w, m = diagnosis.within_model_score, diagnosis.mcnemar
+        print(
+            f"Within-model ({args.candidate_model}): lacking in {_fmt(w.baseline_rate)} of its "
+            f"own wins (N={w.n_relevant_wins}), {_fmt(w.incident_rate)} of its own losses "
+            f"(N={w.n_relevant_losses})"
+        )
+        print(
+            f"Same-task McNemar: b={m.frontier_only} (frontier only), c={m.candidate_only} "
+            f"(candidate only), {m.discordant_n} discordant, "
+            f"p={'n/a' if m.p_value is None else f'{m.p_value:.4f}'}"
+            + ("  [underpowered]" if m.underpowered else "")
+        )
+        if not diagnosis.trainable:
+            # A real answer, not a failure — and the point of the second
+            # contrast. Scaffolding a task here would produce a training set
+            # rejection sampling can never fill.
+            print(
+                f"\nIdentified, not trainable: {args.candidate_model} never demonstrated "
+                "this capability often enough in its own wins for rejection sampling to "
+                "have anything to keep. Not generating a task."
+            )
+            print(f"Report written to {write(None, None)}")
+            return 0
 
     tasks_dir = out_dir / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -163,9 +253,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             print(f"  {args.base_agent} passed: {validity['base'].passed}")
         print(f"  valid: {validity['valid']}")
 
-    report = build_report(top, scores, task_dir, validity, thresholds)
-    md_path = write_report(report, out_dir)
-    print(f"\nReport written to {md_path}")
+    print(f"\nReport written to {write(task_dir, validity)}")
     return 0
 
 
@@ -362,7 +450,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
         )
         return 1
 
-    print(f"Next: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
+    print(
+        f"Next: vektori-trace diagnose --manifest {manifest_path} --out {args.out} "
+        f"--frontier-model {args.frontier_model} --candidate-model {args.candidate_model}"
+    )
     return 0
 
 
@@ -545,6 +636,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=_min_support_arg,
         default=DEFAULT_MIN_SUPPORT,
         help="minimum relevant traces on each side of the gap",
+    )
+    # Both or neither. Given both, the manifest is read as a `replay` manifest
+    # and scored as two contrasts (cross-model, within-model) plus a same-task
+    # McNemar test; given neither, the manifest is one undifferentiated win/loss
+    # set exactly as before.
+    p_diag.add_argument(
+        "--frontier-model",
+        default=None,
+        help=(
+            "the frontier model in a `replay` manifest. With --candidate-model, scores "
+            "the cross-model contrast (frontier wins vs candidate losses) instead of "
+            "mixing both models into one win/loss set"
+        ),
+    )
+    p_diag.add_argument(
+        "--candidate-model",
+        default=None,
+        help="the candidate model under test; required alongside --frontier-model",
     )
     p_diag.set_defaults(func=cmd_diagnose)
 

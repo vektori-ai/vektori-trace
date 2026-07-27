@@ -279,6 +279,45 @@ task scores 0 for everyone forever and reads as merely hard.
 Results from the first real run, including two defects it found:
 [`docs/mine-results.md`](docs/mine-results.md).
 
+## Two models, two contrasts
+
+`replay` runs a frontier and a candidate model over the same mined tasks on one
+pinned scaffold, and writes a manifest tagged with `model` and `task`. Handing
+that manifest to `diagnose` unqualified mixes both models into one win/loss set
+and averages away the thing being measured, so name them:
+
+```bash
+vektori-trace diagnose \
+  --manifest ./vektori-out/replay-manifest.json \
+  --frontier-model gpt-5 --candidate-model qwen3-8b \
+  --out ./vektori-out
+```
+
+| Contrast | Wins | Losses | Answers |
+|---|---|---|---|
+| cross-model | frontier's | candidate's | what's worth fixing |
+| within-model | candidate's | candidate's | whether there's anything to train from |
+
+The chosen deficit and the ranked list are the **cross-model** contrast. The
+within-model one decides trainability: rejection sampling keeps only rollouts
+that pass, so if the candidate has never once demonstrated the capability, a
+task built against that deficit yields an empty training set rather than a hard
+one. That result is reported as **"identified, not trainable"** — it exits 0 and
+generates no task, `--prove` included.
+
+Both flags are required together, must name different models, and must both
+appear in the manifest; each is rejected at parse time rather than after an LLM
+call per trace. Given neither, the model-blind path is unchanged.
+
+Alongside them, an **exact McNemar test** on the chosen capability compares the
+two models task by task instead of on average — frontier wins come from easier
+tasks and candidate losses from harder ones, and pairing cancels that. It counts
+tasks where the frontier demonstrated the capability and the candidate didn't
+(`b`) against the reverse (`c`); pairs where either side is NA are dropped as not
+comparable. Under 6 discordant pairs no split can reach p<0.05 at all and under
+9 only a perfectly one-sided one can, so the report flags anything below 8 as
+underpowered — the test having no power is not the models being alike.
+
 ## Model
 
 Diagnosis and task generation use `gpt-5-nano` by default (cheapest current

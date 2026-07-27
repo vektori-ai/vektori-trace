@@ -9,6 +9,7 @@ cheap to reject at parse time and expensive to notice downstream.
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
@@ -81,6 +82,76 @@ def test_selftest_thresholds_are_validated_too() -> None:
         parser.parse_args(["selftest", "--min-gap", "nan"])
     with pytest.raises(SystemExit):
         parser.parse_args(["selftest", "--min-support", "0"])
+
+
+def _manifest(tmp_path, entries: list[dict]):
+    """A manifest plus the trace files it points at — enough for `cmd_diagnose`
+    to load, which is all the model-pairing checks run before."""
+    traces_dir = tmp_path / "traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for i, e in enumerate(entries):
+        p = traces_dir / f"t{i}.json"
+        p.write_text(json.dumps({"runId": f"r{i}", "status": "success", "turns": []}))
+        items.append({"path": str(p), **e})
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(items))
+    return path
+
+
+def _diagnose_args(manifest, *extra: str):
+    return build_parser().parse_args(["diagnose", "--manifest", str(manifest), *extra])
+
+
+PAIRED = [
+    {"outcome": "win", "model": "gpt-5", "task": "t1"},
+    {"outcome": "loss", "model": "small", "task": "t1"},
+]
+
+
+def test_diagnose_rejects_one_model_flag_without_the_other(tmp_path) -> None:
+    """The two contrasts are defined by which model produced which trace — one
+    name on its own defines neither, and finding that out after labelling has
+    cost an LLM call per trace."""
+    from vektori_trace.cli import cmd_diagnose
+
+    manifest = _manifest(tmp_path, PAIRED)
+    assert cmd_diagnose(_diagnose_args(manifest, "--frontier-model", "gpt-5")) == 2
+    assert cmd_diagnose(_diagnose_args(manifest, "--candidate-model", "small")) == 2
+
+
+def test_diagnose_rejects_identical_frontier_and_candidate_model(tmp_path) -> None:
+    from vektori_trace.cli import cmd_diagnose
+
+    manifest = _manifest(tmp_path, PAIRED)
+    args = _diagnose_args(manifest, "--frontier-model", "gpt-5", "--candidate-model", "gpt-5")
+    assert cmd_diagnose(args) == 2
+
+
+def test_diagnose_rejects_a_model_with_no_traces_in_the_manifest(tmp_path) -> None:
+    """Cheap to catch here; expensive to discover as an empty contrast after
+    every trace has been labelled."""
+    from vektori_trace.cli import cmd_diagnose
+
+    manifest = _manifest(tmp_path, PAIRED)
+    args = _diagnose_args(manifest, "--frontier-model", "gpt-5", "--candidate-model", "typo-8b")
+    assert cmd_diagnose(args) == 2
+
+
+def test_diagnose_rejects_model_flags_against_a_mine_manifest(tmp_path) -> None:
+    """`mine` writes no `model` field, so the pairing has nothing to work with."""
+    from vektori_trace.cli import cmd_diagnose
+
+    manifest = _manifest(tmp_path, [{"outcome": "win"}, {"outcome": "loss"}])
+    args = _diagnose_args(manifest, "--frontier-model", "gpt-5", "--candidate-model", "small")
+    assert cmd_diagnose(args) == 2
+
+
+def test_diagnose_model_flags_default_to_none(tmp_path) -> None:
+    """Neither flag given must stay the plain, model-blind path."""
+    args = build_parser().parse_args(["diagnose", "--manifest", "m.json"])
+    assert args.frontier_model is None
+    assert args.candidate_model is None
 
 
 def test_replay_requires_tasks_dir_and_both_models() -> None:
