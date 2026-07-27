@@ -9,8 +9,9 @@ from pathlib import Path
 from .diagnose import MIN_DISCORDANT_PAIRS, DeficitScore, ReplayDiagnosis
 
 
-def score_dict(s: DeficitScore) -> dict:
-    return {
+def score_dict(s: DeficitScore, *, evidence_by_run: dict[str, str] | None = None) -> dict:
+    evidence = evidence_by_run if evidence_by_run is not None else s.lacking_loss_evidence
+    out = {
         "capability": asdict(s.capability),
         "baseline_rate": s.baseline_rate,
         "incident_rate": s.incident_rate,
@@ -21,6 +22,21 @@ def score_dict(s: DeficitScore) -> dict:
         "n_relevant_losses": s.n_relevant_losses,
         "lacking_loss_run_ids": [t.run_id for t in s.lacking_loss_traces],
     }
+    # A1 templates its deficit-targeted prompt from this. Previously thrown away
+    # after labelling (V0_PLAN.md Step 5); without it on disk A1 is hand-authored
+    # and non-reproducible.
+    if evidence:
+        out["lacking_loss_evidence"] = {
+            rid: evidence[rid]
+            for rid in out["lacking_loss_run_ids"]
+            if rid in evidence
+        }
+        uniq = list(dict.fromkeys(out["lacking_loss_evidence"].values()))
+        out["evidence_summary"] = " ".join(uniq)[:800] if uniq else ""
+    else:
+        out["lacking_loss_evidence"] = {}
+        out["evidence_summary"] = ""
+    return out
 
 
 def build_report(

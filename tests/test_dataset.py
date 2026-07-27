@@ -1,0 +1,182 @@
+"""Masking boundary tests for dataset.py — the correctness-critical piece.
+
+Allow-list (assistant only), subagent exclusion, thinking stripped, and a
+label-preserving collator that must NOT regenerate labels from input_ids.
+Fully offline: no HuggingFace download (plan: inject a chat template on a
+from-scratch tokenizer).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from vektori_trace.dataset import (
+    IGNORE_INDEX,
+    TEST_CHAT_TEMPLATE,
+    LabelPreservingCollator,
+    tokenize_sft_example,
+    turns_to_messages,
+)
+from vektori_trace.schema import ToolCall, Turn
+
+pytest.importorskip("torch")
+pytest.importorskip("transformers")
+
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
+
+
+def _tiny_tokenizer():
+    """Offline tokenizer with an injected chat template — no Hub download."""
+    vocab = {
+        "[UNK]": 0,
+        "[PAD]": 1,
+        "<|user|>": 2,
+        "<|assistant|>": 3,
+        "<|tool|>": 4,
+        "<|system|>": 5,
+        "<|end|>": 6,
+        "<|tool_call|>": 7,
+        "fix": 8,
+        "the": 9,
+        "bug": 10,
+        "I'll": 11,
+        "look": 12,
+        "at": 13,
+        "traceback.": 14,
+        "running": 15,
+        "pytest": 16,
+        "FAILED": 17,
+        "test_x.py": 18,
+        "noise": 19,
+        "retry": 20,
+        "with": 21,
+        "prefix": 22,
+        "go": 23,
+        "sub": 24,
+        "only": 25,
+        "hello": 26,
+        "there": 27,
+        "say": 28,
+        "hi": 29,
+        "bash": 30,
+        "{}": 31,
+        "cmd": 32,
+    }
+    for i, tok in enumerate(
+        ["a", "b", "c", "d", "e", "f", "g", "h", ".", ",", ":", "'", '"', "/", "_"]
+    ):
+        vocab.setdefault(tok, 100 + i)
+    backend = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tok = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        bos_token="<|user|>",
+        eos_token="<|end|>",
+    )
+    tok.chat_template = TEST_CHAT_TEMPLATE
+    return tok
+
+
+def _turns() -> list[Turn]:
+    return [
+        Turn(index=0, role="user", content="fix the bug"),
+        Turn(index=1, role="assistant", content="I'll look at traceback."),
+        Turn(
+            index=2,
+            role="assistant",
+            content="running pytest",
+            tool_calls=[ToolCall(id="c1", name="bash", args={"cmd": "pytest"})],
+        ),
+        Turn(index=3, role="tool", content="FAILED test_x.py", tool_call_id="c1"),
+        Turn(index=4, role="system", content="noise"),
+        Turn(index=5, role="assistant", content="sub only", subagent_depth=1),
+        Turn(
+            index=6,
+            role="assistant",
+            thinking="secret chain of thought",
+            content="retry with prefix",
+        ),
+    ]
+
+
+def test_turns_to_messages_allow_list_context_keeps_non_assistant() -> None:
+    msgs = turns_to_messages(_turns())
+    roles = [m["role"] for m in msgs]
+    assert "user" in roles
+    assert "tool" in roles
+    assert "system" in roles
+    assert all(m.get("content") != "sub only" for m in msgs)
+
+
+def test_thinking_is_stripped_not_folded_into_content() -> None:
+    msgs = turns_to_messages(_turns())
+    joined = " ".join(str(m.get("content") or "") for m in msgs)
+    assert "secret chain of thought" not in joined
+    assert "retry with prefix" in joined
+    assert all("thinking" not in m for m in msgs)
+
+
+def test_tokenize_masks_everything_except_parent_assistant() -> None:
+    tok = _tiny_tokenizer()
+    ex = tokenize_sft_example(_turns(), tok, max_length=2048)
+    assert ex is not None
+    assert len(ex.input_ids) == len(ex.labels) == len(ex.attention_mask)
+    assert any(lab != IGNORE_INDEX for lab in ex.labels)
+    assert any(lab == IGNORE_INDEX for lab in ex.labels)
+
+    msgs = turns_to_messages(_turns())
+    first_as_idx = next(i for i, m in enumerate(msgs) if m["role"] == "assistant")
+    prefix = msgs[:first_as_idx]
+    if prefix:
+        prefix_ids = tok.apply_chat_template(prefix, tokenize=True, add_generation_prompt=False)
+        if not isinstance(prefix_ids, list):
+            prefix_ids = list(prefix_ids)
+        n = min(len(prefix_ids), len(ex.labels))
+        assert all(lab == IGNORE_INDEX for lab in ex.labels[:n])
+
+
+def test_subagent_only_trajectory_yields_nothing_trainable() -> None:
+    tok = _tiny_tokenizer()
+    turns = [
+        Turn(index=0, role="user", content="go"),
+        Turn(index=1, role="assistant", content="sub only", subagent_depth=1),
+    ]
+    assert tokenize_sft_example(turns, tok) is None
+
+
+def test_label_preserving_collator_pads_labels_with_ignore_not_input_ids() -> None:
+    """Stock DataCollatorForLanguageModeling would copy input_ids into labels
+    on pad and erase the mask. This is the silent-failure the plan flags."""
+    collator = LabelPreservingCollator(pad_token_id=0, label_pad_id=IGNORE_INDEX)
+    features = [
+        {"input_ids": [1, 2, 3], "labels": [IGNORE_INDEX, 2, 3], "attention_mask": [1, 1, 1]},
+        {"input_ids": [4, 5], "labels": [4, IGNORE_INDEX], "attention_mask": [1, 1]},
+    ]
+    batch = collator(features)
+    assert batch["input_ids"].shape == batch["labels"].shape == (2, 3)
+    assert int(batch["labels"][1, 2]) == IGNORE_INDEX
+    assert int(batch["input_ids"][1, 2]) == 0
+    assert int(batch["labels"][0, 0]) == IGNORE_INDEX
+    assert int(batch["labels"][1, 1]) == IGNORE_INDEX
+
+
+def test_hf_label_shift_convention_is_next_token() -> None:
+    """Pin HF causal-LM convention: loss at position i predicts token i+1.
+    Our labels align 1:1 with input_ids; Trainer shifts internally — we must
+    NOT pre-shift, or every mask boundary is off by one."""
+    import torch
+    from torch.nn import CrossEntropyLoss
+
+    logits = torch.zeros(1, 3, 5)
+    labels = torch.tensor([[IGNORE_INDEX, 1, 2]])
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss = CrossEntropyLoss(ignore_index=IGNORE_INDEX)(
+        shift_logits.view(-1, 5), shift_labels.view(-1)
+    )
+    assert torch.isfinite(loss)

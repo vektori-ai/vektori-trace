@@ -17,6 +17,17 @@ dependencies = [
 # anything reading them already has it; it stays optional so `diagnose` on
 # pasted traces needs neither Harbor nor Docker.
 harbor = ["harbor>=0.20"]
+# SFT+LoRA train / arm-runner path. Kept optional so diagnose-only installs
+# stay light. vllm is deliberately NOT here — it hard-pins torch and only
+# belongs inside the Modal serve image (`serve.py`), never the local venv.
+train = [
+    "torch",
+    "transformers",
+    "peft",
+    "accelerate",
+    "datasets",
+    "modal",
+]
 
 [dependency-groups]
 dev = [

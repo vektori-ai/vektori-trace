@@ -72,7 +72,7 @@ def test_measure_pass_rates_drives_run_trial_and_aggregates(tmp_path: Path, monk
         def __init__(self, passed):
             self.passed = passed
 
-    def fake_run_trial(task_dir, agent, jobs_dir, model=None, timeout_sec=1800):
+    def fake_run_trial(task_dir, agent, jobs_dir, model=None, timeout_sec=1800, **_kw):
         calls.append((task_dir.name, model))
         return _Trial(next(script[task_dir.name]))
 

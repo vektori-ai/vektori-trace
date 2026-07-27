@@ -8,6 +8,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -73,12 +74,42 @@ def _find_parse_status(jobs_dir: Path) -> str | None:
     return None
 
 
+def _ak_args(
+    *,
+    api_base: str | None,
+    model_info: dict[str, Any] | None,
+    agent_kwargs: dict[str, Any] | None,
+) -> list[str]:
+    """Harbor has no top-level `--api-base`. Custom endpoints (Modal vLLM) go
+    through `--ak` into the agent's `__init__` — terminus-2 accepts `api_base`
+    and `model_info` that LiteLLM then forwards. `hosted_vllm/<name>` also
+    requires `model_info` (token limits + costs) or harbor refuses to start."""
+    merged: dict[str, Any] = dict(agent_kwargs or {})
+    if api_base is not None:
+        merged["api_base"] = api_base
+    if model_info is not None:
+        merged["model_info"] = model_info
+    out: list[str] = []
+    for key, value in merged.items():
+        if isinstance(value, (dict, list, bool)) or value is None:
+            rendered = json.dumps(value)
+        else:
+            rendered = str(value)
+        out += ["--ak", f"{key}={rendered}"]
+    return out
+
+
 def run_trial(
     task_dir: Path,
     agent: str,
     jobs_dir: Path,
     model: str | None = None,
     timeout_sec: int = 1800,
+    *,
+    api_base: str | None = None,
+    model_info: dict[str, Any] | None = None,
+    agent_kwargs: dict[str, Any] | None = None,
+    extra_instruction_path: Path | None = None,
 ) -> TrialResult:
     """Invoke `harbor run` for a single agent against a task and parse the reward.
 
@@ -86,6 +117,11 @@ def run_trial(
     before any container starts — so `claude_code` never runs at all. Normalised
     here as well as in `HarborTraceRunner`, since `--base-agent` reaches this
     function without passing through that one.
+
+    A2/A3 evaluate a Modal-hosted candidate via litellm's `hosted_vllm/` provider:
+    pass `model="hosted_vllm/<name>"`, `api_base=<modal url>`, and `model_info`.
+    A1's deficit-targeted prompt is harbor's `--extra-instruction-path`, not a
+    terminus-2 system-prompt kwarg (that agent has none).
     """
     task_dir = task_dir.resolve()
     agent = agent.replace("_", "-")
@@ -105,6 +141,9 @@ def run_trial(
     ]
     if model:
         cmd += ["--model", model]
+    cmd += _ak_args(api_base=api_base, model_info=model_info, agent_kwargs=agent_kwargs)
+    if extra_instruction_path is not None:
+        cmd += ["--extra-instruction-path", str(extra_instruction_path.resolve())]
 
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     reward = _find_reward(job_dir)
