@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *.egg-info/
 vektori-out/
+vektori-out-*/
 jobs/
 .env
 selftest-run/

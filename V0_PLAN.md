@@ -1,11 +1,18 @@
-Vektori — v0 and v1 Plan
-========================
+Vektori — measurement discipline and v1 plan
+============================================
 
-**Date:** 2026-07-25 · **Tree:** `main` @ `c0f190b`
+**Date:** 2026-07-28 · **Branch:** `capability-routing`
 
-`docs/AUDIT.md` = the bug list. `docs/CLAIMS.md` = evidence for every fact and
-number cited here; all code claims were reproduced by executing the code, all
-external claims checked at source. This doc = what we build, in two stages.
+**Scope.** This doc is authoritative for **mining, verification, diagnosis and
+provenance** — the measurement half. The v0 *experiment* design it originally
+carried (task selection by pass-rate band, arms A2/A3, rejection-sampling SFT as
+the training method) is **superseded by [`PLAN.md`](PLAN.md)**, which replaces
+band-selection with support-measured routing and A2/A3 with B1/B2. Where the two
+disagree about the experiment, `PLAN.md` wins.
+
+Steps 1–3 of the original plan (the four launch bugs, the planted-deficit
+selftest, the harbor contract check) are **done** — see `git log` and
+`docs/selftest-results.md`, `docs/network-policy.md`, `docs/mine-results.md`.
 
 - **v0** — mine environments from public repos ourselves, train against them, see
   if the number moves. No customer.
@@ -26,7 +33,7 @@ The question it answers:
 
 > Does training a cheap model on *mined, verified* environments targeting a
 > diagnosed capability beat training it on the same number of mined environments
-> picked at random?
+> under an inverted assignment?
 
 If yes, we have a product. If no, we're a report generator and we know in weeks. A
 report alone can't answer it — "these capabilities cause the gap" stays an LLM's
@@ -37,8 +44,9 @@ permission, and the whole loop runs on our own machines.
 
 Goals:
 
-- Close the loop end to end: one repo, one candidate model, one deficit.
-- A before/after number on held-out mined tasks, with an **untargeted control**.
+- Close the loop end to end: mined repos, one candidate model, one deficit.
+- A before/after number on held-out mined tasks, with the control arm `PLAN.md`
+  specifies (B2, anti-routed).
 - The real frontier-vs-candidate gap at a fixed scaffold.
 
 Why this isn't just TRACE
@@ -47,11 +55,11 @@ Why this isn't just TRACE
 TRACE (the method behind `diagnose.py`) is published *and fully open source* —
 capability labelling, GRPO training, per-capability LoRA, and an inference routing
 gate, with a SWE-bench reference. We adopt their code. Three things differ, and
-they're the reason v0 is designed the way it is:
+they're the reason the loop is designed the way it is:
 
 1. **Real environments, not synthesized ones.** TRACE's training environments are
    LLM-written; ours run the project's own test suite. The paper never validates
-   synthetic-environment fidelity. Testable, not assumed — that's arm A3 vs A5.
+   synthetic-environment fidelity. Testable, not assumed (v1.3).
 2. **Cross-model contrast.** TRACE contrasts one model's wins against its own
    losses (confirmed from the paper). A capability the candidate lacks
    *consistently* is lacking in its wins too, so that gap flattens exactly where
@@ -76,15 +84,8 @@ repo URL
   │
   ├─[3] diagnose ─────▶ ranked capability deficits (or "none found")
   │
-  ├─[4] select ───────▶ deficit-lacking tasks, in the trainable difficulty band
-  │
-  ├─[5] train ────────▶ rejection-sampling SFT + LoRA
-  │
-  └─[6] re-measure ───▶ held-out mined tasks, before vs after
+  └─[4+] ─────────────▶ support measurement, routing, training — see PLAN.md
 ```
-
-Stages 0–1 exist and are the strongest code in the repo (~6.3k LOC). Stage 2 is
-broken. Stages 3–6 need the work below.
 
 **Environments come from two places, and only one is trustworthy:**
 
@@ -97,80 +98,8 @@ v0 uses mined only. Traces carry no environment at all — which is why a
 traces-only product can diagnose but never prove. Training needs an environment and
 evaluation needs the same one; it's one requirement, twice.
 
-What's broken right now
------------------------
-
-The pipeline has never run end to end. All four reproduced by execution
-(`docs/CLAIMS.md`).
-
-1. **Trajectories never parse.** Harbor writes ATIF — an object with `steps[]`;
-   `miner.py:137` checks for a JSON array, so every trace degrades to a 4,000-char
-   stdout blob. The diagnosis LLM is reading a stderr tail.
-2. **Infra failure is recorded as an agent loss.** No `returncode` check, so a
-   Docker OOM becomes a "loss" that diagnosis explains with an invented deficit.
-3. **It can never say "no deficit found."** `cli.py:44` takes `scores[0]` with no
-   threshold; inverted evidence (`gap = -1.0`) still yields a confident report.
-4. **The labeller is told the answer.** `diagnose.py:118` opens with
-   `"Trajectory (outcome: loss)"`.
-
-The plan
---------
-
-### Step 1 — Fix those four *(offline: no Docker, no harbor, no API key)*
-
-- Infra failure ⇒ exclude the task; never write a loss trace.
-- Per-task try/except; write the manifest after each task, not after the loop.
-- Unique job dir per run, newest reward by mtime — today `rglob` returned a stale
-  `0.0` over a fresh `1.0`.
-- Threshold the diagnosis; `deficit: null` is a clean exit 0. A missing label
-  counts as `NA`, not PRESENT (today it reads as *competence*).
-- Remove the outcome from both labeller prompts.
-- Drop the `harbor task init` shell-out — its flags don't exist. `emitter.py`
-  already writes tasks correctly.
-- Make the `verifier.py` ↔ `log_parsers/*` differential a real test. They're
-  duplicated, they agree today, nothing enforces it, and on drift **every task
-  silently scores 0.0**.
-- Fix `owner_name`: `github.com/psf/requests/tree/main` → `('tree','main')` and
-  `/pull/1234` → `('pull','1234')`. Every URL a human copies from a browser.
-
-### Step 2 — Check the diagnosis works at all *(API key only)*
-
-Generate synthetic traces with a deficit injected into losses only — `examples/`
-already has one — and check the ranker finds it. Sweep trace count and prevalence.
-Freeze it as a regression test.
-
-If the ranker can't recover a deficit we planted ourselves, nothing downstream
-matters. Cheapest thing that can kill the idea, so it runs early.
-
-### Step 3 — Install harbor, verify the contract *(first step needing Docker)*
-
-- **First, before anything else:** we emit `environment/Dockerfile` *and*
-  `environment/docker-compose.yaml`, and Harbor honors one of them. If compose
-  wins, the Dockerfile never runs — no base-commit reset, no git-history scrub, and
-  the agent reads the fix out of `.git`. Docs say it's provider-dependent and give
-  no answer for local Docker. Check in the container: `git rev-parse HEAD`,
-  `git log --all`, `git remote -v`. This one check validates or invalidates every
-  task the pipeline has ever emitted.
-- **Real ATIF parser.** `steps[]` → turns; `message` is a string *or* a
-  content-part array; `observation.results[]` become their own turns (**the
-  traceback is the evidence** — without it the labeller sees what the agent tried
-  and never what happened); recurse into `subagent_trajectories`, since Claude Code
-  spawns subagents and skipping them drops most of the work. Import Harbor's own
-  Pydantic models. **Delete the fallback and raise.** Commit a real job dir as a
-  fixture — that's what keeps the bug dead.
-- Move the verifier out of the agent's container (`environment_mode = "separate"`).
-  Today it runs on the agent's `$PATH` with a reward fallback that means: shadow
-  `python3`, exit 0, collect 1.0.
-- `network_mode = "allowlist"`, delete `env_guard.py`. The default is `public`, so
-  mined tasks currently have full access to github.com — and the current denylist
-  only works on local Docker anyway.
-- `task.toml` uses `schema_version`, not `version`; `keywords` under `[task]`.
-- Timeouts: `sandbox.exec` returns 124 and nothing checks it, so a truncated test
-  log produces a wrong F2P set baked into a shipped task.
-- Then mine one small repo, print the skip-reason histogram, and hand-inspect three
-  tasks: base commit right, `.git` scrubbed, F2P names actually in the test patch.
-
-### Step 4 — Paired replay, and the gap number
+Paired replay, and the gap number
+---------------------------------
 
 Run frontier and candidate over the same mined tasks; `collect_traces` takes a list
 of runners; manifest entries record which model produced each trace. This gives the
@@ -186,7 +115,8 @@ candidate must be genuinely small (4B–8B class).
 Measure the real gap on ≥50 tasks before believing any framing. Under ~10 points,
 change the candidate — not the story.
 
-### Step 5 — Diagnose, honestly
+Diagnose, honestly
+------------------
 
 Two contrasts out of the one replay run:
 
@@ -197,7 +127,9 @@ Two contrasts out of the one replay run:
 
 Within-model matters because if the candidate has *never* done the thing right,
 rejection sampling has nothing to keep. Report a cross-model deficit with no
-within-model signal as **"identified, not trainable."**
+within-model signal as **"identified, not trainable."** (`PLAN.md` sharpens this
+into a measurement: `pass@k` decides it, rather than the within-model contrast
+alone.)
 
 Three corrections worth making, and no more:
 
@@ -210,9 +142,9 @@ Three corrections worth making, and no more:
   significance, whatever the data.
 - **The 0.20 threshold is uncalibrated.** Our labeller is a blurry ruler, and blur
   always shrinks effects toward zero — a true gap of 0.5 can surface as 0.18 and be
-  rejected. Hand-label ~50 traces once to measure how blurry, then adjust the
-  threshold. Until then we don't know if 0.20 is strict or loose. (In v0 the
-  win/loss ruler is sharp: it's execution.)
+  rejected. `PLAN.md` Step E replaces hand-labelling with execution-established
+  forking steps as the calibration ground truth. Until that runs we don't know if
+  0.20 is strict or loose. (In v0 the win/loss ruler is sharp: it's execution.)
 - **Decide whether to fix the ruler before calibrating it.** Adjusting the
   threshold compensates for attenuation; it does not recover the *power* blur
   costs, and past some blur a real deficit is unrecoverable at any threshold.
@@ -238,58 +170,8 @@ Three corrections worth making, and no more:
 **Stop replaying when the ranked list stops changing** as tasks are added. If it's
 still reshuffling at the budget cap, the answer is "not enough data," not a report.
 
-### Step 6 — Train and re-measure *(the point of v0)*
-
-- Select training tasks two ways, both required: the deficit was lacking, **and**
-  the candidate's measured pass rate is in **10–40%**.
-- The band isn't a hunch. Rejection sampling keeps only rollouts that pass, so at
-  0% the dataset is empty. In GRPO the advantage is `(r − mean)/std`, so a group
-  where every rollout scores the same gives **zero gradient** — which is why DAPO
-  discards all-right and all-wrong groups. Too easy is equally useless. Hence the
-  middle.
-- Measure pass rate with 8–16 rollouts per task, **only on diagnosis-selected
-  tasks**. Step 4's broad sweep is 1 rollout per task; 16 everywhere costs 16× and
-  buys no diagnostic power.
-- Carve the held-out slice *before* training. Exclude SWE-bench Verified repos and
-  PRs — mining them means training on the answers, and getting caught destroys the
-  number.
-- Vendor TRACE's training code. v0 uses rejection-sampling SFT + LoRA only (LoRA
-  also *is* the non-regression mechanism — base weights untouched). Their GRPO path
-  is v1.
-- **Mask tool output out of the loss.** Our training data is agent trajectories on
-  SWE tasks, so most tokens are *environment observations* — pytest logs, file
-  contents, tracebacks — not the agent's own decisions. Training to predict those
-  teaches the model to memorise this repo's test output, which is both useless and
-  a contamination path into the held-out slice. Compute the loss on the agent's
-  turns only. (AgentV-RL, Findings of ACL 2026, does the same and names the reason:
-  "to mitigate the risk of memorizing environment observations".) Cheap to get
-  wrong silently — the run trains fine and the number just doesn't move.
-- Pilot on ~10 tasks before any full run: does it execute, do metrics compute, is
-  the cost sane.
-
-The experiment
---------------
-
-| Arm | What | Answers |
-|---|---|---|
-| A0 | candidate, untouched | the floor |
-| A1 | candidate + deficit-targeted prompt | "couldn't you just prompt it?" — free |
-| **A2** | trained on **random** mined tasks, same count, same rollout budget | **the control** |
-| **A3** | trained on **deficit-selected** mined tasks | the claim |
-| A4 | frontier | the ceiling |
-
-**A2 is the arm that makes this real.** Without it, "targeted training on mined
-environments" is indistinguishable from TRACE with a different environment source.
-A3 ≈ A2 means targeting adds nothing.
-
-Primary metric: pass rate on the held-out mined slice, **A3 vs A2**, compared
-task-by-task since both arms attempt the same tasks. **Decide the held-out size and
-the smallest effect it can resolve before training** — SWE-Gym moved a 7B model
-about 3 points, and a 50-task slice cannot resolve 3 points.
-
-Also report: A0 vs A4 (the gap), a non-regression check (IFEval or the base model's
-own evals — narrow training genuinely degrades instruction-following), and cost per
-solved task versus frontier.
+Provenance
+----------
 
 Every run writes: arm, task ids and split, scaffold name+version, base model and
 adapter, seed, pass rate with N, the paired comparison, and the environment
@@ -299,30 +181,27 @@ count.
 Stop and rethink if
 -------------------
 
-- Compose wins over the Dockerfile — every task ever emitted is invalid.
-- The ranker can't find a deficit we planted (step 2).
 - The gap is under ~10 points, or the candidate has almost no wins to bootstrap from.
 - A prompt (A1) closes most of the gap — then we're a prompt tool with an expensive
   backend. Thesis-level finding for two eval runs.
-- A3 ≈ A2 — targeting doesn't help.
-- The 10–40% band is empty — nothing trainable at this model + scaffold.
+- The labeller floor sits below ~70% and no structural fix moves it.
+
+`PLAN.md` extends this list with the routing-specific conditions (no `pass@k`
+regime separation, sparse routing cells, B1 ≈ B2, quarantine fraction too large).
 
 Done when
 ---------
 
 - Real trajectories parse into turns with tool calls and results; no fallback path
-  exists; golden-file test passes.
-- Infra failures never appear as losses.
-- Diagnosis is blind to outcome and can return "none found" with exit 0.
+  exists; golden-file test passes. ✅
+- Infra failures never appear as losses. ✅
+- Diagnosis is blind to outcome and can return "none found" with exit 0. ✅
 - A container check confirms base commit, scrubbed `.git`, no remote; a
-  shadow-`python3` reward hack scores 0.0.
+  shadow-`python3` reward hack scores 0.0. ✅
 - A gap number exists on ≥50 mined tasks at a pinned, named scaffold.
 - Labeller accuracy is stated with its per-config **floor**, not just its mean, and
   either clears ~70% or was fixed before `min_gap` was calibrated.
-- A3 vs A2 measured on a held-out slice, task-by-task, with the resolvable effect
-  size stated up front.
-- Non-regression check inside a pre-declared tolerance.
-- Every number re-derivable from artifacts on disk.
+- The experiment's acceptance criteria — see `PLAN.md`.
 
 ---
 
@@ -355,7 +234,7 @@ What changes without an environment:
   step and ask the frontier model what it would do next, then compare to what the
   candidate actually did. Keeps the same-situation pairing, at the cost of comparing
   a judgment to an action. **Validate it in v0 first**, where both the annotation
-  and the real outcome exist.
+  and the real outcome exist — `PLAN.md` Step D is that validation.
 - **Two blurry rulers instead of one**, and blur multiplies: an inferred outcome
   label times a blurry labeller can halve the observable effect. Apply v0's
   calibration.
@@ -409,23 +288,22 @@ grading itself, is a policy learning to satisfy checks rather than do work.
   something — no finite experiment shows that. Train at n ∈ {25, 50, 100}, plot gain
   against log n, and report the bounded form: *not learnable within R rollouts, at
   scaffold S, by method M*.
-- **Multi-deficit + adapter routing** (TRACE's MoE gate), **GRPO** (v0's rollout
-  adapter is the same interface, so it's a trainer swap), **multi-language** (Java
+- **Multi-deficit + adapter routing** (TRACE's MoE gate), **multi-language** (Java
   and Ruby are realistic; Rust and Go put table-tests inside the source file, which
   makes patch/test splitting structurally impossible), **MCP surface** so a coding
   agent can drive the pipeline in one instruction.
+- **Cross-tokenizer distillation** (ULD/MinED/byte-level) — the upgrade path if the
+  same-family teacher proves too weak. See `docs/OPD.md`.
 - **Use the gold patch.** Mined tasks already carry the human's fix, F2P names, and
   changed files, and diagnosis currently sees only turns. Comparing the trajectory
   against the real fix is probably the biggest accuracy upgrade available.
 - **Formal sequential stopping** — proper anytime-valid boundaries (accept / reject /
   continue) instead of v0's rank-stability heuristic. Matters when traces stream in
-  continuously and we'd otherwise peek after every batch.
-- **Mining robustness and yield:** per-PR error isolation with checkpointing (one
-  Docker error currently aborts an hour of work), a fresh-dependency check between
-  base commits (one sandbox reused across all PRs gives false F2P/P2P), and the
-  yield bugs — `C#9` mangled by the leak stripper, `_path_is_test` missing
-  `.go`/`.rs`/`conftest.py`, spaced diff paths dropping PRs, `effaced` matching the
-  SHA regex.
+  continuously and we'd otherwise peek after every batch. Also the right frame for
+  `PLAN.md`'s two-stage `pass@k` escalation.
+- **Mining robustness and yield:** a fresh-dependency check between base commits
+  (one sandbox reused across all PRs gives false F2P/P2P), and the remaining yield
+  bugs.
 - **Go-to-market:** public repos are the demo generator — mine a prospect's own
   open-source repo, run paired replay, lead with their number. No permission, no
   data handoff, no meeting needed to produce it.
@@ -433,14 +311,10 @@ grading itself, is a policy learning to satisfy checks rather than do work.
 Open questions
 --------------
 
-1. **Which candidate model** — 4B or 8B class. Decide from step 4's measurement,
+1. **Which candidate model** — 4B or 8B class. Decide from the measured gap,
    not from benchmark tables.
 2. **Which scaffold** gets pinned, and who owns freezing it.
 3. **How many held-out tasks**, and what effect size that resolves. If ~50 can't
    resolve the expected effect, mine more before training.
-4. **Which repo first** — Python, real tests, issue-linked PRs, not in SWE-bench
-   Verified.
-5. **Training in this repo or a separate package?** Vendoring TRACE argues for
-   separate.
-6. **Canonical win/loss** — strict `resolved`, or `reward = f2p_rate × p2p_rate ≥
+4. **Canonical win/loss** — strict `resolved`, or `reward = f2p_rate × p2p_rate ≥
    1.0`? `grade()` computes both; pick one and say which in every report.
