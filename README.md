@@ -1,4 +1,4 @@
-# vektori-trace
+# pipeI
 
 Paste in failing/passing agent traces, get out: a diagnosed capability deficit, a
 generated verifiable task (Harbor spec) that isolates it, and a validity proof
