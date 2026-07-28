@@ -142,13 +142,13 @@ def parse_trajectory_file(
     return _reindex(turns)
 
 
-def _marker(index: int, text: str) -> Turn:
+def _marker(index: int, text: str, *, subagent_depth: int = 0) -> Turn:
     """A visible placeholder for work we know happened but cannot read.
 
     Silently omitting it would make the trajectory look complete and shorter
     than it was, which is a worse lie than admitting the gap.
     """
-    return Turn(index=index, role="system", content=text)
+    return Turn(index=index, role="system", content=text, subagent_depth=subagent_depth)
 
 
 def _steps_to_turns(
@@ -174,6 +174,7 @@ def _steps_to_turns(
                     thinking=step.reasoning_content,
                     content=content,
                     tool_calls=tool_calls,
+                    subagent_depth=depth,
                 )
             )
 
@@ -190,6 +191,7 @@ def _steps_to_turns(
                         role="tool",
                         content=result_content,
                         tool_call_id=result.source_call_id,
+                        subagent_depth=depth,
                     )
                 )
             turns += _subagent_turns(result, base_dir=base_dir, depth=depth, seen=seen)
@@ -204,22 +206,40 @@ def _subagent_turns(
     if not refs:
         return []
     if depth >= MAX_SUBAGENT_DEPTH:
-        return [_marker(0, f"[subagent trajectory omitted: depth > {MAX_SUBAGENT_DEPTH}]")]
+        return [
+            _marker(
+                0,
+                f"[subagent trajectory omitted: depth > {MAX_SUBAGENT_DEPTH}]",
+                subagent_depth=depth,
+            )
+        ]
 
     turns: list[Turn] = []
     for ref in refs:
         ref_path = getattr(ref, "trajectory_path", None)
         if not ref_path:
-            turns.append(_marker(0, "[subagent trajectory referenced without a path]"))
+            turns.append(
+                _marker(0, "[subagent trajectory referenced without a path]", subagent_depth=depth)
+            )
             continue
         resolved = (base_dir / ref_path).resolve()
         if not resolved.exists():
-            turns.append(_marker(0, f"[subagent trajectory missing: {ref_path}]"))
+            turns.append(
+                _marker(0, f"[subagent trajectory missing: {ref_path}]", subagent_depth=depth)
+            )
             continue
         if resolved in seen:
-            turns.append(_marker(0, f"[subagent trajectory already included: {ref_path}]"))
+            turns.append(
+                _marker(
+                    0,
+                    f"[subagent trajectory already included: {ref_path}]",
+                    subagent_depth=depth,
+                )
+            )
             continue
-        turns.append(_marker(0, f"[subagent trajectory: {ref_path}]"))
+        # Marker stays at parent depth (context only); the followed turns carry
+        # depth+1 so dataset.py can drop them from the SFT loss.
+        turns.append(_marker(0, f"[subagent trajectory: {ref_path}]", subagent_depth=depth))
         turns += parse_trajectory_file(resolved, _depth=depth + 1, _seen=seen)
     return turns
 

@@ -25,6 +25,10 @@ class Turn:
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
+    # 0 = parent/agent trajectory. >0 = inlined from a subagent file via
+    # atif._subagent_turns. SFT must exclude these: training on them teaches the
+    # parent model to emit subagent-internal output as its own (V0 Step 6).
+    subagent_depth: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> Turn:
@@ -38,6 +42,7 @@ class Turn:
                 for tc in d.get("toolCalls", []) or []
             ],
             tool_call_id=d.get("toolCallId"),
+            subagent_depth=int(d.get("subagentDepth", d.get("subagent_depth", 0)) or 0),
         )
 
 

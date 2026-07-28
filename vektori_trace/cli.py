@@ -35,6 +35,7 @@ from .mining.miner import (
     mine_tasks,
 )
 from .mining.spec import LLMSpec, PRRuntimeOptions
+from .passrate import DEFAULT_ROLLOUTS, PASSRATE_MAX, PASSRATE_MIN, measure_pass_rates
 from .planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
@@ -46,6 +47,7 @@ from .planted import (
 )
 from .report import build_replay_report, build_report, write_report
 from .schema import Trace, load_manifest
+from .select import held_out_split, select_training_tasks, write_selection_report
 from .taskgen import scaffold_task
 from .validity import _find_reward, prove_validity
 
@@ -84,6 +86,16 @@ def _min_support_arg(value: str) -> int:
         raise argparse.ArgumentTypeError(
             f"must be >= 1, got {parsed} (0 admits capabilities backed by no traces)"
         )
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {parsed}")
     return parsed
 
 
@@ -259,6 +271,110 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
 def _fmt(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.2f}"
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    """Step 6's first question: of the tasks the diagnosed deficit was lacking
+    in, which does the candidate pass 10-40% of the time — the band rejection
+    sampling and GRPO both need, neither empty nor already-solved."""
+    diagnosis_path = Path(args.diagnosis)
+    diagnosis = json.loads(diagnosis_path.read_text())
+    chosen = diagnosis.get("chosen_deficit")
+    if chosen is None:
+        print(
+            f"error: {diagnosis_path} has no chosen_deficit — nothing to select "
+            "training tasks for. Run `diagnose` again with thresholds that clear a "
+            "deficit, or accept there's none to train against yet.",
+            file=sys.stderr,
+        )
+        return 1
+
+    replay = diagnosis.get("replay")
+    if not replay:
+        print(
+            f"error: {diagnosis_path} wasn't produced with --frontier-model/"
+            "--candidate-model — `select` needs the cross-model/within-model split "
+            "to know whose losses the deficit was measured on.",
+            file=sys.stderr,
+        )
+        return 2
+    frontier_model, candidate_model = replay["frontier_model"], replay["candidate_model"]
+
+    traces = _load_traces(Path(args.manifest))
+    trace_by_run_id = {t.run_id: t for t in traces}
+    lacking_loss_tasks = [
+        trace_by_run_id[rid].task
+        for rid in chosen["lacking_loss_run_ids"]
+        if rid in trace_by_run_id and trace_by_run_id[rid].task is not None
+    ]
+    if not lacking_loss_tasks:
+        print(
+            "error: none of the chosen deficit's lacking-loss run ids resolve to a "
+            f"task in {args.manifest} — is this the same manifest `diagnose` used?",
+            file=sys.stderr,
+        )
+        return 1
+
+    tasks_dir = Path(args.tasks_dir)
+    unique_tasks = list(dict.fromkeys(lacking_loss_tasks))
+    task_dirs = [tasks_dir / t for t in unique_tasks if (tasks_dir / t).is_dir()]
+    missing = set(unique_tasks) - {p.name for p in task_dirs}
+    if missing:
+        print(
+            f"  {len(missing)} lacking-loss task(s) not found under {tasks_dir}, "
+            "skipping: " + ", ".join(sorted(missing)[:5]) + (" ..." if len(missing) > 5 else ""),
+            file=sys.stderr,
+        )
+
+    out_dir = Path(args.out)
+    print(
+        f"Measuring pass rate for {candidate_model} on {len(task_dirs)} lacking-loss "
+        f"task(s), {args.rollouts} rollout(s) each..."
+    )
+    pass_rates = measure_pass_rates(
+        task_dirs, agent=args.agent, model=candidate_model, jobs_dir=out_dir / "jobs", rollouts=args.rollouts
+    )
+
+    band = (args.passrate_min, args.passrate_max)
+    selected = select_training_tasks(lacking_loss_tasks, pass_rates, band=band)
+    print(f"  {len(selected)}/{len(unique_tasks)} task(s) land in band {band}")
+
+    exclude: set[str] = set()
+    if args.exclude:
+        exclude = {
+            line.strip() for line in Path(args.exclude).read_text().splitlines() if line.strip()
+        }
+    train_ids, holdout_ids = held_out_split(
+        selected, exclude=exclude, holdout_frac=args.holdout_frac, seed=args.seed
+    )
+
+    md_path = write_selection_report(
+        out_dir,
+        frontier_model=frontier_model,
+        candidate_model=candidate_model,
+        agent=args.agent,
+        band=band,
+        rollouts=args.rollouts,
+        seed=args.seed,
+        holdout_frac=args.holdout_frac,
+        pass_rates=pass_rates,
+        lacking_loss_tasks=lacking_loss_tasks,
+        selected=selected,
+        train_ids=train_ids,
+        holdout_ids=holdout_ids,
+        exclude=exclude,
+    )
+    print(f"train={len(train_ids)}  holdout={len(holdout_ids)} (frac={args.holdout_frac}, seed={args.seed})")
+    print(f"Selection report written to {md_path}")
+
+    if not selected:
+        print(
+            "\nEmpty band: nothing trainable at this model+scaffold with the current "
+            "deficit (V0_PLAN.md Step 6 stop condition).",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def cmd_mine(args: argparse.Namespace) -> int:
@@ -604,6 +720,125 @@ def cmd_prove(args: argparse.Namespace) -> int:
     return 0 if validity["valid"] else 1
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    """One arm: serve → rejection-sample rollouts → LoRA SFT → adapter + report.
+
+    Train extras are imported lazily so a base install never pays for torch.
+    """
+    # Lazy: torch/transformers/peft/modal must not be imported at cli.py top-level.
+    from .dataset import tokenize_sft_example
+    from .rollout import collect_rollouts
+    from .serve import serve_model, served_to_harbor_kwargs
+    from .train import TrainConfig, run_training, write_train_report
+
+    tasks_dir = Path(args.tasks_dir)
+    if not args.tasks:
+        print("error: pass at least one --task id", file=sys.stderr)
+        return 2
+    task_dirs = [tasks_dir / t for t in args.tasks]
+    missing = [p.name for p in task_dirs if not p.is_dir()]
+    if missing:
+        print(f"error: task dir(s) not found under {tasks_dir}: {', '.join(missing)}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with serve_model(args.model, gpu=args.modal_gpu) as served:
+            hk = served_to_harbor_kwargs(served)
+            rollouts = collect_rollouts(
+                task_dirs,
+                agent=args.agent,
+                jobs_dir=out_dir / "jobs",
+                rollouts=args.rollouts,
+                **hk,
+            )
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    if not rollouts:
+        print(
+            "error: rejection sampling kept nothing — no passing trajectories to train on",
+            file=sys.stderr,
+        )
+        return 1
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    examples = []
+    for r in rollouts:
+        ex = tokenize_sft_example(r.turns, tokenizer)
+        if ex is not None:
+            examples.append(ex)
+    if not examples:
+        print("error: no tokenizable parent-assistant turns in passing rollouts", file=sys.stderr)
+        return 1
+
+    cfg = TrainConfig(
+        base_model=args.model,
+        output_dir=out_dir,
+        task_ids=list(args.tasks),
+        max_steps=args.max_steps,
+        seed=args.seed,
+        use_modal=not args.local,
+        modal_gpu=args.modal_gpu,
+    )
+    result = run_training(examples, cfg, tokenizer=tokenizer)
+    md = write_train_report(result, out_dir)
+    print(f"adapter: {result.adapter_dir}")
+    print(f"final loss: {result.final_loss}")
+    print(f"report: {md}")
+    return 0
+
+
+def cmd_run_arms(args: argparse.Namespace) -> int:
+    """Full A0–A4 orchestrator from selection.json (+ diagnosis.json for A1)."""
+    from .arms import DEFAULT_CANDIDATE_MODEL, ArmsConfig, run_arms
+
+    selection = Path(args.selection)
+    diagnosis = Path(args.diagnosis)
+    if not selection.is_file():
+        print(f"error: selection.json not found: {selection}", file=sys.stderr)
+        return 2
+    if not diagnosis.is_file():
+        print(f"error: diagnosis.json not found: {diagnosis}", file=sys.stderr)
+        return 2
+    tasks_dir = Path(args.tasks_dir)
+    if not tasks_dir.is_dir():
+        print(f"error: tasks dir not found: {tasks_dir}", file=sys.stderr)
+        return 2
+
+    cfg = ArmsConfig(
+        selection_path=selection,
+        diagnosis_path=diagnosis,
+        tasks_dir=tasks_dir,
+        out_dir=Path(args.out),
+        agent=args.agent,
+        candidate_model=args.candidate_model or DEFAULT_CANDIDATE_MODEL,
+        frontier_model=args.frontier_model,
+        rollouts=args.rollouts,
+        seed=args.seed,
+        pilot=args.pilot,
+        use_modal=not args.local,
+        modal_gpu=args.modal_gpu,
+        max_train_steps=args.max_steps,
+        skip_nonregression=args.skip_nonregression,
+    )
+    try:
+        report = run_arms(cfg)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    paths = report.get("_paths") or {}
+    print(f"arms report: {paths.get('md', Path(args.out) / 'arms.md')}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI surface, separated from running it so argument parsing —
     notably the threshold validators — is testable without dispatching."""
@@ -656,6 +891,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="the candidate model under test; required alongside --frontier-model",
     )
     p_diag.set_defaults(func=cmd_diagnose)
+
+    p_select = sub.add_parser(
+        "select",
+        help=(
+            "measure candidate pass rate on the diagnosed deficit's lacking-loss tasks "
+            "and select the ones in the trainable band (V0_PLAN.md Step 6)"
+        ),
+    )
+    p_select.add_argument("--manifest", required=True, help="the replay manifest `diagnose` was run against")
+    p_select.add_argument("--diagnosis", required=True, help="path to a diagnosis.json produced with --frontier-model/--candidate-model")
+    p_select.add_argument("--tasks-dir", required=True, help="mined tasks directory (each task has a task.toml)")
+    p_select.add_argument("--agent", required=True, help="the scaffold pinned across replay — reused for pass-rate rollouts")
+    p_select.add_argument("--out", default="./vektori-out", help="output directory")
+    p_select.add_argument(
+        "--rollouts", type=_positive_int_arg, default=DEFAULT_ROLLOUTS,
+        help="rollouts per lacking-loss task to measure candidate pass rate (plan: 8-16)",
+    )
+    p_select.add_argument("--passrate-min", type=float, default=PASSRATE_MIN)
+    p_select.add_argument("--passrate-max", type=float, default=PASSRATE_MAX)
+    p_select.add_argument("--holdout-frac", type=float, default=0.2, help="fraction of selected tasks carved out as held-out before training")
+    p_select.add_argument("--seed", type=int, default=0, help="held-out split seed — written to the report, re-derivable")
+    p_select.add_argument(
+        "--exclude", default=None,
+        help="file of task ids (one per line) to drop before splitting, e.g. SWE-bench Verified tasks",
+    )
+    p_select.set_defaults(func=cmd_select)
 
     p_self = sub.add_parser(
         "selftest",
@@ -819,6 +1080,91 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_replay.add_argument("--out", default="./vektori-out", help="output directory")
     p_replay.set_defaults(func=cmd_replay)
+
+    p_train = sub.add_parser(
+        "train",
+        help=(
+            "serve the candidate, rejection-sample passing rollouts on a task set, "
+            "and LoRA-SFT an adapter (V0_PLAN.md Step 6)"
+        ),
+    )
+    p_train.add_argument("--tasks-dir", required=True, help="mined tasks directory")
+    p_train.add_argument(
+        "--task",
+        dest="tasks",
+        action="append",
+        default=[],
+        help="task id to train on (repeatable)",
+    )
+    p_train.add_argument("--agent", required=True, help="harbor scaffold, pinned across the run")
+    p_train.add_argument(
+        "--model",
+        default="Qwen/Qwen3-8B",
+        help="base/candidate model to serve + train (placeholder until Step 4 gap exists)",
+    )
+    p_train.add_argument("--out", default="./vektori-out", help="output directory")
+    p_train.add_argument(
+        "--rollouts",
+        type=_positive_int_arg,
+        default=DEFAULT_ROLLOUTS,
+        help="rejection-sampling rollouts per task",
+    )
+    p_train.add_argument("--max-steps", type=_positive_int_arg, default=50)
+    p_train.add_argument("--seed", type=int, default=0)
+    p_train.add_argument("--modal-gpu", default="A10G")
+    p_train.add_argument(
+        "--local",
+        action="store_true",
+        help="run LoRA on this machine instead of Modal (for tiny CPU smoke tests)",
+    )
+    p_train.set_defaults(func=cmd_train)
+
+    p_arms = sub.add_parser(
+        "run-arms",
+        help=(
+            "run A0–A4 from selection.json: prompt baseline, random-task control, "
+            "deficit-selected LoRA, frontier ceiling (V0_PLAN.md Step 6)"
+        ),
+    )
+    p_arms.add_argument("--selection", required=True, help="path to selection.json from `select`")
+    p_arms.add_argument(
+        "--diagnosis",
+        required=True,
+        help="path to diagnosis.json (A1 templates its prompt from stored evidence)",
+    )
+    p_arms.add_argument("--tasks-dir", required=True, help="mined tasks directory")
+    p_arms.add_argument("--agent", required=True, help="harbor scaffold pinned across all arms")
+    p_arms.add_argument(
+        "--candidate-model",
+        default="Qwen/Qwen3-8B",
+        help="placeholder default — swap once Step 4 produces a real gap number",
+    )
+    p_arms.add_argument(
+        "--frontier-model",
+        default=None,
+        help="defaults to selection.json's frontier_model",
+    )
+    p_arms.add_argument("--out", default="./vektori-out", help="output directory")
+    p_arms.add_argument("--rollouts", type=_positive_int_arg, default=DEFAULT_ROLLOUTS)
+    p_arms.add_argument("--max-steps", type=_positive_int_arg, default=50)
+    p_arms.add_argument("--seed", type=int, default=0)
+    p_arms.add_argument("--modal-gpu", default="A10G")
+    p_arms.add_argument(
+        "--pilot",
+        action="store_true",
+        help="cap each arm at ~10 tasks before any full run (V0_PLAN.md)",
+    )
+    p_arms.add_argument(
+        "--local",
+        action="store_true",
+        help="run LoRA locally instead of Modal (orchestration tests / tiny models)",
+    )
+    p_arms.add_argument(
+        "--skip-nonregression",
+        action="store_true",
+        help="skip the IFEval non-regression pass (still records the pre-declared tolerance)",
+    )
+    p_arms.set_defaults(func=cmd_run_arms)
 
     return parser
 
