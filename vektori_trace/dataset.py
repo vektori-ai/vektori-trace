@@ -130,12 +130,17 @@ def tokenize_sft_example(
     tokenizer: Any,
     *,
     max_length: int = 4096,
+    mask_prefix_messages: int = 0,
 ) -> TokenizedExample | None:
     """Tokenize a trajectory and mask non-assistant spans with IGNORE_INDEX.
 
     Uses prefix lengths of `apply_chat_template` (assumes a prefix-stable
     template, which HF chat templates are). Returns None if nothing trainable
     remains (no parent assistant turns).
+
+    Teacher-continuation / ReOPD (PLAN.md): `mask_prefix_messages` masks the
+    first N chat messages entirely (student prefix) — those tokens carry
+    IGNORE_INDEX even if they are assistant turns. Continuation tokens keep loss.
     """
     _require_train()
     messages = turns_to_messages(turns)
@@ -143,6 +148,12 @@ def tokenize_sft_example(
         return None
 
     train_mask = _assistant_mask_for_messages(messages)
+    if mask_prefix_messages < 0:
+        raise ValueError(f"mask_prefix_messages must be >= 0, got {mask_prefix_messages}")
+    if mask_prefix_messages:
+        for i in range(min(mask_prefix_messages, len(train_mask))):
+            train_mask[i] = False
+
     full_ids = _encode_messages(tokenizer, messages)
     if not full_ids:
         return None
@@ -183,6 +194,23 @@ def tokenize_sft_example(
         input_ids=input_ids,
         labels=labels,
         attention_mask=[1] * len(input_ids),
+    )
+
+
+def tokenize_teacher_continuation(
+    prefix_turns: list[Turn],
+    continuation_turns: list[Turn],
+    tokenizer: Any,
+    *,
+    max_length: int = 4096,
+) -> TokenizedExample | None:
+    """SFT example where the student prefix is masked; teacher continuation is not."""
+    n_prefix_msgs = len(turns_to_messages(prefix_turns))
+    return tokenize_sft_example(
+        prefix_turns + continuation_turns,
+        tokenizer,
+        max_length=max_length,
+        mask_prefix_messages=n_prefix_msgs,
     )
 
 
@@ -234,5 +262,6 @@ __all__ = [
     "TokenizedExample",
     "build_sft_dataset",
     "tokenize_sft_example",
+    "tokenize_teacher_continuation",
     "turns_to_messages",
 ]

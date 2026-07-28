@@ -180,3 +180,52 @@ def test_hf_label_shift_convention_is_next_token() -> None:
         shift_logits.view(-1, 5), shift_labels.view(-1)
     )
     assert torch.isfinite(loss)
+
+
+def test_student_prefix_masked_teacher_continuation_not() -> None:
+    """PLAN.md: student-prefix tokens carry IGNORE_INDEX; continuation does not."""
+    from vektori_trace.dataset import tokenize_teacher_continuation
+
+    tok = _tiny_tokenizer()
+    prefix = [
+        Turn(0, "user", content="fix the bug"),
+        Turn(1, "assistant", content="I'll look at traceback."),
+    ]
+    continuation = [
+        Turn(2, "assistant", content="retry with prefix"),
+    ]
+    ex = tokenize_teacher_continuation(prefix, continuation, tok)
+    assert ex is not None
+
+    # Positions, not counts. A count-only check passes on a partial or off-by-one
+    # mask (drop one prefix token, gain one continuation token and the totals
+    # still balance), so assert the boundary itself: the student-prefix span is
+    # [0, n_prefix) and every position in it must be IGNORE_INDEX, while every
+    # position in the continuation span [n_prefix, end) must carry loss.
+    from vektori_trace.dataset import _encode_messages
+
+    n_prefix = len(_encode_messages(tok, turns_to_messages(prefix)))
+    assert 0 < n_prefix < len(ex.labels)
+    assert all(lab == IGNORE_INDEX for lab in ex.labels[:n_prefix]), (
+        "a student-prefix position carries loss"
+    )
+    assert all(lab != IGNORE_INDEX for lab in ex.labels[n_prefix:]), (
+        "a teacher-continuation position was masked"
+    )
+    # Loss labels are the input ids at the same position (no pre-shift).
+    assert ex.labels[n_prefix:] == ex.input_ids[n_prefix:]
+
+    # And the boundary is where the *unmasked* tokenization stops agreeing: the
+    # prefix's own assistant turn is supervised without the mask, masked with it.
+    full = tokenize_sft_example(prefix + continuation, tok)
+    assert full is not None
+    assert any(lab != IGNORE_INDEX for lab in full.labels[:n_prefix])
+    masked_loss = sum(1 for lab in ex.labels if lab != IGNORE_INDEX)
+    full_loss = sum(1 for lab in full.labels if lab != IGNORE_INDEX)
+    assert masked_loss < full_loss
+    # Exactly the continuation carries loss: masking the 2-message student prefix
+    # must remove every one of the prefix assistant turn's supervised tokens, so
+    # what remains equals a fresh tokenization of the continuation's own turn.
+    cont_only = tokenize_sft_example(continuation, tok)
+    assert cont_only is not None
+    assert masked_loss == sum(1 for lab in cont_only.labels if lab != IGNORE_INDEX)
