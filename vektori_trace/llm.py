@@ -46,15 +46,3 @@ def call_json(
     )
     content = resp.choices[0].message.content
     return json.loads(content)
-
-
-def call_text(system: str, user: str, model: str | None = None) -> str:
-    client = _client()
-    resp = client.chat.completions.create(
-        model=model or DEFAULT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    return resp.choices[0].message.content or ""

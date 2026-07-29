@@ -214,8 +214,3 @@ def preset_hints_block(lang: LanguageHint) -> str:
         parts.extend(f"  - {pit}" for pit in pitfalls)
 
     return "\n".join(parts) if parts else "(no language-specific presets available)"
-
-
-def universal_pitfalls() -> tuple[str, ...]:
-    """Exposed for tests / docs that want the raw list."""
-    return _UNIVERSAL_PITFALLS

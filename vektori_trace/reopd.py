@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from .dataset import tokenize_teacher_continuation, turns_to_messages
 from .resume import assistant_tool_steps
 from .schema import Turn
+from .tokenizer_check import DEFAULT_TEACHER
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .intervene import BisectionResult
@@ -55,7 +56,7 @@ class ContainerPoolConfig:
 
 @dataclass
 class TeacherPoolConfig:
-    model: str = "Qwen/Qwen3-Coder-Next-80B"
+    model: str = DEFAULT_TEACHER
     endpoint: str | None = None  # vLLM/SGLang base URL
     require_prompt_logprobs: bool = True
 

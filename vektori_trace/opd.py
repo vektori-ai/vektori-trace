@@ -1,8 +1,9 @@
 """Step H — OPD + RL training branches (PLAN.md).
 
-Configuration:
-  teacher: Qwen3-Coder-Next 80B (prompt_logprobs)
-  student: Qwen3-8B + LoRA
+Configuration (the pair itself lives in `tokenizer_check`, so the pilot and the
+scale-up cannot drift apart here):
+  teacher: DEFAULT_TEACHER, self-hosted for `prompt_logprobs`
+  student: DEFAULT_STUDENT + LoRA
   loss: reverse KL (mode-seeking)
   trainer target: verl distillation_ppo_loss + GRPO
 
@@ -29,7 +30,7 @@ class OPDConfig:
     teacher_model: str = DEFAULT_TEACHER
     student_model: str = DEFAULT_STUDENT
     distillation_loss_coef: float = 1.0
-    reverse_kl: bool = True  # mode-seeking; 8B cannot cover 80B
+    reverse_kl: bool = True  # mode-seeking; the student cannot cover the teacher
     teacher_endpoint: str | None = None
     lora_rank: int = 16
     learning_rate: float = 1e-5

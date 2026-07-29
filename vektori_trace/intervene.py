@@ -33,10 +33,6 @@ class ProbeResult:
     # desync — there was no disagreement — but not a verified prefix either.
     unverified: bool = False
 
-    @property
-    def unanimous(self) -> bool:
-        return not self.disagreed
-
 
 @dataclass
 class BisectionResult:
