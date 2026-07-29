@@ -363,3 +363,65 @@ def test_underscored_agent_names_are_normalised(tmp_path: Path) -> None:
     # Already-correct names must survive untouched.
     assert HarborTraceRunner(agent="terminus-2", jobs_dir=tmp_path).agent == "terminus-2"
     assert HarborTraceRunner(agent="codex", jobs_dir=tmp_path).agent == "codex"
+
+
+# ---------------------------------------------------------------------------
+# Endpoint overrides. `run_trial` has accepted api_base/model_info since the
+# Modal work, but this runner — the one `replay` uses for both arms — built its
+# own harbor command and dropped them. A candidate served on our own vLLM was
+# therefore unreachable from the command that produces the headline gap number.
+# ---------------------------------------------------------------------------
+
+
+def _captured_harbor_cmd(monkeypatch, runner: HarborTraceRunner, task_dir: Path) -> list[str]:
+    seen: list[list[str]] = []
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        seen.append(list(cmd))
+        job_dir = Path(cmd[cmd.index("-o") + 1])
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "result.json").write_text(
+            json.dumps({"verifier_result": {"rewards": {"reward": 1.0}}})
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="out", stderr="err")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        HarborTraceRunner,
+        "_parse_turns",
+        lambda self, *a, **k: [Turn(index=0, role="assistant", content="did a thing")],
+    )
+    runner.run(task_dir)
+    monkeypatch.setattr(subprocess, "run", real_run)
+    return seen[0]
+
+
+def test_api_base_and_model_info_reach_the_harbor_command(tmp_path: Path, monkeypatch) -> None:
+    """Harbor has no top-level --api-base; both travel as --ak key=value, and
+    model_info must arrive as JSON or harbor refuses to start a hosted_vllm run."""
+    task = tmp_path / "t1"
+    task.mkdir()
+    runner = HarborTraceRunner(
+        agent="terminus-2",
+        jobs_dir=tmp_path / "jobs",
+        model="hosted_vllm/qwen3-8b",
+        api_base="https://example.modal.run/v1",
+        model_info={"max_input_tokens": 32768},
+    )
+    cmd = _captured_harbor_cmd(monkeypatch, runner, task)
+
+    assert "--ak" in cmd
+    aks = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--ak"]
+    assert "api_base=https://example.modal.run/v1" in aks
+    assert 'model_info={"max_input_tokens": 32768}' in aks
+
+
+def test_no_ak_args_when_no_endpoint_override(tmp_path: Path, monkeypatch) -> None:
+    """The default path is a public API model; a stray empty --ak is a harbor
+    parse error, not a no-op."""
+    task = tmp_path / "t1"
+    task.mkdir()
+    runner = HarborTraceRunner(agent="claude-code", jobs_dir=tmp_path / "jobs", model="gpt-5")
+    cmd = _captured_harbor_cmd(monkeypatch, runner, task)
+    assert "--ak" not in cmd

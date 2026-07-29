@@ -196,3 +196,78 @@ def test_replay_rejects_identical_frontier_and_candidate_model(tmp_path) -> None
         ]
     )
     assert cmd_replay(args) == 2
+
+
+# ---------------------------------------------------------------------------
+# Endpoint flags. Without these, `passk` and `replay` can only name models a
+# public provider already hosts — which excludes the served candidate the whole
+# measurement exists to characterise.
+# ---------------------------------------------------------------------------
+
+
+def test_model_info_accepts_inline_json() -> None:
+    from vektori_trace.cli import _model_info_arg
+
+    assert _model_info_arg('{"max_input_tokens": 32768}') == {"max_input_tokens": 32768}
+
+
+def test_model_info_accepts_a_file(tmp_path) -> None:
+    from vektori_trace.cli import _model_info_arg
+
+    path = tmp_path / "info.json"
+    path.write_text(json.dumps({"input_cost_per_token": 0.0}))
+    assert _model_info_arg(f"@{path}") == {"input_cost_per_token": 0.0}
+
+
+@pytest.mark.parametrize("value", ["{not json}", "[1, 2]", '"a string"', "7"])
+def test_model_info_rejects_non_objects(value: str) -> None:
+    """A JSON array parses fine and then arrives at harbor as a model_info it
+    cannot index — a failure that surfaces only after a container has started."""
+    from vektori_trace.cli import _model_info_arg
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        _model_info_arg(value)
+
+
+def test_passk_endpoint_flags_parse() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "passk",
+            "--tasks-dir", "t",
+            "--agent", "terminus-2",
+            "--model", "hosted_vllm/qwen3-8b",
+            "--api-base", "https://example.modal.run/v1",
+            "--model-info", '{"max_input_tokens": 32768}',
+            "--max-workers", "8",
+        ]
+    )
+    assert args.api_base == "https://example.modal.run/v1"
+    assert args.model_info == {"max_input_tokens": 32768}
+    assert args.max_workers == 8
+
+
+def test_passk_endpoint_flags_default_to_none() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["passk", "--tasks-dir", "t", "--agent", "a", "--model", "m"])
+    assert args.api_base is None
+    assert args.model_info is None
+    assert args.max_workers == 1
+
+
+def test_replay_endpoint_flags_are_candidate_only() -> None:
+    """The frontier arm is the ceiling being measured against. If it could be
+    pointed at our own server, the number it produces would no longer be a
+    frontier number — so there is deliberately no --frontier-api-base."""
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "replay",
+            "--tasks-dir", "t",
+            "--frontier-model", "gpt-5",
+            "--candidate-model", "hosted_vllm/qwen3-8b",
+            "--candidate-api-base", "https://example.modal.run/v1",
+        ]
+    )
+    assert args.candidate_api_base == "https://example.modal.run/v1"
+    assert not hasattr(args, "frontier_api_base")
