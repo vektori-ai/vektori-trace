@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import LabelPreservingCollator, TokenizedExample, build_sft_dataset
-from .modal_env import VOLUME_MOUNT, VOLUME_NAME, volume_adapter_dir
+from .modal_env import (
+    HF_CACHE_MOUNT,
+    HF_CACHE_VOLUME_NAME,
+    VOLUME_MOUNT,
+    VOLUME_NAME,
+    volume_adapter_dir,
+)
 
 
 def _require_train():
@@ -235,16 +241,22 @@ def train_lora_modal(
 
     app = modal.App("vektori-trace-train")
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+    hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
     image = (
         modal.Image.debian_slim(python_version="3.12")
         .pip_install("torch", "transformers", "peft", "accelerate", "datasets")
+        .env({"HF_HOME": HF_CACHE_MOUNT})
         .add_local_python_source("vektori_trace")
     )
 
     @app.function(
         gpu=config.modal_gpu,
         image=image,
-        volumes={VOLUME_MOUNT: vol},
+        # Same HF cache Volume `serve.py` mounts, so the base weights are
+        # downloaded once for the whole project rather than once per arm.
+        # Training runs one arm after another; without this each arm pays to
+        # fetch the same base model on a GPU billed by the second.
+        volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
         timeout=4 * 60 * 60,
     )
     def _remote(payload: list[dict], cfg: dict) -> dict:

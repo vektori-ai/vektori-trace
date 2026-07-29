@@ -16,7 +16,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .modal_env import VOLUME_MOUNT, VOLUME_NAME
+from .modal_env import (
+    HF_CACHE_MOUNT,
+    HF_CACHE_VOLUME_NAME,
+    SCALEDOWN_WINDOW_SECONDS,
+    VOLUME_MOUNT,
+    VOLUME_NAME,
+)
 
 # Default model_info harbor requires for hosted_vllm (token limits + costs).
 DEFAULT_HOSTED_VLLM_MODEL_INFO: dict[str, Any] = {
@@ -103,11 +109,12 @@ def serve_model(
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+    hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
     image = (
         modal.Image.debian_slim(python_version="3.12")
         .pip_install("vllm", "huggingface_hub")
-        .env({"HF_HOME": "/root/.cache/huggingface"})
+        .env({"HF_HOME": HF_CACHE_MOUNT})
     )
 
     app = modal.App(_SERVE_APP_NAME)
@@ -115,7 +122,11 @@ def serve_model(
     @app.cls(
         gpu=gpu,
         image=image,
-        volumes={VOLUME_MOUNT: vol},
+        # HF_HOME is backed by a Volume so weights survive scale-to-zero. The
+        # env var alone only relocated the cache inside an ephemeral container,
+        # so every cold start paid to download the model again.
+        volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+        scaledown_window=SCALEDOWN_WINDOW_SECONDS,
         timeout=60 * 60,
     )
     class VllmServer:

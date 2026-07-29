@@ -121,15 +121,38 @@ colocated with training via vLLM sleep/wake.
 
 | Phase | GPUs | Running |
 |---|---|---|
-| 0 — measurement | 1× L40S or A100-40G | student serving only; the frontier arm is an API call |
+| 0 — measurement | 1× L40S **+ 1×H100** | student *and* teacher serving; the frontier arm is an API call |
 | 0.5 — token capture | none | a serving flag and plumbing |
 | 1 — OPD smoke | 1×H100 + 1×A100 | teacher scoring + student LoRA, one task |
 | 2 — OPD real | same, longer | + student rollout serving |
 | 3 — RL branch | 4–8×H100 (verl) | only if routing populates the RL bucket |
 
-Serverless H100 runs roughly $2–5/GPU-hr depending on provider. **Confirm
-current Modal pricing before committing** — this is the one number here nobody
-has checked.
+Phase 0 needs the **teacher** GPU too, not just the student: `route` consumes a
+teacher `pass@k` report, and the teacher is self-hosted. An earlier draft of
+this table said "student serving only", which was wrong.
+
+Modal, per-second billing, no idle charge (checked 2026-07-29):
+
+| GPU | $/hr | role |
+|---|---|---|
+| H100 80GB | $3.95 | teacher, fp8 |
+| A100 80GB | $2.50 | student LoRA training |
+| L40S 48GB | $1.95 | student serving |
+| A100 40GB | $2.10 | — |
+| A10 24GB | $1.10 | too tight for 8B + KV cache |
+
+Volumes are $0.09/GiB/month with 1 TiB free, so the weights cache and the
+adapter volume are effectively free. Phase 0 lands around **$80–200** including
+the frontier API arm, which matches the ~$200 gate `PLAN.md` pre-registered.
+Phase 2 runs H100 + A100 ≈ **$6.45/hr**.
+
+**Where Modal stops being the right answer.** Break-even against dedicated
+hourly rental is roughly 30% GPU utilisation. Phase 0 is far below it — the GPU
+idles while Docker containers run test suites, which is exactly what
+scale-to-zero is for. Sustained training is above it: RunPod on-demand H100 is
+around half Modal's rate. So Phases 0–1 stay here, and Phase 2 is worth
+repricing if training hours climb past ~50. Keep *serving* on Modal regardless,
+so the `serve.py` → harbor path stays intact and only the training job moves.
 
 
 The order, and what kills it
