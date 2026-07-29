@@ -32,7 +32,12 @@ from vektori_trace.mining import (
 from vektori_trace.mining.atif import TrajectoryParseError, parse_job_trajectory
 from vektori_trace.mining.result import PipelineResult
 from vektori_trace.schema import Turn
-from vektori_trace.validity import UNJUDGEABLE_STATUSES, _find_parse_status, _find_reward
+from vektori_trace.validity import (
+    UNJUDGEABLE_STATUSES,
+    _ak_args,
+    _find_parse_status,
+    _find_reward,
+)
 
 
 def discover_tasks(tasks_dir: Path) -> list[Path]:
@@ -263,7 +268,15 @@ class HarborTraceRunner:
     """
 
     def __init__(
-        self, agent: str, jobs_dir: Path, model: str | None = None, timeout_sec: int = 1800
+        self,
+        agent: str,
+        jobs_dir: Path,
+        model: str | None = None,
+        timeout_sec: int = 1800,
+        *,
+        api_base: str | None = None,
+        model_info: dict | None = None,
+        agent_kwargs: dict | None = None,
     ):
         # Harbor's AgentName values are hyphenated (`claude-code`, `terminus-2`,
         # `mini-swe-agent`). An underscore is rejected outright — the run dies
@@ -276,6 +289,13 @@ class HarborTraceRunner:
         self.jobs_dir = jobs_dir
         self.model = model
         self.timeout_sec = timeout_sec
+        # Same escape hatch `run_trial` uses: a self-hosted OpenAI-compatible
+        # endpoint reaches the agent through `--ak`, not a harbor top-level flag.
+        # Without it the replay arms can only name models some provider already
+        # hosts, which excludes the served candidate this repo exists to measure.
+        self.api_base = api_base
+        self.model_info = model_info
+        self.agent_kwargs = agent_kwargs
 
     def _parse_turns(self, job_dir: Path) -> list[Turn]:
         try:
@@ -305,6 +325,11 @@ class HarborTraceRunner:
         ]
         if self.model:
             cmd += ["--model", self.model]
+        cmd += _ak_args(
+            api_base=self.api_base,
+            model_info=self.model_info,
+            agent_kwargs=self.agent_kwargs,
+        )
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_sec)
