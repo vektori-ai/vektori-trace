@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 from .diagnose import (
     DEFAULT_MIN_GAP,
@@ -839,6 +841,615 @@ def cmd_run_arms(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_tokenizers(args: argparse.Namespace) -> int:
+    from .tokenizer_check import (
+        DEFAULT_STUDENT,
+        DEFAULT_TEACHER,
+        TokenizerMismatchError,
+        check_tokenizers,
+    )
+
+    teacher = args.teacher or DEFAULT_TEACHER
+    student = args.student or DEFAULT_STUDENT
+    try:
+        t_fp, s_fp = check_tokenizers(teacher, student)
+    except TokenizerMismatchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "teacher": {
+                    "name": t_fp.name,
+                    "vocab_size": t_fp.vocab_size,
+                    "merges_sha256": t_fp.merges_sha256,
+                    "vocab_sha256": t_fp.vocab_sha256,
+                },
+                "student": {
+                    "name": s_fp.name,
+                    "vocab_size": s_fp.vocab_size,
+                    "merges_sha256": s_fp.merges_sha256,
+                    "vocab_sha256": s_fp.vocab_sha256,
+                },
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_passk(args: argparse.Namespace) -> int:
+    from .passk import two_stage_sweep
+
+    tasks_dir = Path(args.tasks_dir)
+    task_dirs = sorted(
+        p for p in tasks_dir.iterdir() if p.is_dir() and (p / "task.toml").exists()
+    )
+    if not task_dirs:
+        print(f"error: no tasks in {tasks_dir}", file=sys.stderr)
+        return 2
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # PLAN.md aggregates by (capability, model). Without the diagnosis join the
+    # sweep can only report per task, which is the observation unit, not the
+    # reporting unit — so say so rather than printing a bare per-task dump.
+    task_to_capability: dict[str, str] | None = None
+    if args.diagnosis and args.manifest:
+        from .routing import task_capability_map
+
+        diagnosis = json.loads(Path(args.diagnosis).read_text())
+        run_to_task = {
+            t.run_id: t.task for t in _load_traces(Path(args.manifest)) if t.task
+        }
+        caps = task_capability_map(diagnosis, run_to_task)
+        # One capability per task for aggregation; a task lacking several is
+        # aggregated under its top-ranked one (the report keeps the full map).
+        task_to_capability = {t: c[0] for t, c in caps.items() if c}
+    elif args.diagnosis or args.manifest:
+        print(
+            "error: --diagnosis and --manifest must be given together",
+            file=sys.stderr,
+        )
+        return 2
+
+    report = two_stage_sweep(
+        task_dirs,
+        agent=args.agent,
+        model=args.model,
+        jobs_dir=out / "passk_jobs",
+        stage1_n=args.stage1_n,
+        stage2_n=args.stage2_n,
+        task_to_capability=task_to_capability,
+    )
+    path = out / "passk.json"
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"passk report: {path}")
+    print(
+        f"escalated: {len(report['escalated'])}  "
+        f"luck_quarantine: {len(report['luck_quarantine'])}"
+    )
+    support_counts: dict[str, int] = {}
+    for cls in report["support"].values():
+        support_counts[cls] = support_counts.get(cls, 0) + 1
+    print("support: " + json.dumps(support_counts))
+    if report["no_gradeable_rollouts"]:
+        print(
+            f"warning: {len(report['no_gradeable_rollouts'])} task(s) produced no "
+            "gradeable rollout (all infra failures)",
+            file=sys.stderr,
+        )
+    if task_to_capability is None:
+        print(
+            "note: no --diagnosis/--manifest, so no (capability, model) aggregation "
+            "— per-task curves only",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_import_gym(args: argparse.Namespace) -> int:
+    from .gym_import import import_gym
+
+    result = import_gym(Path(args.source), Path(args.out), limit=args.limit)
+    print(f"imported {len(result.tasks)} tasks → {args.out}")
+    if result.skipped:
+        print(f"skipped {len(result.skipped)} record(s) with no runnable oracle:")
+        for iid, reason in sorted(result.skipped.items())[:10]:
+            print(f"  {iid}: {reason}")
+        if len(result.skipped) > 10:
+            print(f"  ... and {len(result.skipped) - 10} more")
+    if not result.tasks:
+        print(
+            "error: nothing importable — every record lacked an image, F2P set, "
+            "base_commit or test_patch",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    from .routing import (
+        ROUTING_RULES,
+        CurveSummary,
+        decision_to_dict,
+        per_cell_counts,
+        route_cell,
+    )
+
+    student = json.loads(Path(args.student_passk).read_text())
+    teacher = json.loads(Path(args.teacher_passk).read_text())
+
+    def _curve(block: dict, task: str) -> CurveSummary:
+        # Prefer stage2 if present for this task, else stage1.
+        row = (block.get("stage2") or {}).get(task) or (block.get("stage1") or {}).get(task)
+        if not row:
+            return CurveSummary(pass1=None, pass32=None)
+        curves = row.get("curves") or {}
+        # n32/c32 are the *actual* stage-2 stratum, which is `--stage2-n` and not
+        # necessarily 32. routing.py compares them as a rate against 1/32, so the
+        # pre-registered rule holds whatever sample size the sweep took.
+        return CurveSummary(
+            pass1=curves.get("1"),
+            pass32=curves.get("32"),
+            n32=int(row["n"]) if row.get("stratum") == "stage2" else 0,
+            c32=int(row["c"]) if row.get("stratum") == "stage2" else 0,
+            luck_quarantine=bool(row.get("luck_quarantine")),
+        )
+
+    tasks = sorted(
+        set(student.get("stage1") or {})
+        | set(student.get("stage2") or {})
+        | set(teacher.get("stage1") or {})
+        | set(teacher.get("stage2") or {})
+    )
+
+    # Cells are (task × capability). The capabilities come from the diagnosis
+    # report joined to the replay manifest — one blanket label across every task
+    # would make the per-capability counts meaningless.
+    if args.diagnosis:
+        from .routing import task_capability_map
+
+        if not args.manifest:
+            print(
+                "error: --diagnosis needs --manifest to map lacking-loss run ids "
+                "back to tasks",
+                file=sys.stderr,
+            )
+            return 2
+        diagnosis = json.loads(Path(args.diagnosis).read_text())
+        run_to_task = {
+            t.run_id: t.task for t in _load_traces(Path(args.manifest)) if t.task
+        }
+        caps_by_task = task_capability_map(
+            diagnosis, run_to_task, only_chosen=args.chosen_deficit_only
+        )
+        unlabelled = [t for t in tasks if not caps_by_task.get(t)]
+        if unlabelled:
+            print(
+                f"  {len(unlabelled)} task(s) carry no LACKING capability in "
+                f"{args.diagnosis}; excluded from routing",
+                file=sys.stderr,
+            )
+    else:
+        caps_by_task = {t: [args.capability] for t in tasks}
+
+    decisions = [
+        route_cell(t, cap, _curve(student, t), _curve(teacher, t))
+        for t in tasks
+        for cap in caps_by_task.get(t, [])
+    ]
+    if not decisions:
+        print("error: no (task × capability) cells to route", file=sys.stderr)
+        return 1
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    report = {
+        "thresholds": decisions[0].thresholds if decisions else {},
+        "rules": ROUTING_RULES,
+        "counts": per_cell_counts(decisions),
+        "decisions": [decision_to_dict(d) for d in decisions],
+    }
+    path = out / "routing.json"
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"routing report: {path}")
+    print(json.dumps(report["counts"], indent=2))
+    return 0
+
+
+def _reload_routing_decisions(raw: dict) -> list:
+    """Rebuild `RoutingDecision`s from a routing.json, provenance intact."""
+    from .routing import CurveSummary, RoutingDecision
+
+    decisions = []
+    for d in raw.get("decisions") or []:
+        decisions.append(
+            RoutingDecision(
+                task=d["task"],
+                capability=d["capability"],
+                route=d["route"],
+                student=CurveSummary(**d["student"]),
+                teacher=CurveSummary(**d["teacher"]),
+                thresholds=d.get("thresholds") or {},
+                quarantine_cause=d.get("quarantine_cause"),
+                evidence=d.get("evidence") or "",
+                held_for_luck=bool(d.get("held_for_luck")),
+                # Carry the rule through: without it every reloaded cell reads as
+                # pre-registered, and the mid-band extension becomes invisible to
+                # exactly the filtering it was tagged for.
+                rule=d.get("rule") or "",
+            )
+        )
+    return decisions
+
+
+def _sandbox_for_task(task_dir: Path, platform: str = "linux/amd64"):
+    """Start a fresh container for one task's environment image.
+
+    Step A replays into a *fresh* container per prefix — reusing one would let an
+    earlier probe's writes leak into the next, which is the desync the assertion
+    is supposed to detect.
+    """
+    import tempfile
+
+    from .mining.bootstrap.docker import DockerSandbox
+
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        raise FileNotFoundError(f"no environment/Dockerfile in {task_dir}")
+    image = ""
+    for line in dockerfile.read_text().splitlines():
+        if line.strip().upper().startswith("FROM "):
+            image = line.split(None, 1)[1].strip()
+            break
+    if not image:
+        raise ValueError(f"no FROM line in {dockerfile}")
+    marker = Path(tempfile.mkdtemp(prefix="r2e-resume-"))
+    (marker / ".keep").write_text("")
+    return DockerSandbox.start(base_image=image, repo_dir=marker, platform=platform)
+
+
+def cmd_resume_check(args: argparse.Namespace) -> int:
+    """Step A — replay trajectory prefixes into fresh containers, report desync.
+
+    PLAN.md calls this the spike that gates the design: "High desync makes ReOPD
+    mandatory rather than merely preferable — that must be known in week 1."
+    """
+    from .resume import assistant_tool_steps, measure_desync_rate, replay_prefix
+
+    traces = _load_traces(Path(args.manifest))
+    if args.model:
+        traces = [t for t in traces if t.model == args.model]
+    traces = [t for t in traces if t.task]
+    if not traces:
+        print("error: no traces with a task id in the manifest", file=sys.stderr)
+        return 2
+    if args.limit:
+        traces = traces[: args.limit]
+
+    tasks_dir = Path(args.tasks_dir)
+    results = []
+    per_trace: list[dict[str, Any]] = []
+    for trace in traces:
+        task_dir = tasks_dir / str(trace.task)
+        if not task_dir.is_dir():
+            print(f"  skip {trace.run_id}: no task dir {task_dir}", file=sys.stderr)
+            continue
+        n_steps = len(assistant_tool_steps(trace.turns))
+        if n_steps == 0:
+            continue
+        # Probe prefixes across the trajectory rather than only the full one:
+        # desync is a function of how far in you replay.
+        fractions = [f for f in (0.25, 0.5, 1.0) if int(n_steps * f) > 0]
+        for frac in fractions:
+            T = int(n_steps * frac) - 1
+            sandbox = None
+            try:
+                sandbox = _sandbox_for_task(task_dir, platform=args.platform)
+                res = replay_prefix(trace.turns, T, sandbox, hard_fail=False)
+            except Exception as e:
+                print(f"  {trace.run_id} T={T}: infra failure: {e}", file=sys.stderr)
+                continue
+            finally:
+                if sandbox is not None:
+                    with contextlib.suppress(Exception):
+                        sandbox.cleanup()
+            results.append(res)
+            per_trace.append(
+                {
+                    "run_id": trace.run_id,
+                    "task": trace.task,
+                    "T": T,
+                    "steps": n_steps,
+                    "verified": res.verified,
+                    "consistent": res.consistent,
+                    "checks_run": res.checks_run,
+                    "unsupported_skipped": res.unsupported_skipped,
+                    "readonly_skipped": res.readonly_skipped,
+                    "desync_reason": res.desync_reason,
+                }
+            )
+
+    if not results:
+        print("error: no prefix was replayed", file=sys.stderr)
+        return 1
+    stats = measure_desync_rate(results)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "resume-check.json"
+    path.write_text(json.dumps({"stats": stats, "replays": per_trace}, indent=2) + "\n")
+    print(f"resume check: {path}")
+    print(json.dumps(stats, indent=2))
+    if stats["verified"] == 0:
+        print(
+            "warning: nothing was verifiable — the desync rate is undefined, not 0",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_bisect(args: argparse.Namespace) -> int:
+    """Step D — verifier-guided bisection to the forking step."""
+    import shlex
+    import subprocess
+
+    from .intervene import bisect_forking_step, make_resume_fn
+
+    # The teacher must continue *from the replayed prefix*. `validity.run_trial`
+    # starts its own fresh container and cannot be handed one, so using it here
+    # would run the teacher from scratch and ignore T entirely — every probe
+    # would return the same answer and the located "forking step" would be an
+    # artifact of the search, not of the trajectory. Until a scaffold that
+    # accepts a seeded container exists, the continuation backend is supplied by
+    # the caller: a command receiving the task dir and a JSON prefix, exiting 0
+    # when the mined verifier passes.
+    if not args.continuation_cmd:
+        print(
+            "error: --continuation-cmd is required. Bisection needs a teacher "
+            "continuation that starts from the replayed prefix at step T; there "
+            "is no harbor entrypoint for that yet, so the backend is external. "
+            "The command receives {task_dir} and {prefix_json} and must exit 0 "
+            "iff the verifier passes.",
+            file=sys.stderr,
+        )
+        return 2
+
+    traces = _load_traces(Path(args.manifest))
+    traces = [t for t in traces if t.task and t.outcome == "loss"]
+    if args.model:
+        traces = [t for t in traces if t.model == args.model]
+    if not traces:
+        print("error: no failed traces with task ids in the manifest", file=sys.stderr)
+        return 2
+    if args.limit:
+        traces = traces[: args.limit]
+
+    tasks_dir = Path(args.tasks_dir)
+    jobs = Path(args.out) / "bisect_jobs"
+    rows: list[dict[str, Any]] = []
+    for trace in traces:
+        task_dir = tasks_dir / str(trace.task)
+        if not task_dir.is_dir():
+            continue
+
+        def continue_with_teacher(turns, T, _task_dir=task_dir, _trace=trace):
+            from .resume import assistant_tool_steps
+
+            jobs.mkdir(parents=True, exist_ok=True)
+            prefix_path = jobs / f"{_trace.run_id}-T{T}.json"
+            prefix_path.write_text(
+                json.dumps(
+                    {
+                        "task": str(_trace.task),
+                        "run_id": _trace.run_id,
+                        "T": T,
+                        "n_action_steps": len(assistant_tool_steps(turns)),
+                        "teacher_model": args.teacher_model,
+                        "prefix_turns": [
+                            {
+                                "index": t.index,
+                                "role": t.role,
+                                "content": t.content,
+                                "tool_calls": [
+                                    {"id": tc.id, "name": tc.name, "args": tc.args}
+                                    for tc in t.tool_calls
+                                ],
+                            }
+                            for t in turns
+                        ][: T + 1 if T >= 0 else 0],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            cmd = args.continuation_cmd.format(
+                task_dir=shlex.quote(str(_task_dir)),
+                prefix_json=shlex.quote(str(prefix_path)),
+            )
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return proc.returncode == 0
+
+        resume_fn = None
+        sandbox = None
+        if args.replay_prefix:
+            try:
+                sandbox = _sandbox_for_task(task_dir, platform=args.platform)
+                resume_fn = make_resume_fn(sandbox, hard_fail=True)
+            except Exception as e:
+                print(f"  {trace.run_id}: sandbox unavailable: {e}", file=sys.stderr)
+        try:
+            result = bisect_forking_step(
+                trace.turns,
+                resume=resume_fn,
+                continue_with_teacher=continue_with_teacher,
+                samples_per_probe=args.samples_per_probe,
+                verify_probes=args.verify_probes,
+            )
+        finally:
+            if sandbox is not None:
+                with contextlib.suppress(Exception):
+                    sandbox.cleanup()
+        rows.append(
+            {
+                "run_id": trace.run_id,
+                "task": trace.task,
+                "steps": result.steps,
+                "forking_step": result.forking_step,
+                "largest_recoverable_T": result.largest_recoverable_T,
+                "monotone": result.monotone,
+                "non_monotone_fraction": result.non_monotone_fraction,
+                "sample_disagreements": result.sample_disagreements,
+                "teacher_continuations": result.teacher_continuations,
+                "budget_ok": result.budget_ok,
+                "continuation_budget_ok": result.continuation_budget_ok,
+                "dropped": result.dropped,
+                "drop_reason": result.drop_reason,
+                "resume_unverified": result.resume_unverified,
+            }
+        )
+
+    if not rows:
+        print("error: no trajectory was bisected", file=sys.stderr)
+        return 1
+    located = [r for r in rows if r["forking_step"] is not None and not r["dropped"]]
+    summary = {
+        "n": len(rows),
+        "located": len(located),
+        "dropped": sum(1 for r in rows if r["dropped"]),
+        "non_monotone": sum(1 for r in rows if not r["monotone"]),
+        "resume_unverified": sum(1 for r in rows if r["resume_unverified"]),
+        "total_teacher_continuations": sum(r["teacher_continuations"] for r in rows),
+    }
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "bisection.json"
+    path.write_text(json.dumps({"summary": summary, "trajectories": rows}, indent=2) + "\n")
+    print(f"bisection report: {path}")
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_ground(args: argparse.Namespace) -> int:
+    """Step E — compare diagnose labels against execution-located forking steps."""
+    from .grounding import GroundingPair, ground_diagnosis, report_to_dict
+
+    bisection = json.loads(Path(args.bisection).read_text())
+    diagnosis = json.loads(Path(args.diagnosis).read_text())
+    judgments: dict[str, bool] = {}
+    if args.judgments:
+        judgments = {
+            k: bool(v) for k, v in json.loads(Path(args.judgments).read_text()).items()
+        }
+
+    gap_by_cap = {}
+    for score in diagnosis.get("all_deficits_ranked") or []:
+        cap = (score.get("capability") or {}).get("id")
+        if cap:
+            gap_by_cap[cap] = score.get("gap")
+    run_to_cap: dict[str, str] = {}
+    for score in diagnosis.get("all_deficits_ranked") or []:
+        cap = (score.get("capability") or {}).get("id")
+        for rid in score.get("lacking_loss_run_ids") or []:
+            run_to_cap.setdefault(rid, cap)
+
+    pairs = []
+    for row in bisection.get("trajectories") or []:
+        if row.get("dropped") or row.get("forking_step") is None:
+            continue
+        rid = row["run_id"]
+        cap = run_to_cap.get(rid)
+        if cap is None:
+            continue
+        pairs.append(
+            GroundingPair(
+                task=str(row.get("task")),
+                capability=cap,
+                forking_step=row["forking_step"],
+                label_agrees=judgments.get(rid),
+                diagnose_gap=gap_by_cap.get(cap),
+            )
+        )
+    if not pairs:
+        print(
+            "error: no (forking step, capability) pair — is this the diagnosis "
+            "and bisection from the same replay run?",
+            file=sys.stderr,
+        )
+        return 1
+
+    report = ground_diagnosis(pairs, current_min_gap=args.min_gap)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "grounding.json"
+    path.write_text(json.dumps(report_to_dict(report), indent=2) + "\n")
+    print(f"grounding report: {path}")
+    print(
+        f"pairs={report.n} agreement={report.agreement_rate} "
+        f"blur={report.blur:.3f} suggested_min_gap={report.suggested_min_gap}"
+    )
+    if report.agreement_rate is None:
+        print(
+            "note: no human judgments supplied (--judgments), so agreement is "
+            "unmeasured. PLAN.md acceptance criterion 4 needs 10 hand-inspected "
+            "forking steps; the ids to inspect are in the report.",
+            file=sys.stderr,
+        )
+    elif report.underpowered:
+        print("warning: fewer than 10 judged pairs — underpowered", file=sys.stderr)
+    return 0
+
+
+def cmd_plan_b_arms(args: argparse.Namespace) -> int:
+    from .arms import plan_b_arms
+
+    decisions = _reload_routing_decisions(json.loads(Path(args.routing).read_text()))
+    holdout = None
+    if args.holdout:
+        holdout = [
+            line.strip()
+            for line in Path(args.holdout).read_text().splitlines()
+            if line.strip()
+        ]
+    if args.resolvable_effect_size is None:
+        print(
+            "warning: no --resolvable-effect-size recorded. PLAN.md requires the "
+            "smallest resolvable effect to be stated before training; without it "
+            "B1-vs-B2 cannot be interpreted afterwards.",
+            file=sys.stderr,
+        )
+    plans = plan_b_arms(
+        decisions,
+        holdout=holdout,
+        resolvable_effect_size=args.resolvable_effect_size,
+        pilot=args.pilot,
+        seed=args.seed,
+        exclude_not_preregistered=args.preregistered_only,
+    )
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    payload = {
+        arm: {
+            "arm": p.arm,
+            "description": p.description,
+            # Keyed by "<task>::<capability>" — the routing unit is the cell, not
+            # the task, so the mix B2 has to hold identical is counted per cell.
+            "assignments": p.assignments,
+            "task_ids": p.task_ids,
+            "cells": [list(c) for c in p.cells],
+            "n_cells": len(p.cells),
+            "method_mix": p.method_mix,
+            "resolvable_effect_size": p.resolvable_effect_size,
+        }
+        for arm, p in plans.items()
+    }
+    path = out / "b_arms_plan.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"B-arm plan: {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI surface, separated from running it so argument parsing —
     notably the threshold validators — is testable without dispatching."""
@@ -1165,6 +1776,151 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the IFEval non-regression pass (still records the pre-declared tolerance)",
     )
     p_arms.set_defaults(func=cmd_run_arms)
+
+    # --- PLAN.md capability-routing commands ---
+    p_tok = sub.add_parser(
+        "check-tokenizers",
+        help="Step 0: verify teacher/student share a tokenizer (hard-fail on mismatch)",
+    )
+    p_tok.add_argument("--teacher", default=None, help="defaults to Qwen3-Coder-Next-80B")
+    p_tok.add_argument("--student", default=None, help="defaults to Qwen3-8B")
+    p_tok.set_defaults(func=cmd_check_tokenizers)
+
+    p_passk = sub.add_parser(
+        "passk",
+        help="Step C: two-stage pass@k sweep (n=8, escalate zeros to n=32); never pools strata",
+    )
+    p_passk.add_argument("--tasks-dir", required=True)
+    p_passk.add_argument("--agent", required=True)
+    p_passk.add_argument("--model", required=True)
+    p_passk.add_argument("--out", default="./vektori-out")
+    p_passk.add_argument("--stage1-n", type=_positive_int_arg, default=8)
+    p_passk.add_argument("--stage2-n", type=_positive_int_arg, default=32)
+    p_passk.add_argument(
+        "--diagnosis",
+        default=None,
+        help="report.json from `diagnose`; with --manifest, aggregates by (capability, model)",
+    )
+    p_passk.add_argument(
+        "--manifest", default=None, help="replay manifest.json (run_id → task)"
+    )
+    p_passk.set_defaults(func=cmd_passk)
+
+    p_gym = sub.add_parser(
+        "import-gym",
+        help="Step B: import R2E-Gym/SWE-smith JSONL into harbor task dirs",
+    )
+    p_gym.add_argument("--source", required=True, help="JSONL of gym instances")
+    p_gym.add_argument("--out", required=True, help="output tasks directory")
+    p_gym.add_argument("--limit", type=int, default=None)
+    p_gym.set_defaults(func=cmd_import_gym)
+
+    p_route = sub.add_parser(
+        "route",
+        help="Step F: apply routing rule to a passk JSON report → RL|OPD|QUARANTINE|NONE",
+    )
+    p_route.add_argument("--student-passk", required=True, help="passk JSON for the student")
+    p_route.add_argument("--teacher-passk", required=True, help="passk JSON for the teacher")
+    p_route.add_argument(
+        "--diagnosis",
+        default=None,
+        help="report.json from `diagnose` — cells become (task × LACKING capability)",
+    )
+    p_route.add_argument(
+        "--manifest",
+        default=None,
+        help="replay manifest.json, required with --diagnosis (run_id → task)",
+    )
+    p_route.add_argument(
+        "--chosen-deficit-only",
+        action="store_true",
+        help="route only the chosen deficit instead of every ranked capability",
+    )
+    p_route.add_argument(
+        "--capability",
+        default="default",
+        help="single label for every task; ignored when --diagnosis is given",
+    )
+    p_route.add_argument("--out", default="./vektori-out")
+    p_route.set_defaults(func=cmd_route)
+
+    p_bplan = sub.add_parser(
+        "plan-b-arms",
+        help="Step I: build B1–B4 assignment plans from routing.json (pilot caps at 10)",
+    )
+    p_bplan.add_argument("--routing", required=True, help="routing.json from `route`")
+    p_bplan.add_argument("--out", default="./vektori-out")
+    p_bplan.add_argument("--resolvable-effect-size", type=float, default=None)
+    p_bplan.add_argument("--pilot", action="store_true")
+    p_bplan.add_argument("--seed", type=int, default=0)
+    p_bplan.add_argument(
+        "--holdout",
+        default=None,
+        help="file of held-out task ids, one per line — removed from every training arm",
+    )
+    p_bplan.add_argument(
+        "--preregistered-only",
+        action="store_true",
+        help="drop cells decided by a rule outside the pre-registration (mid band)",
+    )
+    p_bplan.set_defaults(func=cmd_plan_b_arms)
+
+    p_resume = sub.add_parser(
+        "resume-check",
+        help="Step A: replay trajectory prefixes into fresh containers; report desync rate",
+    )
+    p_resume.add_argument("--manifest", required=True, help="replay manifest.json")
+    p_resume.add_argument("--tasks-dir", required=True)
+    p_resume.add_argument("--model", default=None, help="only replay this model's traces")
+    p_resume.add_argument("--limit", type=int, default=None)
+    p_resume.add_argument("--platform", default="linux/amd64")
+    p_resume.add_argument("--out", default="./vektori-out")
+    p_resume.set_defaults(func=cmd_resume_check)
+
+    p_bisect = sub.add_parser(
+        "bisect",
+        help="Step D: verifier-guided bisection to the forking step of failed trajectories",
+    )
+    p_bisect.add_argument("--manifest", required=True)
+    p_bisect.add_argument("--tasks-dir", required=True)
+    p_bisect.add_argument("--model", default=None, help="only bisect this model's losses")
+    p_bisect.add_argument("--teacher-model", default=None)
+    p_bisect.add_argument(
+        "--continuation-cmd",
+        default=None,
+        help=(
+            "REQUIRED. Shell command run per probe, with {task_dir} and "
+            "{prefix_json} substituted; exit 0 iff the verifier passes. The "
+            "teacher must continue from the replayed prefix, and no harbor "
+            "entrypoint accepts a seeded container yet."
+        ),
+    )
+    p_bisect.add_argument(
+        "--replay-prefix",
+        action="store_true",
+        help="also replay the prefix into a container and assert consistency (Step A)",
+    )
+    p_bisect.add_argument("--samples-per-probe", type=_positive_int_arg, default=2)
+    p_bisect.add_argument("--verify-probes", type=int, default=2)
+    p_bisect.add_argument("--platform", default="linux/amd64")
+    p_bisect.add_argument("--limit", type=int, default=None)
+    p_bisect.add_argument("--out", default="./vektori-out")
+    p_bisect.set_defaults(func=cmd_bisect)
+
+    p_ground = sub.add_parser(
+        "ground",
+        help="Step E: compare diagnose labels against execution-located forking steps",
+    )
+    p_ground.add_argument("--bisection", required=True, help="bisection.json from `bisect`")
+    p_ground.add_argument("--diagnosis", required=True, help="report.json from `diagnose`")
+    p_ground.add_argument(
+        "--judgments",
+        default=None,
+        help='JSON {run_id: true|false} of hand-inspected agreement (AC #4)',
+    )
+    p_ground.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
+    p_ground.add_argument("--out", default="./vektori-out")
+    p_ground.set_defaults(func=cmd_ground)
 
     return parser
 

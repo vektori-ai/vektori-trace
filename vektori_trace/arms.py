@@ -15,12 +15,12 @@ from __future__ import annotations
 import json
 import random
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .dataset import tokenize_sft_example
-from .diagnose import _exact_mcnemar_p
+from .diagnose import MIN_DISCORDANT_PAIRS, _exact_mcnemar_p
 from .nonregression import (
     IFEVAL_TOLERANCE,
     NonRegressionResult,
@@ -29,6 +29,7 @@ from .nonregression import (
 )
 from .passrate import DEFAULT_ROLLOUTS, PassRate, measure_pass_rates
 from .rollout import CollectedRollout, collect_rollouts
+from .routing import Route, RoutingDecision
 from .serve import (
     ServedModel,
     dump_serve_record,
@@ -620,15 +621,279 @@ def write_arms_report(
     return report
 
 
+# --- B1–B4 (PLAN.md Stage 7) -------------------------------------------------
+# B1 routed: RL on in-support, OPD on out-of-support
+# B2 anti-routed: identical tasks/compute/method mix, assignments inverted
+# B3 RL on everything
+# B4 OPD on everything
+
+
+CELL_SEP = "::"
+
+
+def cell_key(task: str, capability: str) -> str:
+    """Stable JSON-safe key for a (task × capability) routing cell."""
+    return f"{task}{CELL_SEP}{capability}"
+
+
+def split_cell_key(key: str) -> tuple[str, str]:
+    task, _, capability = key.partition(CELL_SEP)
+    return task, capability
+
+
+@dataclass
+class BArmPlan:
+    """Per-arm cell→method assignment. Resolvable effect size recorded before train.
+
+    The assignment unit is the (task × capability) cell, not the task: PLAN.md
+    routes per cell, and a task can be RL for one capability and OPD for another.
+    Keying by task collapses those into whichever decision was seen last, which
+    silently drops rows from the very method mix B2 has to hold identical.
+    """
+
+    arm: str
+    description: str
+    assignments: dict[str, Route]  # cell_key(task, capability) → RL|OPD
+    task_ids: list[str]
+    method_mix: dict[str, int]
+    resolvable_effect_size: float | None = None
+    cells: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _invert_route(route: Route) -> Route:
+    if route == "RL":
+        return "OPD"
+    if route == "OPD":
+        return "RL"
+    return route
+
+
+def plan_b_arms(
+    decisions: list[RoutingDecision],
+    *,
+    holdout: list[str] | None = None,
+    resolvable_effect_size: float | None = None,
+    pilot: bool = False,
+    seed: int = 0,
+    exclude_not_preregistered: bool = False,
+) -> dict[str, BArmPlan]:
+    """Build B1–B4 assignment plans from routing decisions.
+
+    Only RL/OPD cells are trainable. Quarantine/NONE excluded from all B arms.
+    B2 inverts RL↔OPD on the same *cell* set (identical method mix counts).
+
+    Assignments are keyed by `cell_key(task, capability)`, because the routing
+    unit is the (task × capability) cell: one task may be RL for one capability
+    and OPD for another, and a task-keyed map keeps only whichever decision came
+    last. `task_ids` remains the deduplicated task set (what pilot-capping and
+    holdout removal operate on); `cells` lists the (task, capability) pairs.
+
+    `holdout` is the *evaluation* slice and is therefore **removed** from every
+    training arm — training on it is the contamination the split exists to
+    prevent. `exclude_not_preregistered` drops cells decided by a rule outside
+    the pre-registration (currently the mid-band extension), so the B1-vs-B2
+    comparison can be re-run on registered cells only.
+    """
+    trainable = [d for d in decisions if d.route in ("RL", "OPD")]
+    if exclude_not_preregistered:
+        trainable = [d for d in trainable if d.preregistered]
+    if holdout is not None:
+        hold = set(holdout)
+        trainable = [d for d in trainable if d.task not in hold]
+    task_ids = _cap_pilot(
+        sorted({d.task for d in trainable}),
+        pilot=pilot,
+        seed=seed,
+    )
+    kept = set(task_ids)
+    # Ordered by cell, deduplicated on (task, capability). Two decisions for the
+    # same cell would be a routing bug upstream; the first is kept and the shape
+    # here makes the collision visible rather than absorbing it as it did when the
+    # map was keyed by task alone.
+    by_cell: dict[str, RoutingDecision] = {}
+    for d in trainable:
+        if d.task not in kept:
+            continue
+        by_cell.setdefault(cell_key(d.task, d.capability), d)
+    cell_keys = sorted(by_cell)
+    cells = [split_cell_key(k) for k in cell_keys]
+
+    b1_assign = {k: by_cell[k].route for k in cell_keys}
+    b2_assign = {k: _invert_route(by_cell[k].route) for k in cell_keys}
+    b3_assign = {k: "RL" for k in cell_keys}  # type: ignore[dict-item]
+    b4_assign = {k: "OPD" for k in cell_keys}  # type: ignore[dict-item]
+
+    def _mix(assign: dict[str, Route]) -> dict[str, int]:
+        return {
+            "RL": sum(1 for r in assign.values() if r == "RL"),
+            "OPD": sum(1 for r in assign.values() if r == "OPD"),
+        }
+
+    # B2 holds task count and method-mix identical and permutes only the
+    # assignment — that is what isolates the routing decision. True by
+    # construction here (`_invert_route` is a bijection on the trainable routes),
+    # so it is stated as an invariant rather than tested as if it could vary.
+
+    return {
+        "B1": BArmPlan(
+            arm="B1",
+            description="routed: RL on in-support, OPD on out-of-support",
+            assignments=b1_assign,
+            task_ids=task_ids,
+            method_mix=_mix(b1_assign),
+            resolvable_effect_size=resolvable_effect_size,
+            cells=cells,
+        ),
+        "B2": BArmPlan(
+            arm="B2",
+            description="anti-routed: identical tasks/compute/mix, assignments inverted",
+            assignments=b2_assign,
+            task_ids=task_ids,
+            method_mix=_mix(b2_assign),
+            resolvable_effect_size=resolvable_effect_size,
+            cells=cells,
+        ),
+        "B3": BArmPlan(
+            arm="B3",
+            description="RL on everything",
+            assignments=b3_assign,
+            task_ids=task_ids,
+            method_mix=_mix(b3_assign),
+            resolvable_effect_size=resolvable_effect_size,
+            cells=cells,
+        ),
+        "B4": BArmPlan(
+            arm="B4",
+            description="OPD on everything",
+            assignments=b4_assign,
+            task_ids=task_ids,
+            method_mix=_mix(b4_assign),
+            resolvable_effect_size=resolvable_effect_size,
+            cells=cells,
+        ),
+    }
+
+
+def compare_b1_b2_paired(
+    b1_rates: dict[str, PassRate],
+    b2_rates: dict[str, PassRate],
+    *,
+    resolvable_effect_size: float | None = None,
+    alpha: float = 0.05,
+) -> dict[str, Any]:
+    """Primary metric: pass@1 on held-out slice, B1 vs B2, paired task-by-task.
+
+    Reports an exact paired test, not just a mean delta. Discordant tasks (one
+    arm solves it, the other does not) are the paired evidence; under H0 each is
+    a coin flip, so the same exact McNemar `diagnose._exact_mcnemar_p` used for
+    the cross-model contrast applies here. Do not invent a second test.
+
+    `resolvable_effect_size` is PLAN.md's pre-registered smallest effect the
+    slice can resolve (AC #8). When the observed delta is smaller than it, the
+    result is reported as **unresolvable** regardless of p — a slice sized for a
+    5-point effect saying nothing about a 1-point one is a fact about the design,
+    not a finding. When it is absent, that absence is itself flagged: the number
+    was supposed to be recorded before training.
+    """
+    shared = sorted(set(b1_rates) & set(b2_rates))
+    deltas = []
+    b1_wins = b2_wins = ties = 0
+    for task in shared:
+        r1 = b1_rates[task].rate
+        r2 = b2_rates[task].rate
+        if r1 is None or r2 is None:
+            continue
+        deltas.append(r1 - r2)
+        if r1 > r2:
+            b1_wins += 1
+        elif r2 > r1:
+            b2_wins += 1
+        else:
+            ties += 1
+    mean_delta = (sum(deltas) / len(deltas)) if deltas else None
+
+    # Paired exact test on the discordant tasks — same binarization the A-arms
+    # use, so the two comparisons stay commensurable.
+    b = c = 0
+    for task in shared:
+        p1, p2 = b1_rates[task].majority_pass(), b2_rates[task].majority_pass()
+        if p1 and not p2:
+            b += 1
+        elif p2 and not p1:
+            c += 1
+    discordant = b + c
+    p_value = _exact_mcnemar_p(b, c) if discordant > 0 else None
+
+    resolvable = None
+    interpretation = ""
+    if resolvable_effect_size is None:
+        interpretation = (
+            "no pre-registered resolvable effect size — PLAN.md AC #8 requires it "
+            "to be recorded before training, so this comparison cannot be "
+            "interpreted as designed"
+        )
+    elif mean_delta is not None:
+        resolvable = abs(mean_delta) >= resolvable_effect_size
+        if not resolvable:
+            interpretation = (
+                f"observed |delta|={abs(mean_delta):.4f} is below the "
+                f"pre-registered resolvable effect {resolvable_effect_size} — "
+                "underpowered, no claim either way"
+            )
+    if discordant < MIN_DISCORDANT_PAIRS:
+        floor_note = (
+            f"only {discordant} discordant pair(s) — below the "
+            f"{MIN_DISCORDANT_PAIRS} floor at which any paired test can reach "
+            "significance, whatever the data"
+        )
+        interpretation = f"{interpretation}; {floor_note}" if interpretation else floor_note
+
+    return {
+        "shared_tasks": len(shared),
+        "paired_n": len(deltas),
+        "mean_pass1_delta_b1_minus_b2": mean_delta,
+        "b1_wins": b1_wins,
+        "b2_wins": b2_wins,
+        "ties": ties,
+        "binarization": MCNEMAR_BINARIZATION,
+        "b1_only": b,
+        "b2_only": c,
+        "discordant_n": discordant,
+        "p_value": p_value,
+        "alpha": alpha,
+        "significant": (p_value is not None and p_value < alpha),
+        "resolvable_effect_size": resolvable_effect_size,
+        "effect_is_resolvable": resolvable,
+        "interpretation": interpretation,
+        "per_task": {
+            t: {
+                "b1": b1_rates[t].rate,
+                "b2": b2_rates[t].rate,
+                "delta": (
+                    None
+                    if b1_rates[t].rate is None or b2_rates[t].rate is None
+                    else b1_rates[t].rate - b2_rates[t].rate
+                ),
+            }
+            for t in shared
+        },
+    }
+
+
 __all__ = [
     "DEFAULT_CANDIDATE_MODEL",
     "MCNEMAR_BINARIZATION",
     "PILOT_TASK_CAP",
     "ArmResult",
     "ArmsConfig",
+    "BArmPlan",
     "build_a1_prompt",
+    "cell_key",
     "compare_arms_mcnemar",
+    "compare_b1_b2_paired",
+    "plan_b_arms",
     "run_arms",
     "select_a2_tasks",
+    "split_cell_key",
     "write_arms_report",
 ]

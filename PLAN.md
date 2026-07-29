@@ -1,0 +1,472 @@
+Capability Routing — Design Doc
+===============================
+
+**Date:** 2026-07-28 · **Branch:** `step6-train-arms` · **Supersedes:** the Step-6
+experiment design in `V0_PLAN.md`. Mining, verification and diagnosis sections of
+`V0_PLAN.md` remain authoritative.
+
+Companion: [`docs/OPD.md`](docs/OPD.md) — the OPD method survey this design rests
+on. Read it for anything about distillation mechanics.
+
+
+Context and Motivation
+----------------------
+
+### Problem statement
+
+Given a capability a small model lacks, nobody can currently say **which
+intervention will fix it**. Teams try RL, find the gradient is zero, try
+distillation, find the teacher never demonstrated the behaviour, and burn weeks
+discovering by exhaustion what is decidable by measurement.
+
+The decision is decidable. From `docs/OPD.md`:
+
+- RL's gradient is `Σ A_t ∇log π_s(y_t)`. When all rollouts fail, `A_t = 0` and
+  the gradient is **identically zero**. RL sharpens within the model's support;
+  it cannot create support.
+- OPD's gradient is `Σ (log π_s − log π_t) ∇log π_s`. It is nonzero wherever
+  student and teacher disagree, **regardless of outcome**. It moves mass into
+  regions the student assigns ≈0 probability.
+- OPD is bounded by the *teacher's* support, not the student's.
+
+`pass@k` measures support directly. Therefore `pass@k` decides the intervention.
+
+### Goals
+
+1. **Measure support**, not just difficulty — `pass@k` for k ∈ {1,4,8,16,32} per
+   task per model, with an unbiased estimator.
+2. **Localise failure to a step** by execution rather than LLM opinion —
+   verifier-guided bisection produces the forking step.
+3. **Route** each (task × capability) to exactly one of: RL, OPD, quarantine,
+   or none, by a rule stated before any data is seen.
+4. **Prove routing pays** — routed training beats anti-routed training at
+   identical task count, method mix and compute.
+5. **Ship a diagnostic artefact** that stands alone as a customer deliverable
+   before any training runs.
+
+### Non-goals
+
+- **Not** building a general coding agent. Repo-diverse mining serves capability
+  isolation, not generality. Competing with DeepSWE on SWE-bench Verified is
+  explicitly out of scope.
+- **Not** claiming mining is novel. It is a Repo2RLEnv port. Mining is the
+  *transfer test*, not the corpus.
+- **Not** doing cross-tokenizer distillation in v0. ULD/MinED/DSKD are real but
+  unvalidated on 40-step agentic trajectories (`docs/OPD.md` row 14). v1 upgrade.
+- **Not** using an adversarial discriminator (GAD). A learned reward model
+  substitutes for a verifier we already have.
+- **Not** running GRPO at DeepSWE scale. 100k–500k containerised rollouts is
+  outside budget; the design accommodates this rather than pretending otherwise.
+- **Not** shipping a model. The product is the loop.
+
+
+Implementation Considerations
+-----------------------------
+
+### Constraints
+
+| # | Constraint | Consequence |
+|---|---|---|
+| C1 | OPD requires `prompt_logprobs` — scoring of *supplied* tokens | Teacher must be self-hosted (vLLM/SGLang, incl. Modal). No hosted endpoint suffices, open or closed. |
+| C2 | Teacher and student must share a tokenizer | Same model family. Verified by check, not assumption. |
+| C3 | Containerised agent rollouts cost minutes each | Environment interaction must be removed from the training loop. |
+| C4 | Corpus is 29 mined tasks | Insufficient for per-cell power. External gyms required. |
+| C5 | Gyms overlap SWE-bench and student pretraining | Mined held-out slice is the only clean evaluation. |
+| C6 | Frontier scores are scaffold-dependent | Every number names its scaffold. |
+
+### Design principles
+
+- **Execution over opinion.** Where an LLM judgment and a test run disagree, the
+  test run wins. Bisection exists because `diagnose.py` currently has no ground
+  truth to check itself against.
+- **Pre-register every threshold.** Routing rule, effect size, escalation
+  schedule — all fixed before data.
+- **Gate before spending.** The `pass@k` sweep costs ~$200 and can kill the
+  thesis. Nothing expensive precedes it.
+- **Separable halves.** The diagnostic half ships as a product without the
+  training half.
+
+### Trade-offs taken
+
+| Decision | Alternative | Why |
+|---|---|---|
+| ReOPD prefix replay as primary training mode | full on-policy rollouts | removes containers from the training loop; ≥4× faster; converts distributed-systems risk into data-loading |
+| Qwen3-Coder-Next 80B teacher | Kimi K3 | K3 has no small sibling (cross-tokenizer), needs 8×H200 at MXFP4, and OPD queries the teacher every step |
+| Kimi K3 as oracle | GPT-5 | open weights make the ceiling reproducible by a reviewer |
+| Reverse KL | forward KL | 8B cannot cover an 80B distribution; mode-seeking beats hedging under capacity mismatch |
+| Gyms as corpus, mining as transfer test | mining as corpus | 29 tasks cannot support the claim; and transfer is the stronger result |
+| verl | vendored TRACE | native OPD + GRPO, teacher resource pool, `distillation_loss_coef` blending |
+
+
+High-Level Behavior
+-------------------
+
+```
+[0] ENV SUPPLY      mined repos + imported gyms  →  executable tasks + verifiers
+      ↓
+[1] PAIRED REPLAY   teacher + student, pinned scaffold  →  trajectories
+      ↓
+[2] PASS@K PROFILE  n=8, escalate to n=32 on zeros  →  support classification
+      ↓
+[3] LOCALIZATION    verifier-guided bisection  →  forking step per failure
+      ↓
+[4] DIAGNOSIS       capability labels, grounded against [3]
+      ↓
+[5] ROUTING         (task × capability)  →  {RL, OPD, quarantine, none}
+      ↓
+[6] TRAINING        RL branch (GRPO)  ‖  OPD branch (reverse KL)
+      ↓
+[7] EVALUATION      held-out, paired, B1–B4 arms, non-regression
+      ↓
+[8] PROVENANCE      every number re-derivable from disk
+```
+
+### Current status
+
+| Stage | Status | Missing | Effort |
+|---|---|---|---|
+| 0 Env supply | works, **29 tasks** | gym import adapter | M |
+| 1 Paired replay | coded, never run at scale | execution, throughput | M |
+| 2 pass@k | `passrate.py` is pass@1 only | estimator, escalation, aggregation | S |
+| 3 Localization | absent | trajectory state resume + bisection | **L** |
+| 4 Diagnosis | strongest component | grounding against [3] | S |
+| 5 Routing | absent | rule + report | S |
+| 6 Training | SFT+LoRA vendored, unexecuted | rollout infra, teacher pool, OPD loss | **XL** |
+| 7 Evaluation | A0–A4 coded, never run | B1–B4, non-regression | M |
+| 8 Provenance | designed throughout | — | — |
+
+The repository holds ~19k LOC of measurement infrastructure and effectively no
+training infrastructure. The next phase is a different discipline.
+
+
+Support Measurement (Stage 2)
+-----------------------------
+
+**Estimator.** Sample `n` once, estimate every `k` from that sample:
+
+```
+pass@k = 1 − C(n−c, k) / C(n, k)          c = number of passing rollouts
+```
+
+Never run five separate sweeps.
+
+**Two-stage escalation.** Stage 1 samples n=8 on all tasks, both models. Stage 2
+escalates to n=32 **only for tasks at 0/8** — precisely the tasks where the
+support question is live.
+
+Cost: ~1,300 rollouts for 50 tasks against a naive 3,200.
+
+**This is a sequential design and is pre-registered as such.** Escalating only
+zeros biases naively pooled estimates upward. Report per stratum; never pool
+stage 1 and stage 2 into one estimate.
+
+**Aggregation unit is (capability, model).** `pass@k` is observed per task;
+routing decisions are made per capability. Tasks are grouped by which capability
+`diagnose.py` marks LACKING, and curves are aggregated within each group. `N` is
+printed beside every rate.
+
+**Luck controls.** Any task whose only passes occur at k>8 is quarantined for
+review before it may set a routing decision: its passing patch is diffed against
+the gold patch, and an independent second sample of n=32 must reproduce the sign
+of the decision. A routing decision driven by one lucky rollout is the failure
+mode that invalidates the result.
+
+
+Localization (Stage 3)
+----------------------
+
+**Purpose.** Find, by execution, the step at which a failed trajectory became
+unrecoverable — the *forking step*.
+
+**Method.** Binary search over prefix length `T`:
+
+1. Replay the student's failed trajectory to step `T`.
+2. Hand the resulting environment state and history to the teacher; the teacher
+   continues to termination through the pinned scaffold.
+3. The mined verifier grades the result (F2P/P2P, separate container).
+4. Search for the **largest** `T` at which teacher-continuation still succeeds.
+   Step `T+1` is the forking step.
+
+**Cost.** `log₂(steps)` teacher continuations per task — 5–6 for a 40-step
+trajectory. Teacher access required is **text generation only**, so any model
+serves, including hosted K3.
+
+**Two outputs, both load-bearing:**
+
+- *Training data.* Teacher continuations that pass, with the student prefix
+  masked out of the loss. SAGE-OPD's finding is that selective intervention beats
+  uniform; bisection selects by execution rather than by LLM turn-judgment.
+- *Diagnostic ground truth.* The forking step is where the capability failed,
+  established by execution. `V0_PLAN.md` names the labeller the weakest
+  instrument in the system (87.8% mean, 50% floor) and sets a stop-condition on
+  it. This is the first ground truth available to calibrate it against.
+
+**Monotonicity is an assumption, and it is measured rather than assumed.**
+Recoverability is usually monotone in `T` but not always — a student can wander
+back into a recoverable state. Each probe point is sampled twice, and the
+non-monotonic fraction is reported as a statistic.
+
+
+Routing (Stage 5)
+-----------------
+
+Every (task × capability) pair receives exactly one label. The rule is fixed
+before data collection.
+
+| Candidate `pass@k` | Teacher `pass@k` | Classification | Route |
+|---|---|---|---|
+| pass@1 low, **pass@32 > 0** | high | in support, unreliable | **RL** (GRPO) |
+| **pass@32 = 0** | high | outside student support | **OPD** |
+| pass@32 = 0 | **pass@32 ≈ 0** | outside teacher support | **QUARANTINE** |
+| pass@1 high | high | no deficit | **NONE** (excluded) |
+
+Thresholds, pre-registered: "pass@1 low" is ≤ 0.25; "pass@1 high" is ≥ 0.75;
+"pass@32 = 0" is 0/32 passing after luck controls; "teacher pass@32 ≈ 0" is
+≤ 1/32.
+
+**Quarantine** is not a discard. It is the routing outcome for tasks no
+intervention can fix, and it splits by cause on inspection:
+
+- *Broken task* — impossible F2P set, environment defect, ambiguous instruction.
+  This is an **environment-quality signal** and feeds back into mining filters.
+- *Genuine frontier limitation* — the capability is absent from the teacher too,
+  so it cannot be distilled and there is no verified trajectory to reinforce.
+
+Both are reportable findings. The fraction of automatically-mined tasks solvable
+by nobody is a number the mining literature does not publish, and it is obtained
+here as a by-product.
+
+
+Training (Stage 6)
+------------------
+
+**Rollout economics govern the design.** A standard GRPO configuration is 64
+tasks × 8 rollouts = 512 rollouts per gradient step; at 200–1000 steps that is
+100k–500k containerised agent rollouts. This budget does not exist.
+
+Mitigations, in order of leverage:
+
+1. **ReOPD prefix replay.** Prefixes come from pre-collected teacher
+   trajectories; the student acts at one step; that step is supervised. No
+   containers in the training loop, ≥4× faster per rollout.
+2. **Shared environment per repo** (SWE-smith design) — one image per repo, not
+   per task; ~500× storage reduction.
+3. Warm container pools; never cold starts.
+4. LoRA only — also the non-regression mechanism, base weights untouched.
+
+**Loss masking.** `dataset.py` already restricts loss to `role == "assistant"
+AND subagent_depth == 0`. Teacher-continuation training adds one predicate: the
+student prefix is masked. Same machinery, same tests.
+
+**Configuration:**
+
+```
+teacher:  Qwen3-Coder-Next 80B, self-hosted vLLM on Modal   (prompt_logprobs)
+student:  Qwen3-8B + LoRA
+oracle:   Kimi K3                                            (text generation)
+loss:     reverse KL (mode-seeking; student cannot cover teacher)
+trainer:  verl — distillation_ppo_loss, separate teacher resource pool
+```
+
+
+Evaluation (Stage 7)
+--------------------
+
+| Arm | What | Kills |
+|---|---|---|
+| A0 | student, untouched | — (floor) |
+| A1 | student + deficit-targeted prompt | "couldn't you just prompt it?" |
+| **B1** | **routed**: RL on in-support, OPD on out-of-support | the claim |
+| **B2** | **anti-routed**: identical tasks, compute and method mix, assignments inverted | **the control** |
+| B3 | RL on everything | "just use RL" |
+| B4 | OPD on everything | "just distill" |
+| A4 | oracle (Kimi K3) | — (ceiling) |
+
+**B2 is the arm that makes this real.** It holds task count, method mix and
+compute identical and permutes only the assignment, isolating the routing
+decision from everything else. A random control cannot do this.
+
+Primary metric: `pass@1` on the held-out mined slice, B1 vs B2, paired
+task-by-task. **The resolvable effect size is stated before training.** SWE-Gym
+moved a 7B model ~3 points; a 50-task slice cannot resolve 3 points, so the slice
+is sized against the expected effect or the claim is scoped to what it resolves.
+
+Also reported: A0 vs A4 (the gap), non-regression inside a pre-declared tolerance
+(IFEval or the base model's own evals), and cost per solved task.
+
+
+Error Handling
+--------------
+
+| Condition | Behavior |
+|---|---|
+| Infra failure during a rollout | excluded from `pass@k` denominator; never recorded as a loss (existing `V0_PLAN.md` rule) |
+| Trajectory replay desync at step `T` | hard fail; task dropped from bisection; desync rate reported |
+| Bisection non-monotone | recorded, not silently resolved; reported as a fraction |
+| Task passes only at k>8 | quarantined pending patch-vs-gold diff and independent re-sample |
+| Teacher `pass@32 ≈ 0` | QUARANTINE, split by cause on inspection |
+| Routing cell underpopulated | reported as underpowered; no claim made from it |
+| Tokenizer mismatch detected | hard fail at startup, before any GPU is allocated |
+
+**Underpowered is a first-class result.** "Not enough data, N more needed" is a
+valid output and is preferred to a claim asserted from four observations.
+
+
+Future-Proofing
+---------------
+
+- **The gap number has a shelf life.** K2 → K2.5 → K2.6 → K3 inside a year;
+  DeepSeek V3 → V4; GLM-5 → 5.2. Every figure pins its date, weights and
+  scaffold. The *routing method* is invariant to which models are plugged in —
+  that is the durable asset, and it is why the paper's headline is the decision
+  rule rather than any point measurement.
+- **Cross-tokenizer distillation (ULD/MinED/byte-level)** is the upgrade path if
+  the same-family teacher proves too weak. Deferred, not rejected.
+- **`verifiers` / OpenEnv interface** as an adapter over harbor — gym
+  compatibility and a publication channel to the Environments Hub, without
+  rewriting the container and verifier work that is already done.
+- **Serving cost, not capability, is the widening gap.** K3 needs 8×H200
+  minimum. The distance between what is SOTA and what an enterprise can afford
+  to run on every commit is growing. That is the market.
+
+
+Implementation Outline
+----------------------
+
+```
+Land step6-train-arms → main
+   │
+   ├─► [A] Spike trajectory state resume ──────┐   2 days · gates the design
+   │                                            │
+   ├─► [B] Gym import adapter (R2E-Gym/SWE-smith)  unblocks volume
+   │        │                                   │
+   │        └─► [C] pass@k ──► ★ GATE ★         │   ~$200 · kill-or-continue
+   │                    │                       │
+   │                    ├─► [D] Bisection localizer ◄┘
+   │                    │        └─► [E] Ground diagnosis against D
+   │                    │
+   │                    └─► [F] Routing rule + report
+   │                              │
+   └─► [G] Rollout infra ─────────┴─► [H] OPD + RL branches ─► [I] B1–B4
+```
+
+**Step 0 — verify the tokenizer.** Load `Qwen3-Coder-Next-80B` and `Qwen3-8B`
+tokenizers, compare `vocab_size`, hash the merges. 30 seconds. Gates everything.
+
+**Step A — trajectory resume spike (2 days).** Replay tool calls into a fresh
+container with a hard consistency assertion: post-replay `git diff` must match
+the transcript-implied diff at step `T`. Measure the desync rate. No OPD paper
+hits this problem because they all use ALFWorld/WebShop/math, which reset for
+free. High desync makes ReOPD mandatory rather than merely preferable — that must
+be known in week 1.
+
+**Step B — gym import.** R2E-Gym or SWE-smith behind the existing task interface.
+
+**Step C — `passk.py`.** Estimator, two-stage escalation, per-capability
+aggregation, luck controls. Then **run the sweep and look at the histogram.**
+
+> ★ **GATE.** If tasks do not separate into distinct curve regimes, there is no
+> routing decision and the thesis dies for ~$200. Nothing expensive precedes
+> this. Scope G in parallel; build it only after C passes.
+
+**Step D — `intervene.py`.** Bisection driver + teacher continuation.
+
+**Step E — grounding.** Compare `diagnose.py` labels against forking steps;
+recalibrate `min_gap` from measured blur.
+
+**Step F — `routing.py`.** Decision rule, per-cell counts, quarantine split.
+
+**Step G — rollout infra.** ReOPD prefix replay, container pooling, teacher pool.
+
+**Step H — training branches.** verl: GRPO and `distillation_ppo_loss`.
+
+**Step I — arms.** B1–B4 in `arms.py`; pilot 10 tasks per arm before the full run.
+
+
+Testing Approach
+----------------
+
+**Unit**
+
+- `pass@k` estimator against the closed form for known (n, c); n=0, c=0, c=n,
+  k>n boundaries.
+- Two-stage escalation: pooled and per-stratum estimates diverge as expected on
+  synthetic data.
+- Bisection returns the planted forking step on a synthetic trajectory with a
+  known break point; non-monotone case is detected, not silently resolved.
+- Routing rule: every cell of the table, plus threshold boundaries.
+- Prefix masking: student-prefix tokens carry `IGNORE_INDEX`; teacher
+  continuation tokens do not. Extends the existing `dataset.py` suite.
+
+**Integration**
+
+- One mined task end to end: replay → pass@k → bisection → route → report,
+  against a committed fixture, no network.
+- Tokenizer compatibility check fails loudly on a deliberately mismatched pair.
+- Trajectory replay consistency assertion fires on a synthetically desynced
+  container.
+
+**Manual**
+
+- Hand-inspect 10 forking steps against transcripts. Does the located step match
+  where a human reader says it went wrong? This validates the instrument that
+  validates the labeller.
+- Hand-inspect every quarantined task and classify broken-vs-frontier-limited.
+- Pilot `run-arms` on 10 tasks: does it execute, do metrics compute, is cost sane.
+
+
+Acceptance Criteria
+-------------------
+
+1. **Given** a task with `n` recorded rollouts of which `c` passed, **when**
+   `pass@k` is computed, **then** it equals `1 − C(n−c,k)/C(n,k)` for every
+   k ≤ n, and stage-1 and stage-2 estimates are reported separately.
+
+2. **Given** the full corpus, **when** the sweep completes, **then** every task
+   carries a support classification, and per-cell counts are printed with `N`.
+
+3. **Given** a failed trajectory of `s` steps, **when** bisection runs, **then**
+   it returns a forking step using ≤ `⌈log₂ s⌉ + 2` teacher continuations, and
+   reports whether recoverability was monotone.
+
+4. **Given** 10 hand-inspected forking steps, **when** compared to human
+   judgment of where the trajectory went wrong, **then** agreement is ≥ 70% —
+   the same floor `V0_PLAN.md` sets for the labeller.
+
+5. **Given** a (task, capability) pair with measured curves for both models,
+   **when** routing runs, **then** exactly one of {RL, OPD, QUARANTINE, NONE} is
+   assigned, by thresholds recorded in the run manifest.
+
+6. **Given** a quarantined task, **when** the report is produced, **then** it is
+   classified broken-task or frontier-limited, with the evidence cited.
+
+7. **Given** a task whose only passes occur at k>8, **when** it would set a
+   routing decision, **then** it is held until an independent n=32 re-sample
+   reproduces the decision's sign.
+
+8. **Given** trained B1 and B2 arms, **when** evaluated on the held-out slice,
+   **then** the comparison is paired task-by-task, and the resolvable effect size
+   was recorded before training began.
+
+9. **Given** any figure in the final report, **when** a reader has only the
+   artefacts on disk, **then** it is re-derivable — arm, task ids and split,
+   scaffold name and version, base model and adapter, seed, `pass@k` with `N`,
+   paired comparison, GPU/harbor/image digest.
+
+10. **Given** the trained student, **when** non-regression is checked, **then**
+    degradation is inside a tolerance declared before training.
+
+
+Stop Conditions
+---------------
+
+Inherited from `V0_PLAN.md` and extended. Any one halts the work.
+
+- Tokenizer mismatch that no same-family substitution resolves.
+- Trajectory replay desync rate too high for bisection **and** ReOPD infeasible.
+- ★ **`pass@k` curves do not separate into regimes** — no routing decision exists.
+- Any routing cell is too sparse to support a claim.
+- A1 (prompt) closes most of the gap — this is a prompt tool with an expensive
+  backend. Thesis-level finding for two eval runs.
+- **B1 ≈ B2** — routing adds nothing.
+- Quarantine fraction is so large the corpus is mostly broken tasks.
