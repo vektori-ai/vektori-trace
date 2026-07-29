@@ -76,7 +76,7 @@ Implementation Considerations
 | C1 | OPD requires `prompt_logprobs` — scoring of *supplied* tokens | Teacher must be self-hosted (vLLM/SGLang, incl. Modal). No hosted endpoint suffices, open or closed. |
 | C2 | Teacher and student must share a tokenizer | Same model family. Verified by check, not assumption. |
 | C3 | Containerised agent rollouts cost minutes each | Environment interaction must be removed from the training loop. |
-| C4 | Corpus is 29 mined tasks | Insufficient for per-cell power. External gyms required. |
+| C4 | Corpus is 29 mined tasks; measured yield on `hynek/structlog` is 2/20 merged PRs (10%), 12 of the 18 losses for `no_linked_issue` | Insufficient for per-cell power, and mining to 50 needs ~500 PRs. External gyms required. |
 | C5 | Gyms overlap SWE-bench and student pretraining | Mined held-out slice is the only clean evaluation. |
 | C6 | Frontier scores are scaffold-dependent | Every number names its scaffold. |
 
@@ -141,7 +141,7 @@ scale, and the `pass@k` gate has not been spent.
 | 2 pass@k | `passk.py` 505 | estimator, two-stage escalation, luck controls, per-capability aggregation — all present and unit-tested | **the sweep. ~$200. the gate.** |
 | 3 Localization | `resume.py` 483, `intervene.py` 316 | bisection + resume coded | **the desync rate — unmeasured, and it gates the design** |
 | 4 Diagnosis | `diagnose.py`, `grounding.py` 116 | grounding coded | real forking steps to ground against (needs [3]) |
-| 5 Routing | `routing.py` 421 | rule table coded | see divergence note below |
+| 5 Routing | `routing.py` 421 | rule table coded, R1–R6 declared; end-to-end run on synthetic curves | R7 band still undeclared; real curves |
 | 6 Training | `train.py` 360, `opd.py` 255, `dataset.py` 267, `reopd.py` 306, `modal_env.py` 17 | SFT+LoRA and OPD loss coded, unexecuted | teacher pool, container pooling, one real run |
 | 7 Evaluation | `arms.py` 899, `nonregression.py` 167 | A0–A4 and B1–B4 coded | never run |
 | 8 Provenance | throughout | designed | — |
@@ -151,15 +151,16 @@ scale, and the `pass@k` gate has not been spent.
 training infrastructure" — is no longer true. What is true is that none of it
 has met a GPU or a real corpus.
 
-**Routing has drifted past its pre-registration.** `routing.py` implements six
-rules, R1–R6. R1–R4 are the four cells in the table below. R5 (student has
-support, teacher does not) and R6 (support never measured for this cell) were
-added during implementation and route to QUARANTINE; the module also handles
-`low < pass@1 < high`, which this document does not specify. **These are not
-pre-registered.** Either fold them into the table below — making them part of
-the declared rule — or record them as post-hoc and exclude them from the B1/B2
-claim. Leaving them undeclared while running the experiment forfeits the
-pre-registration, which is the property that makes the result worth anything.
+**Routing's pre-registration is now closed, with one exception.** `routing.py`
+implements R1–R6 and the decision table below declares all six — R5 (student has
+support, teacher does not) and R6 (support never measured) were added during
+implementation and are folded in rather than left undeclared. Both route to
+QUARANTINE, so neither can move a cell into RL or OPD. The exception is R7
+(`low < pass@1 < high`), which this document still does not specify and which
+`routing.py` reports as `preregistered: false`. Leaving a rule undeclared while
+running the experiment forfeits the pre-registration, which is the property that
+makes the result worth anything — so R7 is either declared before the sweep or
+excluded from the B1/B2 claim.
 
 
 Support Measurement (Stage 2)
@@ -236,16 +237,33 @@ Routing (Stage 5)
 Every (task × capability) pair receives exactly one label. The rule is fixed
 before data collection.
 
-| Candidate `pass@k` | Teacher `pass@k` | Classification | Route |
-|---|---|---|---|
-| pass@1 low, **pass@32 > 0** | high | in support, unreliable | **RL** (GRPO) |
-| **pass@32 = 0** | high | outside student support | **OPD** |
-| pass@32 = 0 | **pass@32 ≈ 0** | outside teacher support | **QUARANTINE** |
-| pass@1 high | high | no deficit | **NONE** (excluded) |
+| Rule | Candidate `pass@k` | Teacher `pass@k` | Classification | Route |
+|---|---|---|---|---|
+| R1 | pass@1 low, **pass@32 > 0** | high | in support, unreliable | **RL** (GRPO) |
+| R2 | **pass@32 = 0** | high | outside student support | **OPD** |
+| R3 | pass@32 = 0 | **pass@32 ≈ 0** | outside teacher support | **QUARANTINE** |
+| R4 | pass@1 high | high | no deficit | **NONE** (excluded) |
+| R5 | pass@32 > 0 | **pass@32 ≈ 0** | teacher lacks support the student has | **QUARANTINE** |
+| R6 | not measured | any | support never established for this cell | **QUARANTINE**, no claim |
 
 Thresholds, pre-registered: "pass@1 low" is ≤ 0.25; "pass@1 high" is ≥ 0.75;
 "pass@32 = 0" is 0/32 passing after luck controls; "teacher pass@32 ≈ 0" is
 ≤ 1/32.
+
+R5 and R6 were written during implementation and are declared here, before data
+collection, so they are pre-registered on the same footing as R1–R4. Both route
+to QUARANTINE: neither can move a cell into RL or OPD, so folding them in cannot
+manufacture a positive result. What they do is name two cells R1–R4 left
+undefined — a teacher that cannot do what the student can, and a cell whose
+support was never measured — which otherwise fall through to a default nobody
+declared. `routing.py` reports every decision's rule and its pre-registration
+status in the manifest, so this table is checkable against what ran.
+
+**Still not pre-registered: R7** (`low < pass@1 < high` with support → RL). The
+band between the two thresholds is deliberately left undeclared here, and
+`routing.py` marks R7 decisions `preregistered: false`. Exclude them from the
+B1/B2 claim or declare the band before the sweep runs — not after seeing which
+way it falls.
 
 **Quarantine** is not a discard. It is the routing outcome for tasks no
 intervention can fix, and it splits by cause on inspection:
