@@ -10,8 +10,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_TEACHER = "Qwen/Qwen3-Coder-Next-80B"
-DEFAULT_STUDENT = "Qwen/Qwen3-8B"
+# Two pairs, both same-family so the tokenizer check can pass. Which one is the
+# default matters, because `opd.py` reads these as its config defaults.
+#
+# PILOT is the default. The teacher is a 30B MoE with ~3B active parameters, so
+# it serves on one GPU and answers fast — and OPD queries the teacher at *every
+# step*, which makes teacher latency, not student size, the loop's bottleneck.
+# verl's own documented OPD example is a 32B teacher with an 8B student, so this
+# sits close to a configuration someone else has actually run.
+PILOT_TEACHER = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+PILOT_STUDENT = "Qwen/Qwen3-8B"
+
+# SCALE is PLAN.md's stated configuration. An 80B dense teacher needs several
+# GPUs and costs more per teacher query; it is the scale-up once the pilot has
+# closed the loop once, not the thing to debug the loop on.
+SCALE_TEACHER = "Qwen/Qwen3-Coder-Next-80B"
+SCALE_STUDENT = "Qwen/Qwen3-8B"
+
+DEFAULT_TEACHER = PILOT_TEACHER
+DEFAULT_STUDENT = PILOT_STUDENT
 
 
 class TokenizerMismatchError(RuntimeError):
@@ -139,6 +156,10 @@ def check_tokenizers(
 __all__ = [
     "DEFAULT_STUDENT",
     "DEFAULT_TEACHER",
+    "PILOT_STUDENT",
+    "PILOT_TEACHER",
+    "SCALE_STUDENT",
+    "SCALE_TEACHER",
     "TokenizerFingerprint",
     "TokenizerMismatchError",
     "check_tokenizers",

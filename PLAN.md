@@ -8,6 +8,12 @@ experiment design in `V0_PLAN.md`. Mining, verification and diagnosis sections o
 Companion: [`docs/OPD.md`](docs/OPD.md) — the OPD method survey this design rests
 on. Read it for anything about distillation mechanics.
 
+Execution: [`docs/PILOT.md`](docs/PILOT.md) — what runs first, on which GPU, and
+what kills it. It picks the smallest configuration that can execute this design
+(30B MoE teacher → 8B student) and orders the spend so the cheapest falsifying
+step happens first. It also records the trainer decision: **OPD is written
+against `train.py`; verl arrives for the GRPO branch**, not before.
+
 
 Context and Motivation
 ----------------------
@@ -95,7 +101,7 @@ Implementation Considerations
 | Kimi K3 as oracle | GPT-5 | open weights make the ceiling reproducible by a reviewer |
 | Reverse KL | forward KL | 8B cannot cover an 80B distribution; mode-seeking beats hedging under capacity mismatch |
 | Gyms as corpus, mining as transfer test | mining as corpus | 29 tasks cannot support the claim; and transfer is the stronger result |
-| verl | vendored TRACE | native OPD + GRPO, teacher resource pool, `distillation_loss_coef` blending |
+| verl for GRPO, OPD written here | verl for both; vendored TRACE for both | GRPO's multi-turn rollouts and weight-syncing are hard to hand-roll and verl has them. OPD is a loss plus one `prompt_logprobs` call against a server we already run — verl's teacher *pool* solves multi-node throughput we do not have. See [`docs/PILOT.md`](docs/PILOT.md). |
 
 
 High-Level Behavior
@@ -123,20 +129,37 @@ High-Level Behavior
 
 ### Current status
 
-| Stage | Status | Missing | Effort |
-|---|---|---|---|
-| 0 Env supply | works, **29 tasks** | gym import adapter | M |
-| 1 Paired replay | coded, never run at scale | execution, throughput | M |
-| 2 pass@k | `passrate.py` is pass@1 only | estimator, escalation, aggregation | S |
-| 3 Localization | absent | trajectory state resume + bisection | **L** |
-| 4 Diagnosis | strongest component | grounding against [3] | S |
-| 5 Routing | absent | rule + report | S |
-| 6 Training | SFT+LoRA vendored, unexecuted | rollout infra, teacher pool, OPD loss | **XL** |
-| 7 Evaluation | A0–A4 coded, never run | B1–B4, non-regression | M |
-| 8 Provenance | designed throughout | — | — |
+**Updated 2026-07-29**, against `main` @ `d370605` (PR #16 merged). Every stage
+of the Implementation Outline now has a module and, except where noted, a test.
+The blocker is no longer code — it is *execution*. Nothing below has been run at
+scale, and the `pass@k` gate has not been spent.
 
-The repository holds ~19k LOC of measurement infrastructure and effectively no
-training infrastructure. The next phase is a different discipline.
+| Stage | Module(s) | Status | Missing |
+|---|---|---|---|
+| 0 Env supply | `mining/`, `gym_import.py` 303 | 29 mined tasks; gym adapter coded | one real gym import, run |
+| 1 Paired replay | `gap.py` 119, `rollout.py` 86 | coded | execution at scale, throughput |
+| 2 pass@k | `passk.py` 505 | estimator, two-stage escalation, luck controls, per-capability aggregation — all present and unit-tested | **the sweep. ~$200. the gate.** |
+| 3 Localization | `resume.py` 483, `intervene.py` 316 | bisection + resume coded | **the desync rate — unmeasured, and it gates the design** |
+| 4 Diagnosis | `diagnose.py`, `grounding.py` 116 | grounding coded | real forking steps to ground against (needs [3]) |
+| 5 Routing | `routing.py` 421 | rule table coded | see divergence note below |
+| 6 Training | `train.py` 360, `opd.py` 255, `dataset.py` 267, `reopd.py` 306, `modal_env.py` 17 | SFT+LoRA and OPD loss coded, unexecuted | teacher pool, container pooling, one real run |
+| 7 Evaluation | `arms.py` 899, `nonregression.py` 167 | A0–A4 and B1–B4 coded | never run |
+| 8 Provenance | throughout | designed | — |
+
+~16.8k LOC in `vektori_trace/`, ~8.3k in `tests/`, 39 test files, zero
+`TODO`/`FIXME`/`NotImplementedError`. The earlier reading of this table — "no
+training infrastructure" — is no longer true. What is true is that none of it
+has met a GPU or a real corpus.
+
+**Routing has drifted past its pre-registration.** `routing.py` implements six
+rules, R1–R6. R1–R4 are the four cells in the table below. R5 (student has
+support, teacher does not) and R6 (support never measured for this cell) were
+added during implementation and route to QUARANTINE; the module also handles
+`low < pass@1 < high`, which this document does not specify. **These are not
+pre-registered.** Either fold them into the table below — making them part of
+the declared rule — or record them as post-hoc and exclude them from the B1/B2
+claim. Leaving them undeclared while running the experiment forfeits the
+pre-registration, which is the property that makes the result worth anything.
 
 
 Support Measurement (Stage 2)
@@ -261,11 +284,13 @@ student prefix is masked. Same machinery, same tests.
 **Configuration:**
 
 ```
-teacher:  Qwen3-Coder-Next 80B, self-hosted vLLM on Modal   (prompt_logprobs)
+teacher:  Qwen3-Coder-30B-A3B, self-hosted vLLM on Modal    (prompt_logprobs)
+          MoE, ~3.3B active — teacher latency is the loop's bottleneck,
+          since OPD queries it every step. 80B is the scale-up (SCALE_*).
 student:  Qwen3-8B + LoRA
 oracle:   Kimi K3                                            (text generation)
 loss:     reverse KL (mode-seeking; student cannot cover teacher)
-trainer:  verl — distillation_ppo_loss, separate teacher resource pool
+trainer:  OPD here, on train.py + peft; verl for the GRPO branch
 ```
 
 

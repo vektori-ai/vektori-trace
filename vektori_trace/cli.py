@@ -38,6 +38,7 @@ from .mining.miner import (
 )
 from .mining.spec import LLMSpec, PRRuntimeOptions
 from .passrate import DEFAULT_ROLLOUTS, PASSRATE_MAX, PASSRATE_MIN, measure_pass_rates
+from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
 from .planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
@@ -1782,8 +1783,12 @@ def build_parser() -> argparse.ArgumentParser:
         "check-tokenizers",
         help="Step 0: verify teacher/student share a tokenizer (hard-fail on mismatch)",
     )
-    p_tok.add_argument("--teacher", default=None, help="defaults to Qwen3-Coder-Next-80B")
-    p_tok.add_argument("--student", default=None, help="defaults to Qwen3-8B")
+    p_tok.add_argument(
+        "--teacher", default=None, help=f"defaults to the pilot teacher ({DEFAULT_TEACHER})"
+    )
+    p_tok.add_argument(
+        "--student", default=None, help=f"defaults to the pilot student ({DEFAULT_STUDENT})"
+    )
     p_tok.set_defaults(func=cmd_check_tokenizers)
 
     p_passk = sub.add_parser(
