@@ -1,0 +1,67 @@
+# The gate this repo did not have. PLAN.md's whole claim rests on rules and
+# thresholds fixed before data collection; a suite that only runs when someone
+# remembers to run it is not a check on that, it is a hope.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --all-extras, not the default sync. Four test files guard their imports
+      # with `pytest.importorskip("torch")`, so a run without the `train` extra
+      # is green while the dataset, reopd, routing and train tests never
+      # execute — the failure mode where CI reports success for tests it
+      # silently skipped.
+      - run: uv sync --frozen --all-extras
+
+      # `-m "not llm"` keeps CI free. The llm-marked test hits a real API and
+      # costs money per run; it is deliberately opt-in and stays a local /
+      # pre-merge step rather than something every push pays for.
+      # `--strict-markers` so a typo'd marker fails loudly instead of quietly
+      # selecting nothing.
+      - run: uv run pytest -q --strict-markers -m "not llm"
+
+      # Docker-touching commands (check-env, mine, prove) are not run here.
+      # They need a real container runtime, minutes of build time, and in
+      # mining's case the GitHub API — they belong in a manual workflow, not on
+      # every push. What CI guarantees is that the pure logic and the CLI
+      # surface are sound; the container integrity claims are verified by
+      # `vektori-trace check-env`, run deliberately.
+
+  import:
+    # Cheap canary the test suite does not give: every module importable from a
+    # bare install, with no optional extra present. Catches a top-level import
+    # of torch or harbor leaking into the diagnose-only path, which is the one
+    # install shape a customer starts from.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --no-dev
+      - run: uv run vektori-trace --help
