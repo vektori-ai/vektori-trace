@@ -29,29 +29,55 @@ consumes them with no changes.
 | Max top-K | unlimited (K=16 used) | **5** (public cap) | unlimited, per docs |
 | Quantisation | yours to choose | **FP8** | yours (you imported the weights) |
 | GPU to hold | yes | no | no |
-| Verified firsthand | yes (`tests/test_endpoint.py`) | **no — run the probe** | **no — run the probe** |
+| Verified firsthand | yes (`tests/test_endpoint.py`) | request shape matches the vendor's shipped code; **not yet run** | **no — run the probe** |
+| Teacher runs on | your vLLM | a **dedicated deployment**, not serverless | the imported model |
 
 
 Fireworks
 ---------
 
-`POST /inference/v1/completions` accepts three things that combine into exactly
-the operation OPD needs:
+**Settled from Fireworks' own source, not from the API reference.**
+`fw-ai/cookbook`, `training/utils/distillation/sampling.py`,
+`_request_teacher_echo` — the teacher-scoring call their `sampled_reverse_kl`
+distillation mode runs in production:
 
-- `prompt` as an **array of integers** — the ids the student sampled reach the
-  teacher unchanged, so no tokenisation boundary can shift between the two.
-- `echo_last: N` — documented as "echo back the last N tokens of the prompt …
-  useful for obtaining logprobs of the prompt suffix". `prompt_logprobs`
-  restricted to a suffix, which is the only window OPD scores.
-- `logprobs: true` + `top_logprobs: K` — the OpenAI-compatible response format,
-  whose entries carry `token_id` on both the token and every alternative. Ids,
-  not strings, so `distill.align_topk_rows` consumes them directly.
+```python
+response, _metrics = await sampler.async_completions_stream(
+    prompt=token_ids,        # integer array — the student's sampled ids
+    max_tokens=1,
+    temperature=0.0,
+    logprobs=True,
+    echo=True,
+    raw_output=True,
+    top_logprobs=K,          # only when K > 0
+)
+```
 
-The strongest evidence this is supported rather than incidental: Fireworks built
-their own on-policy distillation recipe on it
-(`training.recipes.distillation_loop`, mode `sampled_reverse_kl`, trained on
-`teacher_logprob - sampling_logprob`), which is the same objective as
-`opd.reverse_kl_surrogate`.
+then reads `choices[0].logprobs.content` for one teacher logprob per sampled
+response token. Their loss is `teacher_logprob - sampling_logprob`, the same
+objective as `opd.reverse_kl_surrogate`. So this is not a capability inferred
+from prose — it is the vendor shipping the exact operation OPD needs.
+
+`teacher_fireworks.py` sends that request verbatim. Four details taken from the
+source rather than the docs:
+
+- **`echo: true`, not `echo_last`.** `echo_last: N` is in the public OpenAPI
+  schema and is much cheaper — it ships logprobs for a suffix instead of a
+  3.5k-token prefix — but the vendor's code does not use it. It is available as
+  `echo_mode="last"` and is opt-in until the probe confirms it; `"full"` is the
+  proven default.
+- **The teacher is a dedicated inference deployment**, not a serverless model.
+  The recipe auto-creates one when handed a base model
+  (`teacher_deployment_id`, `teacher_deployment_shape`). Budget for it.
+- **`top_logprobs` is omitted, not sent as 0**, when the sampled-token objective
+  is the one running.
+- **Entries are not guaranteed to carry `token_id`.** The vendor's
+  `_candidate_token_id` falls back to round-tripping the token *string* through a
+  local tokenizer — precisely the boundary-shift risk `teacher.py` exists to rule
+  out. Our alignment verifies by id when ids are present and otherwise dispatches
+  on the response *length* against the two known echo layouts, refusing anything
+  that fits neither. `content[i]` scores `token[i]`, or `token[i+1]` in the
+  "training-aligned" P+C−1 shape.
 
 Two numbers that belong in provenance, both emitted by
 `FireworksTeacherPool.provenance()`:
@@ -165,8 +191,10 @@ for the ReOPD prefix-replay data path (`docs/OPD.md`, Axis 1) that the whole
 Open questions
 --------------
 
-1. **Does Fireworks' `echo_last` return logprobs over an integer-array prompt?**
-   Doc-confirmed, not probe-confirmed. `probe-teacher --backend fireworks`.
+1. ~~**Does Fireworks score supplied tokens?**~~ **Resolved 2026-07-30 from
+   `fw-ai/cookbook`** — their production distillation does exactly this, and our
+   request is now that request. What remains is running it against a real
+   deployment, and whether the cheaper `echo_mode="last"` behaves the same.
 2. **Does Bedrock CMI's OpenAICompletion accept an integer-array `prompt`?**
    Undocumented either way. `probe-teacher --backend bedrock`.
 3. **Is FP8 teacher noise tolerable inside the KL?** Not answerable by probing —

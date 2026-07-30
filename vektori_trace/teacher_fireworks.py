@@ -6,16 +6,28 @@ true of Fireworks' `/completions`, which accepts three things together:
 
 - `prompt` as an **array of integers** — an already-tokenised prompt, so the ids
   the student sampled reach the teacher unchanged (no re-tokenisation boundary).
-- `echo_last: N` — documented as "echo back the last N tokens of the prompt …
-  useful for obtaining logprobs of the prompt suffix". That is `prompt_logprobs`
-  restricted to a suffix, which is exactly the window OPD needs.
+- `echo: true` (or `echo_last: N`, the cheaper documented variant) — logprobs
+  over prompt positions, which is the window OPD needs.
 - `logprobs: true` + `top_logprobs: K` — the OpenAI-compatible response format,
   whose entries carry `token_id` on both the returned token and every
   alternative. Ids, not strings: `align_topk_rows` can consume them directly.
 
-Fireworks built their own on-policy distillation recipe on this same mechanism
-(`training.recipes.distillation_loop`, mode `sampled_reverse_kl`), which is the
-strongest evidence the path is supported rather than incidental.
+This is not inferred from the API reference. Fireworks' own distillation recipe
+does exactly it — `training/utils/distillation/sampling.py` in `fw-ai/cookbook`,
+`_request_teacher_echo`, which posts::
+
+    prompt=token_ids, max_tokens=1, temperature=0.0,
+    logprobs=True, echo=True, raw_output=True, top_logprobs=K
+
+against a frozen teacher deployment, then reads `choices[0].logprobs.content` for
+one teacher logprob per sampled response token. Their `sampled_reverse_kl` mode
+trains on `teacher_logprob - sampling_logprob` — the same objective as
+`opd.reverse_kl_surrogate`. So the request shape here is the vendor's own, not a
+reconstruction from prose.
+
+Two details taken from that source rather than the docs: the teacher runs on a
+**dedicated inference deployment** (the recipe auto-creates one when handed a
+base model), and `top_logprobs` is omitted entirely rather than sent as 0.
 
 Two facts about the numbers, both of which belong in a run's provenance:
 
@@ -74,11 +86,19 @@ class FireworksTeacherPool:
     api_key: str | None = None
     api_base: str = DEFAULT_FIREWORKS_BASE
     timeout: float = 120.0
+    #: `"full"` sends `echo: true` — the shape Fireworks' own distillation recipe
+    #: uses in production, and therefore the one known to work. `"last"` sends
+    #: `echo_last: N`, which is documented and ships far fewer logprobs for a long
+    #: prefix, but which the vendor's code does not use. Default to the proven one
+    #: and treat the cheap one as an optimisation to verify with the probe.
+    echo_mode: str = "full"
     # Recorded in provenance so a run states which teacher produced its scores.
     meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.api_base = self.api_base.rstrip("/")
+        if self.echo_mode not in ("full", "last"):
+            raise ValueError(f"echo_mode must be 'full' or 'last', got {self.echo_mode!r}")
         if self.api_key is None:
             self.api_key = os.environ.get("FIREWORKS_API_KEY")
         if not self.api_key:
@@ -195,6 +215,7 @@ class FireworksTeacherPool:
             "teacher_api_base": self.api_base,
             "teacher_host": "fireworks",
             "teacher_quantisation": "fp8 (Fireworks serving default)",
+            "teacher_echo_mode": self.echo_mode,
             **self.meta,
         }
 
@@ -213,21 +234,32 @@ class FireworksTeacherPool:
     ) -> list[dict[str, Any]]:
         """POST the scoring request and return one entry per token in `tokens`."""
         ids = [int(t) for t in tokens]
+        prefix = [int(t) for t in prefix_ids]
         payload: dict[str, Any] = {
             "model": self.model,
             # The integer-array `prompt` form, which is why no re-tokenisation
             # happens anywhere in this path.
-            "prompt": [int(t) for t in prefix_ids] + ids,
-            # `echo_last` is the whole point: score the suffix without paying to
-            # ship logprobs for a 3.5k-token prefix we are not training on.
-            "echo_last": len(ids),
+            "prompt": prefix + ids,
             # Not 0: some deployments reject a zero-token generation. One token is
-            # sampled and discarded; its entry is dropped by the id-run match below.
+            # sampled and discarded; its entry is dropped by the alignment below.
             "max_tokens": 1,
             "temperature": 0.0,
             "logprobs": True,
-            "top_logprobs": top_k,
+            # Fireworks' own recipe sets this on every teacher scoring request.
+            "raw_output": True,
         }
+        if self.echo_mode == "last":
+            # Cheaper: score the suffix without shipping logprobs for a
+            # 3.5k-token prefix we are not training on. Documented, but not the
+            # shape Fireworks' own code uses — see `echo_mode`.
+            payload["echo_last"] = len(ids)
+        else:
+            payload["echo"] = True
+        if top_k > 0:
+            # Omitted rather than sent as 0, matching the vendor recipe: some
+            # deployments treat a present-but-zero `top_logprobs` as a request for
+            # alternatives they then refuse.
+            payload["top_logprobs"] = top_k
         out = self._post(payload)
         choices = out.get("choices") or []
         if not choices:
@@ -246,41 +278,72 @@ class FireworksTeacherPool:
                 f"Cannot align. Got keys: {sorted(logprobs)}"
             )
         entries = [e for e in content if isinstance(e, dict)]
-        window = _locate_id_run(entries, ids)
-        return window
+        return _align_scored_entries(entries, len(prefix), ids, echo_mode=self.echo_mode)
 
 
-def _locate_id_run(entries: list[dict[str, Any]], ids: list[int]) -> list[dict[str, Any]]:
-    """Return the sub-run of `entries` whose `token_id`s equal `ids` exactly.
+def _align_scored_entries(
+    entries: list[dict[str, Any]],
+    prefix_len: int,
+    ids: list[int],
+    *,
+    echo_mode: str = "full",
+) -> list[dict[str, Any]]:
+    """The entries that scored `ids`, verified by token id where possible.
 
-    `echo_last=N` should put the scored tokens first, so position 0 is tried
-    before scanning. A scan that finds the run more than once is an error, not a
-    coin flip: `docs/OPD.md`'s whole failure mode is a one-token offset that
-    corrupts the objective silently instead of crashing.
+    Two strategies, in order of how much they can prove:
+
+    1. **By id.** The response schema marks `token_id` required, so normally every
+       entry says which token it scored and the run equal to `ids` can be located
+       outright. This survives any echo offset, which matters because `echo` and
+       `echo_last` do not put the scored window in the same place.
+    2. **By position**, only when the entries carry no ids at all. Fireworks' own
+       recipe aligns this way — `content[1:]` predicts `tokens[1:]`, response
+       tokens at `prompt_len - 1` — and falls back to tokenizer round-tripping,
+       which is exactly the local-tokenizer risk `teacher.py` rules out. So this
+       branch dispatches on the returned length instead, and refuses when the
+       length matches neither layout.
     """
     n = len(ids)
-    got = []
-    for i, e in enumerate(entries):
-        if "token_id" not in e:
+    total = prefix_len + n
+    got = [int(e["token_id"]) for e in entries if isinstance(e.get("token_id"), int)]
+
+    if len(got) == len(entries) and entries:
+        # Every entry is identified. `echo_last` puts the run first, so a match at
+        # 0 is the answer rather than one candidate among many.
+        if got[:n] == ids:
+            return entries[:n]
+        hits = [s for s in range(len(got) - n + 1) if got[s : s + n] == ids]
+        if len(hits) == 1:
+            return entries[hits[0] : hits[0] + n]
+        if not hits:
             raise TeacherScoringError(
-                f"logprobs entry {i} carries no token_id ({e!r}) — cannot verify "
-                "that the teacher scored the tokens we sent"
+                f"the {n} tokens we asked about do not appear in the returned "
+                f"logprobs (got {len(got)} entries, first ids {got[:8]}, wanted "
+                f"{ids[:8]}) — the teacher did not echo what we sent"
             )
-        got.append(int(e["token_id"]))
-    if got[:n] == ids:
-        return entries[:n]
-    hits = [s for s in range(len(got) - n + 1) if got[s : s + n] == ids]
-    if len(hits) == 1:
-        return entries[hits[0] : hits[0] + n]
-    if not hits:
         raise TeacherScoringError(
-            f"the {n} tokens we asked about do not appear in the returned "
-            f"logprobs (got {len(got)} entries, first ids {got[:8]}, wanted "
-            f"{ids[:8]}) — `echo_last` did not echo what we sent"
+            f"the scored token run appears {len(hits)} times in the response at "
+            f"offsets {hits[:5]} — refusing to guess which one is ours"
         )
+
+    # No ids anywhere: fall back to the layout the vendor's own code assumes.
+    # Which layouts are admissible depends on what was *asked for* — accepting a
+    # suffix-shaped response to an `echo: true` request would be a guess.
+    if echo_mode == "last":
+        if len(entries) in (n, n + 1):
+            # Only the suffix was echoed, plus possibly the generated token.
+            return entries[:n]
+    else:
+        if len(entries) == total:
+            # content[i] scores token[i]; token 0 is unconditioned and meaningless.
+            return entries[prefix_len:total]
+        if len(entries) == total - 1:
+            # content[i] scores token[i+1] — the P+C-1 "training-aligned" shape.
+            return entries[prefix_len - 1 : prefix_len - 1 + n]
     raise TeacherScoringError(
-        f"the scored token run appears {len(hits)} times in the response at "
-        f"offsets {hits[:5]} — refusing to guess which one is ours"
+        f"logprobs entries carry no token_id and their count ({len(entries)}) "
+        f"matches no echo_mode={echo_mode!r} layout for a {total}-token prompt "
+        f"scoring {n} tokens — refusing to guess the alignment"
     )
 
 
@@ -291,11 +354,15 @@ def _entry_logprob(entry: dict[str, Any], token_id: int, *, position: int) -> fl
     renormalised by temperature and sampling filters, so training against it
     would be a KL to a warped teacher rather than to the teacher.
     """
-    if int(entry.get("token_id", -1)) != int(token_id):
+    got = entry.get("token_id")
+    if isinstance(got, int) and got != int(token_id):
         raise TeacherScoringError(
-            f"position {position}: teacher scored token {entry.get('token_id')} "
-            f"but we sent {token_id} — the ids we supplied are not the ids it received"
+            f"position {position}: teacher scored token {got} but we sent "
+            f"{token_id} — the ids we supplied are not the ids it received"
         )
+    # `got is None` means this deployment returns no ids and the entry was located
+    # positionally instead. `_align_scored_entries` has already refused every
+    # layout it cannot account for, so there is nothing further to check here.
     lp = entry.get("logprob")
     if lp is None:
         raise TeacherScoringError(f"no logprob for token {token_id} at position {position}")

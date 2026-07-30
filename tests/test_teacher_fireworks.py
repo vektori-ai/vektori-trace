@@ -6,8 +6,9 @@ perfectly finite loss that optimises the wrong thing, so every test here is
 about the pool raising rather than returning something plausible.
 
 No network: `_post_json` is patched and the recorded payload is asserted, which
-is also how the request shape stays pinned to what the Fireworks schema
-documents (integer-array `prompt`, `echo_last`, `logprobs: true`).
+is how the request shape stays pinned to `_request_teacher_echo` in
+`fw-ai/cookbook` — the function Fireworks' own `sampled_reverse_kl` distillation
+uses in production — rather than to a reading of the API reference.
 """
 
 from __future__ import annotations
@@ -51,7 +52,13 @@ def _patch(monkeypatch, response, sink: list | None = None):
     monkeypatch.setattr(tf, "_post_json", fake_post)
 
 
-def test_score_ids_sends_the_documented_request_shape(pool, monkeypatch):
+def test_score_ids_sends_the_request_shape_fireworks_own_recipe_sends(pool, monkeypatch):
+    """Pinned to `_request_teacher_echo` in fw-ai/cookbook, not to the API prose.
+
+    That function is what Fireworks' `sampled_reverse_kl` distillation runs in
+    production, so matching it is the closest thing to a guarantee available
+    without an API key.
+    """
     calls: list[dict] = []
     _patch(monkeypatch, _response([_entry(50, -0.5), _entry(60, -1.5)]), calls)
 
@@ -60,12 +67,35 @@ def test_score_ids_sends_the_documented_request_shape(pool, monkeypatch):
     payload = calls[0]["payload"]
     # Ids, not text: the whole reason this path exists.
     assert payload["prompt"] == [10, 20, 30, 50, 60]
-    # Only the scored suffix is echoed — a 3.5k-token prefix is not free.
-    assert payload["echo_last"] == 2
-    # The OpenAI-compatible format is the one carrying token_id.
+    assert payload["echo"] is True
     assert payload["logprobs"] is True
+    assert payload["raw_output"] is True
+    assert payload["max_tokens"] == 1
     assert payload["temperature"] == 0.0
+    # Omitted, not sent as 0 — the vendor recipe only sets it when K > 0.
+    assert "top_logprobs" not in payload
     assert calls[0]["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_echo_last_mode_sends_the_cheaper_documented_variant(monkeypatch):
+    """`echo_last` ships far fewer logprobs for a 3.5k-token prefix, but the
+    vendor's code does not use it, so it is opt-in rather than the default."""
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+    pool = tf.FireworksTeacherPool(model="m", echo_mode="last")
+    calls: list[dict] = []
+    _patch(monkeypatch, _response([_entry(50, -0.5), _entry(60, -1.5)]), calls)
+
+    pool.score_ids([10, 20, 30], [50, 60])
+
+    assert calls[0]["payload"]["echo_last"] == 2
+    assert "echo" not in calls[0]["payload"]
+
+
+def test_an_unknown_echo_mode_is_rejected(monkeypatch):
+    monkeypatch.setenv("FIREWORKS_API_KEY", "test-key")
+
+    with pytest.raises(ValueError, match="echo_mode"):
+        tf.FireworksTeacherPool(model="m", echo_mode="suffix")
 
 
 def test_score_ids_returns_the_model_logprob_not_the_sampling_one(pool, monkeypatch):
@@ -190,6 +220,57 @@ def test_text_prefix_scoring_is_refused_with_a_pointer_to_score_ids(pool):
     """No /tokenize endpoint, and a local tokenizer is the boundary-shift risk."""
     with pytest.raises(TeacherScoringError, match="score_ids"):
         pool.prompt_logprobs("some prefix", [50])
+
+
+def _bare(token_id: int, logprob: float) -> dict:
+    """An entry from a deployment that returns no `token_id` — the shape
+    Fireworks' own code defends against by round-tripping the token string."""
+    return {"token": f"<{token_id}>", "logprob": logprob, "bytes": []}
+
+
+def test_positional_fallback_uses_the_full_length_layout(pool, monkeypatch):
+    """No ids anywhere: `content[i]` scores `token[i]`, so the sampled tokens sit
+    at `prompt_len:`. Verified by count, since nothing else can verify it."""
+    _patch(
+        monkeypatch,
+        _response(
+            [_bare(10, -9.0), _bare(20, -9.0), _bare(50, -0.5), _bare(60, -1.5)]
+        ),
+    )
+
+    assert pool.score_ids([10, 20], [50, 60]) == [-0.5, -1.5]
+
+
+def test_positional_fallback_uses_the_p_plus_c_minus_one_layout(pool, monkeypatch):
+    """The "training-aligned" shape: `content[i]` scores `token[i+1]`, one entry
+    shorter, because token 0 has nothing conditioning it."""
+    _patch(
+        monkeypatch,
+        _response([_bare(20, -9.0), _bare(50, -0.5), _bare(60, -1.5)]),
+    )
+
+    assert pool.score_ids([10, 20], [50, 60]) == [-0.5, -1.5]
+
+
+def test_positional_fallback_refuses_an_unrecognised_length(pool, monkeypatch):
+    """Neither layout fits, and no ids to fall back on. Guessing here produces a
+    finite loss against the wrong positions — the failure this module exists for."""
+    _patch(monkeypatch, _response([_bare(99, -9.0), _bare(98, -9.0)]))
+
+    with pytest.raises(TeacherScoringError, match="matches no echo_mode"):
+        pool.score_ids([10, 20, 30], [50, 60])
+
+
+def test_ids_are_still_verified_when_present_despite_the_fallback(pool, monkeypatch):
+    """The fallback must not weaken the strict path: a response that carries ids
+    and scored the wrong tokens still raises rather than aligning by count."""
+    _patch(
+        monkeypatch,
+        _response([_entry(10, -9.0), _entry(20, -9.0), _entry(51, -0.5), _entry(61, -1.5)]),
+    )
+
+    with pytest.raises(TeacherScoringError, match="do not appear"):
+        pool.score_ids([10, 20], [50, 60])
 
 
 def test_missing_api_key_fails_at_construction(monkeypatch):
