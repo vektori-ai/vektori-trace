@@ -35,6 +35,30 @@ def _require_train():
         ) from e
 
 
+def _JsonlLogger(path: Path):
+    """TrainerCallback appending every HF log dict to `path` as JSONL.
+
+    Defined inside a function because `TrainerCallback` requires transformers,
+    which cli.py must not import at module scope.
+    """
+    _require_train()
+    from transformers import TrainerCallback
+
+    class JsonlLogger(TrainerCallback):
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs:
+                return
+            row = {"step": state.global_step, **logs}
+            with self.path.open("a") as fh:
+                fh.write(json.dumps(row) + "\n")
+
+    return JsonlLogger(path)
+
+
 @dataclass
 class LoraHyperparams:
     r: int = 16
@@ -59,6 +83,29 @@ class TrainConfig:
     modal_gpu: str = "A10G"
     # Distinguishes A2 vs A3 adapters on the shared Volume.
     arm: str | None = None
+    # --- memory / throughput -------------------------------------------------
+    # bf16 is the default because fp32 does not fit the pilot: Qwen3-8B is ~32GB
+    # of weights in fp32 before optimizer state, which OOMs every 24GB card and
+    # wastes an 80GB one. Ignored when CUDA is unavailable (offline tests train a
+    # tiny model on CPU, where bf16 is slower and less numerically forgiving).
+    bf16: bool = True
+    gradient_accumulation_steps: int = 1
+    # Trades ~30% step time for a large activation-memory reduction. Off by
+    # default so short pilot runs stay fast; turn it on when sequences are long.
+    gradient_checkpointing: bool = False
+    warmup_ratio: float = 0.03
+    lr_scheduler_type: str = "cosine"
+    max_grad_norm: float = 1.0
+    # HF keeps every checkpoint by default. Adapters land on a shared, billed
+    # volume once per arm per seed, so retain only the newest.
+    save_total_limit: int = 1
+    # Set False for a self-managed GPU (EC2/local) where Modal is not in play at
+    # all. The default preserves the Modal train → Modal serve handoff.
+    stage_to_volume: bool = True
+    # Optional held-out examples: without them a 29-task corpus cannot show
+    # whether the adapter learned the capability or memorised the test output,
+    # which is the one thing dataset.py's masking exists to prevent.
+    eval_steps: int = 0
 
 
 @dataclass
@@ -110,6 +157,7 @@ def train_lora(
     *,
     model: Any | None = None,
     tokenizer: Any | None = None,
+    eval_examples: list[TokenizedExample] | None = None,
 ) -> TrainResult:
     """Run LoRA SFT. Lazy-imports train extras. Writes adapter under output_dir."""
     _require_train()
@@ -133,9 +181,17 @@ def train_lora(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # bf16 only where it is both supported and a win. `is_bf16_supported()` is
+    # False on pre-Ampere cards (e.g. T4/V100 on older EC2 families), where
+    # requesting it would either error or silently emulate.
+    use_bf16 = bool(
+        config.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    )
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(
-            config.base_model, trust_remote_code=True, torch_dtype=torch.float32
+            config.base_model,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
         )
 
     target = list(config.lora.target_modules)
@@ -155,26 +211,49 @@ def train_lora(
     model = get_peft_model(model, peft_config)
 
     ds = build_sft_dataset(examples)
+    eval_ds = build_sft_dataset(eval_examples) if eval_examples else None
     collator = LabelPreservingCollator(pad_token_id=tokenizer.pad_token_id)
+
+    eval_kwargs: dict[str, Any] = {}
+    if eval_ds is not None and config.eval_steps > 0:
+        eval_kwargs = {"eval_strategy": "steps", "eval_steps": config.eval_steps}
 
     args = TrainingArguments(
         output_dir=str(config.output_dir / "hf_runs"),
         max_steps=config.max_steps,
         per_device_train_batch_size=config.per_device_train_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        gradient_checkpointing=config.gradient_checkpointing,
+        bf16=use_bf16,
         learning_rate=config.learning_rate,
+        lr_scheduler_type=config.lr_scheduler_type,
+        warmup_ratio=config.warmup_ratio,
+        max_grad_norm=config.max_grad_norm,
         logging_steps=1,
         save_steps=max(config.max_steps, 1),
+        save_total_limit=config.save_total_limit,
         report_to=[],
         seed=config.seed,
         remove_unused_columns=False,
         label_names=["labels"],
+        **eval_kwargs,
     )
+    # A loss curve is the only in-flight evidence that a billed GPU run is
+    # working. `report_to=[]` keeps W&B optional; this writes the same series to
+    # the run directory so a finished run can be audited without a SaaS account.
+    history_path = config.output_dir / "train_log.jsonl"
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
+        callbacks=[_JsonlLogger(history_path)],
     )
+    if config.gradient_checkpointing:
+        # LoRA freezes the base weights, so without this the checkpointed
+        # activations have nothing requiring grad and the backward pass is empty.
+        model.enable_input_require_grads()
     train_out = trainer.train()
     final_loss = None
     if train_out and train_out.metrics:
@@ -237,6 +316,13 @@ def train_lora_modal(
         "modal_gpu": config.modal_gpu,
         "volume_adapter_path": vol_path,
         "arm": config.arm,
+        "bf16": config.bf16,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "gradient_checkpointing": config.gradient_checkpointing,
+        "warmup_ratio": config.warmup_ratio,
+        "lr_scheduler_type": config.lr_scheduler_type,
+        "max_grad_norm": config.max_grad_norm,
+        "save_total_limit": config.save_total_limit,
     }
 
     app = modal.App("vektori-trace-train")
@@ -281,6 +367,13 @@ def train_lora_modal(
                 lora=LoraHyperparams(**cfg["lora"]),
                 use_modal=False,
                 arm=cfg.get("arm"),
+                bf16=cfg.get("bf16", True),
+                gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
+                gradient_checkpointing=cfg.get("gradient_checkpointing", False),
+                warmup_ratio=cfg.get("warmup_ratio", 0.03),
+                lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine"),
+                max_grad_norm=cfg.get("max_grad_norm", 1.0),
+                save_total_limit=cfg.get("save_total_limit", 1),
             ),
         )
         vol.commit()
@@ -341,22 +434,36 @@ def run_training(
     *,
     model: Any | None = None,
     tokenizer: Any | None = None,
+    eval_examples: list[TokenizedExample] | None = None,
 ) -> TrainResult:
-    """Dispatch to Modal or local based on `config.use_modal`."""
+    """Dispatch to Modal or local based on `config.use_modal`.
+
+    Three destinations, not two:
+      use_modal=True                        → train on a Modal GPU
+      use_modal=False, stage_to_volume=True  → train here, upload for Modal serve
+      use_modal=False, stage_to_volume=False → train here, touch Modal never (AWS)
+    """
     if config.use_modal and model is None:
         return train_lora_modal(examples, config)
-    result = train_lora(examples, config, model=model, tokenizer=tokenizer)
-    # Local train + Modal serve still needs the weights on the Volume.
-    if config.use_modal is False and model is not None:
+    result = train_lora(
+        examples, config, model=model, tokenizer=tokenizer, eval_examples=eval_examples
+    )
+    # An injected model means an offline unit test; never reach the network.
+    if model is not None:
         return result
-    if not config.use_modal:
-        vol_path = volume_adapter_dir(config.base_model, config.seed, arm=config.arm)
-        try:
-            stage_local_adapter_to_volume(result.adapter_dir, vol_path)
-            result.volume_adapter_path = vol_path
-        except RuntimeError:
-            # Modal not available (offline unit test) — leave volume path unset.
-            pass
+    # A self-managed GPU serves the adapter off local disk, so there is no Volume
+    # to stage to. Previously this path attempted a Modal upload regardless and
+    # relied on the exception handler, which turned "Modal isn't part of this run"
+    # into a silent dependency on Modal being importable.
+    if not config.stage_to_volume:
+        return result
+    vol_path = volume_adapter_dir(config.base_model, config.seed, arm=config.arm)
+    try:
+        stage_local_adapter_to_volume(result.adapter_dir, vol_path)
+        result.volume_adapter_path = vol_path
+    except RuntimeError:
+        # Modal not available (offline unit test) — leave volume path unset.
+        pass
     return result
 
 

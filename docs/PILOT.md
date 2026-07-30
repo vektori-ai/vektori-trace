@@ -11,6 +11,11 @@ cheapest thing that can falsify the thesis happens first.
 The repository holds ~16.8k LOC and 39 test files, and **none of it has met a
 GPU or a real corpus.** The blocker has not been code for some time.
 
+**GPU choices below are written in Modal's vocabulary because that is what was
+built first — not because anything depends on it.** For the same pilot on a GPU
+you manage (EC2 or otherwise), see `docs/AWS.md`: `--api-base` attaches every
+stage to a vLLM server you started, and Modal drops out of the run entirely.
+
 
 The framework decision
 ----------------------
