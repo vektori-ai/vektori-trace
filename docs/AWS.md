@@ -102,9 +102,9 @@ serially that is the dominant cost of the whole pilot.
 
 ## 3. OPD teacher scoring
 
-The one thing OPD needs that no hosted API provides is `prompt_logprobs` — the
-teacher's logprob for tokens *we* supply, not tokens it sampled. That requires a
-teacher server you control, which is exactly what you now have:
+OPD needs `prompt_logprobs` — the teacher's logprob for tokens *we* supply, not
+tokens it sampled. A teacher server you control always provides it, which is
+exactly what you now have:
 
 ```bash
 # on the teacher instance
@@ -131,6 +131,19 @@ vektori-trace distill \
   --student Qwen/Qwen3-8B \
   --max-steps 200 --examples-per-step 4 \
   --out ./out/opd
+```
+
+### Not renting the teacher GPU at all
+
+The teacher instance above is the expensive half of this page and the half that
+H100 capacity keeps blocking. Two hosted endpoints score supplied tokens and can
+stand in for it — Fireworks, and Bedrock Custom Model Import, which needs no
+capacity reservation. `docs/HOSTED_TEACHERS.md` covers both, what they cost in
+quantisation and top-K, and the one-request probe that decides whether a given
+deployment can do it at all:
+
+```bash
+vektori-trace probe-teacher --backend fireworks
 ```
 
 `--teacher-traces` takes harbor job dirs (what `replay` leaves behind) and/or

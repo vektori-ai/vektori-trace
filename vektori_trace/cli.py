@@ -950,12 +950,50 @@ def _load_teacher_trajectories(source: Path) -> list[tuple[str, list[Any]]]:
     return trajectories
 
 
+def _teacher_pool_for(args: argparse.Namespace) -> Any:
+    """The teacher named by `--teacher-backend`, checked before any GPU time.
+
+    Every backend fails fast here rather than on the first scoring call halfway
+    into a run: whether the teacher can score supplied tokens at all is the
+    precondition for the entire method (`docs/OPD.md`), and finding out late costs
+    whatever the student instance has already billed.
+    """
+    backend = getattr(args, "teacher_backend", "vllm")
+    if backend == "vllm":
+        from .teacher import teacher_pool_from_endpoint
+
+        if not args.teacher_api_base:
+            raise ValueError("--teacher-api-base is required for --teacher-backend vllm")
+        return teacher_pool_from_endpoint(
+            args.teacher_api_base, model=args.teacher_served_name
+        )
+    if backend == "fireworks":
+        from .teacher_fireworks import fireworks_pool_from_env
+
+        return fireworks_pool_from_env(
+            model=args.teacher_model_id, api_base=args.teacher_api_base
+        )
+    from .teacher_bedrock import BedrockTeacherPool
+
+    if not args.teacher_model_id:
+        raise ValueError(
+            "--teacher-model-id is required for --teacher-backend bedrock "
+            "(the imported model's ARN)"
+        )
+    pool = BedrockTeacherPool(model_id=args.teacher_model_id, region=args.teacher_region)
+    # Bedrock's ability to score supplied tokens is the repo's open question
+    # (docs/HOSTED_TEACHERS.md), so it gets the same one-request check the other
+    # two backends get rather than being taken on trust.
+    pool.score_ids([9707, 11], [1879, 0])
+    return pool
+
+
 def cmd_distill(args: argparse.Namespace) -> int:
     """OPD: teacher prefix → student samples → teacher scores → reverse-KL step."""
     from .distill import OPDTrainConfig, run_opd_training, write_opd_report
     from .endpoint import EndpointError
     from .reopd import iter_reopd_examples
-    from .teacher import TeacherScoringError, teacher_pool_from_endpoint
+    from .teacher import TeacherScoringError
     from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER, TokenizerMismatchError
 
     try:
@@ -978,10 +1016,8 @@ def cmd_distill(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     try:
         # Fails before any GPU time if the teacher cannot score supplied tokens.
-        pool = teacher_pool_from_endpoint(
-            args.teacher_api_base, model=args.teacher_served_name
-        )
-    except (EndpointError, TeacherScoringError) as e:
+        pool = _teacher_pool_for(args)
+    except (EndpointError, TeacherScoringError, ValueError) as e:
         print(f"error: teacher endpoint unusable for OPD: {e}", file=sys.stderr)
         return 2
 
@@ -998,9 +1034,10 @@ def cmd_distill(args: argparse.Namespace) -> int:
         top_k=args.top_k,
         gradient_checkpointing=args.gradient_checkpointing,
     )
+    prov = pool.provenance()
     print(
         f"OPD: {len(examples)} step-examples from {len(trajectories)} trajectories · "
-        f"teacher {pool.model} @ {pool.api_base}"
+        f"teacher {prov['teacher_model']} @ {prov['teacher_api_base']}"
     )
     try:
         result = run_opd_training(examples, pool, cfg)
@@ -1019,6 +1056,116 @@ def cmd_distill(args: argparse.Namespace) -> int:
         print(f"note: {result.skipped_empty_samples} example(s) sampled no tokens")
     print(f"report: {md}")
     return 0
+
+
+def cmd_probe_teacher(args: argparse.Namespace) -> int:
+    """Does this hosted teacher return per-token logprobs for tokens we supply?
+
+    The whole hosted-teacher question reduces to this one request, and neither
+    vendor's documentation settles it: Fireworks documents `echo_last` and the
+    integer-array prompt separately without an example combining them, and AWS
+    documents `prompt_logprobs` on the chat schema while claiming completion-schema
+    support it never demonstrates. So: send it, print what came back.
+
+    Exit 0 means OPD can run against this teacher. Exit 1 means it cannot, and the
+    message is the reason — which is a result worth recording, not a failure.
+    """
+    from .teacher import TeacherScoringError
+
+    # Arbitrary-but-valid ids. The check is on the shape of the response, not on
+    # what the tokens mean, and there is no server-side tokenizer to ask.
+    prefix_ids = [9707, 11, 1879]
+    tokens = [0, 1986, 374]
+
+    pool: Any
+    if args.backend == "fireworks":
+        from .teacher_fireworks import (
+            DEFAULT_FIREWORKS_BASE,
+            DEFAULT_FIREWORKS_TEACHER,
+            FireworksTeacherPool,
+        )
+
+        try:
+            pool = FireworksTeacherPool(
+                model=args.model or DEFAULT_FIREWORKS_TEACHER,
+                api_base=args.api_base or DEFAULT_FIREWORKS_BASE,
+            )
+        except TeacherScoringError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        target = f"{pool.model} @ {pool.api_base}"
+    else:
+        if not args.model:
+            print(
+                "error: --model is required for bedrock (the imported model's ARN)",
+                file=sys.stderr,
+            )
+            return 2
+        from .teacher_bedrock import BedrockTeacherPool
+
+        try:
+            pool = BedrockTeacherPool(model_id=args.model, region=args.region)
+        except TeacherScoringError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        target = f"{pool.model_id} @ bedrock:{pool.region}"
+
+    print(f"probing {args.backend}: {target}")
+    result: dict[str, Any] = {
+        "backend": args.backend,
+        "target": target,
+        "prefix_ids": prefix_ids,
+        "tokens": tokens,
+    }
+    try:
+        scored = pool.score_ids(prefix_ids, tokens)
+    except TeacherScoringError as e:
+        result.update({"score_ids": "failed", "error": str(e)})
+        _write_probe(args, result)
+        print(f"score_ids: FAILED — {e}", file=sys.stderr)
+        print(
+            "OPD cannot run against this teacher. This is the documented outcome "
+            "to record, not something to work around.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if len(scored) != len(tokens):
+        result.update({"score_ids": "failed", "error": f"{len(scored)} logprobs for {len(tokens)} tokens"})
+        _write_probe(args, result)
+        print(f"score_ids: FAILED — {result['error']}", file=sys.stderr)
+        return 1
+
+    result.update({"score_ids": "ok", "logprobs": scored})
+    print(f"score_ids: OK — {len(scored)} logprobs, {[round(x, 4) for x in scored]}")
+
+    if args.top_k > 0:
+        try:
+            rows = pool.score_ids_topk(prefix_ids, tokens, args.top_k)
+            widths = [len(r) for r in rows]
+            result.update({"score_ids_topk": "ok", "row_widths": widths})
+            print(f"score_ids_topk(K={args.top_k}): OK — row widths {widths}")
+        except (TeacherScoringError, ValueError) as e:
+            # Not fatal: the sampled-token objective is the declared one and it
+            # works. Top-K is the lower-variance variant, and losing it costs
+            # variance, not correctness.
+            result.update({"score_ids_topk": "failed", "topk_error": str(e)})
+            print(f"score_ids_topk(K={args.top_k}): FAILED — {e}")
+            print("note: top_k=0 (`reverse_kl_surrogate`) is unaffected.")
+
+    result["provenance"] = pool.provenance()
+    _write_probe(args, result)
+    print("this teacher can run OPD.")
+    return 0
+
+
+def _write_probe(args: argparse.Namespace, result: dict[str, Any]) -> None:
+    if not args.out:
+        return
+    path = Path(args.out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"probe result: {path}")
 
 
 def cmd_check_tokenizers(args: argparse.Namespace) -> int:
@@ -2003,9 +2150,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="dir of harbor job dirs and/or ATIF .json traces from the teacher",
     )
     p_distill.add_argument(
+        "--teacher-backend",
+        choices=("vllm", "fireworks", "bedrock"),
+        default="vllm",
+        help=(
+            "where the teacher runs. vllm (default) is the reference path and the "
+            "only unquantised one; fireworks and bedrock need no GPU but should "
+            "pass `probe-teacher` first (docs/HOSTED_TEACHERS.md)"
+        ),
+    )
+    p_distill.add_argument(
         "--teacher-api-base",
-        required=True,
-        help="self-hosted vLLM serving the teacher (needs prompt_logprobs — PLAN.md C1)",
+        default=None,
+        help=(
+            "vllm: the self-hosted server (required, needs prompt_logprobs — "
+            "PLAN.md C1). fireworks: overrides the default gateway. bedrock: unused"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-model-id",
+        default=None,
+        help=(
+            "fireworks: `accounts/.../models/<id>` or a deployment path. "
+            "bedrock: the imported model's ARN (required)"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-region",
+        default="us-east-1",
+        help="bedrock only; must be a Custom Model Import region",
     )
     p_distill.add_argument(
         "--teacher-served-name",
@@ -2206,6 +2379,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_ground.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
     p_ground.add_argument("--out", default="./vektori-out")
     p_ground.set_defaults(func=cmd_ground)
+
+    p_probe = sub.add_parser(
+        "probe-teacher",
+        help="one request: can this hosted teacher score tokens we supply?",
+        description=(
+            "Sends a single scoring request and reports what came back. This is "
+            "the empirical check that decides whether a hosted teacher can run OPD "
+            "at all — a 400 here is a finding, not a bug. Nothing else in the "
+            "pipeline should be run against a teacher that has not passed it."
+        ),
+    )
+    p_probe.add_argument(
+        "--backend", choices=("fireworks", "bedrock"), required=True
+    )
+    p_probe.add_argument(
+        "--model",
+        default=None,
+        help="Fireworks resource path, or the Bedrock imported-model ARN",
+    )
+    p_probe.add_argument("--api-base", default=None, help="fireworks only")
+    p_probe.add_argument("--region", default="us-east-1", help="bedrock only")
+    p_probe.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="also probe score_ids_topk at this K (Fireworks caps at 5)",
+    )
+    p_probe.add_argument("--out", default=None, help="write the result as JSON here")
+    p_probe.set_defaults(func=cmd_probe_teacher)
 
     return parser
 

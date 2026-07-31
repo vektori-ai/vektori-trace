@@ -2,11 +2,20 @@
 
 `reopd.TeacherPool` is a Protocol; until now the only implementation was
 `InMemoryTeacherPool`, a fake returning a constant logprob. This is the real one:
-it scores *supplied* tokens against the teacher via vLLM's `prompt_logprobs`,
-which is why PLAN.md C1 requires the teacher be self-hosted. No hosted API
-exposes per-token logprobs for tokens you hand it — OpenAI-compatible `logprobs`
-only covers tokens the server itself sampled, which is the wrong quantity: OPD
-needs log π_t(a_t) for the *student's* action.
+it scores *supplied* tokens against the teacher via vLLM's `prompt_logprobs`.
+
+The quantity OPD needs is log π_t(a_t) for the *student's* action. Plain
+OpenAI-compatible `logprobs` is the wrong one — it covers only tokens the server
+itself sampled. `prompt_logprobs` is a vLLM extension, not an OpenAI-API feature,
+which is why PLAN.md C1 reaches for a self-hosted teacher.
+
+Two hosted endpoints do nonetheless expose the right quantity through their own
+extensions, and have their own pools rather than being forced through this one:
+`teacher_fireworks.FireworksTeacherPool` (`echo_last` over an integer-array
+prompt) and `teacher_bedrock.BedrockTeacherPool` (Custom Model Import's
+`prompt_logprobs`). `docs/HOSTED_TEACHERS.md` covers the trade — quantisation and
+a top-K cap in exchange for no GPU to hold. This module remains the reference
+implementation and the only one with an unquantised teacher.
 
 Backend-agnostic by construction — an EC2 instance running `vllm serve`, a Modal
 container, or localhost all look identical here. Stdlib-only for the same reason
@@ -40,12 +49,24 @@ class TeacherScoringError(RuntimeError):
     """The teacher endpoint cannot produce usable `prompt_logprobs`."""
 
 
-def _post_json(url: str, payload: dict[str, Any], *, timeout: float) -> Any:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> Any:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # Hosted teachers (`teacher_fireworks.py`) need an Authorization
+            # header; a self-hosted vLLM server needs none.
+            **(headers or {}),
+        },
         method="POST",
     )
     try:

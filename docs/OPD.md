@@ -175,22 +175,37 @@ Teacher access: what is actually obtainable
 The required operation is `prompt_logprobs` — **scoring of supplied tokens**,
 not generation logprobs.
 
-| Access path | Generation top-k | `prompt_logprobs` | OPD viable |
+| Access path | Generation top-k | Scores supplied tokens | OPD viable |
 |---|---|---|---|
 | OpenAI GPT-5-class, Anthropic | no | no | **no** |
-| Hosted open-weight (Together, Fireworks, OpenRouter) | sometimes — ~23% of OpenRouter endpoints comply, 5–20 top-k | **no — vLLM extension, not an OpenAI-API feature** | **no** |
+| Hosted open-weight, generic OpenAI-compatible endpoint (Together, OpenRouter) | sometimes — ~23% of OpenRouter endpoints comply, 5–20 top-k | **no — `prompt_logprobs` is a vLLM extension, not an OpenAI-API feature** | **no** |
+| **Fireworks `/completions`** | yes | **yes — `echo_last` + integer-array `prompt`** | **yes** |
+| **Bedrock Custom Model Import, OpenAICompletion schema** | yes | **documented yes — `prompt_logprobs`; unverified firsthand** | **probe first** |
 | **Self-hosted vLLM / SGLang (incl. Modal)** | yes | **yes** | **yes** |
 
-**The binding constraint is hosted-vs-self-hosted, not open-vs-closed.** A
-frontier open-weight model behind someone else's OpenAI-compatible endpoint
-gives no more than GPT-5 does. The same weights on your own vLLM deployment give
-everything.
+> **Corrected 2026-07-30.** Earlier revisions of this table said no hosted API
+> could score supplied tokens, and `teacher.py` was written on that basis. That
+> is true of the *generic* OpenAI-compatible surface and false of two specific
+> vendors, both of which now have implementations in the repo
+> (`teacher_fireworks.py`, `teacher_bedrock.py`). See `docs/HOSTED_TEACHERS.md`
+> for the request shapes and what remains unverified.
 
-Two further cautions:
+**The binding constraint is the specific endpoint, not hosted-vs-self-hosted.** A
+frontier open-weight model behind a *generic* OpenAI-compatible endpoint still
+gives no more than GPT-5 does. But an endpoint that accepts an already-tokenised
+prompt and will echo logprobs over a suffix — Fireworks' `echo_last`, Bedrock
+CMI's `prompt_logprobs` — gives the same quantity a self-hosted vLLM gives.
 
-- Hosted logprobs, where they exist, are unreliable for this purpose:
-  Fireworks serves FP8, Together serves INT8 on some tiers. Quantisation noise
-  inside a KL term you differentiate through.
+Three further cautions:
+
+- Hosted logprobs are **quantised**: Fireworks serves FP8, Together INT8 on some
+  tiers. Quantisation noise inside a KL term you differentiate through. This is
+  now a difference to record in provenance rather than a reason to rule the path
+  out — `FireworksTeacherPool.provenance()` emits it.
+- Hosted **top-K is capped**. Fireworks' public inference caps `top_logprobs` at
+  5, so `topk_reverse_kl` cannot reach thunlp/OPD's K=16 there. The sampled-token
+  objective is unaffected; the pool raises rather than clamping, because K is part
+  of the objective.
 - The **tokenizer constraint is independent of hosting**. verl: teachers "must
   share the student's tokenizer/vocab — typically satisfied by picking a teacher
   in the same model family."
