@@ -237,13 +237,18 @@ def encode_prefix_pair(
             teacher_messages = turns_to_openai_messages(prefix_turns)
             teacher_text = render_teacher_prefix(teacher_messages, thinking_mode=thinking_mode)
             teacher_ids = encode_teacher_ids(teacher_text, teacher_tokenizer)
-            if isinstance(prefix_cache, TeacherPrefixCache):
+
+        if len(student_ids) <= max_prefix_tokens and len(teacher_ids) <= max_prefix_tokens:
+            # Cache only the fitted prefix — putting before the fit check would
+            # store a too-long encoding and then conflict after truncation.
+            if (
+                cached_teacher is None
+                and isinstance(prefix_cache, TeacherPrefixCache)
+            ):
                 prefix_cache.put(
                     example.task or "", example.step_index, teacher_ids,
                     thinking_mode=thinking_mode,
                 )
-
-        if len(student_ids) <= max_prefix_tokens and len(teacher_ids) <= max_prefix_tokens:
             return student_ids, teacher_ids
 
         # Drop the earliest turn and retry.
@@ -377,41 +382,35 @@ def run_opd_training(
     if not examples:
         raise ValueError("no ReOPD examples — nothing to distil from")
 
-    if cfg.verify_tokenizers:
-        if cfg.cross_tokenizer:
-            # Cross-tokenizer path: validate the bridge artifact, not the
-            # tokenizer identity.  check_tokenizers would hard-fail because the
-            # two vocabularies differ by design.
-            _bridge_for_check = bridge
-            if _bridge_for_check is None and cfg.bridge_path is not None:
-                from .vocab_bridge import CrossTokenizerBridge
-                _bridge_for_check = CrossTokenizerBridge.load(cfg.bridge_path)
-            if _bridge_for_check is not None:
-                from .encoding_dsv4 import ENCODING_DSV4_SHA256
-                if _bridge_for_check.encoding_dsv4_hash != ENCODING_DSV4_SHA256:
-                    raise RuntimeError(
-                        f"bridge encoding_dsv4 hash mismatch: "
-                        f"bridge has {_bridge_for_check.encoding_dsv4_hash!r}, "
-                        f"current encoder is {ENCODING_DSV4_SHA256!r}. "
-                        "Rebuild the bridge with `vektori-trace build-bridge`."
-                    )
-        else:
-            from .tokenizer_check import check_tokenizers
-            check_tokenizers(cfg.teacher_model, cfg.student_model)
+    if cfg.verify_tokenizers and not cfg.cross_tokenizer:
+        from .tokenizer_check import check_tokenizers
+        check_tokenizers(cfg.teacher_model, cfg.student_model)
 
     # ── Cross-tokenizer setup ─────────────────────────────────────────────────
     _bridge = bridge
     _teacher_tok: Any = teacher_tokenizer if teacher_tokenizer is not None else cfg.teacher_tokenizer
     _prefix_cache = prefix_cache
+    if cfg.cross_tokenizer and _prefix_cache is None:
+        from .teacher_cross import TeacherPrefixCache
+        _prefix_cache = TeacherPrefixCache()
 
     if cfg.cross_tokenizer:
+        from .encoding_dsv4 import ENCODING_DSV4_SHA256
+        from .vocab_bridge import CrossTokenizerBridge
+
         if _bridge is None and cfg.bridge_path is not None:
-            from .vocab_bridge import CrossTokenizerBridge
             _bridge = CrossTokenizerBridge.load(cfg.bridge_path)
         if _bridge is None:
             raise ValueError(
                 "cross_tokenizer=True requires a bridge — pass bridge= kwarg or "
                 "set cfg.bridge_path"
+            )
+        if _bridge.encoding_dsv4_hash != ENCODING_DSV4_SHA256:
+            raise RuntimeError(
+                f"bridge encoding_dsv4 hash mismatch: "
+                f"bridge has {_bridge.encoding_dsv4_hash!r}, "
+                f"current encoder is {ENCODING_DSV4_SHA256!r}. "
+                "Rebuild the bridge with `vektori-trace build-bridge`."
             )
         if _teacher_tok is None:
             _teacher_tok = AutoTokenizer.from_pretrained(
@@ -429,6 +428,20 @@ def run_opd_training(
         tokenizer = AutoTokenizer.from_pretrained(cfg.student_model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Cross-tokenizer gate runs after both tokenizers exist (FINAL-PLAN.md:
+    # verify_tokenizers calls check_cross_tokenizer — not check_tokenizers,
+    # and not nothing). Offline tests set verify_tokenizers=False.
+    if cfg.verify_tokenizers and cfg.cross_tokenizer:
+        from .vocab_bridge import check_cross_tokenizer
+
+        check_cross_tokenizer(
+            cfg.teacher_model,
+            cfg.student_model,
+            teacher_tokenizer=_teacher_tok,
+            student_tokenizer=tokenizer,
+            thinking_mode=cfg.thinking_mode,
+        )
 
     use_bf16 = bool(cfg.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     if model is None:
@@ -499,7 +512,7 @@ def run_opd_training(
 
                 if cfg.cross_tokenizer:
                     # ── Cross-tokenizer path (FINAL-PLAN.md) ─────────────────
-                    from .align import AlignmentError, align_by_bytes, classify_spans
+                    from .align import align_by_bytes, classify_spans
                     from .cross_kl import cross_step_loss
                     from .teacher_cross import encode_teacher_ids
 
@@ -551,16 +564,13 @@ def run_opd_training(
                         skipped += 1
                         continue
 
-                    # Byte alignment — hard fail on AlignmentError (desync).
-                    try:
-                        alignment = align_by_bytes(
-                            student_bytes_list,
-                            teacher_bytes_list,
-                            max_span_student_tokens=cfg.max_span_student_tokens,
-                        )
-                    except AlignmentError:
-                        skipped += 1
-                        continue
+                    # Byte alignment — AlignmentError is a hard fail (FINAL-PLAN
+                    # §10 / "never best-effort"), not a skippable example.
+                    alignment = align_by_bytes(
+                        student_bytes_list,
+                        teacher_bytes_list,
+                        max_span_student_tokens=cfg.max_span_student_tokens,
+                    )
 
                     # Granularity gate (hard fail #6 per FINAL-PLAN.md §10).
                     if alignment.granularity < cfg.min_alignment_granularity:
@@ -571,7 +581,23 @@ def run_opd_training(
                             "desynced beyond the pre-registered floor"
                         )
 
-                    span_kinds = classify_spans(alignment)
+                    # Special-token masks over the *aligned* streams (§10.4).
+                    from .vocab_bridge import _special_ids
+
+                    student_specials = _special_ids(tokenizer)
+                    teacher_specials = _special_ids(_teacher_tok)
+                    student_special_mask = [
+                        action_ids[p] in student_specials for p in student_aligned_positions
+                    ]
+                    teacher_special_mask = [
+                        teacher_action_ids[p] in teacher_specials
+                        for p in teacher_aligned_positions
+                    ]
+                    span_kinds = classify_spans(
+                        alignment,
+                        student_special_mask=student_special_mask,
+                        teacher_special_mask=teacher_special_mask,
+                    )
 
                     # ── Teacher scoring (teacher-side ids) ───────────────────
                     teacher_lp_all = pool.score_ids(teacher_prefix, teacher_action_ids)

@@ -40,6 +40,8 @@ class CrossStepStats:
     """Per-step monitoring statistics from cross_step_loss.
 
     Fields match FINAL-PLAN.md §Deliverable-2 exactly; no beta field.
+    ``dropped_by_reason`` covers §10.10 content-type / cause breakdown for
+    dropped spans (keyed by classify_spans reason string).
     """
 
     n_spans: int
@@ -52,6 +54,7 @@ class CrossStepStats:
     special_tokens_masked: int  # spans dropped because they contained only specials
     mean_mapped_teacher_mass: float  # mean mapped-teacher-mass fraction for A spans
     student_entropy: float      # mean Shannon entropy of π_s at A-span positions
+    dropped_by_reason: dict[str, int] | None = None
 
 
 # ── Estimator A: coarse-grained reverse KL ─────────────────────────────────────
@@ -261,11 +264,13 @@ def cross_step_loss(
     mapped_teacher_masses: list[float] = []
     entropy_sum = 0.0
     n_entropy = 0
+    dropped_by_reason: dict[str, int] = {}
 
     for span, (kind, reason) in zip(alignment.spans, span_kinds, strict=True):
         # ── DROP ─────────────────────────────────────────────────────────────
         if kind == SpanKind.DROP:
             n_dropped += 1
+            dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + 1
             if "special" in reason.lower():
                 special_tokens_masked += 1
             continue
@@ -357,6 +362,7 @@ def cross_step_loss(
             else 0.0
         ),
         student_entropy=entropy_sum / n_entropy if n_entropy > 0 else float("nan"),
+        dropped_by_reason=dropped_by_reason or None,
     )
 
     return loss, stats

@@ -1213,17 +1213,24 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
     print("this teacher can run OPD.")
 
     if getattr(args, "echo", False):
-        # Echo-support probe: verify the pool can score supplied token ids, which
-        # is the specific Fireworks `echo=True` capability OPD depends on.
-        # CrossTokenizerTeacherPool.probe_echo_support() runs entirely offline
-        # against a fake pool; against a real pool it makes one real request.
-        if hasattr(pool, "probe_echo_support"):
-            echo_result = pool.probe_echo_support()
-            print(f"echo support: {'OK' if echo_result['ok'] else 'FAILED'}")
-            if not echo_result["ok"]:
-                print(f"  error: {echo_result.get('error')}", file=sys.stderr)
-        else:
-            print("note: --echo: pool does not expose probe_echo_support()")
+        # P0 echo probe. FireworksTeacherPool does not expose probe_echo_support;
+        # wrap it so the same check CrossTokenizerTeacherPool uses is available.
+        echo_pool = pool
+        if not hasattr(echo_pool, "probe_echo_support"):
+            from .teacher_cross import CrossTokenizerTeacherPool
+
+            echo_pool = CrossTokenizerTeacherPool(
+                pool=pool,
+                teacher_tokenizer=None,
+                thinking_mode="chat",
+            )
+        echo_result = echo_pool.probe_echo_support()
+        result["echo"] = echo_result
+        print(f"echo support: {'OK' if echo_result.get('ok') else 'FAILED'}")
+        if not echo_result.get("ok"):
+            print(f"  error: {echo_result.get('error')}", file=sys.stderr)
+            _write_probe(args, result)
+            return 1
     return 0
 
 
