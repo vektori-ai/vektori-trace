@@ -989,7 +989,14 @@ def _teacher_pool_for(args: argparse.Namespace) -> Any:
 
 
 def cmd_distill(args: argparse.Namespace) -> int:
-    """OPD: teacher prefix → student samples → teacher scores → reverse-KL step."""
+    """OPD: teacher prefix → student samples → teacher scores → reverse-KL step.
+
+    Same-vocab path: student and teacher share a vocabulary; student ids are
+    sent directly to the teacher for scoring.
+
+    Cross-tokenizer path (--cross-tokenizer): student and teacher have different
+    vocabularies; byte alignment maps the two token streams (FINAL-PLAN.md).
+    """
     from .distill import OPDTrainConfig, run_opd_training, write_opd_report
     from .endpoint import EndpointError
     from .reopd import iter_reopd_examples
@@ -1021,6 +1028,45 @@ def cmd_distill(args: argparse.Namespace) -> int:
         print(f"error: teacher endpoint unusable for OPD: {e}", file=sys.stderr)
         return 2
 
+    cross_tokenizer = getattr(args, "cross_tokenizer", False)
+    bridge_path = getattr(args, "bridge", None)
+    thinking_mode = getattr(args, "thinking_mode", "chat")
+    min_granularity = getattr(args, "min_granularity", 0.5)
+    cross_top_k = getattr(args, "cross_top_k", 5)
+    teacher_tok_id = getattr(args, "teacher_tokenizer_id", None)
+
+    # For cross-tokenizer mode, load bridge + teacher tokenizer here so errors
+    # surface before any GPU allocation.
+    _bridge = None
+    _teacher_tok = None
+    if cross_tokenizer:
+        if not bridge_path:
+            print(
+                "error: --cross-tokenizer requires --bridge PATH (run "
+                "`vektori-trace build-bridge` first)",
+                file=sys.stderr,
+            )
+            return 2
+        from .vocab_bridge import CrossTokenizerBridge
+        try:
+            _bridge = CrossTokenizerBridge.load(bridge_path)
+        except Exception as e:
+            print(f"error: cannot load bridge {bridge_path}: {e}", file=sys.stderr)
+            return 2
+
+        if teacher_tok_id:
+            from transformers import AutoTokenizer
+            _teacher_tok = AutoTokenizer.from_pretrained(teacher_tok_id, trust_remote_code=True)
+
+        # Wrap pool in CrossTokenizerTeacherPool for provenance recording.
+        from .teacher_cross import CrossTokenizerTeacherPool
+        pool = CrossTokenizerTeacherPool(
+            pool=pool,
+            teacher_tokenizer=_teacher_tok,
+            thinking_mode=thinking_mode,
+            bridge=_bridge,
+        )
+
     cfg = OPDTrainConfig(
         student_model=args.student or DEFAULT_STUDENT,
         teacher_model=args.teacher or DEFAULT_TEACHER,
@@ -1033,14 +1079,23 @@ def cmd_distill(args: argparse.Namespace) -> int:
         max_new_tokens=args.max_new_tokens,
         top_k=args.top_k,
         gradient_checkpointing=args.gradient_checkpointing,
+        cross_tokenizer=cross_tokenizer,
+        bridge_path=bridge_path,
+        thinking_mode=thinking_mode,
+        min_alignment_granularity=min_granularity,
+        cross_top_k=cross_top_k,
     )
     prov = pool.provenance()
     print(
         f"OPD: {len(examples)} step-examples from {len(trajectories)} trajectories · "
-        f"teacher {prov['teacher_model']} @ {prov['teacher_api_base']}"
+        f"teacher {prov.get('teacher_model', '?')} @ {prov.get('teacher_api_base', '?')}"
     )
     try:
-        result = run_opd_training(examples, pool, cfg)
+        result = run_opd_training(
+            examples, pool, cfg,
+            bridge=_bridge,
+            teacher_tokenizer=_teacher_tok,
+        )
     except TokenizerMismatchError as e:
         print(f"error: teacher/student tokenizers differ: {e}", file=sys.stderr)
         return 2
@@ -1156,6 +1211,19 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
     result["provenance"] = pool.provenance()
     _write_probe(args, result)
     print("this teacher can run OPD.")
+
+    if getattr(args, "echo", False):
+        # Echo-support probe: verify the pool can score supplied token ids, which
+        # is the specific Fireworks `echo=True` capability OPD depends on.
+        # CrossTokenizerTeacherPool.probe_echo_support() runs entirely offline
+        # against a fake pool; against a real pool it makes one real request.
+        if hasattr(pool, "probe_echo_support"):
+            echo_result = pool.probe_echo_support()
+            print(f"echo support: {'OK' if echo_result['ok'] else 'FAILED'}")
+            if not echo_result["ok"]:
+                print(f"  error: {echo_result.get('error')}", file=sys.stderr)
+        else:
+            print("note: --echo: pool does not expose probe_echo_support()")
     return 0
 
 
@@ -1203,6 +1271,103 @@ def cmd_check_tokenizers(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    return 0
+
+
+def cmd_build_bridge(args: argparse.Namespace) -> int:
+    """Build a CrossTokenizerBridge JSON from a teacher/student tokenizer pair.
+
+    The bridge maps every teacher token id to the byte-identical student token id
+    (when one exists), and stores the byte tables for both tokenizers so that
+    run_opd_training can align sampled student tokens with teacher re-tokenisation
+    without loading either tokenizer at training time.
+    """
+    from .vocab_bridge import CrossTokenizerError, check_cross_tokenizer
+
+    try:
+        bridge = check_cross_tokenizer(
+            args.teacher_tokenizer,
+            args.student_tokenizer,
+            thinking_mode=args.thinking_mode,
+        )
+    except CrossTokenizerError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge.save(out_path)
+    print(f"bridge: {out_path}")
+    print(f"exact-map size: {len(bridge.exact_map)} byte-identical token pairs")
+    print(
+        f"teacher vocab: {bridge.teacher_table.vocab_size}  "
+        f"student vocab: {bridge.student_table.vocab_size}"
+    )
+    print(
+        f"coverage: {len(bridge.exact_map) / bridge.teacher_table.vocab_size:.1%} "
+        "of teacher tokens map exactly"
+    )
+    return 0
+
+
+def cmd_align_report(args: argparse.Namespace) -> int:
+    """Offline granularity report: encode text samples with both tokenizers and
+    align by bytes, reporting granularity (spans / student tokens) per sample.
+
+    Uses the bridge byte tables so no network is required; tokenizers are loaded
+    locally to encode the input text.
+    """
+    import sys
+
+    from .align import AlignmentError, align_by_bytes
+    from .vocab_bridge import CrossTokenizerBridge
+
+    bridge = CrossTokenizerBridge.load(args.bridge)
+
+    # Load both tokenizers to encode the samples.
+    from transformers import AutoTokenizer
+
+    teacher_name = bridge.teacher_fingerprint.name
+    student_name = bridge.student_fingerprint.name
+    teacher_tok = AutoTokenizer.from_pretrained(teacher_name, trust_remote_code=True)
+    student_tok = AutoTokenizer.from_pretrained(student_name, trust_remote_code=True)
+
+    raw = Path(args.text).read_text() if args.text else sys.stdin.read()
+    samples = [line for line in raw.splitlines() if line.strip()]
+    if not samples:
+        print("error: no samples to align (empty input)", file=sys.stderr)
+        return 1
+
+    rows = []
+    for sample in samples:
+        s_ids = student_tok.encode(sample, add_special_tokens=False)
+        t_ids = teacher_tok.encode(sample, add_special_tokens=False)
+        s_bytes = [bridge.student_table.table.get(i, b"") for i in s_ids]
+        t_bytes = [bridge.teacher_table.table.get(i, b"") for i in t_ids]
+        s_bytes = [b for b in s_bytes if b]
+        t_bytes = [b for b in t_bytes if b]
+        if not s_bytes or not t_bytes:
+            rows.append({"sample": sample[:40], "error": "empty after EOS stripping"})
+            continue
+        try:
+            al = align_by_bytes(s_bytes, t_bytes)
+            rows.append({
+                "sample": sample[:40],
+                "granularity": round(al.granularity, 4),
+                "n_student": al.n_student_tokens,
+                "n_teacher": al.n_teacher_tokens,
+                "n_spans": len(al.spans),
+            })
+        except AlignmentError as e:
+            rows.append({"sample": sample[:40], "error": str(e)})
+
+    print(json.dumps(rows, indent=2))
+    gran = [r["granularity"] for r in rows if "granularity" in r]
+    if gran:
+        print(
+            f"\nmean granularity: {sum(gran) / len(gran):.4f}  "
+            f"(n={len(gran)}, min={min(gran):.4f})"
+        )
     return 0
 
 
@@ -2136,12 +2301,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_arms.set_defaults(func=cmd_run_arms)
 
-    # --- PLAN.md capability-routing commands ---
+    # --- FINAL-PLAN.md cross-tokenizer OPD path ---
     p_distill = sub.add_parser(
         "distill",
         help=(
-            "OPD branch (PLAN.md Step H): student samples at a teacher prefix, the "
-            "teacher scores those tokens, reverse-KL step. Needs a self-hosted teacher."
+            "OPD: student samples at a teacher prefix, the teacher scores those "
+            "tokens, reverse-KL step. Same-vocab path: teacher/student share a "
+            "tokenizer. Cross-tokenizer path (--cross-tokenizer): byte-alignment "
+            "of Qwen3 + DeepSeek-V4-Flash (FINAL-PLAN.md)."
         ),
     )
     p_distill.add_argument(
@@ -2226,6 +2393,64 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="trade step time for activation memory on a smaller card",
     )
+    # ── Cross-tokenizer flags (FINAL-PLAN.md) ──────────────────────────────
+    p_distill.add_argument(
+        "--cross-tokenizer",
+        action="store_true",
+        dest="cross_tokenizer",
+        help=(
+            "enable cross-tokenizer OPD: student and teacher have different "
+            "vocabularies; byte alignment maps both token streams. Requires "
+            "--bridge and typically --teacher-backend fireworks."
+        ),
+    )
+    p_distill.add_argument(
+        "--bridge",
+        default=None,
+        metavar="PATH",
+        help="CrossTokenizerBridge JSON artifact from `vektori-trace build-bridge`",
+    )
+    p_distill.add_argument(
+        "--thinking-mode",
+        default="chat",
+        choices=("chat", "thinking"),
+        dest="thinking_mode",
+        help=(
+            "teacher deployment inference mode; must match the bridge's thinking_mode "
+            "(default: chat)"
+        ),
+    )
+    p_distill.add_argument(
+        "--min-granularity",
+        type=float,
+        default=0.5,
+        dest="min_granularity",
+        help=(
+            "hard-fail if alignment granularity (spans/student tokens) is below this "
+            "for any example (pre-registered floor: 0.5, FINAL-PLAN.md §4)"
+        ),
+    )
+    p_distill.add_argument(
+        "--cross-top-k",
+        type=int,
+        default=5,
+        dest="cross_top_k",
+        help=(
+            "request top-K teacher logprobs per position for Estimator A "
+            "(Fireworks caps at 5; set 0 to disable Estimator A entirely)"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-tokenizer",
+        default=None,
+        dest="teacher_tokenizer_id",
+        metavar="HF_ID",
+        help=(
+            "HF model id for the teacher tokenizer, used to re-tokenise the "
+            "student's sampled action text on the teacher side. Required for "
+            "--cross-tokenizer unless the teacher model id is already set."
+        ),
+    )
     p_distill.set_defaults(func=cmd_distill)
 
     p_tok = sub.add_parser(
@@ -2239,6 +2464,59 @@ def build_parser() -> argparse.ArgumentParser:
         "--student", default=None, help=f"defaults to the pilot student ({DEFAULT_STUDENT})"
     )
     p_tok.set_defaults(func=cmd_check_tokenizers)
+
+    p_bridge = sub.add_parser(
+        "build-bridge",
+        help=(
+            "build a CrossTokenizerBridge JSON artifact from a teacher/student "
+            "tokenizer pair (required for --cross-tokenizer distillation)"
+        ),
+    )
+    p_bridge.add_argument(
+        "--teacher-tokenizer",
+        required=True,
+        metavar="HF_ID",
+        help="HF model id for the teacher tokenizer, e.g. deepseek-ai/DeepSeek-V4-Flash",
+    )
+    p_bridge.add_argument(
+        "--student-tokenizer",
+        required=True,
+        metavar="HF_ID",
+        help="HF model id for the student tokenizer, e.g. Qwen/Qwen3-8B",
+    )
+    p_bridge.add_argument(
+        "--thinking-mode",
+        default="chat",
+        choices=("chat", "thinking"),
+        help="teacher deployment inference mode (default: chat)",
+    )
+    p_bridge.add_argument(
+        "--out",
+        default="bridge.json",
+        help="output path for the bridge artifact (default: bridge.json)",
+    )
+    p_bridge.set_defaults(func=cmd_build_bridge)
+
+    p_align = sub.add_parser(
+        "align-report",
+        help=(
+            "offline granularity report: encode text samples with both tokenizers "
+            "and align by bytes, printing granularity per sample"
+        ),
+    )
+    p_align.add_argument(
+        "--bridge",
+        required=True,
+        metavar="PATH",
+        help="CrossTokenizerBridge JSON artifact from `build-bridge`",
+    )
+    p_align.add_argument(
+        "--text",
+        default=None,
+        metavar="FILE",
+        help="file of text samples (one per line); defaults to stdin",
+    )
+    p_align.set_defaults(func=cmd_align_report)
 
     p_passk = sub.add_parser(
         "passk",
@@ -2407,6 +2685,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="also probe score_ids_topk at this K (Fireworks caps at 5)",
     )
     p_probe.add_argument("--out", default=None, help="write the result as JSON here")
+    p_probe.add_argument(
+        "--echo",
+        action="store_true",
+        help=(
+            "also run probe_echo_support() to verify the teacher can score "
+            "supplied token ids (the Fireworks echo=True capability OPD depends on)"
+        ),
+    )
     p_probe.set_defaults(func=cmd_probe_teacher)
 
     return parser

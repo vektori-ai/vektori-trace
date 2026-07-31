@@ -1,7 +1,9 @@
+> **STALE — do not build from this.** Superseded by `FINAL-PLAN.md`.
+> Kept for history. No longer true: Assumes two GPU instances, one serving the teacher for prompt_logprobs. That teacher instance no longer exists — teacher is Fireworks-hosted; student is local LoRA.
+
 # Running the pilot on AWS
 
-`docs/PILOT.md` describes the spend order on Modal. Nothing in the measurement
-half requires Modal, and this document is the AWS path. The only Modal-specific
+Historical AWS attach path for a self-hosted student endpoint. Teacher serving assumptions here are superseded by `FINAL-PLAN.md` (Fireworks teacher). Nothing in the measurement half requires Modal. The only Modal-specific
 things in the repo are (a) `serve.py`, which spawns a container and owns its
 lifecycle, and (b) the Volume used to hand an adapter from train to serve. Both
 have replacements:

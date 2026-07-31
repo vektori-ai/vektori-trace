@@ -1,3 +1,6 @@
+> **STALE — do not build from this.** Superseded by `FINAL-PLAN.md`.
+> Kept for history. No longer true: Modal spend-order; 30B→8B same-family Qwen teacher; H100+A100. Teacher is hosted, there is no Modal GPU requirement for the teacher, and the pair is cross-tokenizer (DeepSeek-V4-Flash → Qwen3-8B).
+
 Pilot — 30B → 8B, and the order to run it in
 ============================================
 

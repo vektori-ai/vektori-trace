@@ -1,15 +1,16 @@
-"""On-policy distillation (OPD) training loop — PLAN.md Step H, OPD branch.
+"""On-policy distillation (OPD) training loop.
 
-The pieces existed separately and nothing drove them: `opd.reverse_kl_surrogate`
-is the objective, `reopd.ReOPDStepExample` is the data, `teacher.VllmTeacherPool`
-supplies the scores. This is the optimizer loop that closes them, and the reason
-it is not `train.py`: HF's `Trainer` optimises a loss over a *fixed* dataset, and
-OPD has no fixed dataset. Every step samples fresh tokens from the current policy
-and asks the teacher what it thinks of them. That sample-score-update cycle is
-the method, so the loop is written out rather than hidden behind a callback.
+Same-vocab path: student and teacher share a tokenizer. Student samples an
+action, teacher scores those exact ids via `prompt_logprobs`. Gradient from
+`reverse_kl_surrogate`.
 
-One step
---------
+Cross-tokenizer path (FINAL-PLAN.md): student is Qwen3-8B, teacher is
+DeepSeek-V4-Flash. Tokenisations are aligned by bytes (§7 two-pointer merge),
+the aligned token streams are supervised with `cross_step_loss` (§6 estimators
+A and B). Same reverse-KL objective, different score routing.
+
+One step (same-vocab)
+---------------------
 1. Encode the frozen teacher prefix with `add_generation_prompt=True` — the
    student must be positioned to *start* an assistant turn.
 2. **Student samples** the action (`do_sample=True`). Not greedy: the objective's
@@ -24,13 +25,13 @@ Why the student samples from the training model rather than from vLLM
 --------------------------------------------------------------------
 vLLM would sample far faster, but the sample must come from the *current* policy,
 so every step would need a weight sync into the server. That is the hard part of
-GRPO infrastructure and the reason `docs/PILOT.md` defers the RL branch to verl.
+GRPO infrastructure and the reason the RL branch defers to verl.
 OPD does not need it: one forward pass per step is already required for the
 gradient, so sampling from the same in-process model costs one extra pass and
 removes the sync entirely. The teacher stays on vLLM because it is frozen.
 
 Cost shape: the teacher is queried every step, so teacher latency — not student
-FLOPs — sets the step time. That is why the pilot pair uses an MoE teacher.
+FLOPs — sets the step time.
 """
 
 from __future__ import annotations
@@ -98,6 +99,25 @@ class OPDTrainConfig:
     # with a fake pool: sending student ids to a real teacher with a different
     # vocabulary trains on scores for different strings than the student sampled.
     verify_tokenizers: bool = True
+    # ── Cross-tokenizer OPD (FINAL-PLAN.md) ──────────────────────────────────
+    # When True, student and teacher have different vocabularies; alignment is
+    # done by bytes (align_by_bytes) and the loss is cross_step_loss.
+    cross_tokenizer: bool = False
+    # Path to a CrossTokenizerBridge JSON artifact. May be None when bridge= is
+    # injected directly into run_opd_training (e.g. offline tests).
+    bridge_path: Path | str | None = None
+    # "chat" or "thinking" — must match the teacher deployment's inference setting.
+    thinking_mode: str = "chat"
+    # Hard-fail if alignment granularity (spans / student tokens) falls below this.
+    min_alignment_granularity: float = 0.5
+    # Hard-fail if any single span covers more than this many student tokens.
+    max_span_student_tokens: int = 8
+    # 0 = no top-K; >0 = also call score_ids_topk at this K for Estimator A.
+    # Fireworks caps at 5 (FINAL-PLAN.md §2).
+    cross_top_k: int = 5
+    # Optional teacher tokenizer — injectable for offline tests so no HF download
+    # is needed. When None and cross_tokenizer=True, loaded from teacher_model.
+    teacher_tokenizer: Any | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # `do_sample=True` with temperature=0.0 raises inside HF's sampler — after
@@ -107,6 +127,10 @@ class OPDTrainConfig:
             raise ValueError(
                 f"--temperature must be > 0 (got {self.temperature}); the OPD "
                 "sample is drawn, not greedy. Use 1.0 to stay on-policy."
+            )
+        if self.cross_tokenizer and self.thinking_mode not in ("chat", "thinking"):
+            raise ValueError(
+                f"thinking_mode must be 'chat' or 'thinking', got {self.thinking_mode!r}"
             )
 
 
@@ -149,6 +173,86 @@ def encode_prefix(example: ReOPDStepExample, tokenizer: Any, *, max_prefix_token
         # to the action about to be taken.
         ids = ids[-max_prefix_tokens:]
     return ids
+
+
+def encode_prefix_pair(
+    example: ReOPDStepExample,
+    student_tokenizer: Any,
+    teacher_tokenizer: Any,
+    *,
+    max_prefix_tokens: int,
+    thinking_mode: str = "chat",
+    prefix_cache: Any | None = None,
+) -> tuple[list[int], list[int]]:
+    """Encode the prefix for both student and teacher tokenizers.
+
+    Student encoding: same as `encode_prefix` (apply_chat_template +
+    add_generation_prompt=True).
+
+    Teacher encoding: turns_to_openai_messages → render_teacher_prefix →
+    encode_teacher_ids, which produces teacher-side ids suitable for
+    `pool.score_ids`.
+
+    Truncation is at a **shared message boundary**: earliest turns are dropped
+    one at a time until BOTH encoded sequences fit within `max_prefix_tokens`.
+    This keeps both sides conditioning on the same conversational context.
+
+    When `prefix_cache` is provided it is used to skip re-rendering the teacher
+    prefix on repeated encounters of the same (task, step_index).
+    """
+    from .teacher_cross import (
+        TeacherPrefixCache,
+        encode_teacher_ids,
+        render_teacher_prefix,
+        turns_to_openai_messages,
+    )
+
+    prefix_turns = list(example.prefix_turns)
+
+    for _ in range(len(prefix_turns) + 1):
+        if not prefix_turns:
+            break
+
+        # ── Student encoding ──────────────────────────────────────────────
+        messages = turns_to_messages(prefix_turns)
+        if not messages:
+            break
+        student_ids = student_tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
+        )
+        if hasattr(student_ids, "get") and "input_ids" in student_ids:
+            student_ids = student_ids["input_ids"]
+        student_ids = list(student_ids)
+
+        # ── Teacher encoding (with optional cache) ────────────────────────
+        cached_teacher: list[int] | None = None
+        if isinstance(prefix_cache, TeacherPrefixCache):
+            cached_teacher = prefix_cache.get(
+                example.task or "", example.step_index, thinking_mode=thinking_mode
+            )
+
+        if cached_teacher is not None:
+            teacher_ids = cached_teacher
+        else:
+            teacher_messages = turns_to_openai_messages(prefix_turns)
+            teacher_text = render_teacher_prefix(teacher_messages, thinking_mode=thinking_mode)
+            teacher_ids = encode_teacher_ids(teacher_text, teacher_tokenizer)
+            if isinstance(prefix_cache, TeacherPrefixCache):
+                prefix_cache.put(
+                    example.task or "", example.step_index, teacher_ids,
+                    thinking_mode=thinking_mode,
+                )
+
+        if len(student_ids) <= max_prefix_tokens and len(teacher_ids) <= max_prefix_tokens:
+            return student_ids, teacher_ids
+
+        # Drop the earliest turn and retry.
+        prefix_turns = prefix_turns[1:]
+
+    raise ValueError(
+        f"{example.task} step {example.step_index}: empty prefix after cross-tokenizer "
+        "truncation — no turns fit within max_prefix_tokens on both sides"
+    )
 
 
 def _sample_action(model: Any, tokenizer: Any, prefix_ids: list[int], cfg: OPDTrainConfig) -> list[int]:
@@ -247,12 +351,23 @@ def run_opd_training(
     *,
     model: Any | None = None,
     tokenizer: Any | None = None,
+    bridge: Any | None = None,
+    teacher_tokenizer: Any | None = None,
+    prefix_cache: Any | None = None,
 ) -> OPDTrainResult:
     """Train the student against teacher scores. Writes an adapter under output_dir.
 
     `model`/`tokenizer` are injectable so offline tests can run the real loop on a
     tiny from-scratch model with a fake pool — the loop under test is the same one
     that runs on the GPU.
+
+    Cross-tokenizer kwargs:
+      bridge: CrossTokenizerBridge — overrides cfg.bridge_path when provided.
+      teacher_tokenizer: teacher-side HF tokenizer for encoding teacher prefixes
+          and retokenising the student's action text.  When None, loaded from
+          cfg.teacher_model (or taken from cfg.teacher_tokenizer).
+      prefix_cache: TeacherPrefixCache — caches rendered teacher prefix ids so
+          that the same (task, step_index) renders identically across all steps.
     """
     _require_train()
     import torch
@@ -263,11 +378,45 @@ def run_opd_training(
         raise ValueError("no ReOPD examples — nothing to distil from")
 
     if cfg.verify_tokenizers:
-        # Sending student-sampled ids to the teacher is only meaningful if both
-        # models read those ids as the same strings. This is the gate for that.
-        from .tokenizer_check import check_tokenizers
+        if cfg.cross_tokenizer:
+            # Cross-tokenizer path: validate the bridge artifact, not the
+            # tokenizer identity.  check_tokenizers would hard-fail because the
+            # two vocabularies differ by design.
+            _bridge_for_check = bridge
+            if _bridge_for_check is None and cfg.bridge_path is not None:
+                from .vocab_bridge import CrossTokenizerBridge
+                _bridge_for_check = CrossTokenizerBridge.load(cfg.bridge_path)
+            if _bridge_for_check is not None:
+                from .encoding_dsv4 import ENCODING_DSV4_SHA256
+                if _bridge_for_check.encoding_dsv4_hash != ENCODING_DSV4_SHA256:
+                    raise RuntimeError(
+                        f"bridge encoding_dsv4 hash mismatch: "
+                        f"bridge has {_bridge_for_check.encoding_dsv4_hash!r}, "
+                        f"current encoder is {ENCODING_DSV4_SHA256!r}. "
+                        "Rebuild the bridge with `vektori-trace build-bridge`."
+                    )
+        else:
+            from .tokenizer_check import check_tokenizers
+            check_tokenizers(cfg.teacher_model, cfg.student_model)
 
-        check_tokenizers(cfg.teacher_model, cfg.student_model)
+    # ── Cross-tokenizer setup ─────────────────────────────────────────────────
+    _bridge = bridge
+    _teacher_tok: Any = teacher_tokenizer if teacher_tokenizer is not None else cfg.teacher_tokenizer
+    _prefix_cache = prefix_cache
+
+    if cfg.cross_tokenizer:
+        if _bridge is None and cfg.bridge_path is not None:
+            from .vocab_bridge import CrossTokenizerBridge
+            _bridge = CrossTokenizerBridge.load(cfg.bridge_path)
+        if _bridge is None:
+            raise ValueError(
+                "cross_tokenizer=True requires a bridge — pass bridge= kwarg or "
+                "set cfg.bridge_path"
+            )
+        if _teacher_tok is None:
+            _teacher_tok = AutoTokenizer.from_pretrained(
+                cfg.teacher_model, trust_remote_code=True
+            )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     adapter_dir = cfg.output_dir / "adapter"
@@ -336,6 +485,7 @@ def run_opd_training(
     tokens_scored = 0
     skipped = 0
     completed_steps = 0
+    _last_cross_stats: Any = None  # most recent CrossStepStats (cross path only)
 
     with log_path.open("w") as log:
         for step in range(cfg.max_steps):
@@ -346,60 +496,199 @@ def run_opd_training(
 
             for _ in range(cfg.examples_per_step):
                 ex = next_example()
-                prefix_ids = encode_prefix(ex, tokenizer, max_prefix_tokens=cfg.max_prefix_tokens)
-                action_ids = _sample_action(model, tokenizer, prefix_ids, cfg)
-                if not action_ids:
-                    # Immediate EOS: no sampled tokens, so no gradient exists. A
-                    # zero loss here would be a real datum saying "teacher and
-                    # student agree", which is not what happened.
-                    skipped += 1
-                    continue
 
-                logits = _student_action_logits(model, prefix_ids, action_ids)
-                action_t = torch.tensor([action_ids], device=logits.device)
-                # Sampled-token logprobs either way: they are the objective in the
-                # top_k=0 case and the monitoring scalar in both.
-                student_lp = token_logprobs(logits, action_t)
+                if cfg.cross_tokenizer:
+                    # ── Cross-tokenizer path (FINAL-PLAN.md) ─────────────────
+                    from .align import AlignmentError, align_by_bytes, classify_spans
+                    from .cross_kl import cross_step_loss
+                    from .teacher_cross import encode_teacher_ids
 
-                if cfg.top_k > 0:
-                    rows = pool.score_ids_topk(prefix_ids, action_ids, cfg.top_k)
-                    if len(rows) != len(action_ids):
-                        raise RuntimeError(
-                            f"teacher returned {len(rows)} top-K rows for "
-                            f"{len(action_ids)} sampled tokens"
+                    try:
+                        student_prefix, teacher_prefix = encode_prefix_pair(
+                            ex, tokenizer, _teacher_tok,
+                            max_prefix_tokens=cfg.max_prefix_tokens,
+                            thinking_mode=cfg.thinking_mode,
+                            prefix_cache=_prefix_cache,
                         )
-                    ids, lps = align_topk_rows(rows, action_ids, cfg.top_k)
-                    loss = topk_reverse_kl(
-                        logits,
-                        torch.tensor([ids], device=logits.device),
-                        torch.tensor([lps], dtype=torch.float32, device=logits.device),
+                    except ValueError:
+                        skipped += 1
+                        continue
+
+                    action_ids = _sample_action(model, tokenizer, student_prefix, cfg)
+                    if not action_ids:
+                        skipped += 1
+                        continue
+
+                    # Build student byte list — strip tokens with empty bytes
+                    # (EOS, unknown specials) so align_by_bytes sees only
+                    # content-carrying tokens.
+                    student_bytes_list: list[bytes] = []
+                    student_aligned_positions: list[int] = []
+                    for pos, tid in enumerate(action_ids):
+                        b = _bridge.student_table.table.get(tid, b"")
+                        if b:
+                            student_bytes_list.append(b)
+                            student_aligned_positions.append(pos)
+
+                    if not student_bytes_list:
+                        skipped += 1
+                        continue
+
+                    # Reconstruct the sampled text and re-tokenise for the teacher.
+                    action_text = b"".join(student_bytes_list).decode("utf-8", errors="replace")
+                    teacher_action_ids = encode_teacher_ids(action_text, _teacher_tok)
+
+                    # Build teacher byte list — same EOS-stripping convention.
+                    teacher_bytes_list: list[bytes] = []
+                    teacher_aligned_positions: list[int] = []
+                    for pos, tid in enumerate(teacher_action_ids):
+                        b = _bridge.teacher_table.table.get(tid, b"")
+                        if b:
+                            teacher_bytes_list.append(b)
+                            teacher_aligned_positions.append(pos)
+
+                    if not teacher_bytes_list:
+                        skipped += 1
+                        continue
+
+                    # Byte alignment — hard fail on AlignmentError (desync).
+                    try:
+                        alignment = align_by_bytes(
+                            student_bytes_list,
+                            teacher_bytes_list,
+                            max_span_student_tokens=cfg.max_span_student_tokens,
+                        )
+                    except AlignmentError:
+                        skipped += 1
+                        continue
+
+                    # Granularity gate (hard fail #6 per FINAL-PLAN.md §10).
+                    if alignment.granularity < cfg.min_alignment_granularity:
+                        raise RuntimeError(
+                            f"alignment granularity {alignment.granularity:.3f} < "
+                            f"min_alignment_granularity={cfg.min_alignment_granularity:.3f} "
+                            "— the student action and teacher re-tokenisation have "
+                            "desynced beyond the pre-registered floor"
+                        )
+
+                    span_kinds = classify_spans(alignment)
+
+                    # ── Teacher scoring (teacher-side ids) ───────────────────
+                    teacher_lp_all = pool.score_ids(teacher_prefix, teacher_action_ids)
+                    teacher_lp_aligned = [teacher_lp_all[p] for p in teacher_aligned_positions]
+
+                    teacher_topk_by_teacher_pos: dict[int, dict[int, float]] = {}
+                    if cfg.cross_top_k > 0 and hasattr(pool, "score_ids_topk"):
+                        teacher_topk_all = pool.score_ids_topk(
+                            teacher_prefix, teacher_action_ids, cfg.cross_top_k
+                        )
+                        for aligned_pos, orig_pos in enumerate(teacher_aligned_positions):
+                            teacher_topk_by_teacher_pos[aligned_pos] = teacher_topk_all[orig_pos]
+
+                    # ── Student logits (student-side ids, with grad) ──────────
+                    logits = _student_action_logits(model, student_prefix, action_ids)
+                    action_t = torch.tensor([action_ids], device=logits.device)
+
+                    # Full log_softmax over vocab at every action position.
+                    # Shape [A, V] where A = len(action_ids).
+                    lp_all = torch.log_softmax(logits[0].float(), dim=-1)
+                    # Per-token log π_s for the sampled ids, shape [A].
+                    token_lp_all = token_logprobs(logits, action_t)[0]
+
+                    # Slice to aligned (non-EOS) positions.
+                    pos_tensor = torch.tensor(
+                        student_aligned_positions, dtype=torch.long, device=logits.device
                     )
-                    # The monitoring ratio still uses the sampled token, so it
-                    # stays comparable across both objectives.
-                    teacher_lp = [row[tid] for row, tid in zip(rows, action_ids, strict=True)]
+                    student_logprobs_full = lp_all[pos_tensor]       # [n_aligned, V]
+                    student_token_logprobs_vec = token_lp_all[pos_tensor]  # [n_aligned]
+
+                    loss, cross_stats = cross_step_loss(
+                        alignment=alignment,
+                        span_kinds=span_kinds,
+                        student_logprobs_full=student_logprobs_full,
+                        student_token_logprobs=student_token_logprobs_vec,
+                        teacher_token_logprobs=teacher_lp_aligned,
+                        teacher_topk_by_teacher_pos=teacher_topk_by_teacher_pos,
+                        exact_map=_bridge.exact_map,
+                    )
+
+                    (loss / cfg.examples_per_step).backward()
+
+                    step_losses.append(float(loss.detach()))
+                    n_aligned = len(student_aligned_positions)
+                    step_tokens += n_aligned
+                    # Monitoring ratio — use span-level sums so student and
+                    # teacher have the same count regardless of span width.
+                    if n_aligned > 0 and alignment.spans:
+                        from .align import span_logprob_sums
+                        span_pairs = span_logprob_sums(
+                            alignment,
+                            [float(x) for x in student_token_logprobs_vec.detach().tolist()],
+                            teacher_lp_aligned,
+                        )
+                        if span_pairs:
+                            step_ratios.append(
+                                sum(s - t for s, t in span_pairs) / len(span_pairs)
+                            )
+                    # Carry cross_stats for log line below.
+                    _last_cross_stats = cross_stats
+
                 else:
-                    teacher_lp = pool.score_ids(prefix_ids, action_ids)
-                    if len(teacher_lp) != len(action_ids):
-                        raise RuntimeError(
-                            f"teacher returned {len(teacher_lp)} logprobs for "
-                            f"{len(action_ids)} sampled tokens"
+                    # ── Same-vocab path (byte-identical to before) ────────────
+                    prefix_ids = encode_prefix(ex, tokenizer, max_prefix_tokens=cfg.max_prefix_tokens)
+                    action_ids = _sample_action(model, tokenizer, prefix_ids, cfg)
+                    if not action_ids:
+                        # Immediate EOS: no sampled tokens, so no gradient exists. A
+                        # zero loss here would be a real datum saying "teacher and
+                        # student agree", which is not what happened.
+                        skipped += 1
+                        continue
+
+                    logits = _student_action_logits(model, prefix_ids, action_ids)
+                    action_t = torch.tensor([action_ids], device=logits.device)
+                    # Sampled-token logprobs either way: they are the objective in the
+                    # top_k=0 case and the monitoring scalar in both.
+                    student_lp = token_logprobs(logits, action_t)
+
+                    if cfg.top_k > 0:
+                        rows = pool.score_ids_topk(prefix_ids, action_ids, cfg.top_k)
+                        if len(rows) != len(action_ids):
+                            raise RuntimeError(
+                                f"teacher returned {len(rows)} top-K rows for "
+                                f"{len(action_ids)} sampled tokens"
+                            )
+                        ids, lps = align_topk_rows(rows, action_ids, cfg.top_k)
+                        loss = topk_reverse_kl(
+                            logits,
+                            torch.tensor([ids], device=logits.device),
+                            torch.tensor([lps], dtype=torch.float32, device=logits.device),
                         )
-                    teacher_t = torch.tensor(
-                        [teacher_lp], dtype=student_lp.dtype, device=student_lp.device
-                    )
-                    loss = reverse_kl_surrogate(student_lp, teacher_t)
+                        # The monitoring ratio still uses the sampled token, so it
+                        # stays comparable across both objectives.
+                        teacher_lp = [row[tid] for row, tid in zip(rows, action_ids, strict=True)]
+                    else:
+                        teacher_lp = pool.score_ids(prefix_ids, action_ids)
+                        if len(teacher_lp) != len(action_ids):
+                            raise RuntimeError(
+                                f"teacher returned {len(teacher_lp)} logprobs for "
+                                f"{len(action_ids)} sampled tokens"
+                            )
+                        teacher_t = torch.tensor(
+                            [teacher_lp], dtype=student_lp.dtype, device=student_lp.device
+                        )
+                        loss = reverse_kl_surrogate(student_lp, teacher_t)
 
-                # Scale before backward so accumulated grads average over the
-                # examples that actually produced one (skips excluded).
-                (loss / cfg.examples_per_step).backward()
+                    # Scale before backward so accumulated grads average over the
+                    # examples that actually produced one (skips excluded).
+                    (loss / cfg.examples_per_step).backward()
 
-                step_losses.append(float(loss.detach()))
-                step_ratios.append(
-                    mean_log_ratio(
-                        [float(x) for x in student_lp.detach()[0].tolist()], teacher_lp
+                    step_losses.append(float(loss.detach()))
+                    step_ratios.append(
+                        mean_log_ratio(
+                            [float(x) for x in student_lp.detach()[0].tolist()], teacher_lp
+                        )
                     )
-                )
-                step_tokens += len(action_ids)
+                    step_tokens += len(action_ids)
 
             if not step_losses:
                 # Every example in this step sampled nothing — no gradient to
@@ -429,24 +718,30 @@ def run_opd_training(
             completed_steps += 1
 
             final_loss = mean_loss
-            final_ratio = sum(step_ratios) / len(step_ratios)
+            final_ratio = sum(step_ratios) / len(step_ratios) if step_ratios else None
             tokens_scored += step_tokens
-            log.write(
-                json.dumps(
-                    {
-                        "step": step,
-                        "loss": final_loss,
-                        # Monitoring only, carries no gradient: the sample estimate
-                        # of the reverse-KL coefficient. It should trend toward 0
-                        # as the student's distribution approaches the teacher's.
-                        "mean_log_ratio": final_ratio,
-                        "action_tokens": step_tokens,
-                        "lr": step_lr,
-                        "n_examples": len(step_losses),
-                    }
-                )
-                + "\n"
-            )
+            log_entry: dict[str, Any] = {
+                "step": step,
+                "loss": final_loss,
+                # Monitoring only, carries no gradient: the sample estimate
+                # of the reverse-KL coefficient. It should trend toward 0
+                # as the student's distribution approaches the teacher's.
+                "mean_log_ratio": final_ratio,
+                "action_tokens": step_tokens,
+                "lr": step_lr,
+                "n_examples": len(step_losses),
+            }
+            if cfg.cross_tokenizer and _last_cross_stats is not None:
+                log_entry.update({
+                    "granularity": _last_cross_stats.granularity,
+                    "frac_A": _last_cross_stats.frac_A,
+                    "frac_B": _last_cross_stats.frac_B,
+                    "frac_dropped": _last_cross_stats.frac_dropped,
+                    "bytes_aligned": _last_cross_stats.bytes_aligned,
+                    "bytes_total": _last_cross_stats.bytes_total,
+                    "special_tokens_masked": _last_cross_stats.special_tokens_masked,
+                })
+            log.write(json.dumps(log_entry) + "\n")
             log.flush()
 
     if adapter_dir.exists():
@@ -456,12 +751,26 @@ def run_opd_training(
 
     # State the objective that actually ran, not the branch name: the two paths
     # optimise different quantities and a report must not conflate them.
-    provenance = {
-        "branch": "OPD",
-        "loss": "topk_reverse_kl" if cfg.top_k > 0 else "reverse_kl_surrogate",
-        "top_k": cfg.top_k,
-        "temperature": cfg.temperature,
-    }
+    if cfg.cross_tokenizer:
+        from .encoding_dsv4 import ENCODING_DSV4_SHA256
+        provenance: dict[str, Any] = {
+            "branch": "OPD",
+            "loss": "cross_tokenizer_reverse_kl",
+            "thinking_mode": cfg.thinking_mode,
+            "cross_top_k": cfg.cross_top_k,
+            "temperature": cfg.temperature,
+            "encoding_dsv4": ENCODING_DSV4_SHA256,
+        }
+        if _bridge is not None:
+            provenance["bridge_teacher_fingerprint"] = _bridge.teacher_fingerprint.vocab_sha256
+            provenance["bridge_student_fingerprint"] = _bridge.student_fingerprint.vocab_sha256
+    else:
+        provenance = {
+            "branch": "OPD",
+            "loss": "topk_reverse_kl" if cfg.top_k > 0 else "reverse_kl_surrogate",
+            "top_k": cfg.top_k,
+            "temperature": cfg.temperature,
+        }
     if hasattr(pool, "provenance"):
         provenance.update(pool.provenance())
 
@@ -525,6 +834,7 @@ __all__ = [
     "TopKScoringPool",
     "align_topk_rows",
     "encode_prefix",
+    "encode_prefix_pair",
     "run_opd_training",
     "write_opd_report",
 ]

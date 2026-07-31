@@ -58,6 +58,8 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vendored DeepSeek encoder — pinned by SHA256 in FINAL-PLAN.md; do not reformat.
+extend-exclude = ["vektori_trace/encoding_dsv4.py"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
