@@ -78,8 +78,13 @@ def wait_for_health(api_base: str, *, wait_seconds: float = DEFAULT_WAIT_SECONDS
                 return
             except json.JSONDecodeError:
                 # /health returns an empty 200 body on vLLM — reaching it is the
-                # signal; a body was never the point.
-                return
+                # signal; a body was never the point. That reasoning does not
+                # extend to /v1/models: a proxy or ALB answering 200 with an HTML
+                # page is not a model server, and accepting it here defers the
+                # failure to a broken rollout mid-sweep.
+                if url == health:
+                    return
+                last = EndpointError(f"{url} returned a non-JSON body")
             except (urllib.error.URLError, OSError, urllib.error.HTTPError) as e:
                 last = e
         if time.monotonic() >= deadline:

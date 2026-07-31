@@ -207,6 +207,17 @@ class ArmsConfig:
     serve_cm: Any = None
     nonregression_fn: Callable[..., NonRegressionResult] | None = None
 
+    def __post_init__(self) -> None:
+        # A server we manage owns training too. `run_arms` already keys
+        # `stage_to_volume` off `api_base`, so leaving `use_modal` at its `True`
+        # default here would train on Modal *and* skip the Volume upload:
+        # `volume_adapter_path` comes back None, the serve falls through to a
+        # local stub dir, and the endpoint is handed a path it cannot read —
+        # after the training has been paid for. `cmd_run_arms` derives this
+        # correctly; the coupling belongs on the field, not only in the CLI.
+        if self.api_base:
+            self.use_modal = False
+
 
 def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
     """Full A0–A4 orchestrator. Returns the arms report dict (also written to disk)."""

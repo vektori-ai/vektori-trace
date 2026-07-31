@@ -222,6 +222,11 @@ def train_lora(
         output_dir=str(config.output_dir / "hf_runs"),
         max_steps=config.max_steps,
         per_device_train_batch_size=config.per_device_train_batch_size,
+        # Track the train batch size. HF defaults eval to 8, which on the
+        # memory-constrained pilot GPU this config is tuned for (bf16 +
+        # gradient checkpointing, train batch of 1) OOMs the first time
+        # periodic evaluation fires — minutes into a run that was fine.
+        per_device_eval_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         gradient_checkpointing=config.gradient_checkpointing,
         bf16=use_bf16,
@@ -444,6 +449,13 @@ def run_training(
       use_modal=False, stage_to_volume=False → train here, touch Modal never (AWS)
     """
     if config.use_modal and model is None:
+        if eval_examples:
+            # `train_lora_modal` has no eval parameter and the Modal cfg payload
+            # carries no eval data, so this would silently run without evaluation.
+            raise NotImplementedError(
+                "eval_examples is not wired through train_lora_modal; "
+                "set use_modal=False to use step-based evaluation"
+            )
         return train_lora_modal(examples, config)
     result = train_lora(
         examples, config, model=model, tokenizer=tokenizer, eval_examples=eval_examples

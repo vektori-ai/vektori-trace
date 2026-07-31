@@ -202,7 +202,10 @@ def test_teacher_length_disagreement_is_fatal(tmp_path, tiny):
 
     class _Short(InMemoryIdScoringPool):
         def score_ids(self, prompt_ids, tokens):
-            return super().score_ids(prompt_ids, tokens)[:-1] or [-0.5]
+            # One score too many — mismatched for *any* sample length. Truncating
+            # instead would return a length-1 list when the student happens to
+            # sample a single token, which matches and skips the guard entirely.
+            return [*super().score_ids(prompt_ids, tokens), -0.5]
 
     with pytest.raises(RuntimeError, match="logprobs for"):
         run_opd_training(
@@ -305,3 +308,17 @@ def test_report_states_the_teacher_and_the_monitoring_scalar(tmp_path, tiny):
     assert payload["provenance"]["teacher_model"] == "in-memory"
     assert payload["action_tokens_scored"] == result.action_tokens_scored
     assert "mean log ratio" in md_path.read_text()
+
+
+def test_zero_temperature_is_rejected_at_config_time():
+    """`do_sample=True` with temperature=0.0 raises inside HF's sampler.
+
+    Left to surface there, it fires after the student weights are loaded and the
+    tokenizer check has run — minutes and a GPU allocation into the run, for a
+    flag value that was wrong before anything started.
+    """
+    with pytest.raises(ValueError, match="temperature"):
+        OPDTrainConfig(temperature=0.0)
+    with pytest.raises(ValueError, match="temperature"):
+        OPDTrainConfig(temperature=-1.0)
+    assert OPDTrainConfig().temperature == 1.0

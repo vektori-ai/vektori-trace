@@ -99,6 +99,16 @@ class OPDTrainConfig:
     # vocabulary trains on scores for different strings than the student sampled.
     verify_tokenizers: bool = True
 
+    def __post_init__(self) -> None:
+        # `do_sample=True` with temperature=0.0 raises inside HF's sampler — after
+        # the student weights are loaded and the tokenizer check has run, which is
+        # minutes and a GPU allocation into the run. Reject it at construction.
+        if self.temperature <= 0.0:
+            raise ValueError(
+                f"--temperature must be > 0 (got {self.temperature}); the OPD "
+                "sample is drawn, not greedy. Use 1.0 to stay on-policy."
+            )
+
 
 @dataclass
 class OPDTrainResult:
@@ -398,6 +408,16 @@ def run_opd_training(
                 log.write(json.dumps({"step": step, "skipped_step": True}) + "\n")
                 continue
 
+            # Before the step, not after: a NaN loss caught downstream has already
+            # flowed through the clip and into the LoRA weights. Nothing corrupt is
+            # persisted either way (the run aborts before `save_pretrained`), but
+            # failing here keeps the weights in memory consistent with the log.
+            mean_loss = sum(step_losses) / len(step_losses)
+            if mean_loss != mean_loss:  # NaN
+                raise RuntimeError(
+                    "OPD loss is NaN — check teacher/student tokenizer identity and "
+                    "that the sampled ids are the ids the teacher scored"
+                )
             torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             optimizer.step()
             # Read the LR *before* advancing: after `scheduler.step()` this
@@ -408,14 +428,9 @@ def run_opd_training(
             scheduler.step()
             completed_steps += 1
 
-            final_loss = sum(step_losses) / len(step_losses)
+            final_loss = mean_loss
             final_ratio = sum(step_ratios) / len(step_ratios)
             tokens_scored += step_tokens
-            if final_loss != final_loss:  # NaN
-                raise RuntimeError(
-                    "OPD loss is NaN — check teacher/student tokenizer identity and "
-                    "that the sampled ids are the ids the teacher scored"
-                )
             log.write(
                 json.dumps(
                     {

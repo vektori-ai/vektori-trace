@@ -19,6 +19,7 @@ from vektori_trace.endpoint import (
     attach_endpoint,
     discover_model_name,
     endpoint_serve_cm,
+    wait_for_health,
 )
 from vektori_trace.teacher import (
     TeacherScoringError,
@@ -230,3 +231,40 @@ def test_scored_logprobs_feed_the_opd_objective(server):
     loss = reverse_kl_surrogate(student, teacher)
     loss.backward()
     assert student.grad is not None
+
+
+def test_html_at_v1_models_is_not_healthy():
+    """A proxy answering 200 with an HTML page is not a model server.
+
+    `/health` returning an empty 200 body is vLLM's documented behaviour and the
+    reason a `JSONDecodeError` is tolerated there. Extending that tolerance to
+    `/v1/models` makes an ALB error page pass the probe, so the failure resurfaces
+    as a broken rollout mid-sweep instead of here.
+    """
+
+    class _Html(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"<html>503 Service Unavailable</html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Html)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(EndpointError):
+            wait_for_health(f"http://127.0.0.1:{httpd.server_port}/v1", wait_seconds=0.0)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

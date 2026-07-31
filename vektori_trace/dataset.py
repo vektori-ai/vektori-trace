@@ -39,7 +39,10 @@ TEST_CHAT_TEMPLATE = (
     "{% endif %}"
     "{{ '<|end|>\\n' }}"
     "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}"
+    # Trailing newline to match the message header above: a generation boundary
+    # that differs from the template's own turn boundary is exactly the
+    # off-by-one-token shift these offline tests exist to catch.
+    "{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
 )
 
 

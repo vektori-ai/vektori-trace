@@ -934,7 +934,14 @@ def _load_teacher_trajectories(source: Path) -> list[tuple[str, list[Any]]]:
             except TrajectoryParseError as e:
                 raise ValueError(f"{path}: not a readable harbor job dir ({e})") from e
         elif path.suffix == ".json":
-            trace = Trace.load(path)
+            try:
+                trace = Trace.load(path)
+            except Exception as e:
+                # Match the job-dir branch above: name the file that failed.
+                # Trace.load raises schema/decode errors the caller's
+                # FileNotFoundError/ValueError handler does not catch, so without
+                # this an unreadable trace escapes as a bare traceback.
+                raise ValueError(f"{path}: not a readable ATIF trace ({e})") from e
             trajectories.append((trace.task or path.stem, trace.turns))
     if not trajectories:
         raise ValueError(
