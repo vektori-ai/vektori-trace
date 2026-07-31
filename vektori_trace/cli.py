@@ -901,6 +901,7 @@ def cmd_run_arms(args: argparse.Namespace) -> int:
         skip_nonregression=args.skip_nonregression,
         api_base=args.api_base,
         served_model_name=args.served_model_name,
+        capture_tokens=bool(getattr(args, "capture_tokens", False)),
     )
     try:
         report = run_arms(cfg)
@@ -1731,6 +1732,48 @@ def cmd_ground(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_capture_proxy(args: argparse.Namespace) -> int:
+    """Run a Phase 0.5 reverse proxy that injects return_token_ids and logs ids."""
+    import signal
+
+    from .token_capture import CaptureProxy, load_captures
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    proxy = CaptureProxy(
+        upstream_api_base=args.upstream,
+        capture_dir=out,
+        host=args.host,
+        port=args.port,
+        inject_logprobs=args.logprobs,
+    )
+    api_base = proxy.start()
+    print(f"capture proxy listening at {api_base}")
+    print(f"upstream: {proxy.upstream_api_base}")
+    print(f"captures → {out / 'token_captures.jsonl'}")
+    print("point harbor --api-base (or --ak api_base=...) at this URL")
+    print("Ctrl-C to stop")
+
+    def _stop(signum, frame):
+        proxy.stop()
+        n = len(load_captures(out))
+        print(f"\nstopped — {n} completion(s) captured under {out}")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        while True:
+            signal.pause()
+    except AttributeError:
+        # Windows has no signal.pause; sleep-loop instead.
+        import time
+
+        while True:
+            time.sleep(3600)
+    return 0
+
+
 def cmd_plan_b_arms(args: argparse.Namespace) -> int:
     from .arms import plan_b_arms
 
@@ -2134,6 +2177,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the IFEval non-regression pass (still records the pre-declared tolerance)",
     )
+    p_arms.add_argument(
+        "--capture-tokens",
+        action="store_true",
+        help=(
+            "Phase 0.5: request vLLM return_token_ids during rollout collection and "
+            "persist sampled ids next to each harbor job. Required before OPD/GRPO; "
+            "optional for SFT (A2/A3 still re-tokenizeize when captures are absent)."
+        ),
+    )
     p_arms.set_defaults(func=cmd_run_arms)
 
     # --- PLAN.md capability-routing commands ---
@@ -2408,6 +2460,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_probe.add_argument("--out", default=None, help="write the result as JSON here")
     p_probe.set_defaults(func=cmd_probe_teacher)
+
+    p_cap = sub.add_parser(
+        "capture-proxy",
+        help=(
+            "Phase 0.5: reverse-proxy a vLLM server, inject return_token_ids, and "
+            "persist sampled prompt/completion ids as JSONL"
+        ),
+        description=(
+            "Harbor agents we do not control still need sampled token ids for OPD. "
+            "This proxy sits in front of your vLLM OpenAI-compatible server, forces "
+            "`return_token_ids: true` on every chat/completions request, forwards "
+            "the response unchanged, and appends each capture to "
+            "<out>/token_captures.jsonl. Point harbor's api_base at the printed URL."
+        ),
+    )
+    p_cap.add_argument(
+        "--upstream",
+        required=True,
+        help="real vLLM api base, e.g. http://127.0.0.1:8000/v1",
+    )
+    p_cap.add_argument(
+        "--out",
+        default="./vektori-out/token-captures",
+        help="directory for token_captures.jsonl",
+    )
+    p_cap.add_argument("--host", default="127.0.0.1")
+    p_cap.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="local listen port (0 = ephemeral; the printed api_base always wins)",
+    )
+    p_cap.add_argument(
+        "--logprobs",
+        action="store_true",
+        help="also request per-token logprobs alongside token ids",
+    )
+    p_cap.set_defaults(func=cmd_capture_proxy)
 
     return parser
 

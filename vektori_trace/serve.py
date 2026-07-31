@@ -6,6 +6,12 @@ vLLM itself is installed only inside the Modal image — never in the local venv
 
 Adapter handoff: pass `adapter_path` as a Volume path (`/adapters/...`) from
 `TrainResult.volume_adapter_path`. Local paths are staged onto the Volume first.
+
+Phase 0.5 (`docs/PILOT.md`): OPD/GRPO need the token ids vLLM actually sampled.
+Pass `return_token_ids` through litellm (`litellm_generate_captured`,
+`served_to_harbor_kwargs(capture_tokens=True)`), or put
+`token_capture.capture_proxy` in front of `api_base` so harbor agents we do not
+control still get the flag. Requires vLLM ≥ 0.10.2 in the serve image.
 """
 
 from __future__ import annotations
@@ -189,15 +195,6 @@ def serve_model(
         yield served
 
 
-def served_to_harbor_kwargs(served: ServedModel) -> dict[str, Any]:
-    """kwargs for `measure_pass_rates` / `collect_rollouts` / `run_trial`."""
-    return {
-        "model": served.harbor_model,
-        "api_base": served.api_base,
-        "model_info": served.model_info,
-    }
-
-
 def dump_serve_record(served: ServedModel) -> dict[str, Any]:
     """Environment record for arms.json (V0_PLAN.md: every run writes GPU/image)."""
     return {
@@ -211,18 +208,89 @@ def dump_serve_record(served: ServedModel) -> dict[str, Any]:
     }
 
 
-def litellm_generate(served: ServedModel, prompt: str, *, max_tokens: int = 512) -> str:
-    """One completion against a served candidate — used by non-regression."""
+def litellm_generate(
+    served: ServedModel,
+    prompt: str,
+    *,
+    max_tokens: int = 512,
+    return_token_ids: bool = False,
+) -> str:
+    """One completion against a served candidate — used by non-regression.
+
+    When `return_token_ids` is True the request asks vLLM for sampled ids
+    (Phase 0.5). The text return value is unchanged; use
+    `litellm_generate_captured` when the ids themselves are needed.
+    """
     import litellm
+
+    from .token_capture import litellm_extra_body
+
+    kwargs: dict[str, Any] = {
+        "model": served.harbor_model,
+        "api_base": served.api_base,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "api_key": "EMPTY",  # vLLM OpenAI-compat often ignores auth
+    }
+    if return_token_ids:
+        kwargs["extra_body"] = litellm_extra_body(return_token_ids=True)
+    resp = litellm.completion(**kwargs)
+    return (resp.choices[0].message.content or "") if resp.choices else ""
+
+
+def litellm_generate_captured(
+    served: ServedModel,
+    prompt: str,
+    *,
+    max_tokens: int = 512,
+    logprobs: bool = False,
+) -> Any:
+    """Completion that *must* return sampled token ids (Phase 0.5).
+
+    Raises `TokenCaptureError` if the endpoint ignored `return_token_ids` —
+    silently falling back to re-tokenization is exactly the failure mode this
+    path exists to prevent.
+    """
+    import litellm
+
+    from .token_capture import extract_captured_completion, litellm_extra_body
 
     resp = litellm.completion(
         model=served.harbor_model,
         api_base=served.api_base,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
-        api_key="EMPTY",  # vLLM OpenAI-compat often ignores auth
+        api_key="EMPTY",
+        extra_body=litellm_extra_body(return_token_ids=True, logprobs=logprobs),
     )
-    return (resp.choices[0].message.content or "") if resp.choices else ""
+    return extract_captured_completion(resp)
+
+
+def served_to_harbor_kwargs(
+    served: ServedModel,
+    *,
+    capture_tokens: bool = False,
+    capture_logprobs: bool = False,
+) -> dict[str, Any]:
+    """kwargs for `measure_pass_rates` / `collect_rollouts` / `run_trial`.
+
+    With `capture_tokens=True`, harbor agents receive litellm `extra_body` that
+    requests vLLM `return_token_ids` (and optional logprobs). Prefer also
+    wrapping `api_base` in `token_capture.capture_proxy` when the agent harness
+    may drop unknown kwargs — the proxy injects the flag server-side.
+    """
+    out: dict[str, Any] = {
+        "model": served.harbor_model,
+        "api_base": served.api_base,
+        "model_info": served.model_info,
+    }
+    if capture_tokens:
+        from .token_capture import token_capture_agent_kwargs
+
+        out["agent_kwargs"] = token_capture_agent_kwargs(
+            return_token_ids=True, logprobs=capture_logprobs
+        )
+    return out
 
 
 __all__ = [
@@ -230,6 +298,7 @@ __all__ = [
     "ServedModel",
     "dump_serve_record",
     "litellm_generate",
+    "litellm_generate_captured",
     "serve_model",
     "served_to_harbor_kwargs",
 ]

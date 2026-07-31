@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .dataset import tokenize_sft_example
+from .dataset import tokenize_from_captures, tokenize_sft_example
 from .diagnose import MIN_DISCORDANT_PAIRS, _exact_mcnemar_p
 from .nonregression import (
     IFEVAL_TOLERANCE,
@@ -131,15 +131,64 @@ def _cap_pilot(task_ids: list[str], *, pilot: bool, seed: int) -> list[str]:
 
 
 def _tokenize_rollouts(rollouts: list[CollectedRollout], tokenizer: Any) -> list:
+    """Prefer Phase 0.5 captured ids; fall back to re-tokenization for SFT-only.
+
+    OPD/GRPO must not silently re-tokenizeize when captures were requested but
+    missing — that path is handled by callers that set `require_captures`.
+    Here (A2/A3 SFT arms) re-tokenization remains valid.
+    """
     from .dataset import TokenizedExample
+    from .token_capture import load_captures
 
     out: list[TokenizedExample] = []
     for r in rollouts:
         if not r.passed:
             continue
+        if r.jobs_dir is not None:
+            captures = load_captures(r.jobs_dir)
+            if captures:
+                out.extend(tokenize_from_captures(captures))
+                continue
         ex = tokenize_sft_example(r.turns, tokenizer)
         if ex is not None:
             out.append(ex)
+    return out
+
+
+def tokenize_rollouts_for_opd(
+    rollouts: list[CollectedRollout],
+    *,
+    require_captures: bool = True,
+) -> list:
+    """Build training examples for OPD/GRPO from captured token ids only.
+
+    Raises `TokenCaptureError` when `require_captures` and any kept rollout
+    lacks captures — re-tokenization would silently corrupt the objective.
+    """
+    from .token_capture import TokenCaptureError, load_captures
+
+    out = []
+    for r in rollouts:
+        if not r.passed:
+            continue
+        if r.jobs_dir is None:
+            if require_captures:
+                raise TokenCaptureError(
+                    f"rollout for task {r.task!r} has no jobs_dir — cannot load "
+                    "captured token ids for OPD"
+                )
+            continue
+        captures = load_captures(r.jobs_dir)
+        if not captures:
+            if require_captures:
+                raise TokenCaptureError(
+                    f"no token captures under {r.jobs_dir} — OPD refuses to "
+                    "re-tokenizeize text (docs/PILOT.md Phase 0.5). Re-run "
+                    "collect_rollouts(..., capture_tokens=True) against a vLLM "
+                    "server that supports return_token_ids."
+                )
+            continue
+        out.extend(tokenize_from_captures(captures))
     return out
 
 
@@ -200,6 +249,9 @@ class ArmsConfig:
     served_model_name: str | None = None
     max_train_steps: int = 50
     skip_nonregression: bool = False
+    # Phase 0.5: capture sampled token ids during rollout collection so OPD
+    # can train without re-tokenization. SFT arms still work either way.
+    capture_tokens: bool = False
     # Injectables for unit tests (monkeypatch-friendly).
     measure_fn: Callable[..., dict[str, PassRate]] | None = None
     collect_fn: Callable[..., list[CollectedRollout]] | None = None
@@ -360,12 +412,13 @@ def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
     ) -> ArmResult:
         with serve_cm(candidate, gpu=cfg.modal_gpu) as served:
             assert isinstance(served, ServedModel)
-            hk = served_to_harbor_kwargs(served)
+            hk = served_to_harbor_kwargs(served, capture_tokens=cfg.capture_tokens)
             rollouts = collect(
                 task_dirs,
                 agent=cfg.agent,
                 jobs_dir=out / "jobs" / f"{arm_name}_rollout",
                 rollouts=cfg.rollouts,
+                capture_tokens=cfg.capture_tokens,
                 **hk,
             )
             serve_rec = dump_serve_record(served)

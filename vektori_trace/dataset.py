@@ -222,6 +222,74 @@ def tokenize_teacher_continuation(
     )
 
 
+def tokenize_from_ids(
+    prompt_token_ids: list[int],
+    completion_token_ids: list[int],
+    *,
+    max_length: int = 4096,
+    mask_prompt: bool = True,
+) -> TokenizedExample | None:
+    """Build a training example from *sampled* ids — no re-tokenization.
+
+    Phase 0.5 (`docs/PILOT.md`): OPD and GRPO must supervise the tokens the
+    student actually emitted at inference. Re-encoding the text is close but
+    not identical (retokenization drift); this path refuses to invent ids.
+
+    Loss lands on completion tokens only when `mask_prompt` is True (the
+    default). Empty completions yield None.
+    """
+    if not completion_token_ids:
+        return None
+    prompt = [int(x) for x in prompt_token_ids]
+    completion = [int(x) for x in completion_token_ids]
+    input_ids = prompt + completion
+    labels = (
+        [IGNORE_INDEX] * len(prompt) + list(completion) if mask_prompt else list(input_ids)
+    )
+    if len(input_ids) > max_length:
+        input_ids = input_ids[:max_length]
+        labels = labels[:max_length]
+    if not any(lab != IGNORE_INDEX for lab in labels):
+        return None
+    return TokenizedExample(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=[1] * len(input_ids),
+    )
+
+
+def tokenize_from_captures(
+    captures: list[Any],
+    *,
+    max_length: int = 4096,
+) -> list[TokenizedExample]:
+    """One TokenizedExample per captured completion (assistant turn).
+
+    Accepts `CapturedCompletion` instances or dicts with `prompt_token_ids` /
+    `token_ids`. Skips empty completions. Does not stitch multi-turn into one
+    sequence — each model call is its own training sample, matching how OPD
+    scores per on-policy step.
+    """
+    out: list[TokenizedExample] = []
+    for cap in captures:
+        if hasattr(cap, "prompt_token_ids") and hasattr(cap, "token_ids"):
+            prompt_ids = list(cap.prompt_token_ids)
+            token_ids = list(cap.token_ids)
+        elif isinstance(cap, dict):
+            prompt_ids = list(cap.get("prompt_token_ids") or [])
+            token_ids = list(cap.get("token_ids") or [])
+        else:
+            raise TypeError(
+                f"capture must be CapturedCompletion or dict, got {type(cap).__name__}"
+            )
+        ex = tokenize_from_ids(
+            prompt_ids, token_ids, max_length=max_length, mask_prompt=True
+        )
+        if ex is not None:
+            out.append(ex)
+    return out
+
+
 class LabelPreservingCollator:
     """Pad `labels` with IGNORE_INDEX. Stock DataCollatorForLanguageModeling
     regenerates labels from input_ids on pad and silently erases every mask."""
@@ -269,6 +337,8 @@ __all__ = [
     "LabelPreservingCollator",
     "TokenizedExample",
     "build_sft_dataset",
+    "tokenize_from_captures",
+    "tokenize_from_ids",
     "tokenize_sft_example",
     "tokenize_teacher_continuation",
     "turns_to_messages",

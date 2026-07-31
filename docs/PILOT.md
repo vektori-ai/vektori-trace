@@ -186,10 +186,18 @@ vLLM added `"return_token_ids": true` on `/v1/chat/completions` for exactly this
 — it returns `prompt_token_ids` and `token_ids` alongside the text, plus
 `logprobs`. We own the server, so this is a flag, not a framework:
 
-- enable it in `serve.py`
-- pass it through litellm's `hosted_vllm` provider
-- store the per-request token ids and logprobs, correlated to the harbor job dir
+- enable it in `serve.py` (`litellm_generate` / `litellm_generate_captured`,
+  `served_to_harbor_kwargs(capture_tokens=True)`)
+- pass it through litellm's `hosted_vllm` provider (`extra_body`)
+- store the per-request token ids and logprobs, correlated to the harbor job
+  dir (`token_capture.py`, `collect_rollouts(..., capture_tokens=True)`, or
+  `vektori-trace capture-proxy --upstream …`)
 - `dataset.py` consumes ids instead of re-tokenizing
+  (`tokenize_from_ids` / `tokenize_from_captures`)
+
+**Status (coded).** The plumbing is shipped. A real sweep still needs a vLLM
+≥0.10.2 endpoint; without `return_token_ids` the proxy records nothing and
+`tokenize_rollouts_for_opd` refuses rather than silently re-tokenizing.
 
 ### Phase 1 — OPD smoke, one task.
 
