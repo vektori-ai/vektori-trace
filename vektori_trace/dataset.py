@@ -24,6 +24,10 @@ from .schema import Turn
 IGNORE_INDEX = -100
 
 # Minimal chat template for offline tests (from-scratch tokenizers have none).
+# Honours `add_generation_prompt` because the OPD loop depends on it: the student
+# must be positioned to *open* an assistant turn, and a template that ignored the
+# flag would silently have it continue the previous message instead
+# (`distill.encode_prefix`).
 TEST_CHAT_TEMPLATE = (
     "{% for message in messages %}"
     "{{ '<|' + message['role'] + '|>\\n' }}"
@@ -35,6 +39,10 @@ TEST_CHAT_TEMPLATE = (
     "{% endif %}"
     "{{ '<|end|>\\n' }}"
     "{% endfor %}"
+    # Trailing newline to match the message header above: a generation boundary
+    # that differs from the template's own turn boundary is exactly the
+    # off-by-one-token shift these offline tests exist to catch.
+    "{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
 )
 
 

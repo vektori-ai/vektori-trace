@@ -212,3 +212,34 @@ def test_pilot_caps_task_count() -> None:
     capped = _cap_pilot(ids, pilot=True, seed=0)
     assert len(capped) == PILOT_TASK_CAP
     assert _cap_pilot(ids, pilot=False, seed=0) == ids
+
+
+def test_api_base_forces_use_modal_off(tmp_path) -> None:
+    """`api_base` and `use_modal` must not be able to disagree.
+
+    `run_arms` already keys `stage_to_volume` off `api_base`. If a programmatic
+    caller supplies only `api_base` and leaves `use_modal` at its `True` default,
+    the arm trains on Modal *and* skips the Volume upload — `volume_adapter_path`
+    comes back None, the serve falls back to a local stub dir, and the endpoint is
+    handed a path it cannot read, after the training has been paid for. The CLI
+    derives this correctly; the coupling belongs where the field lives.
+    """
+    cfg = ArmsConfig(
+        selection_path=tmp_path / "sel.json",
+        diagnosis_path=tmp_path / "diag.json",
+        tasks_dir=tmp_path / "tasks",
+        out_dir=tmp_path / "out",
+        agent="terminus-2",
+        api_base="http://10.0.0.5:8000/v1",
+        # Left at its default on purpose — this is the disagreement under test.
+    )
+    assert cfg.use_modal is False
+
+    # No endpoint means Modal stays the default, unchanged.
+    assert ArmsConfig(
+        selection_path=tmp_path / "sel.json",
+        diagnosis_path=tmp_path / "diag.json",
+        tasks_dir=tmp_path / "tasks",
+        out_dir=tmp_path / "out",
+        agent="terminus-2",
+    ).use_modal is True

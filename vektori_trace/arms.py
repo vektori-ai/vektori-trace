@@ -193,6 +193,11 @@ class ArmsConfig:
     pilot: bool = False
     use_modal: bool = True
     modal_gpu: str = "A10G"
+    # Self-managed server (EC2/local vLLM): every arm runs against this endpoint
+    # instead of spawning Modal containers. `arms.py` never learns the difference —
+    # it goes through `serve_cm`, which this populates in `run_arms`.
+    api_base: str | None = None
+    served_model_name: str | None = None
     max_train_steps: int = 50
     skip_nonregression: bool = False
     # Injectables for unit tests (monkeypatch-friendly).
@@ -201,6 +206,17 @@ class ArmsConfig:
     train_fn: Callable[..., TrainResult] | None = None
     serve_cm: Any = None
     nonregression_fn: Callable[..., NonRegressionResult] | None = None
+
+    def __post_init__(self) -> None:
+        # A server we manage owns training too. `run_arms` already keys
+        # `stage_to_volume` off `api_base`, so leaving `use_modal` at its `True`
+        # default here would train on Modal *and* skip the Volume upload:
+        # `volume_adapter_path` comes back None, the serve falls through to a
+        # local stub dir, and the endpoint is handed a path it cannot read —
+        # after the training has been paid for. `cmd_run_arms` derives this
+        # correctly; the coupling belongs on the field, not only in the CLI.
+        if self.api_base:
+            self.use_modal = False
 
 
 def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
@@ -225,7 +241,14 @@ def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
     measure = cfg.measure_fn or measure_pass_rates
     collect = cfg.collect_fn or collect_rollouts
     train = cfg.train_fn or run_training
-    serve_cm = cfg.serve_cm or serve_model
+    if cfg.serve_cm is not None:
+        serve_cm = cfg.serve_cm
+    elif cfg.api_base:
+        from .endpoint import endpoint_serve_cm
+
+        serve_cm = endpoint_serve_cm(cfg.api_base, model_name=cfg.served_model_name)
+    else:
+        serve_cm = serve_model
 
     out = cfg.out_dir
     out.mkdir(parents=True, exist_ok=True)
@@ -393,6 +416,9 @@ def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
             use_modal=cfg.use_modal,
             modal_gpu=cfg.modal_gpu,
             arm=arm_name,
+            # A self-managed server reads the adapter off local disk, so there is
+            # no Modal Volume in the loop at all.
+            stage_to_volume=cfg.api_base is None,
         )
         result = train(examples, train_cfg, tokenizer=tokenizer)
         write_train_report(result, out / arm_name)

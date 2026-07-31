@@ -164,6 +164,71 @@ def reverse_kl_surrogate(
     return total / denom
 
 
+def topk_reverse_kl(
+    student_logits: Any,
+    token_ids: Any,
+    teacher_logprobs: Any,
+    loss_mask: Any | None = None,
+) -> Any:
+    """Analytic reverse KL over the teacher's top-K token set at each position.
+
+    The other estimator in this module (`reverse_kl_surrogate`) is a policy-gradient
+    surrogate: it sees one sampled token per position, so its gradient is an
+    unbiased but high-variance estimate. When the teacher also returns its top-K
+    (`teacher.score_ids_topk`), the distribution over that set is known outright and
+    the KL can be differentiated directly — no sampling variance at all.
+
+    That is worth having because thunlp/OPD reports 97–99% of the probability mass
+    at student-visited states concentrating in a small shared token set, so K≈16
+    captures nearly the whole distribution rather than a slice of it.
+
+    Both sides are renormalised over the K set, which is what makes this a KL
+    between two proper distributions rather than a sum over an unnormalised
+    fragment. Still *reverse* KL — `Σ p_s (log p_s − log p_t)`, mode-seeking, the
+    direction PLAN.md declares — so the student cannot cover the teacher by
+    smearing mass.
+
+    Shapes: `student_logits` [B, T, V] (already sliced to the scored positions),
+    `token_ids` [B, T, K], `teacher_logprobs` [B, T, K]. `loss_mask` is [B, T].
+
+    Note this is a *different objective* from `reverse_kl_surrogate`, not a variance
+    reduction of the same one applied silently. Which one a run used belongs in its
+    provenance record.
+    """
+    _require_train()
+    import torch
+
+    if token_ids.shape != teacher_logprobs.shape:
+        raise ValueError(
+            f"token_ids {tuple(token_ids.shape)} != teacher_logprobs "
+            f"{tuple(teacher_logprobs.shape)}"
+        )
+    if student_logits.shape[:2] != token_ids.shape[:2]:
+        raise ValueError(
+            f"student_logits {tuple(student_logits.shape[:2])} does not align with "
+            f"token_ids {tuple(token_ids.shape[:2])}"
+        )
+
+    student_all = torch.log_softmax(student_logits.float(), dim=-1)
+    student_k = student_all.gather(-1, token_ids)  # [B, T, K]
+
+    # Renormalise both over the K set: log p̃ = log p − logsumexp(log p over K).
+    student_k = student_k - torch.logsumexp(student_k, dim=-1, keepdim=True)
+    teacher_k = teacher_logprobs.float()
+    teacher_k = teacher_k - torch.logsumexp(teacher_k, dim=-1, keepdim=True)
+
+    p_student = student_k.exp()
+    per_position = (p_student * (student_k - teacher_k.detach())).sum(dim=-1)  # [B, T]
+
+    if loss_mask is None:
+        return per_position.mean()
+    mask = loss_mask.to(per_position.dtype)
+    denom = mask.sum()
+    if float(denom) == 0.0:
+        return per_position.sum() * 0.0
+    return (per_position * mask).sum() / denom
+
+
 def mask_from_labels(labels: Any, ignore_index: int = -100) -> Any:
     """1 where `labels` carries loss, 0 at IGNORE_INDEX — bridges `dataset.py`."""
     _require_train()
@@ -253,4 +318,5 @@ __all__ = [
     "mean_log_ratio",
     "reverse_kl_surrogate",
     "token_logprobs",
+    "topk_reverse_kl",
 ]

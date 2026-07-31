@@ -803,8 +803,18 @@ def cmd_train(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    api_base = getattr(args, "api_base", None)
+    if api_base:
+        from .endpoint import endpoint_serve_cm
+
+        serve_cm = endpoint_serve_cm(
+            api_base, model_name=getattr(args, "served_model_name", None)
+        )
+    else:
+        serve_cm = serve_model
+
     try:
-        with serve_model(args.model, gpu=args.modal_gpu) as served:
+        with serve_cm(args.model, gpu=args.modal_gpu) as served:
             hk = served_to_harbor_kwargs(served)
             rollouts = collect_rollouts(
                 task_dirs,
@@ -844,8 +854,10 @@ def cmd_train(args: argparse.Namespace) -> int:
         task_ids=list(args.tasks),
         max_steps=args.max_steps,
         seed=args.seed,
-        use_modal=not args.local,
+        # An endpoint we manage means this box owns training too — no Modal.
+        use_modal=not (args.local or bool(api_base)),
         modal_gpu=args.modal_gpu,
+        stage_to_volume=not api_base,
     )
     result = run_training(examples, cfg, tokenizer=tokenizer)
     md = write_train_report(result, out_dir)
@@ -883,10 +895,12 @@ def cmd_run_arms(args: argparse.Namespace) -> int:
         rollouts=args.rollouts,
         seed=args.seed,
         pilot=args.pilot,
-        use_modal=not args.local,
+        use_modal=not (args.local or bool(args.api_base)),
         modal_gpu=args.modal_gpu,
         max_train_steps=args.max_steps,
         skip_nonregression=args.skip_nonregression,
+        api_base=args.api_base,
+        served_model_name=args.served_model_name,
     )
     try:
         report = run_arms(cfg)
@@ -895,6 +909,115 @@ def cmd_run_arms(args: argparse.Namespace) -> int:
         return 2
     paths = report.get("_paths") or {}
     print(f"arms report: {paths.get('md', Path(args.out) / 'arms.md')}")
+    return 0
+
+
+def _load_teacher_trajectories(source: Path) -> list[tuple[str, list[Any]]]:
+    """Teacher trajectories from harbor job dirs or ATIF JSON traces.
+
+    Two shapes, because two things produce them: `replay` leaves harbor job
+    directories, and mined/example traces are JSON. Anything unreadable is
+    reported rather than skipped — a silently smaller corpus changes what the run
+    measured.
+    """
+    from .mining.atif import TrajectoryParseError, parse_job_trajectory
+    from .schema import Trace
+
+    trajectories: list[tuple[str, list[Any]]] = []
+    if not source.is_dir():
+        raise FileNotFoundError(f"teacher trace source not found: {source}")
+
+    for path in sorted(source.iterdir()):
+        if path.is_dir():
+            try:
+                trajectories.append((path.name, parse_job_trajectory(path)))
+            except TrajectoryParseError as e:
+                raise ValueError(f"{path}: not a readable harbor job dir ({e})") from e
+        elif path.suffix == ".json":
+            try:
+                trace = Trace.load(path)
+            except Exception as e:
+                # Match the job-dir branch above: name the file that failed.
+                # Trace.load raises schema/decode errors the caller's
+                # FileNotFoundError/ValueError handler does not catch, so without
+                # this an unreadable trace escapes as a bare traceback.
+                raise ValueError(f"{path}: not a readable ATIF trace ({e})") from e
+            trajectories.append((trace.task or path.stem, trace.turns))
+    if not trajectories:
+        raise ValueError(
+            f"no trajectories under {source} — expected harbor job dirs or ATIF .json traces"
+        )
+    return trajectories
+
+
+def cmd_distill(args: argparse.Namespace) -> int:
+    """OPD: teacher prefix → student samples → teacher scores → reverse-KL step."""
+    from .distill import OPDTrainConfig, run_opd_training, write_opd_report
+    from .endpoint import EndpointError
+    from .reopd import iter_reopd_examples
+    from .teacher import TeacherScoringError, teacher_pool_from_endpoint
+    from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER, TokenizerMismatchError
+
+    try:
+        trajectories = _load_teacher_trajectories(Path(args.teacher_traces))
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    examples = list(
+        iter_reopd_examples(trajectories, steps_per_traj=args.steps_per_trajectory)
+    )
+    if not examples:
+        print(
+            "error: teacher trajectories contain no parent assistant turns — "
+            "nothing for the student to act on",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_dir = Path(args.out)
+    try:
+        # Fails before any GPU time if the teacher cannot score supplied tokens.
+        pool = teacher_pool_from_endpoint(
+            args.teacher_api_base, model=args.teacher_served_name
+        )
+    except (EndpointError, TeacherScoringError) as e:
+        print(f"error: teacher endpoint unusable for OPD: {e}", file=sys.stderr)
+        return 2
+
+    cfg = OPDTrainConfig(
+        student_model=args.student or DEFAULT_STUDENT,
+        teacher_model=args.teacher or DEFAULT_TEACHER,
+        output_dir=out_dir,
+        max_steps=args.max_steps,
+        learning_rate=args.learning_rate,
+        examples_per_step=args.examples_per_step,
+        seed=args.seed,
+        temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens,
+        top_k=args.top_k,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+    print(
+        f"OPD: {len(examples)} step-examples from {len(trajectories)} trajectories · "
+        f"teacher {pool.model} @ {pool.api_base}"
+    )
+    try:
+        result = run_opd_training(examples, pool, cfg)
+    except TokenizerMismatchError as e:
+        print(f"error: teacher/student tokenizers differ: {e}", file=sys.stderr)
+        return 2
+    except (RuntimeError, TeacherScoringError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    md = write_opd_report(result, out_dir)
+    print(f"adapter: {result.adapter_dir}")
+    print(f"steps: {result.steps}  final loss: {result.final_loss}")
+    print(f"mean log ratio: {result.mean_log_ratio_final}")
+    if result.skipped_empty_samples:
+        print(f"note: {result.skipped_empty_samples} example(s) sampled no tokens")
+    print(f"report: {md}")
     return 0
 
 
@@ -1789,6 +1912,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run LoRA on this machine instead of Modal (for tiny CPU smoke tests)",
     )
+    p_train.add_argument(
+        "--api-base",
+        default=None,
+        help=(
+            "attach to a vLLM server you already run (EC2/local) instead of "
+            "spawning Modal; implies --local for training"
+        ),
+    )
+    p_train.add_argument(
+        "--served-model-name",
+        default=None,
+        help="name the endpoint serves under (default: discovered from /v1/models)",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_arms = sub.add_parser(
@@ -1832,6 +1968,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="run LoRA locally instead of Modal (orchestration tests / tiny models)",
     )
     p_arms.add_argument(
+        "--api-base",
+        default=None,
+        help=(
+            "run every arm against a vLLM server you already run (EC2/local) "
+            "instead of spawning Modal containers; implies --local for training. "
+            "The server needs --enable-lora and VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 "
+            "so A2/A3 adapters can be loaded without a restart."
+        ),
+    )
+    p_arms.add_argument(
+        "--served-model-name",
+        default=None,
+        help="name the endpoint serves under (default: discovered from /v1/models)",
+    )
+    p_arms.add_argument(
         "--skip-nonregression",
         action="store_true",
         help="skip the IFEval non-regression pass (still records the pre-declared tolerance)",
@@ -1839,6 +1990,71 @@ def build_parser() -> argparse.ArgumentParser:
     p_arms.set_defaults(func=cmd_run_arms)
 
     # --- PLAN.md capability-routing commands ---
+    p_distill = sub.add_parser(
+        "distill",
+        help=(
+            "OPD branch (PLAN.md Step H): student samples at a teacher prefix, the "
+            "teacher scores those tokens, reverse-KL step. Needs a self-hosted teacher."
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-traces",
+        required=True,
+        help="dir of harbor job dirs and/or ATIF .json traces from the teacher",
+    )
+    p_distill.add_argument(
+        "--teacher-api-base",
+        required=True,
+        help="self-hosted vLLM serving the teacher (needs prompt_logprobs — PLAN.md C1)",
+    )
+    p_distill.add_argument(
+        "--teacher-served-name",
+        default=None,
+        help="name the teacher endpoint serves under (default: discovered)",
+    )
+    p_distill.add_argument("--teacher", default=None, help="teacher HF id for the tokenizer check")
+    p_distill.add_argument("--student", default=None, help="student HF id to train")
+    p_distill.add_argument("--out", default="./vektori-out/opd", help="output directory")
+    p_distill.add_argument("--max-steps", type=_positive_int_arg, default=200)
+    p_distill.add_argument("--learning-rate", type=float, default=1e-5)
+    p_distill.add_argument(
+        "--examples-per-step",
+        type=_positive_int_arg,
+        default=4,
+        help="examples accumulated per optimizer step (one teacher round-trip each)",
+    )
+    p_distill.add_argument(
+        "--steps-per-trajectory",
+        type=_positive_int_arg,
+        default=None,
+        help="cap ReOPD step-examples taken from each trajectory (default: all)",
+    )
+    p_distill.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="sampling temperature; 1.0 keeps the sample on-policy (see distill.py)",
+    )
+    p_distill.add_argument("--max-new-tokens", type=_positive_int_arg, default=256)
+    p_distill.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) = reverse-KL surrogate over sampled tokens, the objective "
+            "PLAN.md declares. >0 = analytic top-K KL (thunlp/OPD uses 16): same "
+            "teacher cost, lower variance, but a different objective — pre-register "
+            "before switching. Recorded in the run's provenance either way."
+        ),
+    )
+    p_distill.add_argument("--seed", type=int, default=0)
+    p_distill.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="trade step time for activation memory on a smaller card",
+    )
+    p_distill.set_defaults(func=cmd_distill)
+
     p_tok = sub.add_parser(
         "check-tokenizers",
         help="Step 0: verify teacher/student share a tokenizer (hard-fail on mismatch)",
