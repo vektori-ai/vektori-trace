@@ -200,8 +200,8 @@ def classify_spans(
                    coarse-grained reverse KL (§6 estimator A) is available.
     ESTIMATOR_B  — multi-token span.  Use the policy-gradient surrogate (§6
                    estimator B): ``Σ log π_s`` and ``Σ log π_t`` over the span.
-    DROP         — empty byte span or span consisting entirely of special tokens
-                   on either side.
+    DROP         — empty byte span, or span containing any special token on
+                   either side (FINAL-PLAN.md §10.4: partition around / mask).
 
     ``student_special_mask[i]`` is True when student token *i* is a special
     token (BOS, EOS, padding, etc.).  If not supplied, no DROP-for-specials
@@ -214,16 +214,16 @@ def classify_spans(
             result.append((SpanKind.DROP, "empty byte span"))
             continue
 
-        if student_special_mask is not None and all(
+        if student_special_mask is not None and any(
             student_special_mask[i] for i in span.student_idx
         ):
-            result.append((SpanKind.DROP, "student span contains only special tokens"))
+            result.append((SpanKind.DROP, "student span contains special tokens"))
             continue
 
-        if teacher_special_mask is not None and all(
+        if teacher_special_mask is not None and any(
             teacher_special_mask[i] for i in span.teacher_idx
         ):
-            result.append((SpanKind.DROP, "teacher span contains only special tokens"))
+            result.append((SpanKind.DROP, "teacher span contains special tokens"))
             continue
 
         if span.n_student == 1 and span.n_teacher == 1:

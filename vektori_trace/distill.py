@@ -506,6 +506,15 @@ def run_opd_training(
     skipped = 0
     completed_steps = 0
     _last_cross_stats: Any = None  # most recent CrossStepStats (cross path only)
+    # Run-level aggregates for provenance (§10.10 / §10.11).
+    _run_bytes_aligned = 0
+    _run_bytes_total = 0
+    _run_n_A = 0
+    _run_n_B = 0
+    _run_n_other_clamped = 0
+    _run_special_tokens_masked = 0
+    _run_dropped_by_content_type: dict[str, int] = {}
+    _run_eos_stripped = 0
 
     with log_path.open("w") as log:
         for step in range(cfg.max_steps):
@@ -513,6 +522,19 @@ def run_opd_training(
             step_losses: list[Any] = []
             step_ratios: list[float] = []
             step_tokens = 0
+            # Step-aggregated cross stats (not last-example-only).
+            step_n_A = 0
+            step_n_B = 0
+            step_n_dropped = 0
+            step_n_spans = 0
+            step_bytes_aligned = 0
+            step_bytes_total = 0
+            step_special_masked = 0
+            step_n_other_clamped = 0
+            step_granularity_sum = 0.0
+            step_granularity_n = 0
+            step_dropped_by_reason: dict[str, int] = {}
+            step_dropped_by_content_type: dict[str, int] = {}
 
             for _ in range(cfg.examples_per_step):
                 ex = next_example()
@@ -541,7 +563,7 @@ def run_opd_training(
 
                     # Build student byte list — strip tokens with empty bytes
                     # (EOS, unknown specials) so align_by_bytes sees only
-                    # content-carrying tokens.
+                    # content-carrying tokens. Count stripped empties (§7).
                     student_bytes_list: list[bytes] = []
                     student_aligned_positions: list[int] = []
                     for pos, tid in enumerate(action_ids):
@@ -549,6 +571,8 @@ def run_opd_training(
                         if b:
                             student_bytes_list.append(b)
                             student_aligned_positions.append(pos)
+                        else:
+                            _run_eos_stripped += 1
 
                     if not student_bytes_list:
                         skipped += 1
@@ -684,8 +708,27 @@ def run_opd_training(
                             step_ratios.append(
                                 sum(s - t for s, t in span_pairs) / len(span_pairs)
                             )
-                    # Carry cross_stats for log line below.
+                    # Carry cross_stats for step aggregation below.
                     _last_cross_stats = cross_stats
+                    step_n_A += cross_stats.n_A
+                    step_n_B += cross_stats.n_B
+                    step_n_spans += cross_stats.n_spans
+                    n_drop = cross_stats.n_spans - cross_stats.n_A - cross_stats.n_B
+                    step_n_dropped += max(0, n_drop)
+                    step_bytes_aligned += cross_stats.bytes_aligned
+                    step_bytes_total += cross_stats.bytes_total
+                    step_special_masked += cross_stats.special_tokens_masked
+                    step_n_other_clamped += cross_stats.n_other_clamped
+                    step_granularity_sum += cross_stats.granularity
+                    step_granularity_n += 1
+                    if cross_stats.dropped_by_reason:
+                        for k, v in cross_stats.dropped_by_reason.items():
+                            step_dropped_by_reason[k] = step_dropped_by_reason.get(k, 0) + v
+                    if cross_stats.dropped_by_content_type:
+                        for k, v in cross_stats.dropped_by_content_type.items():
+                            step_dropped_by_content_type[k] = (
+                                step_dropped_by_content_type.get(k, 0) + v
+                            )
 
                 else:
                     # ── Same-vocab path (byte-identical to before) ────────────
@@ -785,29 +828,45 @@ def run_opd_training(
                 "lr": step_lr,
                 "n_examples": len(step_losses),
             }
-            if cfg.cross_tokenizer and _last_cross_stats is not None:
+            if cfg.cross_tokenizer and step_granularity_n > 0:
+                supervised = step_n_A + step_n_B
                 log_entry.update({
-                    "granularity": _last_cross_stats.granularity,
-                    "frac_A": _last_cross_stats.frac_A,
-                    "frac_B": _last_cross_stats.frac_B,
-                    "frac_dropped": _last_cross_stats.frac_dropped,
-                    "bytes_aligned": _last_cross_stats.bytes_aligned,
-                    "bytes_total": _last_cross_stats.bytes_total,
-                    "special_tokens_masked": _last_cross_stats.special_tokens_masked,
-                    "n_other_clamped": _last_cross_stats.n_other_clamped,
-                    "n_A": _last_cross_stats.n_A,
-                    "n_B": _last_cross_stats.n_B,
-                    "dropped_by_reason": _last_cross_stats.dropped_by_reason,
-                    "dropped_by_content_type": _last_cross_stats.dropped_by_content_type,
+                    "granularity": step_granularity_sum / step_granularity_n,
+                    "frac_A": step_n_A / supervised if supervised else 0.0,
+                    "frac_B": step_n_B / supervised if supervised else 0.0,
+                    "frac_dropped": (
+                        step_n_dropped / step_n_spans if step_n_spans else 0.0
+                    ),
+                    "bytes_aligned": step_bytes_aligned,
+                    "bytes_total": step_bytes_total,
+                    "special_tokens_masked": step_special_masked,
+                    "n_other_clamped": step_n_other_clamped,
+                    "n_A": step_n_A,
+                    "n_B": step_n_B,
+                    "dropped_by_reason": step_dropped_by_reason or None,
+                    "dropped_by_content_type": step_dropped_by_content_type or None,
                 })
+                _run_bytes_aligned += step_bytes_aligned
+                _run_bytes_total += step_bytes_total
+                _run_n_A += step_n_A
+                _run_n_B += step_n_B
+                _run_n_other_clamped += step_n_other_clamped
+                _run_special_tokens_masked += step_special_masked
+                for k, v in step_dropped_by_content_type.items():
+                    _run_dropped_by_content_type[k] = (
+                        _run_dropped_by_content_type.get(k, 0) + v
+                    )
                 # §10.11 — above 1% of A positions clamped → logprobs too noisy.
-                n_A = _last_cross_stats.n_A
-                if n_A > 0 and _last_cross_stats.n_other_clamped / n_A > 0.01:
+                # Aggregated across all examples in this optimiser step.
+                if step_n_A > 0 and step_n_other_clamped / step_n_A > 0.01:
                     raise RuntimeError(
-                        f"§10.11: {_last_cross_stats.n_other_clamped}/{n_A} "
+                        f"§10.11: {step_n_other_clamped}/{step_n_A} "
                         "Estimator-A positions needed other_t clamp "
                         "(>1%) — teacher logprobs too noisy for coarse-grained A"
                     )
+            elif cfg.cross_tokenizer and _last_cross_stats is not None:
+                # Defensive: an example produced stats but granularity_n stayed 0.
+                log_entry["cross_stats_note"] = "no aggregated cross examples this step"
             log.write(json.dumps(log_entry) + "\n")
             log.flush()
 
@@ -827,6 +886,18 @@ def run_opd_training(
             "cross_top_k": cfg.cross_top_k,
             "temperature": cfg.temperature,
             "encoding_dsv4": ENCODING_DSV4_SHA256,
+            # §10.10 / §10.11 run-level coverage (every run).
+            "bytes_aligned": _run_bytes_aligned,
+            "bytes_total": _run_bytes_total,
+            "frac_bytes_aligned": (
+                _run_bytes_aligned / _run_bytes_total if _run_bytes_total else 0.0
+            ),
+            "n_A": _run_n_A,
+            "n_B": _run_n_B,
+            "n_other_clamped": _run_n_other_clamped,
+            "special_tokens_masked": _run_special_tokens_masked,
+            "eos_stripped": _run_eos_stripped,
+            "dropped_by_content_type": _run_dropped_by_content_type or None,
         }
         if _bridge is not None:
             provenance["bridge_teacher_fingerprint"] = _bridge.teacher_fingerprint.vocab_sha256

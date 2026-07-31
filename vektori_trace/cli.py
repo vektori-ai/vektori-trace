@@ -1333,6 +1333,22 @@ def cmd_align_report(args: argparse.Namespace) -> int:
 
     bridge = CrossTokenizerBridge.load(args.bridge)
 
+    # §10.7 — refuse a drifted encoder even for offline reporting.
+    from .encoding_dsv4 import ENCODING_DSV4_SHA256, verify_encoding_dsv4_pin
+
+    try:
+        verify_encoding_dsv4_pin()
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if bridge.encoding_dsv4_hash != ENCODING_DSV4_SHA256:
+        print(
+            f"error: bridge encoding_dsv4 hash mismatch: "
+            f"bridge={bridge.encoding_dsv4_hash!r} current={ENCODING_DSV4_SHA256!r}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Load both tokenizers to encode the samples.
     from transformers import AutoTokenizer
 

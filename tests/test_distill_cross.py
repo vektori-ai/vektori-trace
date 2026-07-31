@@ -407,6 +407,11 @@ def test_cross_tokenizer_provenance_records_bridge_fingerprints(tmp_path, tiny, 
     assert prov.get("encoding_dsv4") == ENCODING_DSV4_SHA256
     assert "bridge_teacher_fingerprint" in prov
     assert "bridge_student_fingerprint" in prov
+    assert "bytes_aligned" in prov
+    assert "bytes_total" in prov
+    assert "dropped_by_content_type" in prov or prov.get("dropped_by_content_type") is None
+    assert "n_other_clamped" in prov
+    assert "eos_stripped" in prov
 
 
 def test_cross_tokenizer_equivalence_oracle_matches_reverse_kl(tiny, ascii_action):

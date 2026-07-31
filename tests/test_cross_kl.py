@@ -545,7 +545,7 @@ def test_stats_special_tokens_masked_counts_special_drops():
     token_bytes = [b"a", b"b", b"c"]
     alignment = align_by_bytes(token_bytes, token_bytes)
     span_kinds = [
-        (SpanKind.DROP, "student span contains only special tokens"),
+        (SpanKind.DROP, "student span contains special tokens"),
         (SpanKind.DROP, "empty byte span"),  # not a special-token drop
         (SpanKind.ESTIMATOR_B, "B"),
     ]

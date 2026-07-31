@@ -300,6 +300,20 @@ def test_classify_spans_drop_if_student_span_is_special():
     assert kinds[2] == SpanKind.DROP
 
 
+def test_classify_spans_drop_mixed_special_and_content():
+    """§10.4 — any special in a multi-token span masks the whole span."""
+    student_bytes = [b"ab", b"cd"]  # will form one 2↔2 or 2↔1… use matching
+    teacher_bytes = [b"abcd"]  # 1 teacher token covering both student tokens
+    alignment = align_by_bytes(student_bytes, teacher_bytes)
+    assert len(alignment.spans) == 1
+    # First student token special → entire multi-token span DROPped.
+    classified = classify_spans(
+        alignment, student_special_mask=[True, False]
+    )
+    assert classified[0][0] == SpanKind.DROP
+    assert "special" in classified[0][1]
+
+
 def test_classify_spans_estimator_b_for_multi_token_span():
     student_bytes = [b"a", b"b", b"c"]  # 3 tokens, 3 bytes
     teacher_bytes = [b"abc"]  # 1 token, 3 bytes
