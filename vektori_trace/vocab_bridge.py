@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vektori_trace.encoding_dsv4 import ENCODING_DSV4_SHA256
+from vektori_trace.encoding_dsv4 import ENCODING_DSV4_SHA256, verify_encoding_dsv4_pin
 from vektori_trace.tokenizer_check import TokenizerFingerprint, fingerprint_tokenizer
 
 # ── ByteLevel unicode → byte table ────────────────────────────────────────────
@@ -436,6 +436,9 @@ def check_cross_tokenizer(
 
     Raises CrossTokenizerError on any failure.
     """
+    # §10.7 — pin check before anything else.
+    verify_encoding_dsv4_pin()
+
     if teacher_tokenizer is None:
         from transformers import AutoTokenizer
 

@@ -567,3 +567,24 @@ def test_check_cross_tokenizer_bridge_roundtrip_save_load(tmp_path) -> None:
     assert loaded.student_table.fingerprint == bridge.student_table.fingerprint
     assert loaded.exact_map == bridge.exact_map
     assert loaded.encoding_dsv4_hash == ENCODING_DSV4_SHA256
+
+
+def test_encoding_dsv4_pin_matches_upstream_body():
+    """ENCODING_DSV4_SHA256 must hash the embedded upstream body, not the wrapper."""
+    from vektori_trace.encoding_dsv4 import (
+        ENCODING_DSV4_SHA256,
+        upstream_encoding_dsv4_bytes,
+        verify_encoding_dsv4_pin,
+    )
+
+    digest = verify_encoding_dsv4_pin()
+    assert digest == ENCODING_DSV4_SHA256
+    import hashlib
+
+    assert hashlib.sha256(upstream_encoding_dsv4_bytes()).hexdigest() == ENCODING_DSV4_SHA256
+    # Wrapper header must NOT be part of the pin — file digest differs.
+    from pathlib import Path
+
+    whole = Path(__file__).resolve().parents[1] / "vektori_trace" / "encoding_dsv4.py"
+    whole_digest = hashlib.sha256(whole.read_bytes()).hexdigest()
+    assert whole_digest != ENCODING_DSV4_SHA256

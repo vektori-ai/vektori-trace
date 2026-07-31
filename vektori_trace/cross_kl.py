@@ -55,6 +55,12 @@ class CrossStepStats:
     mean_mapped_teacher_mass: float  # mean mapped-teacher-mass fraction for A spans
     student_entropy: float      # mean Shannon entropy of π_s at A-span positions
     dropped_by_reason: dict[str, int] | None = None
+    # §10.10 — dropped-span bytes bucketed by content type (numeric/identifier/…).
+    dropped_by_content_type: dict[str, int] | None = None
+    # §10.11 — positions where Σexp(mapped_t) ≥ 1 forced other_t to the floor.
+    n_other_clamped: int = 0
+    n_A: int = 0
+    n_B: int = 0
 
 
 # ── Estimator A: coarse-grained reverse KL ─────────────────────────────────────
@@ -91,10 +97,12 @@ def coarse_grained_reverse_kl(
             quantisation noise pushes Σexp(mapped_t) ≥ 1, clamping prevents NaN.
 
     Returns:
-        ``(contribution_tensor, mapped_teacher_mass_fraction)`` on success, or
-        ``None`` when the coverage gate fires.  The contribution is the raw
-        per-span term (no global denominator); the caller divides by the total
-        student-token count.
+        ``(contribution_tensor, mapped_teacher_mass_fraction, other_clamped)`` on
+        success, or ``None`` when the coverage gate fires.  ``other_clamped`` is
+        True when Σexp(mapped_t) ≥ 1 forced the teacher "other" bucket to
+        ``other_floor`` (§10.11).  The contribution is the raw per-span term
+        (no global denominator); the caller divides by the total student-token
+        count.
     """
     _require_train()
     import torch
@@ -113,8 +121,9 @@ def coarse_grained_reverse_kl(
 
     # ── Teacher side: K+1 log-probs (fp32, detached) ─────────────────────────
     log_floor = math.log(other_floor)
-    # fp8 noise: Σexp ≥ 1.0 → clamp "other" to floor; count silently (§10.11).
-    other_t_val = log_floor if mapped_t_total >= 1.0 else math.log1p(-mapped_t_total)
+    # fp8 noise: Σexp ≥ 1.0 → clamp "other" to floor; count (§10.11).
+    other_clamped = mapped_t_total >= 1.0
+    other_t_val = log_floor if other_clamped else math.log1p(-mapped_t_total)
 
     mapped_t_lps = [lp for _, lp in mapped_pairs]
     teacher_lps = torch.tensor(
@@ -148,7 +157,7 @@ def coarse_grained_reverse_kl(
     pi_s = student_lps_cat.exp()  # [K+1], differentiable
     contribution = (pi_s * (student_lps_cat - teacher_lps.detach())).sum()  # scalar
 
-    return contribution, mapped_coverage
+    return contribution, mapped_coverage, other_clamped
 
 
 # ── Estimator B: policy-gradient surrogate ─────────────────────────────────────
@@ -208,6 +217,7 @@ def cross_step_loss(
     exact_map: dict[int, int],
     coverage_threshold: float = 0.9,
     other_floor: float = 1e-9,
+    student_token_bytes: Sequence[bytes] | None = None,
 ) -> tuple[Any, CrossStepStats]:
     """Cross-tokenizer OPD loss with ONE shared global denominator.
 
@@ -238,6 +248,8 @@ def cross_step_loss(
             ``CrossTokenizerBridge``.
         coverage_threshold: passed to ``coarse_grained_reverse_kl``.
         other_floor: passed to ``coarse_grained_reverse_kl``.
+        student_token_bytes: optional per-aligned-student-token byte strings used
+            to bucket dropped spans by content type (§10.10).
 
     Returns:
         ``(loss, CrossStepStats)``.  When no spans are supervised the loss is a
@@ -265,6 +277,8 @@ def cross_step_loss(
     entropy_sum = 0.0
     n_entropy = 0
     dropped_by_reason: dict[str, int] = {}
+    dropped_by_content_type: dict[str, int] = {}
+    n_other_clamped = 0
 
     for span, (kind, reason) in zip(alignment.spans, span_kinds, strict=True):
         # ── DROP ─────────────────────────────────────────────────────────────
@@ -273,6 +287,17 @@ def cross_step_loss(
             dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + 1
             if "special" in reason.lower():
                 special_tokens_masked += 1
+            # §10.10 content-type bucket for the dropped span's bytes.
+            if student_token_bytes is not None:
+                raw = b"".join(student_token_bytes[i] for i in span.student_idx)
+                ctype = _content_type_of_bytes(raw)
+            elif "special" in reason.lower():
+                ctype = "special"
+            elif "empty" in reason.lower():
+                ctype = "empty"
+            else:
+                ctype = "other"
+            dropped_by_content_type[ctype] = dropped_by_content_type.get(ctype, 0) + 1
             continue
 
         n_s = span.n_student
@@ -300,12 +325,14 @@ def cross_step_loss(
                 )
 
                 if result_A is not None:
-                    contrib, mass_frac = result_A
+                    contrib, mass_frac, clamped = result_A
                     contributions.append(contrib)
                     total_student_tokens += n_s  # always 1 for 1:1 spans
                     bytes_aligned += span.byte_len
                     n_A += 1
                     mapped_teacher_masses.append(mass_frac)
+                    if clamped:
+                        n_other_clamped += 1
 
                     # Shannon entropy H = −Σ_v π_s(v) log π_s(v), all fp32
                     lp_v = lp_full_pos.float()
@@ -363,9 +390,35 @@ def cross_step_loss(
         ),
         student_entropy=entropy_sum / n_entropy if n_entropy > 0 else float("nan"),
         dropped_by_reason=dropped_by_reason or None,
+        dropped_by_content_type=dropped_by_content_type or None,
+        n_other_clamped=n_other_clamped,
+        n_A=n_A,
+        n_B=n_B,
     )
 
     return loss, stats
+
+
+def _content_type_of_bytes(raw: bytes) -> str:
+    """Bucket span bytes for §10.10 coverage-bias reporting."""
+    if not raw:
+        return "empty"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "binary"
+    if text.isspace():
+        return "whitespace"
+    stripped = text.strip()
+    if stripped and all(ch.isdigit() or ch in ".-+eE" for ch in stripped) and any(
+        ch.isdigit() for ch in stripped
+    ):
+        return "numeric"
+    if stripped and any(ch.isalpha() for ch in stripped) and all(
+        ch.isalnum() or ch in "_/.-$@:" for ch in stripped
+    ):
+        return "identifier"
+    return "other"
 
 
 __all__ = [

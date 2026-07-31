@@ -335,6 +335,25 @@ class CrossTokenizerTeacherPool:
                 "scored": scored,
             }
 
+        # Shape check: every returned score must be a finite real number.
+        # A wrong echo shape that still has the right *count* (e.g. nulls,
+        # strings, NaN) would otherwise look like a passing P0 probe.
+        bad: list[str] = []
+        for i, v in enumerate(scored):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                bad.append(f"index {i}: type {type(v).__name__}")
+                continue
+            if v != v or v in (float("inf"), float("-inf")):  # NaN / Inf
+                bad.append(f"index {i}: non-finite {v!r}")
+        if bad:
+            return {
+                "ok": False,
+                "error": "echo scores failed shape check: " + "; ".join(bad),
+                "probe_prefix": probe_prefix,
+                "probe_tokens": probe_tokens,
+                "scored": scored,
+            }
+
         return {
             "ok": True,
             "probe_prefix": probe_prefix,

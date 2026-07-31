@@ -163,7 +163,7 @@ def test_other_bucket_math_loss_matches_manual_k_plus_1_kl():
         lp_full, mapped_pairs, teacher_topk, coverage_threshold=0.0
     )
     assert result is not None
-    contrib, _mass_frac = result
+    contrib, _mass_frac, _clamped = result
 
     # Manual K+1 computation
     p0 = float(lp_full[0].exp())
@@ -241,7 +241,8 @@ def test_clamp_when_sum_exp_exceeds_one_does_not_return_nan():
     )
 
     assert result is not None, "clamped path must not return None"
-    contrib, mass_frac = result
+    contrib, mass_frac, clamped = result
+    assert clamped is True
     assert torch.isfinite(contrib), f"contribution must be finite, got {contrib}"
     assert math.isfinite(mass_frac)
 
@@ -263,7 +264,7 @@ def test_clamp_contribution_is_finite_for_borderline_sum():
         lp_full, mapped_pairs, teacher_topk, coverage_threshold=0.0
     )
     assert result is not None
-    contrib, _ = result
+    contrib, _, _clamped = result
     assert torch.isfinite(contrib)
 
 
@@ -742,7 +743,7 @@ def test_estimator_a_gradient_reaches_student_logprobs_full():
         lp_full, mapped_pairs, teacher_topk, coverage_threshold=0.0
     )
     assert result is not None
-    contrib, _ = result
+    contrib, _, _clamped = result
     contrib.backward()
 
     assert lp_full.grad is not None

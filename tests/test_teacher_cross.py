@@ -439,3 +439,38 @@ def test_turns_to_openai_messages_thinking_as_reasoning_content():
     asst = msgs[1]
     assert asst.get("reasoning_content") == "some reasoning"
     assert asst["content"] == "A"
+
+
+def test_probe_echo_support_rejects_non_finite_scores():
+    """P0 shape check: NaN / non-numeric echo scores must fail the probe."""
+    class _NanPool:
+        def score_ids(self, prompt_ids, tokens):
+            return [float("nan")] * len(tokens)
+
+        def provenance(self):
+            return {}
+
+    pool = tc.CrossTokenizerTeacherPool(
+        pool=_NanPool(),
+        teacher_tokenizer=_FakeTokenizer(),
+    )
+    result = pool.probe_echo_support(probe_prefix=[1], probe_tokens=[2, 3])
+    assert result["ok"] is False
+    assert "shape check" in result["error"]
+
+
+def test_probe_echo_support_rejects_string_scores():
+    class _StrPool:
+        def score_ids(self, prompt_ids, tokens):
+            return ["nope"] * len(tokens)
+
+        def provenance(self):
+            return {}
+
+    pool = tc.CrossTokenizerTeacherPool(
+        pool=_StrPool(),
+        teacher_tokenizer=_FakeTokenizer(),
+    )
+    result = pool.probe_echo_support(probe_prefix=[1], probe_tokens=[2])
+    assert result["ok"] is False
+    assert "shape check" in result["error"]

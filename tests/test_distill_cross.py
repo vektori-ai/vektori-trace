@@ -200,19 +200,20 @@ def _cfg(tmp_path, **kw):
 
 
 def test_encode_prefix_pair_returns_two_lists(tiny):
-    """encode_prefix_pair returns (student_ids, teacher_ids) for a tiny example."""
+    """encode_prefix_pair returns (student_ids, teacher_ids, teacher_text)."""
     from vektori_trace.reopd import build_reopd_example
 
     _, tok = tiny
     fake_teacher_tok = _fake_teacher_tokenizer(tok)
     ex = build_reopd_example(_turns(), task="t", action_index=1)
 
-    s_ids, t_ids = encode_prefix_pair(
+    s_ids, t_ids, t_text = encode_prefix_pair(
         ex, tok, fake_teacher_tok, max_prefix_tokens=512, thinking_mode="chat"
     )
 
     assert len(s_ids) > 0, "student prefix must not be empty"
     assert len(t_ids) > 0, "teacher prefix must not be empty"
+    assert isinstance(t_text, str) and t_text, "teacher prefix text required for §10.3"
 
 
 def test_encode_prefix_pair_truncates_at_message_boundary(tiny):
@@ -230,7 +231,7 @@ def test_encode_prefix_pair_truncates_at_message_boundary(tiny):
 
     # max_prefix_tokens=50 forces truncation: full teacher encoding is ~182 tokens,
     # but with 1 turn the teacher encoding is ~39 tokens which fits.
-    s_ids, t_ids = encode_prefix_pair(
+    s_ids, t_ids, _t_text = encode_prefix_pair(
         ex, tok, fake_teacher_tok, max_prefix_tokens=50, thinking_mode="chat"
     )
 
@@ -243,7 +244,32 @@ def test_encode_prefix_pair_truncates_at_message_boundary(tiny):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_cross_tokenizer_loop_trains_and_writes_adapter(tmp_path, tiny):
+def _ascii_action_ids(tok, text: str = " hello") -> list[int]:
+    """Deterministic valid-UTF-8 action ids for offline cross-tokenizer tests.
+
+    Random tiny-GPT-2 samples can emit byte sequences that are not valid UTF-8;
+    with the §10 strict decode those hard-fail the run. Tests pin a known-good
+    ASCII action so alignment/junction stay deterministic.
+    """
+    ids = tok.encode(text, add_special_tokens=False)
+    assert ids, "action text must encode to at least one token"
+    return list(ids)
+
+
+@pytest.fixture()
+def ascii_action(monkeypatch, tiny):
+    """Patch `_sample_action` to always return a fixed ASCII token sequence."""
+    _, tok = tiny
+    fixed = _ascii_action_ids(tok)
+
+    def _fixed_sample(model, tokenizer, prefix_ids, cfg):
+        return list(fixed)
+
+    monkeypatch.setattr("vektori_trace.distill._sample_action", _fixed_sample)
+    return fixed
+
+
+def test_cross_tokenizer_loop_trains_and_writes_adapter(tmp_path, tiny, ascii_action):
     """Full cross-tokenizer loop: finite loss, adapter written, 2 steps complete."""
     model, tok = tiny
     bridge = _make_bridge(tok)
@@ -271,7 +297,7 @@ def test_cross_tokenizer_loop_trains_and_writes_adapter(tmp_path, tiny):
     assert result.provenance["thinking_mode"] == "chat"
 
 
-def test_cross_tokenizer_loop_loss_is_finite(tmp_path, tiny):
+def test_cross_tokenizer_loop_loss_is_finite(tmp_path, tiny, ascii_action):
     """Cross-tokenizer loss must be finite after multiple steps."""
     import math
 
@@ -296,7 +322,7 @@ def test_cross_tokenizer_loop_loss_is_finite(tmp_path, tiny):
     assert math.isfinite(result.final_loss)
 
 
-def test_cross_tokenizer_gradient_reaches_lora(tmp_path, tiny):
+def test_cross_tokenizer_gradient_reaches_lora(tmp_path, tiny, ascii_action):
     """Backward from cross-tokenizer loss reaches LoRA parameters."""
     import torch
 
@@ -331,7 +357,7 @@ def test_cross_tokenizer_gradient_reaches_lora(tmp_path, tiny):
     assert moved, "LoRA weights did not move — gradient is not connected"
 
 
-def test_cross_tokenizer_log_records_granularity(tmp_path, tiny):
+def test_cross_tokenizer_log_records_granularity(tmp_path, tiny, ascii_action):
     """Log lines for the cross path include granularity and frac_A/frac_B."""
     model, tok = tiny
     bridge = _make_bridge(tok)
@@ -356,9 +382,10 @@ def test_cross_tokenizer_log_records_granularity(tmp_path, tiny):
         # Cross-path log entries carry alignment stats.
         assert "granularity" in row, f"missing 'granularity' in row: {row}"
         assert "frac_A" in row or "frac_B" in row, "missing estimator fractions"
+        assert "n_other_clamped" in row
 
 
-def test_cross_tokenizer_provenance_records_bridge_fingerprints(tmp_path, tiny):
+def test_cross_tokenizer_provenance_records_bridge_fingerprints(tmp_path, tiny, ascii_action):
     """Provenance carries bridge fingerprints and encoding_dsv4 hash."""
     model, tok = tiny
     bridge = _make_bridge(tok)
@@ -380,6 +407,61 @@ def test_cross_tokenizer_provenance_records_bridge_fingerprints(tmp_path, tiny):
     assert prov.get("encoding_dsv4") == ENCODING_DSV4_SHA256
     assert "bridge_teacher_fingerprint" in prov
     assert "bridge_student_fingerprint" in prov
+
+
+def test_cross_tokenizer_equivalence_oracle_matches_reverse_kl(tiny, ascii_action):
+    """Identical-tokenizer cross path ≈ reverse_kl_surrogate on 1↔1 spans.
+
+    With student_table == teacher_table and a 1↔1 bridge, Estimator B on each
+    span must match ``opd.reverse_kl_surrogate`` over the same token logprobs
+    (FINAL-PLAN §7 equivalence oracle, distill-level).
+    """
+    import torch
+
+    from vektori_trace import opd
+    from vektori_trace.align import align_by_bytes, classify_spans
+    from vektori_trace.cross_kl import cross_step_loss
+    from vektori_trace.vocab_bridge import build_byte_table
+
+    _, tok = tiny
+    bridge = _make_bridge(tok)
+    action_ids = _ascii_action_ids(tok)
+    bt = build_byte_table(tok)
+    s_bytes = [bt.table[i] for i in action_ids if bt.table.get(i)]
+    assert s_bytes
+    alignment = align_by_bytes(s_bytes, s_bytes)
+    kinds = classify_spans(alignment)
+    assert all(k == kinds[0][0] for k in [x[0] for x in kinds])  # all same kind
+
+    # Fake per-token logprobs — student differentiable, teacher detached scalars.
+    n = len(s_bytes)
+    student_token_lp = torch.tensor(
+        [-0.4 - 0.05 * i for i in range(n)], dtype=torch.float32, requires_grad=True
+    )
+    teacher_token_lp = [-0.5 - 0.03 * i for i in range(n)]
+    # Full vocab logits unused when every span is B or when A has no topk.
+    V = max(tok.vocab_size, 64)
+    student_full = torch.randn(n, V, dtype=torch.float32)
+    student_full = torch.log_softmax(student_full, dim=-1)
+
+    loss_cross, stats = cross_step_loss(
+        alignment=alignment,
+        span_kinds=kinds,
+        student_logprobs_full=student_full,
+        student_token_logprobs=student_token_lp,
+        teacher_token_logprobs=teacher_token_lp,
+        teacher_topk_by_teacher_pos={},  # force B path
+        exact_map=bridge.exact_map,
+        student_token_bytes=s_bytes,
+    )
+
+    loss_ref = opd.reverse_kl_surrogate(
+        student_token_lp.unsqueeze(0),
+        torch.tensor([teacher_token_lp], dtype=torch.float32),
+    )
+    assert torch.allclose(loss_cross, loss_ref, rtol=1e-5, atol=1e-6), (
+        f"cross={float(loss_cross)} ref={float(loss_ref)} stats={stats}"
+    )
 
 
 def test_cross_tokenizer_thinking_mode_validation():

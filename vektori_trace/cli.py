@@ -1032,6 +1032,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
     bridge_path = getattr(args, "bridge", None)
     thinking_mode = getattr(args, "thinking_mode", "chat")
     min_granularity = getattr(args, "min_granularity", 0.5)
+    max_span_student_tokens = getattr(args, "max_span_student_tokens", 8)
     cross_top_k = getattr(args, "cross_top_k", 5)
     teacher_tok_id = getattr(args, "teacher_tokenizer_id", None)
 
@@ -1083,6 +1084,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
         bridge_path=bridge_path,
         thinking_mode=thinking_mode,
         min_alignment_granularity=min_granularity,
+        max_span_student_tokens=max_span_student_tokens,
         cross_top_k=cross_top_k,
     )
     prov = pool.provenance()
@@ -1357,7 +1359,11 @@ def cmd_align_report(args: argparse.Namespace) -> int:
             rows.append({"sample": sample[:40], "error": "empty after EOS stripping"})
             continue
         try:
-            al = align_by_bytes(s_bytes, t_bytes)
+            al = align_by_bytes(
+                s_bytes,
+                t_bytes,
+                max_span_student_tokens=getattr(args, "max_span_student_tokens", 8),
+            )
             rows.append({
                 "sample": sample[:40],
                 "granularity": round(al.granularity, 4),
@@ -2438,6 +2444,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_distill.add_argument(
+        "--max-span-student-tokens",
+        type=int,
+        default=8,
+        dest="max_span_student_tokens",
+        help=(
+            "hard-fail if any aligned span covers more than this many student tokens "
+            "(FINAL-PLAN.md §10.5; default: 8)"
+        ),
+    )
+    p_distill.add_argument(
         "--cross-top-k",
         type=int,
         default=5,
@@ -2522,6 +2538,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FILE",
         help="file of text samples (one per line); defaults to stdin",
+    )
+    p_align.add_argument(
+        "--max-span-student-tokens",
+        type=int,
+        default=8,
+        dest="max_span_student_tokens",
+        help="hard-fail threshold for span width (default: 8)",
     )
     p_align.set_defaults(func=cmd_align_report)
 

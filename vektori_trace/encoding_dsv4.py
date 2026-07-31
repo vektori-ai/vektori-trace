@@ -2,10 +2,61 @@
 
 Source: deepseek-ai/DeepSeek-V4-Flash encoding/encoding_dsv4.py
 Pinned SHA256: bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0
-Do not edit by hand — re-vendor and update ENCODING_DSV4_SHA256.
+
+``ENCODING_DSV4_SHA256`` pins the *upstream source body* below
+``PINNED_UPSTREAM_BEGIN`` (not this wrapper header). Call
+``verify_encoding_dsv4_pin()`` before trusting the encoder; training and
+``check_cross_tokenizer`` do so automatically.
 """
 
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
 ENCODING_DSV4_SHA256 = "bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0"
+
+# Exact line that begins the hashed upstream body (included as a comment only).
+_PINNED_UPSTREAM_MARKER = b"# === PINNED_UPSTREAM_BEGIN ===\n"
+
+
+def upstream_encoding_dsv4_bytes() -> bytes:
+    """Return the pinned upstream source bytes embedded in this file."""
+    raw = Path(__file__).read_bytes()
+    idx = raw.find(_PINNED_UPSTREAM_MARKER)
+    if idx < 0:
+        raise RuntimeError(
+            "encoding_dsv4.py is missing the PINNED_UPSTREAM_BEGIN marker — "
+            "re-vendor from deepseek-ai/DeepSeek-V4-Flash"
+        )
+    return raw[idx + len(_PINNED_UPSTREAM_MARKER) :]
+
+
+def verify_encoding_dsv4_pin() -> str:
+    """Hard-fail if the embedded upstream body drifts from ENCODING_DSV4_SHA256.
+
+    Returns the verified hex digest on success.
+    """
+    digest = hashlib.sha256(upstream_encoding_dsv4_bytes()).hexdigest()
+    if digest != ENCODING_DSV4_SHA256:
+        raise RuntimeError(
+            f"encoding_dsv4 upstream pin mismatch: got {digest}, "
+            f"expected {ENCODING_DSV4_SHA256}. Re-vendor the upstream file and "
+            "update ENCODING_DSV4_SHA256 together."
+        )
+    return digest
+
+
+# Verify the pin at import time so a hand-edit cannot silently ship.
+verify_encoding_dsv4_pin()
+
+# === PINNED_UPSTREAM_BEGIN ===
+"""
+DeepSeek-V4 Encoding
+
+A self-contained implementation for encoding/decoding DeepSeek-V4 chat messages
+with tool calling, thinking mode, and quick instruction task support.
+"""
 
 from typing import Any, Dict, List, Union, Optional, Tuple
 import copy

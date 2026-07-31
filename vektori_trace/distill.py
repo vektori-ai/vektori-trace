@@ -183,7 +183,7 @@ def encode_prefix_pair(
     max_prefix_tokens: int,
     thinking_mode: str = "chat",
     prefix_cache: Any | None = None,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], str]:
     """Encode the prefix for both student and teacher tokenizers.
 
     Student encoding: same as `encode_prefix` (apply_chat_template +
@@ -199,6 +199,9 @@ def encode_prefix_pair(
 
     When `prefix_cache` is provided it is used to skip re-rendering the teacher
     prefix on repeated encounters of the same (task, step_index).
+
+    Returns ``(student_ids, teacher_ids, teacher_prefix_text)``.  The rendered
+    teacher prefix text is required for the §10.3 junction assert.
     """
     from .teacher_cross import (
         TeacherPrefixCache,
@@ -225,6 +228,9 @@ def encode_prefix_pair(
         student_ids = list(student_ids)
 
         # ── Teacher encoding (with optional cache) ────────────────────────
+        teacher_messages = turns_to_openai_messages(prefix_turns)
+        teacher_text = render_teacher_prefix(teacher_messages, thinking_mode=thinking_mode)
+
         cached_teacher: list[int] | None = None
         if isinstance(prefix_cache, TeacherPrefixCache):
             cached_teacher = prefix_cache.get(
@@ -234,8 +240,6 @@ def encode_prefix_pair(
         if cached_teacher is not None:
             teacher_ids = cached_teacher
         else:
-            teacher_messages = turns_to_openai_messages(prefix_turns)
-            teacher_text = render_teacher_prefix(teacher_messages, thinking_mode=thinking_mode)
             teacher_ids = encode_teacher_ids(teacher_text, teacher_tokenizer)
 
         if len(student_ids) <= max_prefix_tokens and len(teacher_ids) <= max_prefix_tokens:
@@ -249,7 +253,7 @@ def encode_prefix_pair(
                     example.task or "", example.step_index, teacher_ids,
                     thinking_mode=thinking_mode,
                 )
-            return student_ids, teacher_ids
+            return student_ids, teacher_ids, teacher_text
 
         # Drop the earliest turn and retry.
         prefix_turns = prefix_turns[1:]
@@ -395,8 +399,11 @@ def run_opd_training(
         _prefix_cache = TeacherPrefixCache()
 
     if cfg.cross_tokenizer:
-        from .encoding_dsv4 import ENCODING_DSV4_SHA256
+        from .encoding_dsv4 import ENCODING_DSV4_SHA256, verify_encoding_dsv4_pin
         from .vocab_bridge import CrossTokenizerBridge
+
+        # §10.7 — refuse to train against a drifted vendored encoder.
+        verify_encoding_dsv4_pin()
 
         if _bridge is None and cfg.bridge_path is not None:
             _bridge = CrossTokenizerBridge.load(cfg.bridge_path)
@@ -512,12 +519,12 @@ def run_opd_training(
 
                 if cfg.cross_tokenizer:
                     # ── Cross-tokenizer path (FINAL-PLAN.md) ─────────────────
-                    from .align import align_by_bytes, classify_spans
+                    from .align import AlignmentError, align_by_bytes, classify_spans
                     from .cross_kl import cross_step_loss
                     from .teacher_cross import encode_teacher_ids
 
                     try:
-                        student_prefix, teacher_prefix = encode_prefix_pair(
+                        student_prefix, teacher_prefix, teacher_prefix_text = encode_prefix_pair(
                             ex, tokenizer, _teacher_tok,
                             max_prefix_tokens=cfg.max_prefix_tokens,
                             thinking_mode=cfg.thinking_mode,
@@ -548,8 +555,28 @@ def run_opd_training(
                         continue
 
                     # Reconstruct the sampled text and re-tokenise for the teacher.
-                    action_text = b"".join(student_bytes_list).decode("utf-8", errors="replace")
+                    # Strict UTF-8: replacement would silently change byte length
+                    # and produce a plausible-looking AlignmentError or worse, a
+                    # finite wrong loss (FINAL-PLAN.md §10).
+                    try:
+                        action_text = b"".join(student_bytes_list).decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise AlignmentError(
+                            f"student action bytes are not valid UTF-8: {exc}"
+                        ) from exc
                     teacher_action_ids = encode_teacher_ids(action_text, _teacher_tok)
+
+                    # §10.3 — prefix/action junction must land on a teacher token
+                    # boundary. encode(prefix)+encode(action) == encode(prefix+action).
+                    teacher_joined = encode_teacher_ids(
+                        teacher_prefix_text + action_text, _teacher_tok
+                    )
+                    if list(teacher_prefix) + list(teacher_action_ids) != list(teacher_joined):
+                        raise AlignmentError(
+                            "teacher prefix/action byte junction is not on a token "
+                            "boundary: encode(prefix)+encode(action) != "
+                            "encode(prefix+action)"
+                        )
 
                     # Build teacher byte list — same EOS-stripping convention.
                     teacher_bytes_list: list[bytes] = []
@@ -636,6 +663,7 @@ def run_opd_training(
                         teacher_token_logprobs=teacher_lp_aligned,
                         teacher_topk_by_teacher_pos=teacher_topk_by_teacher_pos,
                         exact_map=_bridge.exact_map,
+                        student_token_bytes=student_bytes_list,
                     )
 
                     (loss / cfg.examples_per_step).backward()
@@ -766,7 +794,20 @@ def run_opd_training(
                     "bytes_aligned": _last_cross_stats.bytes_aligned,
                     "bytes_total": _last_cross_stats.bytes_total,
                     "special_tokens_masked": _last_cross_stats.special_tokens_masked,
+                    "n_other_clamped": _last_cross_stats.n_other_clamped,
+                    "n_A": _last_cross_stats.n_A,
+                    "n_B": _last_cross_stats.n_B,
+                    "dropped_by_reason": _last_cross_stats.dropped_by_reason,
+                    "dropped_by_content_type": _last_cross_stats.dropped_by_content_type,
                 })
+                # §10.11 — above 1% of A positions clamped → logprobs too noisy.
+                n_A = _last_cross_stats.n_A
+                if n_A > 0 and _last_cross_stats.n_other_clamped / n_A > 0.01:
+                    raise RuntimeError(
+                        f"§10.11: {_last_cross_stats.n_other_clamped}/{n_A} "
+                        "Estimator-A positions needed other_t clamp "
+                        "(>1%) — teacher logprobs too noisy for coarse-grained A"
+                    )
             log.write(json.dumps(log_entry) + "\n")
             log.flush()
 
