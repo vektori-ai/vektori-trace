@@ -4,9 +4,9 @@ Pilot — 30B → 8B, and the order to run it in
 **Date:** 2026-07-29 · **Tree:** `main` @ `d370605`
 
 `PLAN.md` says *what* the capability-routing design is. This says *what runs
-first, on which GPU, and what kills it.* Nothing here changes the design; it
-picks the smallest configuration that can execute it and orders the spend so the
-cheapest thing that can falsify the thesis happens first.
+first and on which GPU.* Nothing here changes the design; it picks the smallest
+configuration that can execute it and orders the steps so that each one's
+result is available to the one after it.
 
 The repository holds ~16.8k LOC and 39 test files, and **none of it has met a
 GPU or a real corpus.** The blocker has not been code for some time.
@@ -147,9 +147,7 @@ Modal, per-second billing, no idle charge (checked 2026-07-29):
 | A10 24GB | $1.10 | too tight for 8B + KV cache |
 
 Volumes are $0.09/GiB/month with 1 TiB free, so the weights cache and the
-adapter volume are effectively free. Phase 0 lands around **$80–200** including
-the frontier API arm, which matches the ~$200 gate `PLAN.md` pre-registered.
-Phase 2 runs H100 + A100 ≈ **$6.45/hr**.
+adapter volume are effectively free. Phase 2 runs H100 + A100 ≈ **$6.45/hr**.
 
 **Where Modal stops being the right answer.** Break-even against dedicated
 hourly rental is roughly 30% GPU utilisation. Phase 0 is far below it — the GPU
@@ -160,8 +158,8 @@ repricing if training hours climb past ~50. Keep *serving* on Modal regardless,
 so the `serve.py` → harbor path stays intact and only the training job moves.
 
 
-The order, and what kills it
-----------------------------
+The order to run it in
+----------------------
 
 ### Phase 0 — measurement. No trainer, no teacher, no framework decision.
 
@@ -169,13 +167,13 @@ The order, and what kills it
 mine → replay → diagnose → passk → route
 ```
 
-Produces the diagnosis, the environment and the routing decision — the three
-things that are a customer deliverable without any training at all. All of it is
-already coded.
+Produces the diagnosis, the environment and the routing decision — three useful
+outputs with no training at all. All of it is already coded.
 
-> ★ **GATE.** If `pass@k` curves do not separate into regimes, there is no
-> routing decision and phases 1–3 are pointless. ~$200, one modest GPU, no verl.
-> Nothing expensive precedes this.
+Phase 1 onward reads the routing decision this phase produces, so this phase
+runs first. If the `pass@k` curves do not separate into regimes, there is no
+routing decision to act on, and that is itself a finding about the task
+distribution worth reporting. One modest GPU, no verl.
 
 ### Phase 0.5 — token capture. Small, and everything after it is wrong without it.
 

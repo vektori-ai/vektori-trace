@@ -77,7 +77,7 @@ open-to-the-world `/v1/completions` is someone else's free GPU.
 Every command that talks to a model already takes `--api-base`:
 
 ```bash
-# pass@k sweep — the routing gate
+# pass@k sweep — the support measurement behind the routing decision
 vektori-trace passk --tasks-dir ./tasks \
   --model hosted_vllm/qwen3-8b \
   --api-base http://<ip>:8000/v1 \
@@ -183,12 +183,12 @@ cost, and cross-AZ transfer is billed.
 and two of its findings bear directly on the plan:
 
 1. *"OPD works when the teacher offers genuinely new capabilities beyond the
-   student's training data."* This is the routing gate, arrived at independently.
-   `passk` + `route` decide RL-vs-OPD by whether the capability is inside the
-   student's support — which is exactly the condition thunlp found determines
-   whether OPD helps at all. Their result is the strongest external evidence the
-   gate is measuring the right thing, and it means a run that skips the gate can
-   spend a full OPD budget learning nothing.
+   student's training data."* This is the routing rule, arrived at
+   independently. `passk` + `route` decide RL-vs-OPD by whether the capability
+   is inside the student's support — which is exactly the condition thunlp found
+   determines whether OPD helps at all. Their result is the strongest external
+   evidence that the measurement is the right one, and it means a run that skips
+   it can train for a long time and learn nothing.
 2. *Top-K, not single-token* (`LOG_PROB_TOP_K=16`). Implemented here as
    `--top-k`; see above.
 
