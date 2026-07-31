@@ -8,10 +8,10 @@ experiment design in `V0_PLAN.md`. Mining, verification and diagnosis sections o
 Companion: [`docs/OPD.md`](docs/OPD.md) — the OPD method survey this design rests
 on. Read it for anything about distillation mechanics.
 
-Execution: [`docs/PILOT.md`](docs/PILOT.md) — what runs first, on which GPU, and
-what kills it. It picks the smallest configuration that can execute this design
-(30B MoE teacher → 8B student) and orders the spend so the cheapest falsifying
-step happens first. It also records the trainer decision: **OPD is written
+Execution: [`docs/PILOT.md`](docs/PILOT.md) — what runs first and on which GPU.
+It picks the smallest configuration that can execute this design (30B MoE
+teacher → 8B student) and orders the steps so each one's result is available to
+the next. It also records the trainer decision: **OPD is written
 against `train.py`; verl arrives for the GRPO branch**, not before.
 
 
@@ -47,8 +47,9 @@ The decision is decidable. From `docs/OPD.md`:
    or none, by a rule stated before any data is seen.
 4. **Prove routing pays** — routed training beats anti-routed training at
    identical task count, method mix and compute.
-5. **Ship a diagnostic artefact** that stands alone as a customer deliverable
-   before any training runs.
+5. **Produce a diagnostic report** that stands on its own — the diagnosis, the
+   environment and the routing decision are useful output before any training
+   runs.
 
 ### Non-goals
 
@@ -73,10 +74,10 @@ Implementation Considerations
 
 | # | Constraint | Consequence |
 |---|---|---|
-| C1 | OPD requires `prompt_logprobs` — scoring of *supplied* tokens | Teacher must be self-hosted (vLLM/SGLang, incl. Modal). No hosted endpoint suffices, open or closed. |
+| C1 | OPD requires `prompt_logprobs` — scoring of *supplied* tokens | Not offered by the generic OpenAI-compatible surface, so a self-hosted vLLM/SGLang teacher always works. Two vendors expose it through their own extensions — see [`docs/HOSTED_TEACHERS.md`](docs/HOSTED_TEACHERS.md). |
 | C2 | Teacher and student must share a tokenizer | Same model family. Verified by check, not assumption. |
 | C3 | Containerised agent rollouts cost minutes each | Environment interaction must be removed from the training loop. |
-| C4 | Corpus is 29 mined tasks; measured yield on `hynek/structlog` is 2/20 merged PRs (10%), 12 of the 18 losses for `no_linked_issue` | Insufficient for per-cell power, and mining to 50 needs ~500 PRs. External gyms required. |
+| C4 | No corpus is currently kept: 6 tasks have been mined across two `structlog` runs and neither run's output was retained. Measured yield is 2/20 merged PRs (10%), 12 of the 18 losses for `no_linked_issue` | Mining to 50 tasks needs ~500 PRs, and the output has to be persisted and version-pinned. External gyms required for per-cell power. |
 | C5 | Gyms overlap SWE-bench and student pretraining | Mined held-out slice is the only clean evaluation. |
 | C6 | Frontier scores are scaffold-dependent | Every number names its scaffold. |
 
@@ -87,10 +88,11 @@ Implementation Considerations
   truth to check itself against.
 - **Pre-register every threshold.** Routing rule, effect size, escalation
   schedule — all fixed before data.
-- **Gate before spending.** The `pass@k` sweep costs ~$200 and can kill the
-  thesis. Nothing expensive precedes it.
-- **Separable halves.** The diagnostic half ships as a product without the
-  training half.
+- **Measure before training.** `pass@k` establishes whether the headroom an
+  intervention needs is there at all. Training before that measurement teaches
+  nothing you can attribute, so the measurement runs first.
+- **Separable halves.** The diagnostic half stands on its own; the training half
+  depends on it, not the reverse.
 
 ### Trade-offs taken
 
@@ -100,7 +102,7 @@ Implementation Considerations
 | Qwen3-Coder-Next 80B teacher | Kimi K3 | K3 has no small sibling (cross-tokenizer), needs 8×H200 at MXFP4, and OPD queries the teacher every step |
 | Kimi K3 as oracle | GPT-5 | open weights make the ceiling reproducible by a reviewer |
 | Reverse KL | forward KL | 8B cannot cover an 80B distribution; mode-seeking beats hedging under capacity mismatch |
-| Gyms as corpus, mining as transfer test | mining as corpus | 29 tasks cannot support the claim; and transfer is the stronger result |
+| Gyms as corpus, mining as transfer test | mining as corpus | mined volume to date cannot support the claim; and transfer is the stronger result |
 | verl for GRPO, OPD written here | verl for both; vendored TRACE for both | GRPO's multi-turn rollouts and weight-syncing are hard to hand-roll and verl has them. OPD is a loss plus one `prompt_logprobs` call against a server we already run — verl's teacher *pool* solves multi-node throughput we do not have. See [`docs/PILOT.md`](docs/PILOT.md). |
 
 
@@ -132,14 +134,14 @@ High-Level Behavior
 **Updated 2026-07-29**, against `main` @ `d370605` (PR #16 merged). Every stage
 of the Implementation Outline now has a module and, except where noted, a test.
 The blocker is no longer code — it is *execution*. Nothing below has been run at
-scale, and the `pass@k` gate has not been spent.
+scale, and the `pass@k` sweep has not been run.
 
 | Stage | Module(s) | Status | Missing |
 |---|---|---|---|
-| 0 Env supply | `mining/`, `gym_import.py` 303 | 29 mined tasks; gym adapter coded | one real gym import, run |
+| 0 Env supply | `mining/`, `gym_import.py` 303 | 6 tasks mined across two `structlog` runs (4 + 2), none persisted; gym adapter coded | a corpus that is kept, and one real gym import |
 | 1 Paired replay | `gap.py` 119, `rollout.py` 86 | coded | execution at scale, throughput |
-| 2 pass@k | `passk.py` 505 | estimator, two-stage escalation, luck controls, per-capability aggregation — all present and unit-tested | **the sweep. ~$200. the gate.** |
-| 3 Localization | `resume.py` 483, `intervene.py` 316 | bisection + resume coded | **the desync rate — unmeasured, and it gates the design** |
+| 2 pass@k | `passk.py` 505 | estimator, two-stage escalation, luck controls, per-capability aggregation — all present and unit-tested | **the sweep itself, on real tasks** |
+| 3 Localization | `resume.py` 483, `intervene.py` 316 | bisection + resume coded | **the desync rate — unmeasured, and the design depends on it** |
 | 4 Diagnosis | `diagnose.py`, `grounding.py` 116 | grounding coded | real forking steps to ground against (needs [3]) |
 | 5 Routing | `routing.py` 421 | rule table coded, R1–R6 declared; end-to-end run on synthetic curves | R7 band still undeclared; real curves |
 | 6 Training | `train.py` 360, `opd.py` 255, `dataset.py` 267, `reopd.py` 306, `modal_env.py` 17 | SFT+LoRA and OPD loss coded, unexecuted | teacher pool, container pooling, one real run |
@@ -379,11 +381,11 @@ Implementation Outline
 ```
 Land step6-train-arms → main
    │
-   ├─► [A] Spike trajectory state resume ──────┐   2 days · gates the design
+   ├─► [A] Spike trajectory state resume ──────┐   2 days · informs the design
    │                                            │
    ├─► [B] Gym import adapter (R2E-Gym/SWE-smith)  unblocks volume
    │        │                                   │
-   │        └─► [C] pass@k ──► ★ GATE ★         │   ~$200 · kill-or-continue
+   │        └─► [C] pass@k ─────────────────────┤   the support measurement
    │                    │                       │
    │                    ├─► [D] Bisection localizer ◄┘
    │                    │        └─► [E] Ground diagnosis against D
@@ -408,9 +410,10 @@ be known in week 1.
 **Step C — `passk.py`.** Estimator, two-stage escalation, per-capability
 aggregation, luck controls. Then **run the sweep and look at the histogram.**
 
-> ★ **GATE.** If tasks do not separate into distinct curve regimes, there is no
-> routing decision and the thesis dies for ~$200. Nothing expensive precedes
-> this. Scope G in parallel; build it only after C passes.
+If tasks do not separate into distinct curve regimes, there is no routing
+decision to make and the honest report says so — that is a result about the
+task distribution, and it is worth having early. Scope G in parallel; build it
+once C has produced curves.
 
 **Step D — `intervene.py`.** Bisection driver + teacher continuation.
 
