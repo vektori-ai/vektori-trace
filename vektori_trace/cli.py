@@ -1380,9 +1380,16 @@ def cmd_align_report(args: argparse.Namespace) -> int:
                 t_bytes,
                 max_span_student_tokens=getattr(args, "max_span_student_tokens", 8),
             )
+            # §4 — log granularity with a coarse content-type tag (numeric-heavy
+            # vs other); do not normalize numbers out of the data.
+            from .cross_kl import _content_type_of_bytes
+
+            joined = b"".join(s_bytes)
+            content_type = _content_type_of_bytes(joined)
             rows.append({
                 "sample": sample[:40],
                 "granularity": round(al.granularity, 4),
+                "content_type": content_type,
                 "n_student": al.n_student_tokens,
                 "n_teacher": al.n_teacher_tokens,
                 "n_spans": len(al.spans),
@@ -1397,6 +1404,16 @@ def cmd_align_report(args: argparse.Namespace) -> int:
             f"\nmean granularity: {sum(gran) / len(gran):.4f}  "
             f"(n={len(gran)}, min={min(gran):.4f})"
         )
+        by_type: dict[str, list[float]] = {}
+        for r in rows:
+            if "granularity" not in r:
+                continue
+            by_type.setdefault(r.get("content_type", "other"), []).append(r["granularity"])
+        for ctype, vals in sorted(by_type.items()):
+            print(
+                f"  {ctype}: mean={sum(vals)/len(vals):.4f} n={len(vals)} "
+                f"min={min(vals):.4f}"
+            )
     return 0
 
 

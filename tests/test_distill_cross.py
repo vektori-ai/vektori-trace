@@ -410,8 +410,10 @@ def test_cross_tokenizer_provenance_records_bridge_fingerprints(tmp_path, tiny, 
     assert "bytes_aligned" in prov
     assert "bytes_total" in prov
     assert "dropped_by_content_type" in prov or prov.get("dropped_by_content_type") is None
+    assert "frac_dropped" in prov
     assert "n_other_clamped" in prov
     assert "eos_stripped" in prov
+    assert "student_entropy" in prov
 
 
 def test_cross_tokenizer_equivalence_oracle_matches_reverse_kl(tiny, ascii_action):
@@ -523,3 +525,71 @@ def test_same_vocab_path_unchanged(tmp_path, tiny):
     assert result.final_loss == result.final_loss  # not NaN
     assert result.adapter_dir.is_dir()
     assert result.provenance["loss"] == "reverse_kl_surrogate"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P6: teacher continuation vs corrupted — catches scrambled alignment
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_p6_span_log_ratio_favors_teacher_own_text(tiny):
+    """FINAL-PLAN.md P6 (offline fixture).
+
+    Score a correct continuation vs a deliberately corrupted one. Span-level
+    mean log-ratio (log π_s − log π_t) must clearly favor the teacher's own
+    text — the only offline check that catches a scrambled alignment producing
+    a finite but wrong loss.
+    """
+    from vektori_trace.align import align_by_bytes, span_logprob_sums
+    from vektori_trace.vocab_bridge import build_byte_table
+
+    _, tok = tiny
+    bt = build_byte_table(tok)
+    correct = "return result"
+    corrupt = "return Xesult"  # one-byte corruption
+
+    def mean_log_ratio_for(text: str, *, teacher_bonus: float) -> float:
+        ids = tok.encode(text, add_special_tokens=False)
+        byte_list = [bt.table[i] for i in ids if bt.table.get(i)]
+        assert byte_list, text
+        alignment = align_by_bytes(byte_list, byte_list)
+        # Fixed student logprobs; teacher LP higher (less negative) when bonus>0.
+        s_lp = [-0.5] * len(byte_list)
+        t_lp = [-0.1 - teacher_bonus] * len(byte_list)
+        pairs = span_logprob_sums(alignment, s_lp, t_lp)
+        assert pairs
+        return sum(s - t for s, t in pairs) / len(pairs)
+
+    # Teacher assigns higher probability to its own text than to the corruption.
+    ratio_correct = mean_log_ratio_for(correct, teacher_bonus=0.0)
+    ratio_corrupt = mean_log_ratio_for(corrupt, teacher_bonus=2.0)
+    assert ratio_correct < ratio_corrupt, (
+        f"correct continuation must win on span log-ratio: "
+        f"correct={ratio_correct}, corrupt={ratio_corrupt}"
+    )
+
+
+def test_p6_scrambled_teacher_logprobs_are_detectable(tiny):
+    """A permuted teacher logprob vector changes per-span (s,t) pairs.
+
+    Global means can be invariant under permutation; the scrambled-alignment
+    bug shows up as wrong *pairing*. This fixture asserts the per-span pairs
+    differ — the signal P6 is meant to catch.
+    """
+    from vektori_trace.align import align_by_bytes, span_logprob_sums
+    from vektori_trace.vocab_bridge import build_byte_table
+
+    _, tok = tiny
+    bt = build_byte_table(tok)
+    text = "alpha beta gamma"
+    ids = tok.encode(text, add_special_tokens=False)
+    byte_list = [bt.table[i] for i in ids if bt.table.get(i)]
+    alignment = align_by_bytes(byte_list, byte_list)
+    n = len(byte_list)
+    assert n >= 2
+
+    s_lp = [-0.4 - 0.01 * i for i in range(n)]
+    t_lp = [-0.01 * (2**i) for i in range(n)]
+    aligned = span_logprob_sums(alignment, s_lp, t_lp)
+    rotated = span_logprob_sums(alignment, s_lp, t_lp[1:] + t_lp[:1])
+    assert aligned != rotated

@@ -37,6 +37,7 @@ FLOPs — sets the step time.
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -514,7 +515,11 @@ def run_opd_training(
     _run_n_other_clamped = 0
     _run_special_tokens_masked = 0
     _run_dropped_by_content_type: dict[str, int] = {}
+    _run_dropped_spans = 0
+    _run_total_spans = 0
     _run_eos_stripped = 0
+    _run_student_entropy_sum = 0.0
+    _run_student_entropy_n = 0
 
     with log_path.open("w") as log:
         for step in range(cfg.max_steps):
@@ -533,6 +538,8 @@ def run_opd_training(
             step_n_other_clamped = 0
             step_granularity_sum = 0.0
             step_granularity_n = 0
+            step_entropy_sum = 0.0
+            step_entropy_n = 0
             step_dropped_by_reason: dict[str, int] = {}
             step_dropped_by_content_type: dict[str, int] = {}
 
@@ -729,6 +736,9 @@ def run_opd_training(
                             step_dropped_by_content_type[k] = (
                                 step_dropped_by_content_type.get(k, 0) + v
                             )
+                    if not math.isnan(cross_stats.student_entropy):
+                        step_entropy_sum += cross_stats.student_entropy
+                        step_entropy_n += 1
 
                 else:
                     # ── Same-vocab path (byte-identical to before) ────────────
@@ -845,6 +855,17 @@ def run_opd_training(
                     "n_B": step_n_B,
                     "dropped_by_reason": step_dropped_by_reason or None,
                     "dropped_by_content_type": step_dropped_by_content_type or None,
+                    "frac_dropped_by_content_type": (
+                        {
+                            k: v / step_n_spans
+                            for k, v in step_dropped_by_content_type.items()
+                        }
+                        if step_n_spans and step_dropped_by_content_type
+                        else None
+                    ),
+                    "student_entropy": (
+                        step_entropy_sum / step_entropy_n if step_entropy_n else None
+                    ),
                 })
                 _run_bytes_aligned += step_bytes_aligned
                 _run_bytes_total += step_bytes_total
@@ -852,6 +873,11 @@ def run_opd_training(
                 _run_n_B += step_n_B
                 _run_n_other_clamped += step_n_other_clamped
                 _run_special_tokens_masked += step_special_masked
+                _run_dropped_spans += step_n_dropped
+                _run_total_spans += step_n_spans
+                if step_entropy_n:
+                    _run_student_entropy_sum += step_entropy_sum
+                    _run_student_entropy_n += step_entropy_n
                 for k, v in step_dropped_by_content_type.items():
                     _run_dropped_by_content_type[k] = (
                         _run_dropped_by_content_type.get(k, 0) + v
@@ -898,6 +924,22 @@ def run_opd_training(
             "special_tokens_masked": _run_special_tokens_masked,
             "eos_stripped": _run_eos_stripped,
             "dropped_by_content_type": _run_dropped_by_content_type or None,
+            "frac_dropped_by_content_type": (
+                {
+                    k: v / _run_total_spans
+                    for k, v in _run_dropped_by_content_type.items()
+                }
+                if _run_total_spans and _run_dropped_by_content_type
+                else None
+            ),
+            "frac_dropped": (
+                _run_dropped_spans / _run_total_spans if _run_total_spans else 0.0
+            ),
+            "student_entropy": (
+                _run_student_entropy_sum / _run_student_entropy_n
+                if _run_student_entropy_n
+                else None
+            ),
         }
         if _bridge is not None:
             provenance["bridge_teacher_fingerprint"] = _bridge.teacher_fingerprint.vocab_sha256
