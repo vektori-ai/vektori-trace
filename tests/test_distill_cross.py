@@ -693,3 +693,78 @@ def test_topk_row_missing_scored_token_is_a_hard_error(tmp_path, tiny, ascii_act
             bridge=_make_bridge(tok),
             teacher_tokenizer=_fake_teacher_tokenizer(tok),
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §7 — "EOS is stripped on both sides before alignment, and counted."
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_special_token_literal_has_real_bytes_not_empty(tiny):
+    """Why emptiness is the wrong strip test: EOS round-trips to real bytes.
+
+    `<|endoftext|>` is ASCII, so every character is in the ByteLevel alphabet
+    and `_token_str_to_bytes` returns the literal ten-plus bytes — not b"".
+    Any strip keyed on byte-emptiness therefore strips nothing.
+    """
+    from vektori_trace.vocab_bridge import build_byte_table
+
+    _, tok = tiny
+    bt = build_byte_table(tok)
+    eos = tok.eos_token_id
+    assert eos is not None
+    assert bt.table[eos] != b"", "EOS has no bytes — this test's premise is stale"
+
+
+def test_trailing_eos_is_stripped_and_counted(tmp_path, tiny, monkeypatch):
+    """A sampled action ending in EOS must not carry the EOS literal into alignment."""
+    model, tok = tiny
+    content = _ascii_action_ids(tok)
+    with_eos = [*content, tok.eos_token_id]
+    monkeypatch.setattr(
+        "vektori_trace.distill._sample_action",
+        lambda model, tokenizer, prefix_ids, cfg: list(with_eos),
+    )
+
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    pool = _FakeCrossPool()
+    result = run_opd_training(
+        [ex],
+        pool,
+        _cfg(tmp_path, max_steps=1),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    # Counted, not silently swallowed.
+    assert result.provenance["eos_stripped"] >= 1
+    # The teacher was asked to score the action text only — no EOS literal.
+    assert "endoftext" not in tok.decode(pool.last_tokens)
+    # And the EOS token itself never reached the teacher.
+    assert tok.eos_token_id not in pool.last_tokens
+
+
+def test_action_that_is_only_eos_is_skipped_not_scored(tmp_path, tiny, monkeypatch):
+    """EOS-only sample has no supervised token; it is a skip, not agreement."""
+    model, tok = tiny
+    monkeypatch.setattr(
+        "vektori_trace.distill._sample_action",
+        lambda model, tokenizer, prefix_ids, cfg: [tok.eos_token_id],
+    )
+
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    pool = _FakeCrossPool()
+    result = run_opd_training(
+        [ex],
+        pool,
+        _cfg(tmp_path, max_steps=1),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    assert result.skipped_empty_samples >= 1
+    assert pool.score_calls == 0

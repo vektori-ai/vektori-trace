@@ -451,6 +451,16 @@ def run_opd_training(
             thinking_mode=cfg.thinking_mode,
         )
 
+    # Special-token id sets, resolved once: they are consulted for every sampled
+    # action, and `_special_ids` walks the whole added vocabulary each call.
+    _student_specials: frozenset[int] = frozenset()
+    _teacher_specials: frozenset[int] = frozenset()
+    if cfg.cross_tokenizer:
+        from .vocab_bridge import _special_ids
+
+        _student_specials = _special_ids(tokenizer)
+        _teacher_specials = _special_ids(_teacher_tok)
+
     use_bf16 = bool(cfg.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(
@@ -572,12 +582,35 @@ def run_opd_training(
                         skipped += 1
                         continue
 
-                    # Build student byte list — strip tokens with empty bytes
-                    # (EOS, unknown specials) so align_by_bytes sees only
-                    # content-carrying tokens. Count stripped empties (§7).
+                    # §7 — "EOS is stripped on both sides before alignment, and
+                    # counted: it has no byte extent and is the likeliest source
+                    # of a phantom zero-width span."
+                    #
+                    # Byte-emptiness alone does NOT identify EOS here. A special
+                    # token's literal form is ASCII, so `_token_str_to_bytes`
+                    # round-trips `<|im_end|>` through the ByteLevel table to ten
+                    # real bytes. Stripping on emptiness therefore stripped
+                    # nothing: the EOS literal entered the alignment as content,
+                    # was re-tokenised and sent to the teacher as text, and could
+                    # form a span wide enough to trip the max_span_student_tokens
+                    # desync check on a perfectly ordinary action.
+                    #
+                    # Strip trailing special-or-empty tokens by id. Mid-sequence
+                    # specials stay in the byte stream — removing them would
+                    # splice unrelated bytes together — and are masked out of the
+                    # loss by classify_spans instead (§10.4 "partition around,
+                    # mask, count").
+                    trimmed_ids = list(action_ids)
+                    while trimmed_ids and (
+                        trimmed_ids[-1] in _student_specials
+                        or not _bridge.student_table.table.get(trimmed_ids[-1], b"")
+                    ):
+                        trimmed_ids.pop()
+                        _run_eos_stripped += 1
+
                     student_bytes_list: list[bytes] = []
                     student_aligned_positions: list[int] = []
-                    for pos, tid in enumerate(action_ids):
+                    for pos, tid in enumerate(trimmed_ids):
                         b = _bridge.student_table.table.get(tid, b"")
                         if b:
                             student_bytes_list.append(b)
@@ -586,6 +619,10 @@ def run_opd_training(
                             _run_eos_stripped += 1
 
                     if not student_bytes_list:
+                        # The sample was EOS (or specials) and nothing else. No
+                        # supervised token exists; counting it as agreement would
+                        # be a fabricated datum (same rule as the same-vocab
+                        # empty-sample case).
                         skipped += 1
                         continue
 
@@ -644,15 +681,16 @@ def run_opd_training(
                         )
 
                     # Special-token masks over the *aligned* streams (§10.4).
-                    from .vocab_bridge import _special_ids
-
-                    student_specials = _special_ids(tokenizer)
-                    teacher_specials = _special_ids(_teacher_tok)
+                    # Trailing specials are already gone; this catches the
+                    # mid-sequence ones, whose bytes must stay in the stream to
+                    # keep the two byte sequences equal but which carry no
+                    # supervisable signal.
                     student_special_mask = [
-                        action_ids[p] in student_specials for p in student_aligned_positions
+                        trimmed_ids[p] in _student_specials
+                        for p in student_aligned_positions
                     ]
                     teacher_special_mask = [
-                        teacher_action_ids[p] in teacher_specials
+                        teacher_action_ids[p] in _teacher_specials
                         for p in teacher_aligned_positions
                     ]
                     span_kinds = classify_spans(
@@ -704,11 +742,15 @@ def run_opd_training(
                     teacher_lp_aligned = [teacher_lp_all[p] for p in teacher_aligned_positions]
 
                     # ── Student logits (student-side ids, with grad) ──────────
-                    logits = _student_action_logits(model, student_prefix, action_ids)
-                    action_t = torch.tensor([action_ids], device=logits.device)
+                    # `trimmed_ids`, not `action_ids`: the stripped trailing EOS
+                    # has no aligned position, so forwarding it would only widen
+                    # the tensor and make `student_aligned_positions` index into
+                    # a differently-sized axis than the one it was built from.
+                    logits = _student_action_logits(model, student_prefix, trimmed_ids)
+                    action_t = torch.tensor([trimmed_ids], device=logits.device)
 
                     # Full log_softmax over vocab at every action position.
-                    # Shape [A, V] where A = len(action_ids).
+                    # Shape [A, V] where A = len(trimmed_ids).
                     lp_all = torch.log_softmax(logits[0].float(), dim=-1)
                     # Per-token log π_s for the sampled ids, shape [A].
                     token_lp_all = token_logprobs(logits, action_t)[0]
