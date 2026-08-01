@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -2764,6 +2766,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Nothing configured logging, so every logger.info/warning in the mining
+    # path went nowhere. `validate_pr` logs the one line that distinguishes
+    # "this PR genuinely has no failing test" from "validation never ran"
+    # ("parsed pre=0 post=0 tests"), and it was invisible for the whole
+    # prefect smoke run — the skip histogram looked like a measurement.
+    # VEKTORI_LOG_LEVEL overrides; INFO is the useful default for long mines.
+    logging.basicConfig(
+        level=os.environ.get("VEKTORI_LOG_LEVEL", "INFO").upper(),
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     args = build_parser().parse_args(argv)
     return args.func(args)
 
