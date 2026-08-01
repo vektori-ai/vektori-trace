@@ -7,6 +7,29 @@ Pinned SHA256: bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0
 ``PINNED_UPSTREAM_BEGIN`` (not this wrapper header). Call
 ``verify_encoding_dsv4_pin()`` before trusting the encoder; training and
 ``check_cross_tokenizer`` do so automatically.
+
+Verified against upstream
+-------------------------
+``verify_encoding_dsv4_pin()`` hashes the body embedded in *this file* against
+the constant below, which was derived from that same body. On its own that is a
+tamper check, not a provenance check: a wrong copy would hash consistently
+forever. The provenance was established out of band, 2026-08-01::
+
+    curl -sL https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/\\
+        encoding/encoding_dsv4.py | sha256sum
+    # bdbd57c1…  27908 bytes — matches ENCODING_DSV4_SHA256 exactly
+
+Re-run that after any re-vendor. Tests cannot: the offline stages take no
+network by design.
+
+Sibling repo `deepseek-ai/DeepSeek-V4-Flash-0731` ships a *newer* encoder
+(29 001 bytes, sha abc0d261…). It is not vendored here and does not need to be:
+its only change is `reasoning_effort`, which gains a "low" default and starts
+prepending a prompt for "high" as well as "max". `render_teacher_prefix` never
+passes `reasoning_effort`, so both encoders render byte-identical prefixes in
+`chat` *and* `thinking` mode. The two repos' `tokenizer.json` are identical
+(vocab 128 000, merges 127 741, 1 283 added tokens), so §4's P1/P2 alignment
+measurements carry over unchanged.
 """
 
 from __future__ import annotations
