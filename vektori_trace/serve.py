@@ -131,8 +131,16 @@ def serve_model(
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
+    # CUDA *devel* base, not debian_slim: vLLM's V1 engine JIT-compiles kernels
+    # at startup and needs `nvcc`. On a slim image it gets as far as allocating
+    # the GPU and pulling the weights, then dies with
+    #   RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
+    #                 doesn't exist
+    # The `-devel` tag carries the toolchain; `-runtime` does not.
     image = (
-        modal.Image.debian_slim(python_version="3.12")
+        modal.Image.from_registry(
+            "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12"
+        )
         .pip_install("vllm", "huggingface_hub")
         .env({"HF_HOME": HF_CACHE_MOUNT})
     )
