@@ -407,11 +407,83 @@ class CrossTokenizerBridge:
         )
 
 
-# ── check_cross_tokenizer ─────────────────────────────────────────────────────
+# ── Tokenizer loading ─────────────────────────────────────────────────────────
 
 class CrossTokenizerError(RuntimeError):
     """Cross-tokenizer compatibility check failed."""
 
+
+def encode_ids(tok: Any, text: str, *, add_special_tokens: bool = False) -> list[int]:
+    """Encode `text` to a flat `list[int]`, whatever tokenizer flavour `tok` is.
+
+    The two flavours disagree on the return type, and the disagreement is silent
+    until it isn't:
+
+    * HF `PreTrainedTokenizerFast.encode` → `list[int]`
+    * bare `tokenizers.Tokenizer.encode` → an `Encoding` object, which is **not**
+      iterable — `[int(i) for i in enc]` raises `TypeError`, and `len(enc)` is
+      not the token count you want either.
+
+    Since `load_tokenizer` can hand back either, every encode site has to go
+    through here. `validate_byte_table` already did this defensively; nothing
+    else did.
+    """
+    try:
+        result = tok.encode(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        # Some tokenizers do not accept the keyword at all.
+        result = tok.encode(text)
+
+    ids = getattr(result, "ids", None)  # tokenizers.Encoding
+    if ids is None:
+        ids = result
+    if hasattr(ids, "tolist"):  # torch / numpy
+        ids = ids.tolist()
+    if isinstance(ids, dict):  # {"input_ids": [...]}
+        ids = ids["input_ids"]
+    return [int(i) for i in ids]
+
+
+def load_tokenizer(name_or_path: str) -> Any:
+    """Load a tokenizer, falling back to the raw `tokenizers` backend.
+
+    `AutoTokenizer.from_pretrained` reads `config.json` to resolve the tokenizer
+    class, so it fails on any repo whose *model* config a given `transformers`
+    release cannot parse — even though the tokenizer itself is fine and is all
+    this module ever needs. `deepseek-ai/DeepSeek-V4-Flash-0731` is exactly that
+    case on transformers 5.5.x: its YaRN rope config raises
+    ``AttributeError: 'PreTrainedConfig' object has no attribute
+    'max_position_embeddings'`` before a single token is read.
+
+    Pinning a newer `transformers` would couple the *offline* stages — which
+    FINAL-PLAN.md says need no GPU and no network beyond the tokenizer files — to
+    the release cadence of a library only the training stages depend on. So fall
+    back to `tokenizers.Tokenizer.from_pretrained`, which downloads
+    `tokenizer.json` and nothing else.
+
+    Everything downstream already accepts a bare `tokenizers.Tokenizer`:
+    `build_byte_table` has a `get_vocab()` path, `assert_byte_level` reads
+    `to_str()` directly, and `_special_ids` uses `get_added_vocabulary()`.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(name_or_path, trust_remote_code=True)
+    except Exception as auto_exc:
+        try:
+            from tokenizers import Tokenizer
+
+            return Tokenizer.from_pretrained(name_or_path)
+        except Exception as raw_exc:
+            raise CrossTokenizerError(
+                f"could not load a tokenizer for {name_or_path!r}. "
+                f"AutoTokenizer failed ({type(auto_exc).__name__}: {auto_exc}); "
+                f"tokenizers.Tokenizer.from_pretrained also failed "
+                f"({type(raw_exc).__name__}: {raw_exc})."
+            ) from raw_exc
+
+
+# ── check_cross_tokenizer ─────────────────────────────────────────────────────
 
 def check_cross_tokenizer(
     teacher: str = "teacher",
@@ -440,13 +512,9 @@ def check_cross_tokenizer(
     verify_encoding_dsv4_pin()
 
     if teacher_tokenizer is None:
-        from transformers import AutoTokenizer
-
-        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher, trust_remote_code=True)
+        teacher_tokenizer = load_tokenizer(teacher)
     if student_tokenizer is None:
-        from transformers import AutoTokenizer
-
-        student_tokenizer = AutoTokenizer.from_pretrained(student, trust_remote_code=True)
+        student_tokenizer = load_tokenizer(student)
 
     # ── ByteLevel guard ───────────────────────────────────────────────────────
     for label, tok in (("teacher", teacher_tokenizer), ("student", student_tokenizer)):
@@ -511,5 +579,7 @@ __all__ = [
     "build_byte_table",
     "build_exact_token_map",
     "check_cross_tokenizer",
+    "encode_ids",
+    "load_tokenizer",
     "validate_byte_table",
 ]

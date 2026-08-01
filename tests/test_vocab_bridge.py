@@ -588,3 +588,147 @@ def test_encoding_dsv4_pin_matches_upstream_body():
     whole = Path(__file__).resolve().parents[1] / "vektori_trace" / "encoding_dsv4.py"
     whole_digest = hashlib.sha256(whole.read_bytes()).hexdigest()
     assert whole_digest != ENCODING_DSV4_SHA256
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loading a teacher whose *model* config transformers cannot parse.
+#
+# deepseek-ai/DeepSeek-V4-Flash-0731 on transformers 5.5.x raises
+#   AttributeError: 'PreTrainedConfig' object has no attribute
+#   'max_position_embeddings'
+# from AutoTokenizer.from_pretrained — because it reads config.json to resolve
+# the tokenizer class, even though only tokenizer.json is ever needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _EncodingLike:
+    """Mimics tokenizers.Encoding: has .ids and is NOT iterable."""
+
+    def __init__(self, ids):
+        self.ids = list(ids)
+
+
+class _BareTokenizerLike:
+    """Mimics tokenizers.Tokenizer: no .vocab_size, no __len__, no decode."""
+
+    def __init__(self, vocab):
+        self._vocab = dict(vocab)
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def get_vocab_size(self):
+        return len(self._vocab)
+
+    def to_str(self):
+        import json as _json
+
+        return _json.dumps({"decoder": {"type": "ByteLevel"}})
+
+    def encode(self, text, add_special_tokens=False):
+        return _EncodingLike([self._vocab[c] for c in text if c in self._vocab])
+
+
+def test_encode_ids_unwraps_a_non_iterable_encoding():
+    """A tokenizers.Encoding is not iterable — the old code raised TypeError."""
+    from vektori_trace.vocab_bridge import encode_ids
+
+    tok = _BareTokenizerLike({"a": 1, "b": 2, "c": 3})
+    with pytest.raises(TypeError):
+        list(tok.encode("abc"))  # premise: the raw return really is unusable
+    assert encode_ids(tok, "abc") == [1, 2, 3]
+
+
+def test_encode_ids_accepts_list_dict_and_tensor_returns():
+    from vektori_trace.vocab_bridge import encode_ids
+
+    class _List:
+        def encode(self, t, add_special_tokens=False):
+            return [4, 5]
+
+    class _Dict:
+        def encode(self, t, add_special_tokens=False):
+            return {"input_ids": [6, 7]}
+
+    class _Tensorish:
+        def encode(self, t, add_special_tokens=False):
+            class _T:
+                def tolist(self):
+                    return [8, 9]
+
+            return _T()
+
+    class _NoKwarg:
+        def encode(self, t):
+            return [10]
+
+    assert encode_ids(_List(), "x") == [4, 5]
+    assert encode_ids(_Dict(), "x") == [6, 7]
+    assert encode_ids(_Tensorish(), "x") == [8, 9]
+    assert encode_ids(_NoKwarg(), "x") == [10]
+
+
+def test_fingerprint_handles_a_bare_tokenizer():
+    """No .vocab_size and no __len__ — the old code raised TypeError on len()."""
+    from vektori_trace.tokenizer_check import fingerprint_tokenizer
+
+    tok = _BareTokenizerLike({"a": 1, "b": 2})
+    with pytest.raises(TypeError):
+        len(tok)  # premise
+    fp = fingerprint_tokenizer("some/teacher-repo", tok)
+    assert fp.vocab_size == 2
+    # to_str() is the backend here, so the merges hash must be real, not None —
+    # a silently-None fingerprint is what tokenizer_check calls "unverified".
+    assert fp.merges_sha256 is not None
+    assert fp.vocab_sha256 is not None
+
+
+def test_load_tokenizer_falls_back_when_autotokenizer_cannot_read_the_config():
+    import transformers
+    from tokenizers import Tokenizer
+
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    sentinel = object()
+
+    class _BoomAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*a, **kw):
+            raise AttributeError(
+                "'PreTrainedConfig' object has no attribute 'max_position_embeddings'"
+            )
+
+    real_auto = transformers.AutoTokenizer
+    real_from_pretrained = Tokenizer.from_pretrained
+    transformers.AutoTokenizer = _BoomAutoTokenizer
+    Tokenizer.from_pretrained = staticmethod(lambda *a, **kw: sentinel)
+    try:
+        assert load_tokenizer("deepseek-ai/DeepSeek-V4-Flash-0731") is sentinel
+    finally:
+        transformers.AutoTokenizer = real_auto
+        Tokenizer.from_pretrained = real_from_pretrained
+
+
+def test_load_tokenizer_reports_both_failures():
+    import transformers
+    from tokenizers import Tokenizer
+
+    from vektori_trace.vocab_bridge import CrossTokenizerError, load_tokenizer
+
+    class _Boom:
+        @staticmethod
+        def from_pretrained(*a, **kw):
+            raise RuntimeError("auto failed")
+
+    real_auto = transformers.AutoTokenizer
+    real_from_pretrained = Tokenizer.from_pretrained
+    transformers.AutoTokenizer = _Boom
+    def _raise(*a, **kw):
+        raise RuntimeError("raw failed")
+    Tokenizer.from_pretrained = staticmethod(_raise)
+    try:
+        with pytest.raises(CrossTokenizerError, match=r"auto failed.*raw failed"):
+            load_tokenizer("nope/nope")
+    finally:
+        transformers.AutoTokenizer = real_auto
+        Tokenizer.from_pretrained = real_from_pretrained

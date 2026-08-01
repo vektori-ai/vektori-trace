@@ -1056,8 +1056,8 @@ def cmd_distill(args: argparse.Namespace) -> int:
             return 2
 
         if teacher_tok_id:
-            from transformers import AutoTokenizer
-            _teacher_tok = AutoTokenizer.from_pretrained(teacher_tok_id, trust_remote_code=True)
+            from .vocab_bridge import load_tokenizer
+            _teacher_tok = load_tokenizer(teacher_tok_id)
 
         # Wrap pool in CrossTokenizerTeacherPool for provenance recording.
         from .teacher_cross import CrossTokenizerTeacherPool
@@ -1349,13 +1349,15 @@ def cmd_align_report(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Load both tokenizers to encode the samples.
-    from transformers import AutoTokenizer
+    # Load both tokenizers to encode the samples. `load_tokenizer` rather than
+    # AutoTokenizer: align-report is an offline stage and must not fail because
+    # `transformers` cannot parse a teacher's *model* config.
+    from .vocab_bridge import encode_ids, load_tokenizer
 
     teacher_name = bridge.teacher_fingerprint.name
     student_name = bridge.student_fingerprint.name
-    teacher_tok = AutoTokenizer.from_pretrained(teacher_name, trust_remote_code=True)
-    student_tok = AutoTokenizer.from_pretrained(student_name, trust_remote_code=True)
+    teacher_tok = load_tokenizer(teacher_name)
+    student_tok = load_tokenizer(student_name)
 
     raw = Path(args.text).read_text() if args.text else sys.stdin.read()
     samples = [line for line in raw.splitlines() if line.strip()]
@@ -1365,8 +1367,8 @@ def cmd_align_report(args: argparse.Namespace) -> int:
 
     rows = []
     for sample in samples:
-        s_ids = student_tok.encode(sample, add_special_tokens=False)
-        t_ids = teacher_tok.encode(sample, add_special_tokens=False)
+        s_ids = encode_ids(student_tok, sample)
+        t_ids = encode_ids(teacher_tok, sample)
         s_bytes = [bridge.student_table.table.get(i, b"") for i in s_ids]
         t_bytes = [bridge.teacher_table.table.get(i, b"") for i in t_ids]
         s_bytes = [b for b in s_bytes if b]

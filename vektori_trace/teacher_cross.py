@@ -132,11 +132,14 @@ def encode_teacher_ids(text: str, teacher_tokenizer: Any) -> list[int]:
     rendered string from ``render_teacher_prefix`` already contains the BOS
     and all turn boundaries, so doubling them would shift every token boundary.
     """
-    ids = teacher_tokenizer.encode(text, add_special_tokens=False)
-    # HF tokenizers may return a list or a tensor; normalise to list[int].
-    if hasattr(ids, "tolist"):
-        ids = ids.tolist()
-    return [int(i) for i in ids]
+    # `encode_ids` normalises across tokenizer flavours. A bare
+    # `tokenizers.Tokenizer` — which `load_tokenizer` returns whenever
+    # AutoTokenizer cannot read the teacher repo's model config — returns a
+    # non-iterable `Encoding`, so the old list/tensor handling raised TypeError
+    # on the training hot path.
+    from .vocab_bridge import encode_ids
+
+    return encode_ids(teacher_tokenizer, text, add_special_tokens=False)
 
 
 # ---------------------------------------------------------------------------

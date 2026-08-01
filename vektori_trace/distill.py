@@ -426,9 +426,14 @@ def run_opd_training(
                 "Rebuild the bridge with `vektori-trace build-bridge`."
             )
         if _teacher_tok is None:
-            _teacher_tok = AutoTokenizer.from_pretrained(
-                cfg.teacher_model, trust_remote_code=True
-            )
+            # `load_tokenizer`, not AutoTokenizer: the teacher side only ever
+            # needs encode/get_vocab, so a repo whose model config this
+            # `transformers` cannot parse must not block training. The *student*
+            # below stays on AutoTokenizer — it needs `apply_chat_template`,
+            # which a bare `tokenizers.Tokenizer` does not have.
+            from .vocab_bridge import load_tokenizer
+
+            _teacher_tok = load_tokenizer(cfg.teacher_model)
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     adapter_dir = cfg.output_dir / "adapter"
