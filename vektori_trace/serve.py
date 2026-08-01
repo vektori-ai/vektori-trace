@@ -34,6 +34,10 @@ DEFAULT_HOSTED_VLLM_MODEL_INFO: dict[str, Any] = {
 
 _SERVE_APP_NAME = "vektori-trace-serve"
 
+# Pinned together — see the comment in serve_model before changing either.
+VLLM_VERSION = "0.21.0"
+VLLM_CUDA_IMAGE = "nvidia/cuda:12.9.0-devel-ubuntu22.04"
+
 
 def _require_modal():
     try:
@@ -131,18 +135,37 @@ def serve_model(
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
-    # CUDA *devel* base, not debian_slim: vLLM's V1 engine JIT-compiles kernels
-    # at startup and needs `nvcc`. On a slim image it gets as far as allocating
-    # the GPU and pulling the weights, then dies with
+    # Base image and vLLM version are PINNED TOGETHER, and must move together.
+    #
+    # vLLM publishes wheels for several CUDA lines and `pip install vllm`
+    # (unpinned) resolves to the newest, which currently drags in cu13 packages
+    # (nvidia-nccl-cu13, nvidia-cudnn-cu13, ...). Dropping those on a CUDA 12.8
+    # base is a version mismatch, and the earlier `debian_slim` image had no
+    # CUDA toolchain at all, so vLLM's V1 engine died on:
     #   RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
     #                 doesn't exist
-    # The `-devel` tag carries the toolchain; `-runtime` does not.
+    # Both failures land *after* Modal has allocated a GPU and pulled ~16 GB of
+    # weights, and both surface as "Engine core initialization failed" with the
+    # real cause a hundred lines earlier.
+    #
+    # This is the pair Modal publishes in its own vLLM example, so it is a
+    # tested combination rather than an inference from the changelog. `-devel`
+    # (not `-runtime`) is required: it carries nvcc.
     image = (
         modal.Image.from_registry(
-            "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12"
+            VLLM_CUDA_IMAGE, add_python="3.12"
         )
-        .pip_install("vllm", "huggingface_hub")
-        .env({"HF_HOME": HF_CACHE_MOUNT})
+        .pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub")
+        .env(
+            {
+                "HF_HOME": HF_CACHE_MOUNT,
+                # Faster weight pulls from the Hub.
+                "HF_XET_HIGH_PERFORMANCE": "1",
+                # Emit engine stats every second so /metrics is actually live —
+                # scripts/vllm_monitor.py reads exactly these.
+                "VLLM_LOG_STATS_INTERVAL": "1",
+            }
+        )
     )
 
     app = modal.App(_SERVE_APP_NAME)
