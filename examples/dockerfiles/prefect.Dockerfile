@@ -36,10 +36,21 @@ COPY . /workspace
 RUN pip install --no-cache-dir uv
 
 # `--inexact` keeps the editable install from being pruned on later syncs.
-RUN uv pip install --system --no-cache -e . \
+# `.[otel]` is not optional in practice: tests/conftest.py imports
+# `tests.fixtures.telemetry` unconditionally, which imports
+# `opentelemetry.sdk`. Without it *every* collection fails, the suite is red at
+# both base and patched commit, and every PR skips as `no_fail_to_pass` — the
+# same silent-zero failure mode structlog's `[tests]` group had.
+#
+# watchfiles / whenever / yamllint are imported by 9 more test modules
+# (tests/cli/test_dev.py, tests/deployment/test_yamllint.py,
+# tests/server/schemas/test_schedules.py, …). Missing, they drop out of the
+# collected set, which would quietly shrink every P2P regression guard.
+RUN uv pip install --system --no-cache -e ".[otel]" \
     && uv pip install --system --no-cache \
         pytest pytest-asyncio pytest-timeout pytest-env pytest-xdist \
-        moto numpy jinja2 pluggy respx
+        moto numpy jinja2 pluggy respx opentelemetry-test-utils \
+        watchfiles whenever yamllint
 
 # prefect's own pytest config: `testpaths = ["tests"]` (so the
 # `src/integrations/*` subpackages are out of scope by default — they need
