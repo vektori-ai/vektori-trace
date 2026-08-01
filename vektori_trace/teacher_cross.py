@@ -147,6 +147,17 @@ def encode_teacher_ids(text: str, teacher_tokenizer: Any) -> list[int]:
 # ---------------------------------------------------------------------------
 
 
+class PrefixCacheConflict(RuntimeError):
+    """A prefix re-rendered differently for the same cache key.
+
+    Deliberately **not** a ValueError: `run_opd_training` wraps
+    `encode_prefix_pair` in `except ValueError` to skip examples whose prefix
+    does not fit, and a conflict inheriting from ValueError would be swallowed
+    into that skip counter — turning the §Stage-3 hard error into a silent
+    half-corpus drop.
+    """
+
+
 @dataclass
 class TeacherPrefixCache:
     """Keyed cache of teacher-side prefix ids.
@@ -210,14 +221,14 @@ class TeacherPrefixCache:
     ) -> None:
         """Store ``ids`` for this key.
 
-        Raises ``ValueError`` if a different id list is already cached for
-        this key — that means the prefix changed between calls, which is the
-        bug the cache exists to detect.
+        Raises ``PrefixCacheConflict`` if a different id list is already
+        cached for this key — that means the prefix changed between calls,
+        which is the bug the cache exists to detect.
         """
         key = self._key(task, step_index, n_dropped_turns, thinking_mode)
         existing = self._store.get(key)
         if existing is not None and existing != ids:
-            raise ValueError(
+            raise PrefixCacheConflict(
                 f"TeacherPrefixCache conflict for key {key!r}: "
                 f"stored {len(existing)} ids, got {len(ids)} ids — "
                 "the prefix re-rendered differently between calls; "
@@ -396,6 +407,7 @@ class CrossTokenizerTeacherPool:
 
 __all__ = [
     "CrossTokenizerTeacherPool",
+    "PrefixCacheConflict",
     "TeacherPrefixCache",
     "encode_teacher_ids",
     "render_teacher_prefix",

@@ -308,7 +308,10 @@ def cross_step_loss(
             n_dropped += 1
             dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + 1
             if "special" in reason.lower():
-                special_tokens_masked += 1
+                # Tokens, not spans: §8 calls this "likely the largest single
+                # coverage loss in tool-call-heavy trajectories", which is a
+                # token count. A multi-token span counted 1 understated it.
+                special_tokens_masked += span.n_student
             # §10.10 content-type bucket for the dropped span's bytes.
             if student_token_bytes is not None:
                 raw = b"".join(student_token_bytes[i] for i in span.student_idx)
@@ -357,9 +360,16 @@ def cross_step_loss(
                         n_other_clamped += 1
 
                     # Shannon entropy H = −Σ_v π_s(v) log π_s(v), all fp32
+                    # H = -Σ π_s log π_s, fp32. `p * lp` is 0 * -inf = NaN at any
+                    # position with a -inf logit (logit masking / banned tokens),
+                    # and one NaN poisons the example's mean — which distill then
+                    # silently drops from the run aggregate, quietly disabling
+                    # §6's mode-collapse tripwire. Those terms are 0 in the limit.
                     lp_v = lp_full_pos.float()
                     p_v = lp_v.exp()
-                    entropy = float(-(p_v * lp_v).sum().item())
+                    terms = p_v * lp_v
+                    entropy = float(-torch.where(torch.isfinite(terms), terms,
+                                                 torch.zeros_like(terms)).sum().item())
                     entropy_sum += entropy
                     n_entropy += 1
                     continue

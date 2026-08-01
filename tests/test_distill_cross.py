@@ -126,6 +126,11 @@ def _fake_teacher_tokenizer(student_tok):
         def convert_ids_to_tokens(self, ids):
             return student_tok.convert_ids_to_tokens(ids)
 
+        def get_added_tokens_decoder(self):
+            # The real API `_special_ids` reads. A fake that omits it would let
+            # the §10.4 masking regression back in unnoticed.
+            return student_tok.backend_tokenizer.get_added_tokens_decoder()
+
         @property
         def vocab_size(self):
             return student_tok.vocab_size
@@ -810,7 +815,7 @@ def test_cached_prefix_never_crosses_truncation_depths(tiny):
 def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
     """A non-deterministic render for the same key must hard-fail."""
     from vektori_trace.reopd import build_reopd_example
-    from vektori_trace.teacher_cross import TeacherPrefixCache
+    from vektori_trace.teacher_cross import PrefixCacheConflict, TeacherPrefixCache
 
     _, tok = tiny
     fake_teacher_tok = _fake_teacher_tokenizer(tok)
@@ -827,7 +832,7 @@ def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
         "vektori_trace.teacher_cross.render_teacher_prefix",
         lambda messages, *, thinking_mode="chat": "drifted prefix text",
     )
-    with pytest.raises(ValueError, match="re-rendered differently"):
+    with pytest.raises(PrefixCacheConflict, match="re-rendered differently"):
         encode_prefix_pair(
             ex, tok, fake_teacher_tok, max_prefix_tokens=10_000,
             thinking_mode="chat", prefix_cache=cache,

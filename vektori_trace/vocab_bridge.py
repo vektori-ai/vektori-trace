@@ -237,22 +237,64 @@ def validate_byte_table(
 
 # ── Special-token helpers ─────────────────────────────────────────────────────
 
-def _special_ids(tok: Any) -> frozenset[int]:
-    """Best-effort extraction of special token ids from a tokenizer."""
-    ids: set[int] = set()
+class SpecialTokenDiscoveryError(RuntimeError):
+    """No added-token inventory could be read from a tokenizer."""
 
-    # transformers: all_special_ids is a list[int]
+
+def _special_ids(tok: Any) -> frozenset[int]:
+    """Every added / control token id, on either tokenizer flavour.
+
+    "Special" here means **added token**, not `all_special_ids`. The two differ
+    and the difference is load-bearing: Qwen3's `all_special_ids` lists 14 ids
+    and omits the twelve functional control tokens 151657–151668 (`<tool_call>`,
+    `</tool_call>`, `<tool_response>`, `<think>`, `</think>`, …) that an agentic
+    student emits constantly. Those must be masked out of the loss (§10.4) and
+    excluded from the exact-byte map (§8), so the added-token inventory is the
+    right source and `all_special_ids` is only a supplement.
+
+    This previously probed `get_added_vocabulary`, which is not a method on any
+    tokenizer object — the real API is `get_added_tokens_decoder`. The `hasattr`
+    guard made that a silent no-op, so the branch never ran on either flavour,
+    and for a bare `tokenizers.Tokenizer` (which has no `all_special_ids`) the
+    function returned the empty set. Raise rather than return `frozenset()`:
+    an empty result silently disables §10.4 masking entirely.
+    """
+    ids: set[int] = set()
+    found_inventory = False
+
+    # transformers: all_special_ids is a list[int]. Supplement, not the source.
     val = getattr(tok, "all_special_ids", None)
     if isinstance(val, list):
         ids.update(int(v) for v in val)
 
-    # tokenizers.Tokenizer.get_added_vocabulary() returns {str: int}
-    backend = getattr(tok, "backend_tokenizer", tok)
-    if hasattr(backend, "get_added_vocabulary"):
-        try:
-            ids.update(backend.get_added_vocabulary().values())
-        except Exception:
-            pass
+    # The added-token inventory, keyed by id. Spelled three different ways
+    # depending on the object, and a slow `PreTrainedTokenizer` (the tiny-GPT-2
+    # test fixture is one) exposes it only on its backend — so probe both
+    # objects and both spellings rather than assuming the fast-tokenizer shape.
+    for candidate in (tok, getattr(tok, "backend_tokenizer", None)):
+        if candidate is None:
+            continue
+        for attr in ("get_added_tokens_decoder", "added_tokens_decoder"):
+            source = getattr(candidate, attr, None)
+            if source is None:
+                continue
+            try:
+                mapping = source() if callable(source) else source
+                ids.update(int(k) for k in mapping)
+                found_inventory = True
+            except Exception:
+                continue
+            break
+        if found_inventory:
+            break
+
+    if not found_inventory and not ids:
+        raise SpecialTokenDiscoveryError(
+            f"could not read an added-token inventory from {type(tok).__name__}. "
+            "Refusing to continue with an empty special-token set: §10.4 masking "
+            "and the §8 exact-byte map would both silently treat control tokens "
+            "as ordinary content."
+        )
 
     return frozenset(ids)
 

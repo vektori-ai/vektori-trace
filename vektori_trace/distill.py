@@ -270,6 +270,29 @@ def encode_prefix_pair(
     )
 
 
+def _decode_utf8_dropping_partial_tail(raw: bytes) -> tuple[str, int]:
+    """Decode `raw` as UTF-8, dropping at most 3 bytes of a truncated tail.
+
+    Returns ``(text, n_bytes_dropped)``. A decode error that is *not* an
+    incomplete sequence at the very end re-raises: mid-stream invalid UTF-8
+    means the byte table or the alignment is wrong, which must hard-fail.
+    """
+    try:
+        return raw.decode("utf-8"), 0
+    except UnicodeDecodeError as exc:
+        # A truncated tail reports `unexpected end of data` (or an invalid
+        # continuation) with `start` inside the last 3 bytes of the buffer —
+        # the longest UTF-8 sequence is 4 bytes.
+        if exc.end != len(raw) or len(raw) - exc.start > 3:
+            from .align import AlignmentError
+
+            raise AlignmentError(
+                f"student action bytes are not valid UTF-8: {exc}"
+            ) from exc
+        dropped = len(raw) - exc.start
+        return raw[: exc.start].decode("utf-8"), dropped
+
+
 def _sample_action(model: Any, tokenizer: Any, prefix_ids: list[int], cfg: OPDTrainConfig) -> list[int]:
     """Sample one action from the *current* policy. No grad — only the ids matter."""
     import torch
@@ -538,6 +561,10 @@ def run_opd_training(
     _run_dropped_spans = 0
     _run_total_spans = 0
     _run_eos_stripped = 0
+    _run_utf8_tail_dropped = 0
+    _run_low_granularity_skipped = 0
+    _run_granularity_sum = 0.0
+    _run_granularity_n = 0
     _run_student_entropy_sum = 0.0
     _run_student_entropy_n = 0
 
@@ -625,8 +652,28 @@ def run_opd_training(
                         if b:
                             student_bytes_list.append(b)
                             student_aligned_positions.append(pos)
-                        else:
+                        elif tid in _student_specials:
                             _run_eos_stripped += 1
+                        else:
+                            # A sampled id with no byte-table entry that is not a
+                            # known special. Qwen3-8B's config declares
+                            # vocab_size=151936 while its tokenizer defines
+                            # 151669 — so 267 ids are samplable from the softmax
+                            # and have no bytes. Dropping one mid-sequence
+                            # splices the byte stream: the teacher is then sent
+                            # text the student never produced, every later
+                            # position is conditioned differently on the two
+                            # sides, granularity still reads 1.000, and the loss
+                            # is finite. Exactly the §10 silent-corruption shape,
+                            # so hard-fail instead.
+                            raise AlignmentError(
+                                f"sampled student id {tid} at action position {pos} "
+                                "has no entry in the bridge byte table and is not a "
+                                "known special token. The model's softmax is wider "
+                                "than its tokenizer (config vocab_size vs "
+                                "len(get_vocab())); dropping it would splice the "
+                                "byte stream and silently mis-condition the teacher."
+                            )
 
                     if not student_bytes_list:
                         # The sample was EOS (or specials) and nothing else. No
@@ -640,12 +687,33 @@ def run_opd_training(
                     # Strict UTF-8: replacement would silently change byte length
                     # and produce a plausible-looking AlignmentError or worse, a
                     # finite wrong loss (FINAL-PLAN.md §10).
-                    try:
+                    #
+                    # One exception: `max_new_tokens` can cut the sample partway
+                    # through a multi-byte character (Qwen3 emits ZWJ and rare
+                    # CJK as byte-fallback tokens, so an emoji sequence spans
+                    # several). That truncation is a sampling-window artifact at
+                    # the *tail*, not a desync — hard-failing it would abort a
+                    # 40-step run because one action ended on an emoji. Drop the
+                    # incomplete trailing sequence and count it. A decode error
+                    # anywhere else is still a hard fail.
+                    raw_action_bytes = b"".join(student_bytes_list)
+                    action_text, n_trunc = _decode_utf8_dropping_partial_tail(raw_action_bytes)
+                    if n_trunc:
+                        _run_utf8_tail_dropped += 1
+                        keep = len(raw_action_bytes) - n_trunc
+                        acc = 0
+                        cut = len(student_bytes_list)
+                        for i, b in enumerate(student_bytes_list):
+                            if acc >= keep:
+                                cut = i
+                                break
+                            acc += len(b)
+                        student_bytes_list = student_bytes_list[:cut]
+                        student_aligned_positions = student_aligned_positions[:cut]
+                        if not student_bytes_list:
+                            skipped += 1
+                            continue
                         action_text = b"".join(student_bytes_list).decode("utf-8")
-                    except UnicodeDecodeError as exc:
-                        raise AlignmentError(
-                            f"student action bytes are not valid UTF-8: {exc}"
-                        ) from exc
                     teacher_action_ids = encode_teacher_ids(action_text, _teacher_tok)
 
                     # §10.3 — prefix/action junction must land on a teacher token
@@ -681,14 +749,24 @@ def run_opd_training(
                         max_span_student_tokens=cfg.max_span_student_tokens,
                     )
 
-                    # Granularity gate (hard fail #6 per FINAL-PLAN.md §10).
+                    # Granularity gate (§10.6). The failure it exists to catch is
+                    # *sequence-level* distillation being reported as token-level
+                    # OPD — a property of the run, not of one sample. Applying it
+                    # per example aborted the whole run on legitimate content:
+                    # measured against the real tokenizers, a single line like
+                    # `size=1073741824 free=536870912 used=536870912` gives 0.471,
+                    # three unix timestamps 0.526, a 40-digit run 0.362 — every
+                    # one byte-exact and correctly aligned. §4 measured 0.667 on
+                    # *aggregated* numeric content; per-sample variance is much
+                    # wider, so one unlucky action out of thousands killed a
+                    # 40-step run with no checkpoint recovery.
+                    #
+                    # Skip and count the sample; gate the run-level aggregate
+                    # below, which is what the section actually asserts.
                     if alignment.granularity < cfg.min_alignment_granularity:
-                        raise RuntimeError(
-                            f"alignment granularity {alignment.granularity:.3f} < "
-                            f"min_alignment_granularity={cfg.min_alignment_granularity:.3f} "
-                            "— the student action and teacher re-tokenisation have "
-                            "desynced beyond the pre-registered floor"
-                        )
+                        _run_low_granularity_skipped += 1
+                        skipped += 1
+                        continue
 
                     # Special-token masks over the *aligned* streams (§10.4).
                     # Trailing specials are already gone; this catches the
@@ -991,6 +1069,8 @@ def run_opd_training(
                         step_entropy_sum / step_entropy_n if step_entropy_n else None
                     ),
                 })
+                _run_granularity_sum += step_granularity_sum
+                _run_granularity_n += step_granularity_n
                 _run_bytes_aligned += step_bytes_aligned
                 _run_bytes_total += step_bytes_total
                 _run_n_A += step_n_A
@@ -1020,6 +1100,23 @@ def run_opd_training(
             log.write(json.dumps(log_entry) + "\n")
             log.flush()
 
+    # §10.6 at run level — "granularity below min_alignment_granularity → abort.
+    # Near-zero granularity is *sequence-level* distillation being reported as
+    # token-level OPD: valid arithmetic, false claim." That is a claim about the
+    # run, so it is asserted over the run's mean rather than per sample. Raise
+    # before the adapter is written: an adapter on disk implies a valid run.
+    if cfg.cross_tokenizer and _run_granularity_n > 0:
+        _mean_gran = _run_granularity_sum / _run_granularity_n
+        if _mean_gran < cfg.min_alignment_granularity:
+            raise RuntimeError(
+                f"mean alignment granularity {_mean_gran:.3f} < "
+                f"min_alignment_granularity={cfg.min_alignment_granularity:.3f} "
+                f"over {_run_granularity_n} supervised examples "
+                f"({_run_low_granularity_skipped} further examples were skipped "
+                "for falling below the floor individually). This run is "
+                "sequence-level distillation reported as token-level OPD."
+            )
+
     if adapter_dir.exists():
         shutil.rmtree(adapter_dir)
     model.save_pretrained(str(adapter_dir))
@@ -1047,6 +1144,11 @@ def run_opd_training(
             "n_other_clamped": _run_n_other_clamped,
             "special_tokens_masked": _run_special_tokens_masked,
             "eos_stripped": _run_eos_stripped,
+            "utf8_tail_dropped": _run_utf8_tail_dropped,
+            "low_granularity_skipped": _run_low_granularity_skipped,
+            "mean_granularity": (
+                _run_granularity_sum / _run_granularity_n if _run_granularity_n else None
+            ),
             "dropped_by_content_type": _run_dropped_by_content_type or None,
             "frac_dropped_by_content_type": (
                 {

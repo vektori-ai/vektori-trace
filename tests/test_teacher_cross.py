@@ -214,7 +214,7 @@ def test_teacher_prefix_cache_conflict_is_hard_error():
     """
     cache = tc.TeacherPrefixCache()
     cache.put("task-1", 0, [1, 2, 3])
-    with pytest.raises(ValueError, match="conflict"):
+    with pytest.raises(tc.PrefixCacheConflict, match="conflict"):
         cache.put("task-1", 0, [1, 2, 4])  # different last id
 
 
@@ -495,11 +495,11 @@ def test_prefix_cache_separates_truncation_depths():
 
 def test_prefix_cache_conflict_at_same_depth_is_a_hard_error():
     """A prefix that re-renders differently for one key is the bug to catch."""
-    from vektori_trace.teacher_cross import TeacherPrefixCache
+    from vektori_trace.teacher_cross import PrefixCacheConflict, TeacherPrefixCache
 
     c = TeacherPrefixCache()
     c.put("t", 3, [1, 2, 3])
-    with pytest.raises(ValueError, match="re-rendered differently"):
+    with pytest.raises(PrefixCacheConflict, match="re-rendered differently"):
         c.put("t", 3, [1, 2, 4])
 
 
