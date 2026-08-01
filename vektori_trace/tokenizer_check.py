@@ -30,6 +30,19 @@ SCALE_STUDENT = "Qwen/Qwen3-8B"
 DEFAULT_TEACHER = PILOT_TEACHER
 DEFAULT_STUDENT = PILOT_STUDENT
 
+# The cross-tokenizer teacher (FINAL-PLAN.md). Deliberately NOT DEFAULT_TEACHER:
+# `check_tokenizers` still hard-fails a vocab mismatch, and that gate stays, so
+# the same-vocab pair above must keep pointing at a same-family Qwen teacher.
+# This id is only reachable via `cross_tokenizer=True`, which routes to
+# `check_cross_tokenizer` instead.
+#
+# `-0731` is the released V4-Flash build and is the teacher. The unsuffixed
+# `deepseek-ai/DeepSeek-V4-Flash` repo is the earlier drop; both ship a
+# byte-identical tokenizer.json, so the §4 alignment measurements hold for
+# either, but the encoders differ and only 0731's is vendored.
+CROSS_TEACHER = "deepseek-ai/DeepSeek-V4-Flash-0731"
+CROSS_STUDENT = PILOT_STUDENT
+
 
 class TokenizerMismatchError(RuntimeError):
     """Teacher/student tokenizers are incompatible — refuse to allocate GPU."""
@@ -60,7 +73,15 @@ def fingerprint_tokenizer(name_or_path: str, tokenizer: Any | None = None) -> To
 
         tokenizer = AutoTokenizer.from_pretrained(name_or_path, trust_remote_code=True)
 
-    vocab_size = int(getattr(tokenizer, "vocab_size", None) or len(tokenizer))
+    # A bare `tokenizers.Tokenizer` has neither `.vocab_size` nor `__len__`, and
+    # the cross-tokenizer path reaches one whenever `AutoTokenizer` cannot load a
+    # repo (see `vocab_bridge.load_tokenizer`). The HF branch is untouched.
+    vocab_size_attr = getattr(tokenizer, "vocab_size", None)
+    if vocab_size_attr is not None:
+        vocab_size = int(vocab_size_attr)
+    else:
+        get_vocab_size = getattr(tokenizer, "get_vocab_size", None)
+        vocab_size = int(get_vocab_size()) if callable(get_vocab_size) else len(tokenizer)
     # Prefer on-disk files when the path is a local dir; otherwise None (remote).
     root = Path(name_or_path)
     merges = vocab = None
@@ -78,6 +99,10 @@ def fingerprint_tokenizer(name_or_path: str, tokenizer: Any | None = None) -> To
         # ran. `backend_tokenizer.to_str()` is the serialized model (merges
         # included) and is the thing to hash.
         backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is None and hasattr(tokenizer, "to_str"):
+            # Already a bare `tokenizers.Tokenizer`: it *is* the backend, so the
+            # merges hash stays real instead of silently degrading to None.
+            backend = tokenizer
         if backend is not None and hasattr(backend, "to_str"):
             try:
                 merges = hashlib.sha256(backend.to_str().encode()).hexdigest()
@@ -154,6 +179,8 @@ def check_tokenizers(
 
 
 __all__ = [
+    "CROSS_STUDENT",
+    "CROSS_TEACHER",
     "DEFAULT_STUDENT",
     "DEFAULT_TEACHER",
     "PILOT_STUDENT",

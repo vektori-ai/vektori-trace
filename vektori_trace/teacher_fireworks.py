@@ -67,7 +67,8 @@ TOP_LOGPROBS_CAP = 5
 
 DEFAULT_FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1"
 
-#: The pilot teacher (`docs/PILOT.md`: Qwen3-Coder-30B-A3B → Qwen3-8B), served.
+#: Default Fireworks teacher id for hosted scoring (cross-tokenizer path uses
+#: DeepSeek-V4-Flash; see FINAL-PLAN.md). Legacy same-vocab pilot used Qwen3.
 DEFAULT_FIREWORKS_TEACHER = "accounts/fireworks/models/qwen3-coder-30b-a3b-instruct"
 
 
