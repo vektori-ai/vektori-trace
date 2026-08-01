@@ -130,6 +130,16 @@ def serve_model(
     import modal
 
     info = dict(model_info or DEFAULT_HOSTED_VLLM_MODEL_INFO)
+    if model_info is None and max_model_len is not None:
+        # DEFAULT_HOSTED_VLLM_MODEL_INFO advertises 32768 input tokens. harbor
+        # and litellm believe it and will send prompts that large. If vLLM was
+        # started with a smaller --max-model-len those requests are rejected
+        # mid-sweep, after the rollout has already done its work. Advertise the
+        # window we actually launched with; reserve a little for the completion.
+        info["max_input_tokens"] = max(1, max_model_len - 512)
+        info["max_output_tokens"] = min(
+            int(info.get("max_output_tokens", 8192)), max(1, max_model_len - 512)
+        )
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -223,15 +233,30 @@ def serve_model(
                 cmd += list(extra_vllm_args)
             if vol_adapter:
                 cmd += ["--enable-lora", "--lora-modules", f"{name}={vol_adapter}"]
-            subprocess.Popen(cmd)
+            # Inherit stdout/stderr so vLLM's own log reaches `modal app logs`.
+            proc = subprocess.Popen(cmd)
             deadline = time.time() + 60 * 25
             while time.time() < deadline:
+                # Fail the moment the process exits. Polling only /health meant a
+                # vLLM that died at second 30 — a missing nvcc, a CUDA mismatch —
+                # still burned the full 25-minute deadline on a GPU before
+                # raising, and the error said "failed to become healthy in time"
+                # rather than naming the cause.
+                rc = proc.poll()
+                if rc is not None:
+                    raise RuntimeError(
+                        f"vLLM exited with code {rc} before becoming healthy. "
+                        "The real cause is in this container's log above — "
+                        "engine-core tracebacks print it ~150 lines before the "
+                        "final 'Engine core initialization failed'."
+                    )
                 try:
                     urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)
                     return
                 except Exception:
                     time.sleep(2)
-            raise RuntimeError("vLLM failed to become healthy in time")
+            proc.terminate()
+            raise RuntimeError("vLLM failed to become healthy within 25 minutes")
 
     with app.run():
         server = VllmServer()

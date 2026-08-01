@@ -47,6 +47,37 @@ def capacity(gpu: str, util: float) -> tuple[float, int]:
     return kv_gib, int(kv_gib * (1024**3) / KV_BYTES_PER_TOKEN)
 
 
+def _smoke(api_base: str, model: str, timeout: float = 120.0) -> tuple[bool, str]:
+    """One real completion. Returns (ok, human-readable detail)."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    body = _json.dumps({
+        "model": model,
+        "prompt": "1 + 1 =",
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }).encode()
+    req = urllib.request.Request(
+        api_base.rstrip("/") + "/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    t = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = _json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read()[:200].decode('utf-8', 'replace')}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    choices = payload.get("choices") or []
+    if not choices:
+        return False, f"no choices in response: {str(payload)[:200]}"
+    return True, f"{time.time() - t:.1f}s, got {choices[0].get('text','')!r}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -59,6 +90,9 @@ def main() -> int:
                     help="max tokens per sequence. MUST fit the KV budget or "
                          "vLLM refuses to start (default: 8192)")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    ap.add_argument("--max-hours", type=float, default=12.0,
+                    help="auto-shutdown after N hours so a forgotten endpoint "
+                         "cannot bill indefinitely; 0 disables (default: 12)")
     ap.add_argument("--write-env", default=None,
                     help="also append STUDENT_API_BASE=<url> to this file")
     args = ap.parse_args()
@@ -95,8 +129,17 @@ def main() -> int:
         nonlocal stop
         stop = True
 
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
+    # SIGHUP matters as much as the other two, and costs money when missed.
+    # `tmux kill-session` sends SIGHUP; so does closing the terminal that owns
+    # the process. Untrapped, Python dies without unwinding the `with` block, so
+    # serve_model's __exit__ never runs, the Modal app stays "ephemeral" with a
+    # live container, and the GPU keeps billing with nothing attached to it.
+    # Observed: a killed session left an A10G running until it was stopped by
+    # hand. Overnight that is real money for zero work.
+    for _s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_s, _sig)
+
+    deadline = time.time() + args.max_hours * 3600 if args.max_hours else None
 
     t0 = time.time()
     with serve_model(
@@ -107,6 +150,19 @@ def main() -> int:
         gpu_memory_utilization=args.gpu_memory_utilization,
     ) as served:
         print(f"UP in {time.time() - t0:.0f}s\n")
+
+        # /health answering is not the same as being able to serve. A one-token
+        # completion is: it exercises the tokenizer, the scheduler, the KV
+        # allocator and the sampler. Without it "UP" only means a socket is
+        # listening, and the first real failure would surface hundreds of
+        # rollouts into a pass@k sweep instead of here.
+        ok, detail = _smoke(served.api_base, served.model_name)
+        print(f"  smoke completion  {'OK' if ok else 'FAILED'}  {detail}")
+        if not ok:
+            print("\nrefusing to report an endpoint that cannot complete. "
+                  "Tearing down.", file=sys.stderr)
+            return 3
+
         print(f"  STUDENT_API_BASE={served.api_base}")
         print(f"  model_name       {served.model_name}")
         print(f"  harbor model     {served.harbor_model}\n")
@@ -116,10 +172,19 @@ def main() -> int:
             with open(args.write_env, "a") as fh:
                 fh.write(f"\nSTUDENT_API_BASE={served.api_base}\n")
             print(f"\nappended STUDENT_API_BASE to {args.write_env}")
+        if args.max_hours:
+            print(f"auto-shutdown in {args.max_hours}h "
+                  f"(--max-hours 0 to disable)")
         print("\nendpoint is live. Ctrl-C to tear it down.\n", flush=True)
         while not stop:
+            if deadline and time.time() > deadline:
+                print(f"\nmax-hours ({args.max_hours}h) reached — shutting down.")
+                break
             time.sleep(2)
-    print("torn down.")
+    # serve_model's __exit__ has now run. Belt and braces: an ephemeral Modal app
+    # that outlives this process is a GPU nobody is using, so say plainly how to
+    # check rather than assuming the teardown worked.
+    print("torn down. verify with:  uv run modal app list")
     return 0
 
 
