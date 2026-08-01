@@ -61,6 +61,10 @@ class CrossStepStats:
     n_other_clamped: int = 0
     n_A: int = 0
     n_B: int = 0
+    # Supervised student tokens contributed by this call — the quantity the
+    # §6 global denominator is summed from.  When ``denominator`` is passed
+    # explicitly the caller is doing that summation itself.
+    n_supervised_tokens: int = 0
 
 
 # ── Estimator A: coarse-grained reverse KL ─────────────────────────────────────
@@ -72,7 +76,7 @@ def coarse_grained_reverse_kl(
     teacher_topk: dict[int, float],
     coverage_threshold: float = 0.9,
     other_floor: float = 1e-9,
-) -> tuple[Any, float] | None:
+) -> tuple[Any, float, bool] | None:
     """Analytic coarse-grained reverse KL for a 1↔1 span (Estimator A).
 
     Implements the K+1-event partition (FINAL-PLAN.md §6 (A))::
@@ -218,6 +222,7 @@ def cross_step_loss(
     coverage_threshold: float = 0.9,
     other_floor: float = 1e-9,
     student_token_bytes: Sequence[bytes] | None = None,
+    denominator: float | None = None,
 ) -> tuple[Any, CrossStepStats]:
     """Cross-tokenizer OPD loss with ONE shared global denominator.
 
@@ -225,6 +230,20 @@ def cross_step_loss(
     then divides by the total number of supervised student tokens.  This single
     denominator ensures that step-to-step drift in the A/B mix does not silently
     rescale the effective learning rate (FINAL-PLAN.md §6 Normalization).
+
+    The plan's denominator is *per optimizer step*, not per example — "total
+    supervised student tokens across the batch, across **both** estimators".
+    One call sees one example, so it cannot know the batch total.  Two modes:
+
+    * ``denominator=None`` (default) — self-normalise by this call's own
+      supervised-token count.  Correct when the step has one example; used by
+      the unit tests and the equivalence oracles.
+    * ``denominator=1.0`` — return the **raw** unnormalised sum.  ``distill.py``
+      uses this: it backwards each example raw, sums ``n_supervised_tokens``
+      across the batch, and rescales the accumulated gradients once by
+      ``1/total`` before clipping.  Backward is linear, so that is exactly the
+      global denominator without holding every example's graph in memory at
+      once.
 
     For each span:
     * **DROP** — skip; count ``special_tokens_masked`` when appropriate.
@@ -250,6 +269,9 @@ def cross_step_loss(
         other_floor: passed to ``coarse_grained_reverse_kl``.
         student_token_bytes: optional per-aligned-student-token byte strings used
             to bucket dropped spans by content type (§10.10).
+        denominator: explicit divisor.  ``None`` self-normalises by this call's
+            supervised-token count; ``1.0`` returns the raw sum for a caller
+            applying the batch-level denominator itself.
 
     Returns:
         ``(loss, CrossStepStats)``.  When no spans are supervised the loss is a
@@ -364,7 +386,14 @@ def cross_step_loss(
         # Zero that still carries a computation graph (no-op optimiser step).
         raw = student_token_logprobs.float().sum() * 0.0
 
-    loss = raw / float(total_student_tokens) if total_student_tokens > 0 else raw * 0.0
+    if denominator is not None:
+        if denominator <= 0.0:
+            raise ValueError(f"denominator must be > 0, got {denominator!r}")
+        loss = raw / float(denominator)
+    elif total_student_tokens > 0:
+        loss = raw / float(total_student_tokens)
+    else:
+        loss = raw * 0.0
 
     # ── Stats ─────────────────────────────────────────────────────────────────
     n_supervised = n_A + n_B
@@ -394,6 +423,7 @@ def cross_step_loss(
         n_other_clamped=n_other_clamped,
         n_A=n_A,
         n_B=n_B,
+        n_supervised_tokens=total_student_tokens,
     )
 
     return loss, stats

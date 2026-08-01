@@ -593,3 +593,33 @@ def test_p6_scrambled_teacher_logprobs_are_detectable(tiny):
     aligned = span_logprob_sums(alignment, s_lp, t_lp)
     rotated = span_logprob_sums(alignment, s_lp, t_lp[1:] + t_lp[:1])
     assert aligned != rotated
+
+
+def test_cross_tokenizer_log_records_global_denominator(tmp_path, tiny, ascii_action):
+    """§6: the step log carries the batch-level supervised-token denominator."""
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    pool = _FakeCrossPool()
+
+    result = run_opd_training(
+        [ex],
+        pool,
+        _cfg(tmp_path, examples_per_step=2),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    lines = [
+        json.loads(ln)
+        for ln in result.log_path.read_text().splitlines()
+        if ln.strip()
+    ]
+    stepped = [ln for ln in lines if not ln.get("skipped_step")]
+    assert stepped, "no completed steps"
+    for ln in stepped:
+        # Present, positive, and at least as large as any single example could
+        # supply on its own — i.e. it is a batch total, not a per-example count.
+        assert ln["supervised_tokens"] > 0
+        assert ln["supervised_tokens"] >= ln["n_A"] + ln["n_B"]

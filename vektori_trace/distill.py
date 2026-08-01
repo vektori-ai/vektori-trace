@@ -527,6 +527,10 @@ def run_opd_training(
             step_losses: list[Any] = []
             step_ratios: list[float] = []
             step_tokens = 0
+            # §6 global denominator: supervised student tokens across the whole
+            # batch, across both estimators.  Applied to the accumulated grads
+            # once, after the example loop.
+            step_supervised_tokens = 0
             # Step-aggregated cross stats (not last-example-only).
             step_n_A = 0
             step_n_B = 0
@@ -695,11 +699,25 @@ def run_opd_training(
                         teacher_topk_by_teacher_pos=teacher_topk_by_teacher_pos,
                         exact_map=_bridge.exact_map,
                         student_token_bytes=student_bytes_list,
+                        # Raw sum: the §6 denominator is the *batch* supervised
+                        # token count, which is not known until every example in
+                        # this optimiser step has run.  Gradients are rescaled
+                        # once by 1/total below — backward is linear, so this is
+                        # exactly one global denominator, without holding every
+                        # example's graph alive simultaneously.
+                        denominator=1.0,
                     )
 
-                    (loss / cfg.examples_per_step).backward()
+                    (loss).backward()
+                    step_supervised_tokens += cross_stats.n_supervised_tokens
 
-                    step_losses.append(float(loss.detach()))
+                    # Report the normalised per-example value so `loss` in the
+                    # log stays on the same scale as the same-vocab path.
+                    step_losses.append(
+                        float(loss.detach()) / cross_stats.n_supervised_tokens
+                        if cross_stats.n_supervised_tokens
+                        else 0.0
+                    )
                     n_aligned = len(student_aligned_positions)
                     step_tokens += n_aligned
                     # Monitoring ratio — use span-level sums so student and
@@ -814,6 +832,28 @@ def run_opd_training(
                     "OPD loss is NaN — check teacher/student tokenizer identity and "
                     "that the sampled ids are the ids the teacher scored"
                 )
+
+            if cfg.cross_tokenizer:
+                # §6 Normalization — "one shared global denominator per optimizer
+                # step: total supervised student tokens across the batch, across
+                # BOTH estimators, never per-estimator". Each example backwarded
+                # its raw sum, so one rescale here is that denominator. Doing it
+                # per example instead would weight a 12-token example the same as
+                # a 200-token one and let an A/B mix drift silently rescale the
+                # learning rate — the exact failure the section names.
+                if step_supervised_tokens <= 0:
+                    log.write(
+                        json.dumps({"step": step, "skipped_step": True,
+                                    "reason": "no supervised tokens"}) + "\n"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                scale = 1.0 / float(step_supervised_tokens)
+                with torch.no_grad():
+                    for p in params:
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
+
             torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             optimizer.step()
             # Read the LR *before* advancing: after `scheduler.step()` this
@@ -841,6 +881,8 @@ def run_opd_training(
             if cfg.cross_tokenizer and step_granularity_n > 0:
                 supervised = step_n_A + step_n_B
                 log_entry.update({
+                    # The §6 global denominator actually applied to this step.
+                    "supervised_tokens": step_supervised_tokens,
                     "granularity": step_granularity_sum / step_granularity_n,
                     "frac_A": step_n_A / supervised if supervised else 0.0,
                     "frac_B": step_n_B / supervised if supervised else 0.0,

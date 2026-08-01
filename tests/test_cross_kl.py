@@ -778,3 +778,138 @@ def test_a_path_falls_back_to_b_when_no_topk_data():
     # Span fell back to B
     assert stats.frac_B == pytest.approx(1.0)
     assert stats.frac_A == pytest.approx(0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §6 Normalization — ONE global denominator per optimizer step
+#
+# "total supervised student tokens across the batch, across BOTH estimators,
+# never per-estimator. Otherwise an A/B mix drifting step to step silently
+# rescales the learning rate."
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _b_only(n: int):
+    """n 1-byte tokens → n 1:1 spans, all forced onto Estimator B."""
+    import torch
+
+    from vektori_trace.align import SpanKind, align_by_bytes
+
+    token_bytes = [bytes([97 + i]) for i in range(n)]
+    alignment = align_by_bytes(token_bytes, token_bytes)
+    kinds = [(SpanKind.ESTIMATOR_B, "forced B")] * n
+    lp_full = torch.log_softmax(torch.zeros(n, 4), dim=-1)
+    return alignment, kinds, lp_full
+
+
+def test_denominator_1_returns_raw_sum():
+    """denominator=1.0 is exactly n_supervised_tokens × the self-normalised loss."""
+    import torch
+
+    from vektori_trace.cross_kl import cross_step_loss
+
+    alignment, kinds, lp_full = _b_only(4)
+    s = torch.tensor([-0.4, -0.7, -1.1, -0.2], dtype=torch.float32)
+    t = [-0.5, -0.6, -0.9, -0.3]
+
+    common = dict(
+        alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+        student_token_logprobs=s, teacher_token_logprobs=t,
+        teacher_topk_by_teacher_pos={}, exact_map={},
+    )
+    normed, stats_n = cross_step_loss(**common)
+    raw, stats_r = cross_step_loss(**common, denominator=1.0)
+
+    assert stats_n.n_supervised_tokens == 4
+    assert stats_r.n_supervised_tokens == 4
+    assert float(raw) == pytest.approx(float(normed) * 4, abs=1e-5)
+
+
+def test_denominator_rejects_non_positive():
+    import torch
+
+    from vektori_trace.cross_kl import cross_step_loss
+
+    alignment, kinds, lp_full = _b_only(2)
+    with pytest.raises(ValueError, match="denominator must be > 0"):
+        cross_step_loss(
+            alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+            student_token_logprobs=torch.tensor([-0.5, -0.5]),
+            teacher_token_logprobs=[-0.4, -0.4],
+            teacher_topk_by_teacher_pos={}, exact_map={}, denominator=0.0,
+        )
+
+
+def test_global_denominator_weights_by_token_not_by_example():
+    """Two unequal examples: grads must be token-weighted, not example-averaged.
+
+    This is the regression that per-example normalisation hides — a 2-token
+    example and a 6-token example would otherwise contribute equally.
+    """
+    import torch
+
+    from vektori_trace.cross_kl import cross_step_loss
+
+    # One shared leaf so both "examples" accumulate into the same .grad,
+    # mirroring how LoRA params accumulate across examples_per_step.
+    leaf = torch.zeros(8, dtype=torch.float32, requires_grad=True)
+
+    def run(n: int, offset: int, denominator: float | None):
+        alignment, kinds, lp_full = _b_only(n)
+        s = leaf[offset : offset + n] + torch.tensor(
+            [-0.3 - 0.1 * i for i in range(n)], dtype=torch.float32
+        )
+        t = [-0.5 - 0.05 * i for i in range(n)]
+        loss, stats = cross_step_loss(
+            alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+            student_token_logprobs=s, teacher_token_logprobs=t,
+            teacher_topk_by_teacher_pos={}, exact_map={},
+            denominator=denominator,
+        )
+        return loss, stats
+
+    # ── The shipped path: raw backward per example, one rescale by 1/total. ──
+    loss_a, stats_a = run(2, 0, 1.0)
+    loss_a.backward()
+    loss_b, stats_b = run(6, 2, 1.0)
+    loss_b.backward()
+    total = stats_a.n_supervised_tokens + stats_b.n_supervised_tokens
+    assert total == 8
+    got = leaf.grad.clone() / total
+
+    # ── Reference: one call over all 8 tokens, self-normalised. ─────────────
+    leaf2 = torch.zeros(8, dtype=torch.float32, requires_grad=True)
+    alignment, kinds, lp_full = _b_only(8)
+    s_all = leaf2 + torch.tensor(
+        [-0.3 - 0.1 * i for i in range(2)] + [-0.3 - 0.1 * i for i in range(6)],
+        dtype=torch.float32,
+    )
+    t_all = [-0.5 - 0.05 * i for i in range(2)] + [-0.5 - 0.05 * i for i in range(6)]
+    ref_loss, _ = cross_step_loss(
+        alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+        student_token_logprobs=s_all, teacher_token_logprobs=t_all,
+        teacher_topk_by_teacher_pos={}, exact_map={},
+    )
+    ref_loss.backward()
+
+    assert torch.allclose(got, leaf2.grad, atol=1e-6), f"got={got} ref={leaf2.grad}"
+
+    # And it is NOT what per-example normalisation would have produced.
+    leaf3 = torch.zeros(8, dtype=torch.float32, requires_grad=True)
+
+    def run3(n: int, offset: int):
+        alignment, kinds, lp_full = _b_only(n)
+        s = leaf3[offset : offset + n] + torch.tensor(
+            [-0.3 - 0.1 * i for i in range(n)], dtype=torch.float32
+        )
+        t = [-0.5 - 0.05 * i for i in range(n)]
+        loss, _ = cross_step_loss(
+            alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+            student_token_logprobs=s, teacher_token_logprobs=t,
+            teacher_topk_by_teacher_pos={}, exact_map={},
+        )
+        return loss
+
+    (run3(2, 0) / 2).backward()
+    (run3(6, 2) / 2).backward()
+    assert not torch.allclose(leaf3.grad, leaf2.grad, atol=1e-6)
