@@ -662,16 +662,46 @@ def run_opd_training(
                     )
 
                     # ── Teacher scoring (teacher-side ids) ───────────────────
-                    teacher_lp_all = pool.score_ids(teacher_prefix, teacher_action_ids)
-                    teacher_lp_aligned = [teacher_lp_all[p] for p in teacher_aligned_positions]
-
+                    # ONE round-trip. `score_ids_topk` already merges each
+                    # scored token's own logprob into its row (the sampled
+                    # token is guaranteed present even when outside the top-K),
+                    # so calling `score_ids` as well would be a second echo call
+                    # returning information we already hold. The plan names
+                    # teacher latency — not student FLOPs — as what sets step
+                    # time (§2 Cost shape), so the duplicate doubled it.
                     teacher_topk_by_teacher_pos: dict[int, dict[int, float]] = {}
                     if cfg.cross_top_k > 0 and hasattr(pool, "score_ids_topk"):
                         teacher_topk_all = pool.score_ids_topk(
                             teacher_prefix, teacher_action_ids, cfg.cross_top_k
                         )
+                        if len(teacher_topk_all) != len(teacher_action_ids):
+                            raise RuntimeError(
+                                f"teacher returned {len(teacher_topk_all)} top-K rows "
+                                f"for {len(teacher_action_ids)} scored tokens"
+                            )
+                        teacher_lp_all = []
+                        for i, tid in enumerate(teacher_action_ids):
+                            row = teacher_topk_all[i]
+                            if int(tid) not in row:
+                                raise RuntimeError(
+                                    f"top-K row {i} carries no logprob for the scored "
+                                    f"token id {tid} — score_ids_topk must merge the "
+                                    "scored token in even when it is outside the top-K"
+                                )
+                            teacher_lp_all.append(row[int(tid)])
                         for aligned_pos, orig_pos in enumerate(teacher_aligned_positions):
                             teacher_topk_by_teacher_pos[aligned_pos] = teacher_topk_all[orig_pos]
+                    else:
+                        # cross_top_k=0 disables Estimator A; B needs only the
+                        # per-token scalars, so one plain echo call suffices.
+                        teacher_lp_all = pool.score_ids(teacher_prefix, teacher_action_ids)
+                        if len(teacher_lp_all) != len(teacher_action_ids):
+                            raise RuntimeError(
+                                f"teacher returned {len(teacher_lp_all)} logprobs for "
+                                f"{len(teacher_action_ids)} scored tokens"
+                            )
+
+                    teacher_lp_aligned = [teacher_lp_all[p] for p in teacher_aligned_positions]
 
                     # ── Student logits (student-side ids, with grad) ──────────
                     logits = _student_action_logits(model, student_prefix, action_ids)

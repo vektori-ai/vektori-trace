@@ -623,3 +623,73 @@ def test_cross_tokenizer_log_records_global_denominator(tmp_path, tiny, ascii_ac
         # supply on its own — i.e. it is a batch total, not a per-example count.
         assert ln["supervised_tokens"] > 0
         assert ln["supervised_tokens"] >= ln["n_A"] + ln["n_B"]
+
+
+def test_cross_tokenizer_uses_one_teacher_round_trip_per_example(tmp_path, tiny, ascii_action):
+    """§2 Cost shape: teacher latency sets step time, so one echo call per example.
+
+    score_ids_topk already carries each scored token's own logprob, so a
+    separate score_ids call would be a second round-trip for data we hold.
+    """
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    pool = _FakeCrossPool()
+
+    run_opd_training(
+        [ex],
+        pool,
+        _cfg(tmp_path, max_steps=3, examples_per_step=2, cross_top_k=3),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    # 3 steps × 2 examples = 6 scoring calls, not 12.
+    assert pool.score_calls == 6, f"expected 6 teacher calls, got {pool.score_calls}"
+
+
+def test_cross_top_k_zero_falls_back_to_plain_score_ids(tmp_path, tiny, ascii_action):
+    """cross_top_k=0 disables Estimator A; B needs only the per-token scalars."""
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+
+    class _NoTopK(_FakeCrossPool):
+        def score_ids_topk(self, *a, **kw):  # pragma: no cover - must not run
+            raise AssertionError("score_ids_topk called with cross_top_k=0")
+
+    pool = _NoTopK()
+    result = run_opd_training(
+        [ex],
+        pool,
+        _cfg(tmp_path, max_steps=1, cross_top_k=0),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+    assert pool.score_calls == 1
+    assert result.provenance["n_A"] == 0
+
+
+def test_topk_row_missing_scored_token_is_a_hard_error(tmp_path, tiny, ascii_action):
+    """A top-K row without the scored token's own logprob must not be guessed at."""
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+
+    class _DropsScoredToken(_FakeCrossPool):
+        def score_ids_topk(self, prompt_ids, tokens, top_k):
+            rows = super().score_ids_topk(prompt_ids, tokens, top_k)
+            rows[0].pop(int(tokens[0]), None)
+            return rows
+
+    with pytest.raises(RuntimeError, match="carries no logprob for the scored"):
+        run_opd_training(
+            [ex],
+            _DropsScoredToken(),
+            _cfg(tmp_path, max_steps=1),
+            model=model,
+            tokenizer=tok,
+            bridge=_make_bridge(tok),
+            teacher_tokenizer=_fake_teacher_tokenizer(tok),
+        )
