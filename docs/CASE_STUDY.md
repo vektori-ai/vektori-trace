@@ -53,25 +53,53 @@ yield the repo determines whether deliverable 4 is resolvable at all.
    the shape you want.
 5. **Application-level bugs.** See §3 on why this matters more than it looks.
 
-### Shortlist
+### Measured, 2026-08-01 — **decided: `prefecthq/prefect`**
 
-| Repo | Post-cutoff PR volume | Issue linking | Suite | Risk |
-|---|---|---|---|---|
-| `home-assistant/core` | very high (~1k/mo) | strong, enforced by template | per-integration, fast | bugs are device/integration-specific |
-| `apache/airflow` | high | strong | heavy, slow to build | bootstrap cost per base commit |
-| `prefecthq/prefect` | moderate–high | good | pure Python, moderate | smaller pool |
-| `dask/dask` | moderate | good | pure Python, moderate | may not reach N alone |
-| `pydantic/pydantic` | high | good | fast | `pydantic-core` Rust coupling per base commit |
+100 merged PRs sampled per repo, merged ≥ 2025-01-01, scored with the miner's
+own `_linked_issue_number` (after fixing it — see below). No Docker, no spend.
 
-**Recommendation: `home-assistant/core`.** It is the only one where post-cutoff
-volume is large enough that you can filter hard — post-cutoff *and* linked issue
-*and* band-resident — and still land at N. Its per-integration test isolation
-also keeps P2P counts naturally small, which §3 argues is the thing that went
-wrong with the current 22.
+| Repo | linked-issue rate | linked **and** touches tests | post-cutoff PR pool |
+|---|---|---|---|
+| **`prefecthq/prefect`** | **20%** | **19/100** | **3,735** |
+| `pydantic/pydantic` | 21% | 18/100 | 748 |
+| `home-assistant/core` | 14% | 7/100 | — |
+| `dask/dask` | 11% | 10/100 | — |
+| `apache/airflow` | **2%** | 1/100 | — |
 
-**Do not commit to it on my say-so.** Run the probe first (§4, Phase 0). It is
-cheap, it is the same measurement `mine-results.md` already did for three repos,
-and it decides this empirically.
+Baseline from `docs/mine-results.md`: structlog 23% → 4 tasks; attrs 12%;
+jsonschema 0% → "would have yielded nothing."
+
+**`apache/airflow` is out on measurement, not on taste.** Its PRs genuinely
+don't link issues — self-contained descriptions plus heavy dependabot and
+`[v3-3-test]` cherry-pick traffic. `--no-require-linked-issue` is not the
+workaround it looks like: Airflow's PR bodies are written *after* the fix and
+describe the diagnosis ("a bare string is a sequence of characters, so this
+declares `"s"`, `"q"`, `"l"`"), which is the exact leak the filter exists to
+prevent. You'd measure instruction-following, not debugging.
+
+**`pydantic` loses on pool size**, not rate — 748 post-cutoff PRs caps it near
+N≈45. `pydantic-core` being a Rust extension whose wheel must match every base
+commit is a second, independent reason.
+
+**`prefect` is the only single repo on the shortlist that can reach N≈150.**
+
+#### A bug this probe found
+
+The first probe run reported pydantic at 40%. It was wrong.
+`_linked_issue_number` had two defects, pushing in opposite directions:
+
+- **False positive.** It ran on the *raw* PR body, so pydantic's template —
+  `<!-- WARNING: please use "fix #123" style references -->` — matched, linking
+  every such PR to issue **#123**. `instruction.md` would have been built from
+  an unrelated issue: a corpus that looks healthy while describing the wrong
+  bugs.
+- **False negative.** The full-URL spelling
+  (`Fixes https://github.com/o/r/issues/13507`), which GitHub honours and
+  pydantic mostly uses, was never matched.
+
+Fixed on branch `mining-linked-issue-fix` with three regression tests
+(578 passed, ruff clean). Corrected rates: pydantic 40%→21%, prefect 13%→20%.
+**Every number in the table above is post-fix.**
 
 ---
 
@@ -130,52 +158,64 @@ before assuming those 4 are recoverable.
 
 ## 4. Phases
 
-### Phase 0 — Repo probe + persistence · ~1 day · ~$0
+### Phase 0 — Repo probe + persistence · **DONE (probe) / ~1 day (persistence)**
 
-Two things, both blocking.
+**Probe: done.** Results in §2. `prefecthq/prefect` selected on measured data.
+The linked-issue filter bug found on the way is fixed on branch
+`mining-linked-issue-fix` and needs to land before any mining run — mining with
+the old regex produces tasks whose instructions describe the wrong bug.
 
-**Probe the linked-issue rate** on the shortlist before spending a bootstrap:
-
-```bash
-for repo in home-assistant/core apache/airflow prefecthq/prefect dask/dask; do
-  vektori-trace mine --repo "$repo" --limit 60 \
-    --no-replay --skip-validation --out "./probe-$(basename $repo)"
-done
-```
-
-Read the skip histogram in each `mine-report.json`. Pick on measured
-`no_linked_issue` rate, not on my table above.
-
-**Fix persistence.** `vektori-out-*/` is gitignored, which is why the structlog
-corpus is gone and why the current 22 exist on exactly one machine. Before
-mining at scale: commit a manifest (task ids, base commits, F2P/P2P counts,
-image digests) even if the task bodies stay out of git. Nothing downstream is
-reproducible — or publishable — without it.
-
-**Gate:** a repo with a linked-issue rate ≥ structlog's 14/60, and a committed
-manifest format.
+**Persistence: still blocking.** `vektori-out-*/` is gitignored, which is why
+the structlog corpus is gone and why the current 22 exist on exactly one
+machine. Before mining at scale, commit a manifest (task ids, base commits,
+F2P/P2P counts, image digests) even if task bodies stay out of git. Nothing
+downstream is reproducible — or publishable — without it.
 
 ---
 
-### Phase 1 — Mine the corpus · ~3–5 days · low $
+### Phase 1 — Mine prefect · ~3–5 days · low $
+
+The bootstrap image is written: `examples/dockerfiles/prefect.Dockerfile`.
 
 ```bash
 vektori-trace mine \
-  --repo <chosen> \
-  --dockerfile examples/dockerfiles/<repo>.Dockerfile \
-  --test-cmd "<suite command>" \
-  --limit 1200 \
+  --repo prefecthq/prefect \
+  --dockerfile examples/dockerfiles/prefect.Dockerfile \
+  --test-cmd 'python -m pytest -m "not service" -p no:randomly -q' \
+  --language python \
+  --limit 1500 \
   --no-replay \
   --out ./case-study/mined
 ```
 
-**Arithmetic.** `mine-results.md` measured 10% yield on structlog and states the
-implication: *"~400 merged PRs to reach 50 tasks."* Targeting ~150 emitted tasks
-means screening **~1,200–1,500 merged PRs**. Restricted to the post-cutoff
-window (2025-01 → 2026-07), only the high-volume end of the shortlist has that.
+**Do a `--limit 100` run first** and read the skip histogram before committing
+to 1,500. That calibrates the yield estimate below against reality for roughly
+one afternoon of compute.
+
+**Yield arithmetic, measured on 200 prefect PRs:** 41 qualified (20.5%).
+Of those, roughly a quarter are `ui-v2/**.test.tsx` frontend PRs that
+`--language python` drops, and a further slice touch only
+`src/integrations/prefect-{aws,slack,kubernetes}` — outside prefect's own
+`testpaths = ["tests"]`, so they need separate installs and drift
+independently. Net Python-core candidates ≈ 15%. Applying structlog's observed
+emitted/qualified ratio (4 of 14 ≈ 29%):
+
+> 3,735 post-cutoff PRs × 15% × 29% ≈ **160 tasks**
+
+That clears N≈150 — from one repo, which is what the P0 asks for. It is an
+estimate stacked on two ratios, so treat the `--limit 100` run as the real test.
+
+**Two things that will eat the estimate.** prefect sets
+`filterwarnings = ["error"]`, so a deprecation from a dependency released after
+a given base commit turns that commit's suite red for unrelated reasons and the
+PR skips as `no_fail_to_pass`. And the dependency set moves over 19 months, so
+one bootstrap image at HEAD will drift. **Mine in ~2-quarter slices with a
+bootstrap image per slice** — it costs a few image builds and protects most of
+the yield.
 
 **Gate:** ≥120 tasks emitted and passing audit. Below that, the one-repo
-constraint has failed on volume and the choice is a bigger repo or a second one.
+constraint has failed on volume, and the choice is to scope deliverable 4's
+claim or add a second repo.
 
 ---
 
@@ -328,13 +368,35 @@ to scope deliverable 4's claim to what it resolves, or add a second repo.
 
 ---
 
-## 8. Open questions for you
+## 8. The next three commands
 
-1. **Repo** — probe the shortlist, or do you already have a friendly customer
-   repo? A customer repo is a much better narrative and I'd weight that heavily
-   over my table, provided it clears the linked-issue rate.
-2. **Publish in two parts, or hold everything for one drop?**
-3. **Cost metric** — cost per solved task, serving cost of the 30B→8B swap, or
-   both?
-4. **Who runs Phase 2?** It needs the vLLM endpoint from #18 standing up, which
-   has never been exercised against a real server.
+Everything above reduces to this. In order:
+
+**1. Land the mining fix.** Branch `mining-linked-issue-fix` is committed and
+tested locally. Mining before it lands produces a corpus whose instructions
+describe the wrong bugs.
+
+**2. Calibrate the yield.** One afternoon, no meaningful spend:
+
+```bash
+vektori-trace mine --repo prefecthq/prefect \
+  --dockerfile examples/dockerfiles/prefect.Dockerfile \
+  --test-cmd 'python -m pytest -m "not service" -p no:randomly -q' \
+  --language python --limit 100 --no-replay --out ./case-study/calib
+```
+
+Read `mine-report.json`. If ≥4 tasks emit and audit clean, the 160-task estimate
+holds and Phase 1 is a matter of compute. If 0–1 emit, the blocker is almost
+certainly `filterwarnings = ["error"]` or dependency drift, both diagnosable
+from the skip histogram.
+
+**3. Stand up the vLLM endpoint.** Phase 2 needs it, and `#18`'s `--api-base`
+path has never been exercised against a real server. This is independent of
+mining and can run in parallel — worth starting now rather than discovering
+endpoint problems when the corpus is ready and the frontier meter is running.
+
+### Still open
+
+- **Publish in two parts, or hold for one drop?** (§4 Phase 3 recommends two.)
+- **Cost metric** — cost per solved task, serving cost of the 30B→8B swap, or
+  both? (§6.)
