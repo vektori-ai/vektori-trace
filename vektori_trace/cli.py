@@ -2532,7 +2532,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--teacher-tokenizer",
         required=True,
         metavar="HF_ID",
-        help="HF model id for the teacher tokenizer, e.g. deepseek-ai/DeepSeek-V4-Flash",
+        help="HF model id for the teacher tokenizer, e.g. deepseek-ai/DeepSeek-V4-Flash-0731",
     )
     p_bridge.add_argument(
         "--student-tokenizer",

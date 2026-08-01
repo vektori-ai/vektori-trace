@@ -1,7 +1,7 @@
 """Vendored DeepSeek-V4 chat encoding (no Jinja template on the teacher).
 
-Source: deepseek-ai/DeepSeek-V4-Flash encoding/encoding_dsv4.py
-Pinned SHA256: bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0
+Source: deepseek-ai/DeepSeek-V4-Flash-0731 encoding/encoding_dsv4.py
+Pinned SHA256: abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6
 
 ``ENCODING_DSV4_SHA256`` pins the *upstream source body* below
 ``PINNED_UPSTREAM_BEGIN`` (not this wrapper header). Call
@@ -15,21 +15,35 @@ the constant below, which was derived from that same body. On its own that is a
 tamper check, not a provenance check: a wrong copy would hash consistently
 forever. The provenance was established out of band, 2026-08-01::
 
-    curl -sL https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/resolve/main/\\
+    curl -sL https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main/\\
         encoding/encoding_dsv4.py | sha256sum
-    # bdbd57c1…  27908 bytes — matches ENCODING_DSV4_SHA256 exactly
+    # abc0d261…  29001 bytes — matches ENCODING_DSV4_SHA256 exactly
 
 Re-run that after any re-vendor. Tests cannot: the offline stages take no
 network by design.
 
-Sibling repo `deepseek-ai/DeepSeek-V4-Flash-0731` ships a *newer* encoder
-(29 001 bytes, sha abc0d261…). It is not vendored here and does not need to be:
-its only change is `reasoning_effort`, which gains a "low" default and starts
-prepending a prompt for "high" as well as "max". `render_teacher_prefix` never
-passes `reasoning_effort`, so both encoders render byte-identical prefixes in
-`chat` *and* `thinking` mode. The two repos' `tokenizer.json` are identical
-(vocab 128 000, merges 127 741, 1 283 added tokens), so §4's P1/P2 alignment
-measurements carry over unchanged.
+Which repo
+----------
+`0731` is the released V4-Flash build and is the teacher. The base repo
+`deepseek-ai/DeepSeek-V4-Flash` ships an older encoder (27 908 bytes, sha
+bdbd57c1…); it was vendored first and is superseded.
+
+The two differ only in `reasoning_effort`: the base version asserts
+``in ['max', None, 'high']`` and prepends a prompt only for ``'max'``, while
+0731 adds a ``"low"`` default and prepends for ``'high'`` too.
+`render_teacher_prefix` never passes `reasoning_effort`, so both render
+byte-identical prefixes in `chat` *and* `thinking` mode — the swap changes no
+conditioning text. It does change `ENCODING_DSV4_SHA256`, so §10.7 will reject
+any bridge built against the old encoder until it is rebuilt, which is the
+intended behaviour.
+
+`reasoning_effort` is deliberately not plumbed through. Like `thinking_mode`
+it changes what the teacher is asked to score, so it is a pre-registration
+decision, not a default (§7). Adding it means recording it in provenance.
+
+Both repos ship a byte-identical `tokenizer.json` (vocab 128 000, merges
+127 741, 1 283 added tokens), so §4's P1/P2 alignment measurements carry over
+unchanged.
 """
 
 from __future__ import annotations
@@ -37,7 +51,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-ENCODING_DSV4_SHA256 = "bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0"
+ENCODING_DSV4_SHA256 = "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6"
 
 # Exact line that begins the hashed upstream body (included as a comment only).
 _PINNED_UPSTREAM_MARKER = b"# === PINNED_UPSTREAM_BEGIN ===\n"
@@ -50,7 +64,7 @@ def upstream_encoding_dsv4_bytes() -> bytes:
     if idx < 0:
         raise RuntimeError(
             "encoding_dsv4.py is missing the PINNED_UPSTREAM_BEGIN marker — "
-            "re-vendor from deepseek-ai/DeepSeek-V4-Flash"
+            "re-vendor from deepseek-ai/DeepSeek-V4-Flash-0731"
         )
     return raw[idx + len(_PINNED_UPSTREAM_MARKER) :]
 
@@ -137,11 +151,23 @@ tool_output_template: str = (
     "<tool_result>{content}</tool_result>"
 )
 
-REASONING_EFFORT_MAX = (
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-)
+# Reasoning effort levels. In thinking mode, the prompt for the selected level is
+# prepended at the very beginning of the conversation. `low` is the default and
+# adds nothing.
+REASONING_EFFORT_PROMPTS: Dict[str, str] = {
+    "low": "",
+    "high": (
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+    ),
+    "max": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+    ),
+}
+DEFAULT_REASONING_EFFORT = "low"
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -308,7 +334,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            None is treated as "low".
 
     Returns:
         Encoded string for this message.
@@ -333,10 +360,12 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
-        prompt += REASONING_EFFORT_MAX
+    # Reasoning effort prefix (only at index 0 in thinking mode; "low" adds nothing)
+    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
+    assert reasoning_effort in REASONING_EFFORT_PROMPTS, \
+        f"Invalid reasoning effort: {reasoning_effort}, expected one of {list(REASONING_EFFORT_PROMPTS)}"
+    if index == 0 and thinking_mode == "thinking":
+        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
@@ -603,7 +632,8 @@ def encode_messages(
         drop_thinking: If True, drop reasoning_content from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level ("max", "high", or None).
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            Only takes effect in thinking mode. None is treated as "low".
 
     Returns:
         The encoded prompt string.
