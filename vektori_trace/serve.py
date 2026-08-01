@@ -57,6 +57,8 @@ class ServedModel:
     adapter_path: str | None = None
     gpu: str = "A10G"
     base_model: str = ""
+    max_model_len: int | None = None
+    gpu_memory_utilization: float | None = None
 
     @property
     def harbor_model(self) -> str:
@@ -97,10 +99,28 @@ def serve_model(
     adapter_path: str | None = None,
     gpu: str = "A10G",
     model_info: dict[str, Any] | None = None,
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    extra_vllm_args: list[str] | None = None,
 ) -> Iterator[ServedModel]:
     """Spin up Modal vLLM with optional LoRA; tear down on exit.
 
     Not unit-tested (needs GPU + real vLLM) — smoke-tested like measure_pass_rates.
+
+    `max_model_len` is not optional in practice on a small card. vLLM defaults it
+    to the model's own maximum — 40 960 for Qwen3-8B — and refuses to start when
+    that exceeds what the KV cache can hold. On a 24 GB A10G the arithmetic is:
+
+        24 GiB × 0.90 utilisation      = 21.6 GiB
+        − 15.3 GiB bf16 weights
+        − ~1.3 GiB CUDA context/workspace
+        =  ~5.0 GiB for KV
+
+    and Qwen3-8B costs 144 KiB per token of KV (36 layers × 8 GQA KV heads ×
+    128 head_dim × 2 for K and V × 2 bytes), so ~36 700 tokens fit *in total,
+    across all concurrent sequences*. Asking for 40 960 for a single sequence is
+    already more than the card has, and vLLM fails at startup rather than
+    silently degrading. Set this to the longest trajectory you actually need.
     """
     _require_modal()
     import modal
@@ -157,6 +177,12 @@ def serve_model(
                 "--served-model-name",
                 name,
             ]
+            if max_model_len is not None:
+                cmd += ["--max-model-len", str(max_model_len)]
+            if gpu_memory_utilization is not None:
+                cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+            if extra_vllm_args:
+                cmd += list(extra_vllm_args)
             if vol_adapter:
                 cmd += ["--enable-lora", "--lora-modules", f"{name}={vol_adapter}"]
             subprocess.Popen(cmd)
@@ -185,6 +211,8 @@ def serve_model(
             adapter_path=vol_adapter,
             gpu=gpu,
             base_model=base_model,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         yield served
 
