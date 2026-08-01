@@ -777,7 +777,7 @@ def run_opd_training(
                         denominator=1.0,
                     )
 
-                    (loss).backward()
+                    loss.backward()
                     step_supervised_tokens += cross_stats.n_supervised_tokens
 
                     # Report the normalised per-example value so `loss` in the

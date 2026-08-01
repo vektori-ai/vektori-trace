@@ -832,3 +832,34 @@ def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
             ex, tok, fake_teacher_tok, max_prefix_tokens=10_000,
             thinking_mode="chat", prefix_cache=cache,
         )
+
+
+def test_estimator_A_actually_runs_in_the_training_loop(tmp_path, tiny, ascii_action):
+    """The analytic branch must be reachable end to end, not just in unit tests.
+
+    Every equivalence oracle at the cross_step_loss level forces the B path by
+    passing no top-K, so without this the real loop could have been running
+    100% Estimator B — the silent demotion §9 warns about for the hosted
+    student — and every test would still be green.
+    """
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+
+    result = run_opd_training(
+        [ex],
+        _FakeCrossPool(),
+        _cfg(tmp_path, max_steps=1, cross_top_k=3),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    assert result.provenance["n_A"] > 0, (
+        f"Estimator A never ran: {result.provenance}"
+    )
+    lines = [json.loads(x) for x in result.log_path.read_text().splitlines() if x.strip()]
+    stepped = [ln for ln in lines if not ln.get("skipped_step")]
+    assert stepped and stepped[0]["frac_A"] > 0.0
+    # Entropy must be recorded from step 0 — §6's mode-collapse tripwire.
+    assert stepped[0]["student_entropy"] is not None

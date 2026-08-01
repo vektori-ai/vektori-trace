@@ -913,3 +913,190 @@ def test_global_denominator_weights_by_token_not_by_example():
     (run3(2, 0) / 2).backward()
     (run3(6, 2) / 2).backward()
     assert not torch.allclose(leaf3.grad, leaf2.grad, atol=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test #12 for Estimator A — the analytic branch had no reference to check
+# against, which is the blind spot the oracle exists to cover: an off-by-one
+# in span reindexing yields a finite, plausible loss forever.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _identity_map(v: int) -> dict[int, int]:
+    return {i: i for i in range(v)}
+
+
+def test_estimator_A_is_exact_full_reverse_kl_when_topk_covers_the_vocab():
+    """K+1 partition with K=V is the full partition, so A == exact reverse KL.
+
+    FINAL-PLAN.md §5: a top-K response is an *exact coarse-grained*
+    distribution.  When the coarse-graining is the identity, "coarse" must
+    vanish and the analytic term must equal Σ_v π_s(v)(log π_s(v) − log π_t(v))
+    to float tolerance.
+    """
+    import torch
+
+    from vektori_trace.cross_kl import coarse_grained_reverse_kl
+
+    torch.manual_seed(0)
+    V = 12
+    lp_s = torch.log_softmax(torch.randn(V), dim=-1).requires_grad_(True)
+    lp_t = torch.log_softmax(torch.randn(V), dim=-1)
+
+    teacher_topk = {i: float(lp_t[i]) for i in range(V)}
+    mapped_pairs = [(i, float(lp_t[i])) for i in range(V)]
+
+    got = coarse_grained_reverse_kl(lp_s, mapped_pairs, teacher_topk)
+    assert got is not None
+    contribution, mass, clamped = got
+
+    exact = (lp_s.exp() * (lp_s - lp_t)).sum()
+    assert float(contribution.detach()) == pytest.approx(float(exact.detach()), abs=1e-5)
+    assert mass == pytest.approx(1.0, abs=1e-5)
+    assert clamped is False
+
+
+def test_estimator_A_is_zero_when_teacher_equals_student():
+    """KL(p‖p) = 0.  If A is non-zero here, the partition is misassembled."""
+    import torch
+
+    from vektori_trace.cross_kl import coarse_grained_reverse_kl
+
+    torch.manual_seed(1)
+    V = 16
+    lp = torch.log_softmax(torch.randn(V), dim=-1)
+
+    # Teacher top-5 drawn from the student's own distribution, identity-mapped.
+    top = torch.topk(lp, 5)
+    teacher_topk = {int(i): float(lp[int(i)]) for i in top.indices}
+    mapped_pairs = [(int(i), float(lp[int(i)])) for i in top.indices]
+
+    got = coarse_grained_reverse_kl(lp.clone().requires_grad_(True), mapped_pairs, teacher_topk)
+    assert got is not None
+    contribution, _mass, _clamped = got
+    assert float(contribution.detach()) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_estimator_A_coarse_graining_is_a_lower_bound_on_true_kl():
+    """§5: KL over a coarse-graining is a lower bound (data-processing)."""
+    import torch
+
+    from vektori_trace.cross_kl import coarse_grained_reverse_kl
+
+    torch.manual_seed(2)
+    V = 40
+    lp_s = torch.log_softmax(torch.randn(V), dim=-1)
+    lp_t = torch.log_softmax(torch.randn(V), dim=-1)
+
+    full_kl = float((lp_s.exp() * (lp_s - lp_t)).sum())
+
+    top = torch.topk(lp_t, 5)
+    teacher_topk = {int(i): float(lp_t[int(i)]) for i in top.indices}
+    mapped_pairs = [(int(i), float(lp_t[int(i)])) for i in top.indices]
+
+    got = coarse_grained_reverse_kl(
+        lp_s.clone().requires_grad_(True), mapped_pairs, teacher_topk,
+        coverage_threshold=0.0,
+    )
+    assert got is not None
+    coarse = float(got[0].detach())
+    assert coarse <= full_kl + 1e-5, f"coarse {coarse} exceeded full KL {full_kl}"
+
+
+def test_estimator_A_detects_off_by_one_span_reindexing():
+    """#12's target: shifting the teacher's top-K by one position must show.
+
+    A finite, plausible loss is exactly what a mis-indexed alignment produces,
+    so the oracle asserts the two are *not* equal rather than that either is
+    finite.
+    """
+    import torch
+
+    from vektori_trace.align import SpanKind, align_by_bytes
+    from vektori_trace.cross_kl import cross_step_loss
+
+    torch.manual_seed(3)
+    V = 24
+    n = 4
+    token_bytes = [bytes([97 + i]) for i in range(n)]
+    alignment = align_by_bytes(token_bytes, token_bytes)
+    kinds = [(SpanKind.ESTIMATOR_A, "1:1")] * n
+
+    lp_full = torch.log_softmax(torch.randn(n, V), dim=-1)
+    s_tok = torch.stack([lp_full[i, i] for i in range(n)])
+
+    # A distinct teacher distribution per position — so a shift is detectable.
+    teacher_rows = [torch.log_softmax(torch.randn(V), dim=-1) for _ in range(n)]
+
+    def loss_for(order):
+        topk = {}
+        for pos in range(n):
+            row = teacher_rows[order[pos]]
+            top = torch.topk(row, 5)
+            topk[pos] = {int(i): float(row[int(i)]) for i in top.indices}
+        loss, stats = cross_step_loss(
+            alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+            student_token_logprobs=s_tok,
+            teacher_token_logprobs=[float(teacher_rows[order[p]][p]) for p in range(n)],
+            teacher_topk_by_teacher_pos=topk, exact_map=_identity_map(V),
+            coverage_threshold=0.0,
+        )
+        return float(loss), stats
+
+    aligned, stats = loss_for([0, 1, 2, 3])
+    shifted, _ = loss_for([1, 2, 3, 0])
+
+    assert stats.n_A == n, f"Estimator A did not run on all spans: {stats}"
+    assert aligned != pytest.approx(shifted, abs=1e-6), (
+        "a one-position shift of the teacher's top-K left the loss unchanged — "
+        "the A path is not actually indexing per span"
+    )
+
+
+def test_estimator_A_and_B_share_the_denominator():
+    """§6: one denominator across BOTH estimators, never per-estimator."""
+    import torch
+
+    from vektori_trace.align import SpanKind, align_by_bytes
+    from vektori_trace.cross_kl import cross_step_loss
+
+    torch.manual_seed(4)
+    V = 16
+    # Student: 3 tokens; teacher: token 0 splits in two → span 0 is 1:2 (B),
+    # spans 1 and 2 are 1:1 (A).  Mixed A/B in one call.
+    s_bytes = [b"ab", b"c", b"d"]
+    t_bytes = [b"a", b"b", b"c", b"d"]
+    alignment = align_by_bytes(s_bytes, t_bytes)
+    kinds = [
+        (SpanKind.ESTIMATOR_B, "1:2"),
+        (SpanKind.ESTIMATOR_A, "1:1"),
+        (SpanKind.ESTIMATOR_A, "1:1"),
+    ]
+
+    lp_full = torch.log_softmax(torch.randn(3, V), dim=-1)
+    s_tok = torch.stack([lp_full[i, i] for i in range(3)])
+    rows = [torch.log_softmax(torch.randn(V), dim=-1) for _ in range(4)]
+    topk = {
+        pos: {int(i): float(rows[pos][int(i)]) for i in torch.topk(rows[pos], 5).indices}
+        for pos in range(4)
+    }
+
+    loss, stats = cross_step_loss(
+        alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+        student_token_logprobs=s_tok,
+        teacher_token_logprobs=[float(rows[i][i]) for i in range(4)],
+        teacher_topk_by_teacher_pos=topk, exact_map=_identity_map(V),
+        coverage_threshold=0.0,
+    )
+
+    assert stats.n_A == 2 and stats.n_B == 1
+    # 3 student tokens supervised in total — not 2 for A and 1 for B separately.
+    assert stats.n_supervised_tokens == 3
+    raw, _ = cross_step_loss(
+        alignment=alignment, span_kinds=kinds, student_logprobs_full=lp_full,
+        student_token_logprobs=s_tok,
+        teacher_token_logprobs=[float(rows[i][i]) for i in range(4)],
+        teacher_topk_by_teacher_pos=topk, exact_map=_identity_map(V),
+        coverage_threshold=0.0, denominator=1.0,
+    )
+    assert float(raw) == pytest.approx(float(loss) * 3, abs=1e-5)
