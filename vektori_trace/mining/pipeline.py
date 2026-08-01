@@ -109,8 +109,20 @@ _GIT_CLEAN_EXCLUDES = (
 # the issue (bug report) instead of the PR body (fix description).
 # Matches `Fixes #123`, `Closes #123`, AND the markdown-link form
 # `fixes [#123](url)` that PR authors commonly use.
+# A markdown comment block (PR templates wrap guidance in <!-- ... -->).
+# Defined here rather than beside `_reflow_pr_body` because the linked-issue
+# check below needs it too — a PR template's example reference must not count
+# as a link.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
 _LINKED_ISSUE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+\[?#(\d+)", re.IGNORECASE
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+    # Two spellings of the same reference. GitHub closes an issue from either,
+    # and repos use both: `Fixes #123` and `Fixes https://github.com/o/r/issues/123`.
+    # Matching only the first silently skipped every PR that used the URL form —
+    # which on pydantic is most of them.
+    r"(?:\[?#(\d+)|https?://(?:\w+\.)?github\.com/[\w.-]+/[\w.-]+/issues/(\d+))",
+    re.IGNORECASE,
 )
 
 # Boilerplate sections that bloat a PR body without describing the problem,
@@ -167,9 +179,22 @@ _LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _linked_issue_number(pr_body: str) -> int | None:
-    """Return the issue number this PR closes, if any (`Closes #123`)."""
-    m = _LINKED_ISSUE_RE.search(pr_body or "")
-    return int(m.group(1)) if m else None
+    """Return the issue number this PR closes, if any (`Closes #123`).
+
+    HTML comments are dropped first. PR templates routinely *instruct* the
+    author inside a comment block — pydantic's says
+    `<!-- please use "fix #123" style references -->` — and matching that
+    boilerplate linked every such PR to issue #123. The task then took its
+    problem statement from an unrelated issue, which is worse than skipping the
+    PR: the corpus looks fine and the instruction describes a different bug.
+    GitHub does not close anything from inside a comment either, so the text
+    carries no reference to find.
+    """
+    m = _LINKED_ISSUE_RE.search(_HTML_COMMENT_RE.sub("", pr_body or ""))
+    if not m:
+        return None
+    # Group 1 is the `#N` spelling, group 2 the full-URL spelling.
+    return int(m.group(1) or m.group(2))
 
 
 def _strip_info_leak(text: str) -> str:
@@ -180,8 +205,6 @@ def _strip_info_leak(text: str) -> str:
     return out
 
 
-# A markdown comment block (PR templates wrap guidance in <!-- ... -->).
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 # Collapse 3+ blank lines down to a single blank line.
 _MULTI_BLANK_RE = re.compile(r"\n{3,}")
 # Cap the instruction body so a 5000-word PR essay doesn't dominate context.
