@@ -109,8 +109,23 @@ _GIT_CLEAN_EXCLUDES = (
 # the issue (bug report) instead of the PR body (fix description).
 # Matches `Fixes #123`, `Closes #123`, AND the markdown-link form
 # `fixes [#123](url)` that PR authors commonly use.
+# A markdown comment block (PR templates wrap guidance in <!-- ... -->).
+# Defined here rather than beside `_reflow_pr_body` because the linked-issue
+# check below needs it too — a PR template's example reference must not count
+# as a link.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
 _LINKED_ISSUE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+\[?#(\d+)", re.IGNORECASE
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+    # Two spellings of the same reference. GitHub closes an issue from either,
+    # and repos use both: `Fixes #123` and `Fixes https://github.com/o/r/issues/123`.
+    # Matching only the first silently skipped every PR that used the URL form —
+    # which on pydantic is most of them.
+    # The URL form's owner/repo are captured, not discarded: the number alone is
+    # meaningless without them (see `_linked_issue_number`).
+    r"(?:\[?#(\d+)"
+    r"|https?://(?:\w+\.)?github\.com/([\w.-]+)/([\w.-]+)/issues/(\d+))",
+    re.IGNORECASE,
 )
 
 # Boilerplate sections that bloat a PR body without describing the problem,
@@ -166,10 +181,51 @@ _LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def _linked_issue_number(pr_body: str) -> int | None:
-    """Return the issue number this PR closes, if any (`Closes #123`)."""
-    m = _LINKED_ISSUE_RE.search(pr_body or "")
-    return int(m.group(1)) if m else None
+def _linked_issue_number(pr_body: str, repo: tuple[str, str] | None = None) -> int | None:
+    """Return the issue number this PR closes, if any (`Closes #123`).
+
+    HTML comments are dropped first. PR templates routinely *instruct* the
+    author inside a comment block — pydantic's says
+    `<!-- please use "fix #123" style references -->` — and matching that
+    boilerplate linked every such PR to issue #123. The task then took its
+    problem statement from an unrelated issue, which is worse than skipping the
+    PR: the corpus looks fine and the instruction describes a different bug.
+    GitHub does not close anything from inside a comment either, so the text
+    carries no reference to find.
+
+    `repo` is the `(owner, name)` being mined, and the URL spelling is only
+    honoured when it points at that repo. An issue number is meaningless on its
+    own: the caller feeds it to `fetch_issue(owner, name, n)` against the *mined*
+    repo, so a cross-repo reference —
+
+        Fixes https://github.com/pydantic/pydantic-core/issues/1234
+
+    in a `prefecthq/prefect` PR — resolves to `prefecthq/prefect#1234`, a real
+    but unrelated issue, whose text then becomes the task's problem statement.
+    That is the same silent corruption as the PR-template case above: the corpus
+    looks healthy and the instruction describes a different bug. Split-repo orgs
+    make this routine (`pydantic/pydantic` ↔ `pydantic/pydantic-core`,
+    `prefecthq/prefect` ↔ `prefecthq/prefect-*`).
+
+    Passing `repo=None` skips the check and is for callers that only ask
+    *whether* a link exists — but every such caller in this module has the repo
+    to hand, so `None` should stay a test-only convenience.
+
+    Scans all matches rather than only the first: a body may cite another repo's
+    issue before its own, and the own-repo link is still the right answer.
+    """
+    text = _HTML_COMMENT_RE.sub("", pr_body or "")
+    for m in _LINKED_ISSUE_RE.finditer(text):
+        hash_num, url_owner, url_name, url_num = m.groups()
+        if hash_num is not None:
+            # `#N` is always relative to the repo the PR lives in.
+            return int(hash_num)
+        if repo is not None:
+            owner, name = repo
+            if (url_owner.lower(), url_name.lower()) != (owner.lower(), name.lower()):
+                continue  # another repo's issue — the number does not transfer
+        return int(url_num)
+    return None
 
 
 def _strip_info_leak(text: str) -> str:
@@ -180,8 +236,6 @@ def _strip_info_leak(text: str) -> str:
     return out
 
 
-# A markdown comment block (PR templates wrap guidance in <!-- ... -->).
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 # Collapse 3+ blank lines down to a single blank line.
 _MULTI_BLANK_RE = re.compile(r"\n{3,}")
 # Cap the instruction body so a 5000-word PR essay doesn't dominate context.
@@ -351,7 +405,9 @@ def _build_instruction(
     title = pr.title
     body = pr.body or ""
 
-    issue_num = _linked_issue_number(pr.body or "")
+    # Same `repo` the fetch below uses, so the URL spelling can never resolve to
+    # a same-numbered issue in a different repository.
+    issue_num = _linked_issue_number(pr.body or "", (owner, name) if owner and name else None)
     if issue_num is not None and owner and name:
         fetched = provider.fetch_issue(owner, name, issue_num, token=token)
         if fetched:
@@ -1176,7 +1232,10 @@ class PRRuntimePipeline:
             # bumps aren't real fix tasks, and their bodies leak commit SHAs
             # and fix-PR links. Drop them up front.
             return "non_bug_pr"
-        if self.options.require_linked_issue and _linked_issue_number(pr.body or "") is None:
+        if (
+            self.options.require_linked_issue
+            and _linked_issue_number(pr.body or "", self.input.repo.owner_name) is None
+        ):
             # The linked issue is the problem statement written *before* the
             # fix existed. Without one, the only text available is the PR body
             # — written by the fixer, describing the solution. The option is
