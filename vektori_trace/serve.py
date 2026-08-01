@@ -142,6 +142,13 @@ def serve_model(
     @app.cls(
         gpu=gpu,
         image=image,
+        # VllmServer is defined inside this function so it can close over
+        # `base_model`, `name`, `vol_adapter` and the vLLM flags. Modal
+        # normally requires globals-scope classes because it re-imports them by
+        # module path in the container; `serialized=True` makes it pickle the
+        # class instead, which is what a locally-defined one needs. Without it
+        # every call raised LocalFunctionError before reaching the GPU.
+        serialized=True,
         # HF_HOME is backed by a Volume so weights survive scale-to-zero. The
         # env var alone only relocated the cache inside an ephemeral container,
         # so every cold start paid to download the model again.
