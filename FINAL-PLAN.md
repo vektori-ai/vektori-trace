@@ -58,7 +58,7 @@ Every OPD primitive in the repo assumes **teacher and student score the same
 token ids**. `tokenizer_check.check_tokenizers` hard-fails otherwise, before any
 GPU is allocated — that gate is deliberate and stays.
 
-The teacher is now **DeepSeek-V4-Flash**, a different tokenizer family from the
+The teacher is now **DeepSeek-V4-Flash-0731**, a different tokenizer family from the
 Qwen3 student. Shared-id scoring is structurally impossible: sending the
 student's ids to the teacher asks it to score *different strings* than the
 student sampled. The danger is that this does not crash — mis-scored tokens still
@@ -81,7 +81,7 @@ P1 and P2, the two decisive measurements, are **run and passed** (§4). Artifact
 d3feceee-2544-460c-98d1-41b78c2a134d/scratchpad/
     p2_align_report.py                      # the measurement, ~180 lines, reruns in seconds
     Qwen_Qwen3-14B.json                     # student tokenizer
-    deepseek-ai_DeepSeek-V4-Flash.json      # teacher tokenizer
+    deepseek-ai_DeepSeek-V4-Flash.json      # teacher tokenizer (identical to -0731's)
 ```
 
 Superseded planning file: `~/.claude/plans/resilient-prancing-ritchie.md`. Its
@@ -147,7 +147,7 @@ opening line.
 
 ## 2. Configuration
 
-- **Teacher: DeepSeek-V4-Flash on Fireworks serverless.** No dedicated
+- **Teacher: DeepSeek-V4-Flash-0731 on Fireworks serverless.** No dedicated
   deployment → `top_logprobs` hard-capped at 5 (`TOP_LOGPROBS_CAP = 5`,
   `teacher_fireworks.py`). Treat K=5 as fixed. Fireworks serves **FP8**, so
   teacher logprobs carry quantisation noise inside a term the student
@@ -237,10 +237,20 @@ Offline, 2026-07-31, against the real `tokenizer.json` of Qwen3 and
 `deepseek-ai/DeepSeek-V4-Flash`. Zero API calls, zero GPU. Rerun:
 `python p2_align_report.py`.
 
+**These measurements were taken against the unsuffixed `deepseek-ai/DeepSeek-V4-Flash`
+repo and carry over to `-0731` unchanged**: the two ship a byte-identical
+`tokenizer.json` (verified 2026-08-01 — vocab 128 000, merges 127 741, 1 283
+added tokens, same bytes). Only the vendored `encoding_dsv4.py` differs, and
+only in `reasoning_effort`, which is never passed. Note `config.json` reports
+`vocab_size: 129280`: that is the padded embedding matrix, not the tokenizer.
+Ids in the pad range never appear in a `tokenizer.json`-derived byte table, so
+they cannot be mapped — they fall into estimator (A)'s `other` bucket, which
+stays exact.
+
 **Both tokenizers are ByteLevel BPE** — this is what makes byte alignment valid,
 and it is asserted, not assumed:
 
-| | Qwen3-8B / 14B (identical) | DeepSeek-V4-Flash |
+| | Qwen3-8B / 14B (identical) | DeepSeek-V4-Flash-0731 |
 |---|---|---|
 | model | BPE, 151 643 vocab | BPE, 127 997 vocab |
 | decoder | ByteLevel | ByteLevel |
@@ -495,7 +505,7 @@ model's correct rendering of the same conversation. Truncation must therefore
 happen at a **shared message boundary**, never independently by token count per
 side.
 
-**The teacher has no Jinja chat template.** `deepseek-ai/DeepSeek-V4-Flash` ships
+**The teacher has no Jinja chat template.** `deepseek-ai/DeepSeek-V4-Flash-0731` ships
 `encoding/encoding_dsv4.py` instead (`encode_messages`,
 `parse_message_from_completion_text`); `apply_chat_template` does not exist on
 the teacher side. **Vendor the file into `vektori_trace/`, pin and hash it** —
@@ -717,7 +727,7 @@ span reindexing, which otherwise yields finite, plausible losses forever.
 |---|---|---|---|
 | P1 | Byte tables, ByteLevel assert, corpus round-trip | — | **DONE, passed** (§4) |
 | P2 | Offline alignment, granularity by content type | — | **DONE, passed** (§4) |
-| P0 | One echo call to V4-Flash on Fireworks with `teacher_fireworks.py`'s exact shape: `prompt=[ids]`, `max_tokens=1`, `temperature=0`, `echo=True`, `logprobs=True`, `raw_output=True`, `top_logprobs=5`. Confirm `choices[0].logprobs.content` carries `token_id` per entry. Also test `echo_last`. | 1 call | fail → fallback above |
+| P0 | One echo call to V4-Flash-0731 on Fireworks with `teacher_fireworks.py`'s exact shape: `prompt=[ids]`, `max_tokens=1`, `temperature=0`, `echo=True`, `logprobs=True`, `raw_output=True`, `top_logprobs=5`. Confirm `choices[0].logprobs.content` carries `token_id` per entry. Also test `echo_last`. | 1 call | fail → fallback above |
 | P3 | Echoed token strings vs local HF tokenizer, 100 strings | ~1 call | any diff → provider drift, stop |
 | P4 | Same prompt scored 5×; determinism / fp8 noise; log mapped-alternative coverage | 5 calls | record in provenance |
 | P5 | Full path incl. one LoRA step, tiny model + fixture, no GPU (mirror `tests/test_distill.py`) | free | — |
@@ -738,7 +748,7 @@ uv run vektori-trace distill --cross-tokenizer --bridge … \
 
 # Open items — none block stages 0–4
 
-- **Fireworks model path** for V4-Flash (`accounts/fireworks/models/…`) — stage 5
+- **Fireworks model path** for V4-Flash-0731 (`accounts/fireworks/models/…`) — stage 5
   only.
 - **Confirm `thinking_mode="chat"`** — it changes what the teacher scores.
 - **GPU card for the 8B student.** 1×A10G (24 GB) is *tight*: ~16.3 GB bf16

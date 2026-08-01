@@ -30,6 +30,19 @@ SCALE_STUDENT = "Qwen/Qwen3-8B"
 DEFAULT_TEACHER = PILOT_TEACHER
 DEFAULT_STUDENT = PILOT_STUDENT
 
+# The cross-tokenizer teacher (FINAL-PLAN.md). Deliberately NOT DEFAULT_TEACHER:
+# `check_tokenizers` still hard-fails a vocab mismatch, and that gate stays, so
+# the same-vocab pair above must keep pointing at a same-family Qwen teacher.
+# This id is only reachable via `cross_tokenizer=True`, which routes to
+# `check_cross_tokenizer` instead.
+#
+# `-0731` is the released V4-Flash build and is the teacher. The unsuffixed
+# `deepseek-ai/DeepSeek-V4-Flash` repo is the earlier drop; both ship a
+# byte-identical tokenizer.json, so the §4 alignment measurements hold for
+# either, but the encoders differ and only 0731's is vendored.
+CROSS_TEACHER = "deepseek-ai/DeepSeek-V4-Flash-0731"
+CROSS_STUDENT = PILOT_STUDENT
+
 
 class TokenizerMismatchError(RuntimeError):
     """Teacher/student tokenizers are incompatible — refuse to allocate GPU."""
@@ -154,6 +167,8 @@ def check_tokenizers(
 
 
 __all__ = [
+    "CROSS_STUDENT",
+    "CROSS_TEACHER",
     "DEFAULT_STUDENT",
     "DEFAULT_TEACHER",
     "PILOT_STUDENT",

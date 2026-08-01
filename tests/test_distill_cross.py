@@ -863,3 +863,22 @@ def test_estimator_A_actually_runs_in_the_training_loop(tmp_path, tiny, ascii_ac
     assert stepped and stepped[0]["frac_A"] > 0.0
     # Entropy must be recorded from step 0 — §6's mode-collapse tripwire.
     assert stepped[0]["student_entropy"] is not None
+
+
+def test_cross_tokenizer_defaults_to_the_deepseek_teacher():
+    """The Qwen pilot default is the student's own family — wrong for cross."""
+    from vektori_trace.tokenizer_check import CROSS_TEACHER, DEFAULT_TEACHER
+
+    same = OPDTrainConfig(output_dir="/tmp/x")
+    assert same.teacher_model == DEFAULT_TEACHER
+
+    cross = OPDTrainConfig(output_dir="/tmp/x", cross_tokenizer=True)
+    assert cross.teacher_model == CROSS_TEACHER == "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+
+def test_explicit_teacher_model_is_respected_in_cross_mode():
+    """The redirect only replaces the untouched default, never a real choice."""
+    cfg = OPDTrainConfig(
+        output_dir="/tmp/x", cross_tokenizer=True, teacher_model="some/other-teacher"
+    )
+    assert cfg.teacher_model == "some/other-teacher"

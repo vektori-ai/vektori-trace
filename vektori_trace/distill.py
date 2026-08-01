@@ -47,7 +47,7 @@ from typing import Any, Protocol
 from .dataset import turns_to_messages
 from .opd import mean_log_ratio, reverse_kl_surrogate, token_logprobs, topk_reverse_kl
 from .reopd import ReOPDStepExample, reopd_loss_mask
-from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
+from .tokenizer_check import CROSS_TEACHER, DEFAULT_STUDENT, DEFAULT_TEACHER
 from .train import LoraHyperparams, _require_train
 
 
@@ -133,6 +133,14 @@ class OPDTrainConfig:
             raise ValueError(
                 f"thinking_mode must be 'chat' or 'thinking', got {self.thinking_mode!r}"
             )
+        # `teacher_model` defaults to the same-vocab Qwen pilot teacher. In the
+        # cross path that default is not merely unhelpful, it is wrong: it is
+        # the *student's* tokenizer family, so the byte tables would agree, the
+        # alignment would be trivially 1↔1, and the run would look healthy while
+        # scoring against a teacher nobody chose. Redirect the untouched default;
+        # an explicit teacher_model is always respected.
+        if self.cross_tokenizer and self.teacher_model == DEFAULT_TEACHER:
+            self.teacher_model = CROSS_TEACHER
 
 
 @dataclass
