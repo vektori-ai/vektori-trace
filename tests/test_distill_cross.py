@@ -768,3 +768,67 @@ def test_action_that_is_only_eos_is_skipped_not_scored(tmp_path, tiny, monkeypat
 
     assert result.skipped_empty_samples >= 1
     assert pool.score_calls == 0
+
+
+def test_cached_prefix_never_crosses_truncation_depths(tiny):
+    """A prefix cached untruncated must not be served after truncation.
+
+    Regression: the cache key omitted truncation depth, so a teacher prefix
+    that fitted at depth 0 kept being returned while the student side dropped
+    turns — a truncated student context paired with an untruncated teacher one,
+    the asymmetry §7 forbids.
+    """
+    from vektori_trace.reopd import build_reopd_example
+    from vektori_trace.teacher_cross import TeacherPrefixCache, encode_teacher_ids
+
+    _, tok = tiny
+    fake_teacher_tok = _fake_teacher_tokenizer(tok)
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    cache = TeacherPrefixCache()
+
+    # Depth 0: generous budget, nothing is dropped.
+    _s0, t0, text0 = encode_prefix_pair(
+        ex, tok, fake_teacher_tok, max_prefix_tokens=10_000,
+        thinking_mode="chat", prefix_cache=cache,
+    )
+    # Depth >0: tight budget forces turns to be dropped on both sides.
+    s1, t1, text1 = encode_prefix_pair(
+        ex, tok, fake_teacher_tok, max_prefix_tokens=50,
+        thinking_mode="chat", prefix_cache=cache,
+    )
+
+    assert len(t1) < len(t0), "tight budget did not actually truncate"
+    assert len(s1) <= 50 and len(t1) <= 50
+    # The returned ids describe the text returned alongside them — not a stale
+    # deeper prefix pulled from the cache.
+    assert t1 == encode_teacher_ids(text1, fake_teacher_tok)
+    assert t0 == encode_teacher_ids(text0, fake_teacher_tok)
+    # Both depths are retained under distinct keys.
+    assert cache.get("t", ex.step_index, n_dropped_turns=0) == t0
+
+
+def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
+    """A non-deterministic render for the same key must hard-fail."""
+    from vektori_trace.reopd import build_reopd_example
+    from vektori_trace.teacher_cross import TeacherPrefixCache
+
+    _, tok = tiny
+    fake_teacher_tok = _fake_teacher_tokenizer(tok)
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+    cache = TeacherPrefixCache()
+
+    encode_prefix_pair(
+        ex, tok, fake_teacher_tok, max_prefix_tokens=10_000,
+        thinking_mode="chat", prefix_cache=cache,
+    )
+
+    # Simulate a date/locale creeping into the render path between steps.
+    monkeypatch.setattr(
+        "vektori_trace.teacher_cross.render_teacher_prefix",
+        lambda messages, *, thinking_mode="chat": "drifted prefix text",
+    )
+    with pytest.raises(ValueError, match="re-rendered differently"):
+        encode_prefix_pair(
+            ex, tok, fake_teacher_tok, max_prefix_tokens=10_000,
+            thinking_mode="chat", prefix_cache=cache,
+        )

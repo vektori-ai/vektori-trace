@@ -213,7 +213,9 @@ def encode_prefix_pair(
 
     prefix_turns = list(example.prefix_turns)
 
-    for _ in range(len(prefix_turns) + 1):
+    # `n_dropped_turns` is the loop counter *and* part of the cache key, so it
+    # is the truncation depth this iteration is testing.
+    for n_dropped_turns in range(len(prefix_turns) + 1):
         if not prefix_turns:
             break
 
@@ -228,35 +230,30 @@ def encode_prefix_pair(
             student_ids = student_ids["input_ids"]
         student_ids = list(student_ids)
 
-        # ── Teacher encoding (with optional cache) ────────────────────────
+        # ── Teacher encoding ──────────────────────────────────────────────
+        # Always re-render and re-encode, then `put`. The cache is a drift
+        # detector, not a shortcut: the plan is explicit that caching saves
+        # ~1 ms against a ~1 s round-trip, so "speed decides nothing", and its
+        # whole value is catching a prefix that renders differently at step 200
+        # than at step 5. Serving a cached value without re-deriving it would
+        # silence exactly the bug it exists to surface.
         teacher_messages = turns_to_openai_messages(prefix_turns)
         teacher_text = render_teacher_prefix(teacher_messages, thinking_mode=thinking_mode)
-
-        cached_teacher: list[int] | None = None
-        if isinstance(prefix_cache, TeacherPrefixCache):
-            cached_teacher = prefix_cache.get(
-                example.task or "", example.step_index, thinking_mode=thinking_mode
-            )
-
-        if cached_teacher is not None:
-            teacher_ids = cached_teacher
-        else:
-            teacher_ids = encode_teacher_ids(teacher_text, teacher_tokenizer)
+        teacher_ids = encode_teacher_ids(teacher_text, teacher_tokenizer)
 
         if len(student_ids) <= max_prefix_tokens and len(teacher_ids) <= max_prefix_tokens:
-            # Cache only the fitted prefix — putting before the fit check would
-            # store a too-long encoding and then conflict after truncation.
-            if (
-                cached_teacher is None
-                and isinstance(prefix_cache, TeacherPrefixCache)
-            ):
+            # Keyed on the truncation depth too: both sides must describe the
+            # same turn set, so a prefix cached at one depth must never be
+            # served at another (§7 shared message boundary).
+            if isinstance(prefix_cache, TeacherPrefixCache):
                 prefix_cache.put(
                     example.task or "", example.step_index, teacher_ids,
+                    n_dropped_turns=n_dropped_turns,
                     thinking_mode=thinking_mode,
                 )
             return student_ids, teacher_ids, teacher_text
 
-        # Drop the earliest turn and retry.
+        # Drop the earliest turn and retry — on both sides together.
         prefix_turns = prefix_turns[1:]
 
     raise ValueError(

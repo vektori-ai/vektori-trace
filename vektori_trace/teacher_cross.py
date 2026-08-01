@@ -148,7 +148,8 @@ def encode_teacher_ids(text: str, teacher_tokenizer: Any) -> list[int]:
 class TeacherPrefixCache:
     """Keyed cache of teacher-side prefix ids.
 
-    Key: ``(task, step_index, encoding_dsv4_hash, thinking_mode)``.
+    Key: ``(task, step_index, n_dropped_turns, encoding_dsv4_hash,
+    thinking_mode)``.
 
     The cache exists for **determinism**, not speed: re-rendering a frozen
     prefix at step 200 must produce the same ids as at step 5. Any render-path
@@ -156,24 +157,44 @@ class TeacherPrefixCache:
     cause the teacher to condition on different text across steps. The cache
     surfaces that failure immediately, before it silently corrupts the loss.
 
-    **A cache miss on an already-seen key that was computed differently is a
-    hard error.** The only legal outcomes are hit (return cached ids) and
-    first-time miss (store and return new ids).
+    ``n_dropped_turns`` is part of the key because truncation drops leading
+    turns until *both* sides fit. Without it, a prefix cached at one truncation
+    depth would be served at another, pairing a truncated student context with
+    an untruncated teacher context — precisely the asymmetry §7 forbids when it
+    requires truncation "at a **shared message boundary**".
+
+    **A prefix that re-renders differently for the same key is a hard error.**
+    Because determinism is the point and speed "decides nothing" (§Stage 3
+    detail), callers re-render every time and always ``put``; the conflict
+    check below is the drift detector, not an optimisation bypass.
     """
 
-    _store: dict[tuple[str, int, str, str], list[int]] = field(
+    _store: dict[tuple[str, int, int, str, str], list[int]] = field(
         default_factory=dict, init=False, repr=False
     )
+
+    def _key(
+        self, task: str, step_index: int, n_dropped_turns: int, thinking_mode: str
+    ) -> tuple[str, int, int, str, str]:
+        return (
+            task,
+            step_index,
+            n_dropped_turns,
+            ENCODING_DSV4_SHA256,
+            thinking_mode,
+        )
 
     def get(
         self,
         task: str,
         step_index: int,
         *,
+        n_dropped_turns: int = 0,
         thinking_mode: str = "chat",
     ) -> list[int] | None:
-        key = (task, step_index, ENCODING_DSV4_SHA256, thinking_mode)
-        return self._store.get(key)
+        return self._store.get(
+            self._key(task, step_index, n_dropped_turns, thinking_mode)
+        )
 
     def put(
         self,
@@ -181,21 +202,23 @@ class TeacherPrefixCache:
         step_index: int,
         ids: list[int],
         *,
+        n_dropped_turns: int = 0,
         thinking_mode: str = "chat",
     ) -> None:
-        """Store ``ids`` for ``(task, step_index)``.
+        """Store ``ids`` for this key.
 
         Raises ``ValueError`` if a different id list is already cached for
         this key — that means the prefix changed between calls, which is the
         bug the cache exists to detect.
         """
-        key = (task, step_index, ENCODING_DSV4_SHA256, thinking_mode)
+        key = self._key(task, step_index, n_dropped_turns, thinking_mode)
         existing = self._store.get(key)
         if existing is not None and existing != ids:
             raise ValueError(
                 f"TeacherPrefixCache conflict for key {key!r}: "
                 f"stored {len(existing)} ids, got {len(ids)} ids — "
-                "the prefix changed between calls; this is a hard error"
+                "the prefix re-rendered differently between calls; "
+                "this is a hard error"
             )
         self._store[key] = ids
 

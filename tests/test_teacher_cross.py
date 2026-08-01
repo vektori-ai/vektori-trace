@@ -474,3 +474,39 @@ def test_probe_echo_support_rejects_string_scores():
     result = pool.probe_echo_support(probe_prefix=[1], probe_tokens=[2])
     assert result["ok"] is False
     assert "shape check" in result["error"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache keying — truncation depth is part of the key (§7 shared boundary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_prefix_cache_separates_truncation_depths():
+    """Same (task, step) at two truncation depths are different prefixes."""
+    from vektori_trace.teacher_cross import TeacherPrefixCache
+
+    c = TeacherPrefixCache()
+    c.put("t", 3, [1, 2, 3], n_dropped_turns=0)
+    c.put("t", 3, [2, 3], n_dropped_turns=1)
+
+    assert c.get("t", 3, n_dropped_turns=0) == [1, 2, 3]
+    assert c.get("t", 3, n_dropped_turns=1) == [2, 3]
+
+
+def test_prefix_cache_conflict_at_same_depth_is_a_hard_error():
+    """A prefix that re-renders differently for one key is the bug to catch."""
+    from vektori_trace.teacher_cross import TeacherPrefixCache
+
+    c = TeacherPrefixCache()
+    c.put("t", 3, [1, 2, 3])
+    with pytest.raises(ValueError, match="re-rendered differently"):
+        c.put("t", 3, [1, 2, 4])
+
+
+def test_prefix_cache_reput_of_identical_ids_is_fine():
+    from vektori_trace.teacher_cross import TeacherPrefixCache
+
+    c = TeacherPrefixCache()
+    c.put("t", 3, [1, 2, 3])
+    c.put("t", 3, [1, 2, 3])
+    assert c.get("t", 3) == [1, 2, 3]
