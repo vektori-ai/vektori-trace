@@ -2321,7 +2321,10 @@ def build_parser() -> argparse.ArgumentParser:
         "mine-commits",
         help=(
             "mine a repo's COMMIT history into sandbox-verified tasks. Sibling of `mine`: "
-            "reaches fixes that never became a PR with a linked issue (54% of candidates in "
+            # argparse runs help strings through %-formatting, so a literal
+            # percent must be doubled or "% o" is read as an octal format spec
+            # and `--help` dies with a TypeError.
+            "reaches fixes that never became a PR with a linked issue (54%% of candidates in "
             "the prefect pilot), at the cost of an LLM-synthesized problem statement"
         ),
     )
