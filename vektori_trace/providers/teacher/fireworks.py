@@ -60,7 +60,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from .teacher import TeacherScoringError, _post_json
+from .base import TeacherScoringError, _post_json
 
 #: Public Fireworks inference rejects `top_logprobs` above this.
 TOP_LOGPROBS_CAP = 5

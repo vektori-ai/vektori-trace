@@ -40,7 +40,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .teacher import TeacherScoringError, _extract_logprob
+from .base import TeacherScoringError, _extract_logprob
 
 #: Only the four CMI regions; `ap-south-1` (the repo's usual default) is not one.
 CMI_REGIONS = ("us-east-1", "us-west-2", "eu-central-1", "ap-northeast-1")

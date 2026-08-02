@@ -1,4 +1,4 @@
-"""Tests for `teacher_cross` — offline, no network, no real tokenizer.
+"""Tests for `providers.teacher.cross` — offline, no network, no real tokenizer.
 
 All tests use injected fakes so they run without FIREWORKS_API_KEY, GPU, or
 the real DeepSeek/Qwen tokenizers. This matches the requirement "offline only".
@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import pytest
 
-from vektori_trace import teacher_cross as tc
 from vektori_trace.encoding_dsv4 import (
     ASSISTANT_SP_TOKEN,
     ENCODING_DSV4_SHA256,
@@ -17,6 +16,7 @@ from vektori_trace.encoding_dsv4 import (
     eos_token,
     thinking_end_token,
 )
+from vektori_trace.providers.teacher import cross as tc
 from vektori_trace.schema import Turn
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ def test_probe_echo_support_ok_with_fake_pool():
 
 
 def test_probe_echo_support_returns_false_when_pool_raises():
-    from vektori_trace.teacher import TeacherScoringError
+    from vektori_trace.providers.teacher.base import TeacherScoringError
 
     error_pool = _FakePool(error=TeacherScoringError("connection failed"))
     pool = tc.CrossTokenizerTeacherPool(
@@ -483,7 +483,7 @@ def test_probe_echo_support_rejects_string_scores():
 
 def test_prefix_cache_separates_truncation_depths():
     """Same (task, step) at two truncation depths are different prefixes."""
-    from vektori_trace.teacher_cross import TeacherPrefixCache
+    from vektori_trace.providers.teacher.cross import TeacherPrefixCache
 
     c = TeacherPrefixCache()
     c.put("t", 3, [1, 2, 3], n_dropped_turns=0)
@@ -495,7 +495,7 @@ def test_prefix_cache_separates_truncation_depths():
 
 def test_prefix_cache_conflict_at_same_depth_is_a_hard_error():
     """A prefix that re-renders differently for one key is the bug to catch."""
-    from vektori_trace.teacher_cross import PrefixCacheConflict, TeacherPrefixCache
+    from vektori_trace.providers.teacher.cross import PrefixCacheConflict, TeacherPrefixCache
 
     c = TeacherPrefixCache()
     c.put("t", 3, [1, 2, 3])
@@ -504,7 +504,7 @@ def test_prefix_cache_conflict_at_same_depth_is_a_hard_error():
 
 
 def test_prefix_cache_reput_of_identical_ids_is_fine():
-    from vektori_trace.teacher_cross import TeacherPrefixCache
+    from vektori_trace.providers.teacher.cross import TeacherPrefixCache
 
     c = TeacherPrefixCache()
     c.put("t", 3, [1, 2, 3])

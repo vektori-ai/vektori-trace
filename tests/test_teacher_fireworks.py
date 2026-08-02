@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from vektori_trace import teacher_fireworks as tf
-from vektori_trace.teacher import TeacherScoringError
+from vektori_trace.providers.teacher import fireworks as tf
+from vektori_trace.providers.teacher.base import TeacherScoringError
 
 
 def _entry(token_id: int, logprob: float, alts: dict[int, float] | None = None) -> dict:

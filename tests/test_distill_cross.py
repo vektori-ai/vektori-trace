@@ -504,7 +504,7 @@ def test_cross_tokenizer_requires_bridge_at_training_time(tmp_path, tiny):
 
 def test_same_vocab_path_unchanged(tmp_path, tiny):
     """Same-vocab path (cross_tokenizer=False) still works after the refactor."""
-    from vektori_trace.teacher import InMemoryIdScoringPool
+    from vektori_trace.providers.teacher.base import InMemoryIdScoringPool
 
     model, tok = tiny
     ex = build_reopd_example(_turns(), task="t", action_index=1)
@@ -783,8 +783,8 @@ def test_cached_prefix_never_crosses_truncation_depths(tiny):
     turns — a truncated student context paired with an untruncated teacher one,
     the asymmetry §7 forbids.
     """
+    from vektori_trace.providers.teacher.cross import TeacherPrefixCache, encode_teacher_ids
     from vektori_trace.reopd import build_reopd_example
-    from vektori_trace.teacher_cross import TeacherPrefixCache, encode_teacher_ids
 
     _, tok = tiny
     fake_teacher_tok = _fake_teacher_tokenizer(tok)
@@ -814,8 +814,8 @@ def test_cached_prefix_never_crosses_truncation_depths(tiny):
 
 def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
     """A non-deterministic render for the same key must hard-fail."""
+    from vektori_trace.providers.teacher.cross import PrefixCacheConflict, TeacherPrefixCache
     from vektori_trace.reopd import build_reopd_example
-    from vektori_trace.teacher_cross import PrefixCacheConflict, TeacherPrefixCache
 
     _, tok = tiny
     fake_teacher_tok = _fake_teacher_tokenizer(tok)
@@ -829,7 +829,7 @@ def test_prefix_render_drift_is_caught_by_the_cache(tiny, monkeypatch):
 
     # Simulate a date/locale creeping into the render path between steps.
     monkeypatch.setattr(
-        "vektori_trace.teacher_cross.render_teacher_prefix",
+        "vektori_trace.providers.teacher.cross.render_teacher_prefix",
         lambda messages, *, thinking_mode="chat": "drifted prefix text",
     )
     with pytest.raises(PrefixCacheConflict, match="re-rendered differently"):

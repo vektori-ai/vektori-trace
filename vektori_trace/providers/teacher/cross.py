@@ -28,11 +28,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from .encoding_dsv4 import (
+from ...encoding_dsv4 import (
     ENCODING_DSV4_SHA256,
     encode_messages,
 )
-from .schema import Turn
+from ...schema import Turn
 
 # ---------------------------------------------------------------------------
 # Protocols (duck-typed, no torch/transformers import needed in this file)
@@ -137,7 +137,7 @@ def encode_teacher_ids(text: str, teacher_tokenizer: Any) -> list[int]:
     # AutoTokenizer cannot read the teacher repo's model config — returns a
     # non-iterable `Encoding`, so the old list/tensor handling raised TypeError
     # on the training hot path.
-    from .vocab_bridge import encode_ids
+    from ...vocab_bridge import encode_ids
 
     return encode_ids(teacher_tokenizer, text, add_special_tokens=False)
 

@@ -1,6 +1,6 @@
 """The Fireworks student loop's alignment and objective, without Fireworks.
 
-Two things in `student_fireworks.py` can be wrong in a way no run would reveal:
+Two things in `providers/student/fireworks.py` can be wrong in a way no run would reveal:
 
 1. `build_opd_datum` lines up three arrays — tokens, loss weights, teacher
    logprobs — by index. A prefix/action off-by-one produces a finite loss that
@@ -22,7 +22,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vektori_trace.student_fireworks import (  # noqa: E402
+from vektori_trace.providers.student.fireworks import (  # noqa: E402
     FireworksOPDConfig,
     build_opd_datum,
     opd_loss_fn,

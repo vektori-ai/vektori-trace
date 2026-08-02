@@ -20,9 +20,9 @@ from vektori_trace.distill import (
     run_opd_training,
     write_opd_report,
 )
+from vektori_trace.providers.teacher.base import InMemoryIdScoringPool
 from vektori_trace.reopd import build_reopd_example
 from vektori_trace.schema import ToolCall, Turn
-from vektori_trace.teacher import InMemoryIdScoringPool
 from vektori_trace.train import LoraHyperparams
 
 pytest.importorskip("torch")

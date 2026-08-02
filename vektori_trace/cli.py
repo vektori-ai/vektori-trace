@@ -1069,7 +1069,7 @@ def _teacher_pool_for(args: argparse.Namespace) -> Any:
     """
     backend = getattr(args, "teacher_backend", "vllm")
     if backend == "vllm":
-        from .teacher import teacher_pool_from_endpoint
+        from .providers.teacher.base import teacher_pool_from_endpoint
 
         if not args.teacher_api_base:
             raise ValueError("--teacher-api-base is required for --teacher-backend vllm")
@@ -1077,12 +1077,12 @@ def _teacher_pool_for(args: argparse.Namespace) -> Any:
             args.teacher_api_base, model=args.teacher_served_name
         )
     if backend == "fireworks":
-        from .teacher_fireworks import fireworks_pool_from_env
+        from .providers.teacher.fireworks import fireworks_pool_from_env
 
         return fireworks_pool_from_env(
             model=args.teacher_model_id, api_base=args.teacher_api_base
         )
-    from .teacher_bedrock import BedrockTeacherPool
+    from .providers.teacher.bedrock import BedrockTeacherPool
 
     if not args.teacher_model_id:
         raise ValueError(
@@ -1108,8 +1108,8 @@ def cmd_distill(args: argparse.Namespace) -> int:
     """
     from .distill import OPDTrainConfig, run_opd_training, write_opd_report
     from .endpoint import EndpointError
+    from .providers.teacher.base import TeacherScoringError
     from .reopd import iter_reopd_examples
-    from .teacher import TeacherScoringError
     from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER, TokenizerMismatchError
 
     try:
@@ -1169,7 +1169,7 @@ def cmd_distill(args: argparse.Namespace) -> int:
             _teacher_tok = load_tokenizer(teacher_tok_id)
 
         # Wrap pool in CrossTokenizerTeacherPool for provenance recording.
-        from .teacher_cross import CrossTokenizerTeacherPool
+        from .providers.teacher.cross import CrossTokenizerTeacherPool
         pool = CrossTokenizerTeacherPool(
             pool=pool,
             teacher_tokenizer=_teacher_tok,
@@ -1236,7 +1236,7 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
     Exit 0 means OPD can run against this teacher. Exit 1 means it cannot, and the
     message is the reason — which is a result worth recording, not a failure.
     """
-    from .teacher import TeacherScoringError
+    from .providers.teacher.base import TeacherScoringError
 
     # Arbitrary-but-valid ids. The check is on the shape of the response, not on
     # what the tokens mean, and there is no server-side tokenizer to ask.
@@ -1245,7 +1245,7 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
 
     pool: Any
     if args.backend == "fireworks":
-        from .teacher_fireworks import (
+        from .providers.teacher.fireworks import (
             DEFAULT_FIREWORKS_BASE,
             DEFAULT_FIREWORKS_TEACHER,
             FireworksTeacherPool,
@@ -1267,7 +1267,7 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        from .teacher_bedrock import BedrockTeacherPool
+        from .providers.teacher.bedrock import BedrockTeacherPool
 
         try:
             pool = BedrockTeacherPool(model_id=args.model, region=args.region)
@@ -1328,7 +1328,7 @@ def cmd_probe_teacher(args: argparse.Namespace) -> int:
         # wrap it so the same check CrossTokenizerTeacherPool uses is available.
         echo_pool = pool
         if not hasattr(echo_pool, "probe_echo_support"):
-            from .teacher_cross import CrossTokenizerTeacherPool
+            from .providers.teacher.cross import CrossTokenizerTeacherPool
 
             echo_pool = CrossTokenizerTeacherPool(
                 pool=pool,

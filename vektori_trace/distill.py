@@ -212,7 +212,7 @@ def encode_prefix_pair(
     Returns ``(student_ids, teacher_ids, teacher_prefix_text)``.  The rendered
     teacher prefix text is required for the §10.3 junction assert.
     """
-    from .teacher_cross import (
+    from .providers.teacher.cross import (
         TeacherPrefixCache,
         encode_teacher_ids,
         render_teacher_prefix,
@@ -424,7 +424,7 @@ def run_opd_training(
     _teacher_tok: Any = teacher_tokenizer if teacher_tokenizer is not None else cfg.teacher_tokenizer
     _prefix_cache = prefix_cache
     if cfg.cross_tokenizer and _prefix_cache is None:
-        from .teacher_cross import TeacherPrefixCache
+        from .providers.teacher.cross import TeacherPrefixCache
         _prefix_cache = TeacherPrefixCache()
 
     if cfg.cross_tokenizer:
@@ -601,7 +601,7 @@ def run_opd_training(
                     # ── Cross-tokenizer path (FINAL-PLAN.md) ─────────────────
                     from .align import AlignmentError, align_by_bytes, classify_spans
                     from .cross_kl import cross_step_loss
-                    from .teacher_cross import encode_teacher_ids
+                    from .providers.teacher.cross import encode_teacher_ids
 
                     try:
                         student_prefix, teacher_prefix, teacher_prefix_text = encode_prefix_pair(
