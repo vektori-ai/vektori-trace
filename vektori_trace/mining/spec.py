@@ -202,6 +202,20 @@ class CommitRuntimeOptions(BaseModel):
     # --- Filters (cheap, applied before validation) ---
     skip_merge_commits: bool = True
     min_message_words: int = 5  # drops "wip", "fmt", "typo", "address review"
+    # Require a `fix:` prefix, a `Closes #N` trailer, or a bugfix keyword in
+    # the subject. Default OFF: measured on prefect's last 25 commits, this
+    # gate rejected real fixes whose titles simply do not use the vocabulary —
+    # "Reject unknown fields for FlowRunFilter", "Preserve subprocesses after
+    # output stream errors", "Relinquish evicted flow runs to infrastructure
+    # retry". The first of those is #22659, which pr_runtime had already
+    # emitted as a valid task.
+    #
+    # What actually establishes a task is real is the F2P oracle: tests that
+    # fail at the parent and pass after the patch. `_NON_BUG_TYPE_RE` still
+    # rejects `chore:`/`docs:`/`feat:` on the conventional-commit type, which
+    # is precise; guessing from prose is not. Turn this on for a repo whose
+    # commit pool is too large to validate exhaustively.
+    require_bugfix_keyword: bool = False
     max_source_files_per_commit: int = 10
     exclude_authors: list[str] = []  # substring match on name or email; bots
     require_new_test_funcs: bool = True

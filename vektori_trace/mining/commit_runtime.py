@@ -111,13 +111,23 @@ _BUGFIX_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Bot authors. Their commits are real and their diffs are large, which is the
-# worst combination: they consume validation budget and never yield a bug fix.
+# Dependency-automation authors only — bots whose *every* commit is a version
+# bump, so excluding them by name costs nothing.
+#
+# Deliberately NOT `[bot]`. Measured on the last 25 prefect commits, a blanket
+# bot pattern excluded 18 of them, and roughly half were real fixes authored by
+# `devin-ai-integration[bot]` — an AI agent that lands substantive changes.
+# One of them was `Reject unknown fields for FlowRunFilter` (#22659), which
+# pr_runtime had already emitted as a valid task: the same change accepted by
+# one pipeline and discarded by the other.
+#
+# Dependency bumps are `chore(deps): …`, which `_NON_BUG_TYPE_RE` rejects on
+# content anyway. So author matching is redundant where it is right and
+# destructive where it is wrong; content filters are the principled gate and
+# this list stays as narrow as possible.
 _DEFAULT_BOT_PATTERNS = (
-    "[bot]",
     "dependabot",
     "renovate",
-    "github-actions",
     "pre-commit-ci",
 )
 
@@ -150,6 +160,19 @@ _DEF_RE = re.compile(
 # carries little solution signal anyway.
 _MIN_LEAK_TOKEN_LEN = 5
 
+# A name only counts as leaked if it *looks like code* rather than English.
+# Auditing the 18 pr_runtime tasks with a length-only rule flagged 16 of them,
+# and 10 of those hits were plain module stems — `server`, `flows`, `futures`,
+# `filters`, `process`, `validators`, `pydantic`. A problem statement about
+# prefect uses those words in ordinary prose, so flagging them would drop good
+# tasks for describing the symptom, which is the same over-filtering that made
+# the first commit_runtime run emit nothing.
+#
+# What survives is the shape a fixer's vocabulary has and a reporter's does
+# not: a leading underscore (private), an embedded underscore, or an internal
+# capital. `_workspace_resolver` and `flow_engine` are leaks; `server` is not.
+_CODE_SHAPED_RE = re.compile(r"^_|_|[a-z][A-Z]")
+
 
 def leaked_identifiers(instruction: str, patch: str, test_patch: str) -> list[str]:
     """Return solution identifiers that survived into the instruction.
@@ -175,6 +198,8 @@ def leaked_identifiers(instruction: str, patch: str, test_patch: str) -> list[st
     hits = []
     for name in names:
         if len(name) < _MIN_LEAK_TOKEN_LEN:
+            continue
+        if not _CODE_SHAPED_RE.search(name):
             continue
         if re.search(rf"\b{re.escape(name)}\b", instruction):
             hits.append(name)
@@ -391,13 +416,16 @@ class CommitRuntimePipeline:
         if _NON_BUG_TYPE_RE.match(subject):
             return "non_bug_type"
 
-        # Positive evidence required: a `fix:` prefix, a linked issue, or a
-        # bugfix keyword somewhere in the message.
-        has_fix_prefix = bool(re.match(r"^fix(?:\([^)]+\))?!?:", subject, re.IGNORECASE))
-        has_issue_ref = bool(_CLOSES_RE.search(commit.message))
-        has_keyword = bool(_BUGFIX_KEYWORD_RE.search(subject))
-        if not (has_fix_prefix or has_issue_ref or has_keyword):
-            return "not_a_bugfix"
+        # Opt-in. A subject that doesn't say "fix" is not evidence the commit
+        # isn't one — see `require_bugfix_keyword` for the measurement. The
+        # structural filter (must add a new test function) and the F2P oracle
+        # are what actually establish that a task is real.
+        if self.options.require_bugfix_keyword:
+            has_fix_prefix = bool(re.match(r"^fix(?:\([^)]+\))?!?:", subject, re.IGNORECASE))
+            has_issue_ref = bool(_CLOSES_RE.search(commit.message))
+            has_keyword = bool(_BUGFIX_KEYWORD_RE.search(subject))
+            if not (has_fix_prefix or has_issue_ref or has_keyword):
+                return "not_a_bugfix"
 
         if (
             self.options.min_problem_statement_words > 0

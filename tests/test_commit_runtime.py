@@ -119,13 +119,23 @@ def _pipeline(**opts) -> CommitRuntimePipeline:
         ({"parents": ["b" * 40, "c" * 40]}, "merge_commit"),
         ({"parent_sha": "", "parents": []}, "root_commit"),
         ({"author_name": "dependabot[bot]"}, "excluded_author"),
+        ({"author_name": "renovate[bot]"}, "excluded_author"),
         ({"subject": "wip"}, "message_too_short"),
         ({"subject": "feat: add a brand new exporting subsystem"}, "non_bug_type"),
-        ({"subject": "update the docs for the new release process"}, "not_a_bugfix"),
     ],
 )
 def test_metadata_filter_rejects(kwargs: dict, expected: str) -> None:
     assert _pipeline()._metadata_filter(_commit(**kwargs)) == expected
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"subject": "update the docs for the new release process"}, "not_a_bugfix"),
+    ],
+)
+def test_metadata_filter_rejects_with_keyword_gate_on(kwargs: dict, expected: str) -> None:
+    assert _pipeline(require_bugfix_keyword=True)._metadata_filter(_commit(**kwargs)) == expected
 
 
 @pytest.mark.parametrize(
@@ -146,13 +156,14 @@ def test_bugfix_signal_required_without_prefix_or_issue() -> None:
     Without a positive signal the candidate reaches validation, which costs a
     container run per commit — the expensive stage this filter exists to guard.
     """
+    pipe = _pipeline(require_bugfix_keyword=True)
     plain = _commit(subject="add support for exporting reports as PDF files")
-    assert _pipeline()._metadata_filter(plain) == "not_a_bugfix"
+    assert pipe._metadata_filter(plain) == "not_a_bugfix"
     linked = _commit(
         subject="add support for exporting reports as PDF files",
         body="Closes #42",
     )
-    assert _pipeline()._metadata_filter(linked) is None
+    assert pipe._metadata_filter(linked) is None
 
 
 def test_cap_pass_to_pass_is_bounded_and_deterministic() -> None:
@@ -203,8 +214,10 @@ def test_leaked_identifiers_flags_names_the_patch_introduces() -> None:
     assert leaked_identifiers(leaky, _PATCH, _TEST_PATCH) == ["normalize_rrule_string"]
 
 
-def test_leaked_identifiers_flags_file_stems_and_test_names() -> None:
-    assert "validators" in leaked_identifiers("See validators for details.", _PATCH, "")
+def test_leaked_identifiers_flags_code_shaped_file_stems_and_test_names() -> None:
+    # `validators` is a plain word a bug report would use; not a leak.
+    assert leaked_identifiers("See validators for details.", _PATCH, "") == []
+    # A test name is code-shaped and is never something a reporter would write.
     assert "test_normalize_none" in leaked_identifiers(
         "Add test_normalize_none coverage.", "", _TEST_PATCH
     )
@@ -279,3 +292,153 @@ def test_instruction_prefers_the_issue_over_the_commit_message() -> None:
     )
     assert "App crashes on startup" in text
     assert "validator" not in text
+
+
+def test_ai_agent_bots_are_not_excluded() -> None:
+    """`[bot]` is not a proxy for "not a real fix".
+
+    Measured on the last 25 prefect commits: a blanket `[bot]` pattern excluded
+    18, about half of them real fixes authored by `devin-ai-integration[bot]`.
+    One was "Reject unknown fields for FlowRunFilter" (#22659) — a change
+    pr_runtime had already emitted as a valid task, so the two pipelines
+    disagreed about the same commit.
+    """
+    agent = _commit(
+        author_name="devin-ai-integration[bot]",
+        author_email="158243242+devin-ai-integration[bot]@users.noreply.github.com",
+        subject="Reject unknown fields for FlowRunFilter and its nested criteria",
+        body="Unknown keys were silently accepted and dropped instead of raising.",
+    )
+    assert _pipeline()._metadata_filter(agent) is None
+
+    gha = _commit(
+        author_name="github-actions[bot]",
+        subject="fix: correct the stale lease-cleanup invariant",
+        body="The documented invariant no longer matches the implementation.",
+    )
+    assert _pipeline()._metadata_filter(gha) is None
+
+
+def test_dependency_bumps_are_rejected_on_content_not_just_author() -> None:
+    """The author list is a cheap pre-filter, not the actual gate.
+
+    A dependency bump from an unrecognised bot account must still be dropped,
+    or narrowing the author list would open a hole.
+    """
+    bump = _commit(
+        author_name="some-unknown-ci-account",
+        subject="chore(deps): bump docker/login-action from 4 to 4.5.2",
+    )
+    assert _pipeline()._metadata_filter(bump) == "non_bug_type"
+
+
+def test_exclude_authors_option_overrides_the_default_list() -> None:
+    custom = _pipeline(exclude_authors=["desertaxle"])
+    assert custom._metadata_filter(_commit(author_email="desertaxle@users.noreply.github.com")) == (
+        "excluded_author"
+    )
+    # Overriding replaces the defaults, so dependabot is no longer named —
+    # its `chore(deps)` content still is.
+    assert custom._metadata_filter(_commit(author_name="dependabot[bot]")) is None
+
+
+def test_bootstrap_cache_misses_when_the_image_is_gone(tmp_path: Path, monkeypatch) -> None:
+    """A pruned image must read as a cache miss, not a registry auth failure.
+
+    `docker system prune` leaves bootstrap.json behind. The image tag is
+    local-only, so the sandbox tries to pull it and every task dies with
+    "pull access denied ... may require 'docker login'" — which looks like a
+    credentials problem and is actually a missing local image.
+    """
+    from vektori_trace.mining.bootstrap import cache as cache_mod
+    from vektori_trace.mining.bootstrap.spec import BootstrapResult, LanguageHint
+
+    result = BootstrapResult(
+        repo="o/n",
+        ref="a" * 40,
+        image_tag="local/r2e-bootstrap/o__n:aaaa",
+        image_digest="sha256:" + "b" * 64,
+        language=LanguageHint.PYTHON,
+        test_cmds=["pytest -q"],
+        rebuild_cmds=[],
+        smoke_passed=True,
+        iterations=0,
+        build_time_sec=1.0,
+        llm_provider="none",
+    )
+    cache_mod.save(result, tmp_path)
+
+    monkeypatch.setattr(cache_mod, "_image_exists_locally", lambda tag: True)
+    assert cache_mod.load("o/n", "a" * 40, tmp_path) is not None
+
+    monkeypatch.setattr(cache_mod, "_image_exists_locally", lambda tag: False)
+    assert cache_mod.load("o/n", "a" * 40, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["server", "flows", "futures", "filters", "process", "validators", "pydantic"],
+)
+def test_leak_gate_ignores_plain_module_stems(word: str) -> None:
+    """Ordinary words must not count as leaks, or the gate drops good tasks.
+
+    Auditing the 18 pr_runtime tasks with a length-only rule flagged 16, and 10
+    of those hits were plain module stems that a problem statement uses in
+    normal prose. Over-filtering here is the same failure that made the first
+    commit_runtime run emit nothing from 25 commits.
+    """
+    patch = (
+        f"diff --git a/src/{word}.py b/src/{word}.py\n"
+        f"--- a/src/{word}.py\n+++ b/src/{word}.py\n"
+    )
+    assert leaked_identifiers(f"The {word} stopped responding after a restart.", patch, "") == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_workspace_resolver", "flow_engine", "block_registration", "StepExecutionError"],
+)
+def test_leak_gate_flags_code_shaped_identifiers(name: str) -> None:
+    """A leading/embedded underscore or an internal capital is fixer vocabulary."""
+    patch = (
+        "diff --git a/src/m.py b/src/m.py\n--- a/src/m.py\n+++ b/src/m.py\n"
+        f"@@ -1 +1 @@\n+def {name}():\n"
+    )
+    assert leaked_identifiers(f"Calling {name} raises immediately.", patch, "") == [name]
+
+
+def test_audit_reads_the_commit_runtime_metadata_table(tmp_path: Path) -> None:
+    """The auditor must find whichever pipeline's table produced the task.
+
+    It originally read only `[metadata.repo2env.pr_runtime]`, so every
+    commit_runtime task failed all five checks — including "no F2P declared" on
+    a task shipping a correct f2p.json. That reads as a broken emitter rather
+    than an auditor looking in the wrong place.
+    """
+    import json as _json
+
+    from vektori_trace.mining.inspect import audit_tasks
+
+    d = tmp_path / "owner__repo-abc123"
+    (d / "tests").mkdir(parents=True)
+    (d / "environment").mkdir()
+    (d / "solution").mkdir()
+    base = "d" * 40
+    (d / "task.toml").write_text(
+        "schema_version = '1.3'\n\n"
+        "[task]\nname = 'x'\n\n"
+        "[metadata.repo2env.commit_runtime]\n"
+        f"base_commit = '{base}'\n"
+        "fail_to_pass = ['tests/test_a.py::test_one']\n"
+    )
+    (d / "tests" / "f2p.json").write_text(_json.dumps(["tests/test_a.py::test_one"]))
+    (d / "tests" / "p2p.json").write_text("[]")
+    (d / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    (d / "environment" / "Dockerfile").write_text(
+        f"FROM scratch\nRUN git reset --hard {base}\n"
+    )
+    (d / "solution" / "patch.diff").write_text("diff --git a/x b/x\n")
+
+    audit = audit_tasks([d])[0]
+    for check in ("metadata_well_formed", "f2p_declared", "shipped_f2p_matches_task_toml"):
+        assert audit.checks.get(check) is not False, f"{check}: {audit.details.get(check)}"

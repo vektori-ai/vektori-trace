@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import subprocess
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -114,4 +115,40 @@ def load(
     if is_dataclass(BootstrapResult):
         known = {f.name for f in fields(BootstrapResult)}
         data = {k: v for k, v in data.items() if k in known}
-    return BootstrapResult(**data)
+    result = BootstrapResult(**data)
+
+    # The JSON is not evidence the image still exists. `docker image prune`,
+    # a disk cleanup or a new machine all leave the metadata behind, and the
+    # tag is local-only — so the sandbox tries to *pull* it and every task
+    # fails with "pull access denied … may require 'docker login'", which
+    # reads as a registry auth problem rather than a missing local image.
+    # Treat a vanished image as a cache miss so it is simply rebuilt.
+    if not result.pushed_to_registry and not _image_exists_locally(result.image_tag):
+        logger.warning(
+            "cache slot %s names image %s, which is not present locally — rebuilding",
+            slot,
+            result.image_tag,
+        )
+        return None
+    return result
+
+
+def _image_exists_locally(image_tag: str) -> bool:
+    """True when `docker image inspect` can resolve the tag on this host."""
+    if not image_tag:
+        return False
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image_tag],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Docker being unreachable is not the same as the image being absent.
+        # Assume present and let the caller fail with the real Docker error
+        # rather than silently triggering an expensive rebuild.
+        logger.debug("docker image inspect failed for %s: %s", image_tag, exc)
+        return True
+    return proc.returncode == 0
