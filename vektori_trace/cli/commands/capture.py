@@ -10,7 +10,7 @@ def cmd_capture_proxy(args: argparse.Namespace) -> int:
     """Run a Phase 0.5 reverse proxy that injects return_token_ids and logs ids."""
     import signal
 
-    from ...token_capture import CaptureProxy, load_captures
+    from ...runtime.token_capture import CaptureProxy, load_captures
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

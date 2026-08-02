@@ -42,8 +42,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .mining.emitter import HarborTask, write_harbor_task
-from .mining.env_guard import AGENT_ALLOWED_HOSTS, FIX_SOURCE_HOSTS, git_history_scrub
+from ..mining.emitter import HarborTask, write_harbor_task
+from ..mining.env_guard import AGENT_ALLOWED_HOSTS, FIX_SOURCE_HOSTS, git_history_scrub
 
 # Commits are built with pinned author/committer identity and dates, so the
 # SHAs are reproducible and can be asserted against literals.
@@ -466,7 +466,7 @@ def build_reward_hack_task(
     what makes the probe a demonstration rather than an assertion: the same
     cheating agent scores 1.0 there and 0.0 here.
     """
-    from .mining.pipeline import (
+    from ..mining.pipeline import (
         MODEL_PATCH_PATH,
         _runtime_aux_files,
         build_eval_script,

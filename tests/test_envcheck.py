@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.envcheck import (
+from vektori_trace.mining.env_guard import AGENT_ALLOWED_HOSTS, FIX_SOURCE_HOSTS
+from vektori_trace.runtime.envcheck import (
     PROBE_ALLOWED_HOST,
     PROBE_BASE_SHA,
     PROBE_FIX_SHA,
@@ -22,7 +23,6 @@ from vektori_trace.envcheck import (
     evaluate_probe,
     probe_dockerfile,
 )
-from vektori_trace.mining.env_guard import AGENT_ALLOWED_HOSTS, FIX_SOURCE_HOSTS
 
 # What a fully sound container reports.
 CLEAN_PROBE = {

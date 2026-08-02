@@ -7,16 +7,6 @@ import json
 import sys
 from pathlib import Path
 
-from ...envcheck import (
-    build_committing_task,
-    build_honest_task,
-    build_probe_task,
-    build_reward_hack_task,
-    evaluate_committing,
-    evaluate_honest,
-    evaluate_reward_hack,
-    run_probe,
-)
 from ...evaluate.planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
@@ -27,6 +17,16 @@ from ...evaluate.planted import (
     write_sweep_report,
 )
 from ...evaluate.validity import _find_reward, prove_validity
+from ...runtime.envcheck import (
+    build_committing_task,
+    build_honest_task,
+    build_probe_task,
+    build_reward_hack_task,
+    evaluate_committing,
+    evaluate_honest,
+    evaluate_reward_hack,
+    run_probe,
+)
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:

@@ -36,7 +36,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vektori_trace.evaluate.passk import PASSK_LOG_FILENAME
-from vektori_trace.token_capture import CAPTURE_FILENAME
+from vektori_trace.runtime.token_capture import CAPTURE_FILENAME
 
 # A GPU sample every `interval` seconds; flag a hole larger than this multiple.
 # Generous on purpose — one slow NVML call is not a fault, a minute of silence is.

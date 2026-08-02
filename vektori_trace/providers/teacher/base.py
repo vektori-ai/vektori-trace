@@ -41,7 +41,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...endpoint import EndpointError, _normalise_base, _root_of
+from ...runtime.endpoint import EndpointError, _normalise_base, _root_of
 from ...tokenizer_check import DEFAULT_TEACHER
 
 
@@ -299,7 +299,7 @@ def teacher_pool_from_endpoint(
     garbage" into "OPD refuses to start", which is the trade V0_PLAN.md asks for
     everywhere else.
     """
-    from ...endpoint import discover_model_name, wait_for_health
+    from ...runtime.endpoint import discover_model_name, wait_for_health
 
     wait_for_health(api_base)
     name = model or discover_model_name(api_base)

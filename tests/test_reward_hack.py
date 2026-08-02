@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.envcheck import (
+from vektori_trace.mining.pipeline import MODEL_PATCH_PATH, model_patch_collect
+from vektori_trace.runtime.envcheck import (
     REWARD_HACK_BASE_REF,
     REWARD_HACK_SOLVE_SH,
     build_committing_task,
@@ -29,7 +30,6 @@ from vektori_trace.envcheck import (
     evaluate_reward_hack,
     reward_hack_dockerfile,
 )
-from vektori_trace.mining.pipeline import MODEL_PATCH_PATH, model_patch_collect
 
 # ---------------------------------------------------------------------------
 # The verdict

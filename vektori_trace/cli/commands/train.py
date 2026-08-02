@@ -14,8 +14,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     """
     # Lazy: torch/transformers/peft/modal must not be imported at cli.py top-level.
     from ...dataset import tokenize_sft_example
-    from ...rollout import collect_rollouts
-    from ...serve import serve_model, served_to_harbor_kwargs
+    from ...runtime.rollout import collect_rollouts
+    from ...runtime.serve import serve_model, served_to_harbor_kwargs
     from ...train import TrainConfig, run_training, write_train_report
 
     tasks_dir = Path(args.tasks_dir)
@@ -33,7 +33,7 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     api_base = getattr(args, "api_base", None)
     if api_base:
-        from ...endpoint import endpoint_serve_cm
+        from ...runtime.endpoint import endpoint_serve_cm
 
         serve_cm = endpoint_serve_cm(
             api_base, model_name=getattr(args, "served_model_name", None)

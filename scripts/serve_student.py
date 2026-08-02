@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vektori_trace.serve import serve_model, served_to_harbor_kwargs
+from vektori_trace.runtime.serve import serve_model, served_to_harbor_kwargs
 
 # Qwen3-8B, measured from its config.json:
 #   36 layers, 8 KV heads (GQA), head_dim 128

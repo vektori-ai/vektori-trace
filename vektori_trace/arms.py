@@ -28,9 +28,9 @@ from .evaluate.nonregression import (
     load_ifeval_subset,
 )
 from .evaluate.passrate import DEFAULT_ROLLOUTS, PassRate, measure_pass_rates
-from .rollout import CollectedRollout, collect_rollouts
 from .routing import Route, RoutingDecision
-from .serve import (
+from .runtime.rollout import CollectedRollout, collect_rollouts
+from .runtime.serve import (
     ServedModel,
     dump_serve_record,
     litellm_generate,
@@ -138,7 +138,7 @@ def _tokenize_rollouts(rollouts: list[CollectedRollout], tokenizer: Any) -> list
     Here (A2/A3 SFT arms) re-tokenization remains valid.
     """
     from .dataset import TokenizedExample
-    from .token_capture import load_captures
+    from .runtime.token_capture import load_captures
 
     out: list[TokenizedExample] = []
     for r in rollouts:
@@ -165,7 +165,7 @@ def tokenize_rollouts_for_opd(
     Raises `TokenCaptureError` when `require_captures` and any kept rollout
     lacks captures — re-tokenization would silently corrupt the objective.
     """
-    from .token_capture import TokenCaptureError, load_captures
+    from .runtime.token_capture import TokenCaptureError, load_captures
 
     out = []
     for r in rollouts:
@@ -296,7 +296,7 @@ def run_arms(cfg: ArmsConfig) -> dict[str, Any]:
     if cfg.serve_cm is not None:
         serve_cm = cfg.serve_cm
     elif cfg.api_base:
-        from .endpoint import endpoint_serve_cm
+        from .runtime.endpoint import endpoint_serve_cm
 
         serve_cm = endpoint_serve_cm(cfg.api_base, model_name=cfg.served_model_name)
     else:

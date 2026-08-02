@@ -94,9 +94,9 @@ def cmd_distill(args: argparse.Namespace) -> int:
     vocabularies; byte alignment maps the two token streams (FINAL-PLAN.md).
     """
     from ...distill import OPDTrainConfig, run_opd_training, write_opd_report
-    from ...endpoint import EndpointError
     from ...providers.teacher.base import TeacherScoringError
     from ...reopd import iter_reopd_examples
+    from ...runtime.endpoint import EndpointError
     from ...tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER, TokenizerMismatchError
 
     try:

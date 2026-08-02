@@ -14,17 +14,17 @@ from typing import ClassVar
 
 import pytest
 
-from vektori_trace.endpoint import (
+from vektori_trace.providers.teacher.base import (
+    TeacherScoringError,
+    VllmTeacherPool,
+    teacher_pool_from_endpoint,
+)
+from vektori_trace.runtime.endpoint import (
     EndpointError,
     attach_endpoint,
     discover_model_name,
     endpoint_serve_cm,
     wait_for_health,
-)
-from vektori_trace.providers.teacher.base import (
-    TeacherScoringError,
-    VllmTeacherPool,
-    teacher_pool_from_endpoint,
 )
 
 SERVED_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
