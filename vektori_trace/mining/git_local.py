@@ -16,6 +16,7 @@ COLM '25) by way of Repo2RLEnv's `commit_runtime` pipeline (Apache-2.0).
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import date
@@ -80,6 +81,26 @@ _LOG_FORMAT = (
 _EXPECTED_FIELDS = 7
 
 
+# `https://user:token@host/...` — the shape `clone_for_log` is handed for a
+# private repo. Matched structurally rather than against a known token value, so
+# the redaction holds for any caller, including ones that build a URL we never
+# see.
+_URL_CREDENTIALS_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@")
+
+
+def _redact(text: str) -> str:
+    """Strip inline credentials from text bound for an exception or a log.
+
+    `_run_git` builds its error from the argv it was given, and for a private
+    repo that argv contains the clone URL with the access token in it. Without
+    this, any clone failure prints a live credential to the CLI and to every log
+    handler. `bootstrap/runner.py` scrubs for the same reason; doing it here
+    puts the guard at the subprocess wrapper, so no future caller has to
+    remember.
+    """
+    return _URL_CREDENTIALS_RE.sub(r"\1***:***@", text)
+
+
 def _run_git(args: list[str], cwd: Path, *, timeout: int = 60) -> str:
     """Run `git ...` in `cwd` and return stdout. Raises GitError on non-zero exit."""
     try:
@@ -92,11 +113,17 @@ def _run_git(args: list[str], cwd: Path, *, timeout: int = 60) -> str:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {' '.join(args)!r} timed out after {timeout}s") from exc
-    if proc.returncode != 0:
         raise GitError(
-            f"git {' '.join(args)!r} failed (exit {proc.returncode}): "
-            f"{proc.stderr.strip()[:400]}"
+            _redact(f"git {' '.join(args)!r} timed out after {timeout}s")
+        ) from exc
+    if proc.returncode != 0:
+        # Both halves are redacted: argv carries the URL, and git echoes the
+        # remote back in its own stderr on auth and not-found failures.
+        raise GitError(
+            _redact(
+                f"git {' '.join(args)!r} failed (exit {proc.returncode}): "
+                f"{proc.stderr.strip()[:400]}"
+            )
         )
     return proc.stdout
 
