@@ -241,7 +241,7 @@ class ArmsConfig:
     seed: int = 0
     pilot: bool = False
     use_modal: bool = True
-    modal_gpu: str = "A10G"
+    modal_gpu: str = "L40S"
     # Self-managed server (EC2/local vLLM): every arm runs against this endpoint
     # instead of spawning Modal containers. `arms.py` never learns the difference —
     # it goes through `serve_cm`, which this populates in `run_arms`.

@@ -1529,7 +1529,7 @@ def cmd_align_report(args: argparse.Namespace) -> int:
 
 
 def cmd_passk(args: argparse.Namespace) -> int:
-    from .passk import two_stage_sweep
+    from .passk import PASSK_LOG_FILENAME, two_stage_sweep
 
     tasks_dir = Path(args.tasks_dir)
     task_dirs = sorted(
@@ -1574,10 +1574,13 @@ def cmd_passk(args: argparse.Namespace) -> int:
         model_info=args.model_info,
         task_to_capability=task_to_capability,
         max_workers=args.max_workers,
+        escalate=not args.no_escalate,
+        log_path=out / PASSK_LOG_FILENAME,
     )
     path = out / "passk.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"passk report: {path}")
+    print(f"rollout log:  {out / PASSK_LOG_FILENAME}")
     print(
         f"escalated: {len(report['escalated'])}  "
         f"luck_quarantine: {len(report['luck_quarantine'])}"
@@ -2491,7 +2494,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_train.add_argument("--max-steps", type=_positive_int_arg, default=50)
     p_train.add_argument("--seed", type=int, default=0)
-    p_train.add_argument("--modal-gpu", default="A10G")
+    p_train.add_argument("--modal-gpu", default="L40S")
     p_train.add_argument(
         "--local",
         action="store_true",
@@ -2541,7 +2544,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_arms.add_argument("--rollouts", type=_positive_int_arg, default=DEFAULT_ROLLOUTS)
     p_arms.add_argument("--max-steps", type=_positive_int_arg, default=50)
     p_arms.add_argument("--seed", type=int, default=0)
-    p_arms.add_argument("--modal-gpu", default="A10G")
+    p_arms.add_argument("--modal-gpu", default="L40S")
     p_arms.add_argument(
         "--pilot",
         action="store_true",
@@ -2830,6 +2833,15 @@ def build_parser() -> argparse.ArgumentParser:
     # ~1,300 containerised rollouts of minutes each; serially that is days,
     # which does not fit "nothing expensive precedes the gate".
     p_passk.add_argument("--max-workers", type=_positive_int_arg, default=1)
+    p_passk.add_argument(
+        "--no-escalate",
+        action="store_true",
+        help=(
+            "run stage 1 only. Escalation fires on c == 0 regardless of how big "
+            "stage 1 was, so a small --stage1-n silently becomes --stage2-n "
+            "rollouts the moment a task fails"
+        ),
+    )
     _add_endpoint_args(p_passk)
     p_passk.add_argument(
         "--diagnosis",
@@ -3042,9 +3054,14 @@ def main(argv: list[str] | None = None) -> int:
     # ("parsed pre=0 post=0 tests"), and it was invisible for the whole
     # prefect smoke run — the skip histogram looked like a measurement.
     # VEKTORI_LOG_LEVEL overrides; INFO is the useful default for long mines.
+    # Timestamps are not decoration here: a sweep's console log has to line up
+    # against passk_log.jsonl, gpu_log.jsonl and the per-call token captures,
+    # all of which carry wall-clock UTC. Without them "it stalled around here"
+    # cannot be turned into "the GPU was idle for 90s waiting on the verifier".
     logging.basicConfig(
         level=os.environ.get("VEKTORI_LOG_LEVEL", "INFO").upper(),
-        format="%(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
         stream=sys.stderr,
     )
     args = build_parser().parse_args(argv)

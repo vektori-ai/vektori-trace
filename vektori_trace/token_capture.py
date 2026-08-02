@@ -21,6 +21,7 @@ This module:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import urllib.error
@@ -32,6 +33,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
+
+_log = logging.getLogger(__name__)
 
 # Filename written under a harbor attempt dir (rollout.py / CaptureProxy).
 CAPTURE_FILENAME = "token_captures.jsonl"
@@ -56,6 +59,17 @@ class CapturedCompletion:
     created_at: float = field(default_factory=time.time)
     choice_index: int = 0
     finish_reason: str | None = None
+    # The text the model emitted, alongside the ids that produced it. Kept in the
+    # same record deliberately: ids and text living in separate files (captures
+    # vs the ATIF trajectory) means every later question needs a join, and a
+    # silent disagreement between them is undetectable. Decoding `token_ids` must
+    # reproduce this string — `scripts/verify_run_logs.py` asserts exactly that.
+    text: str | None = None
+    # Set by CaptureProxy, which is the only component that sees both ends of a
+    # call. `created_at` comes from the upstream response's `created` field: whole
+    # seconds, assigned by the server, and useless for measuring anything.
+    request_started_at: float | None = None
+    latency_ms: float | None = None
 
     @property
     def input_ids(self) -> list[int]:
@@ -79,6 +93,15 @@ class CapturedCompletion:
             created_at=float(data.get("created_at") or time.time()),
             choice_index=int(data.get("choice_index") or 0),
             finish_reason=data.get("finish_reason"),
+            text=data.get("text"),
+            request_started_at=(
+                float(data["request_started_at"])
+                if data.get("request_started_at") is not None
+                else None
+            ),
+            latency_ms=(
+                float(data["latency_ms"]) if data.get("latency_ms") is not None else None
+            ),
         )
 
 
@@ -161,6 +184,25 @@ def _completion_logprobs(choice: dict[str, Any]) -> list[float] | None:
     return None
 
 
+def _completion_text(choice: dict[str, Any]) -> str | None:
+    """The emitted text, from either OpenAI response shape.
+
+    `/v1/chat/completions` puts it at `choice.message.content`; `/v1/completions`
+    at `choice.text`. Streaming deltas land at `choice.delta.content`. None means
+    the response carried no text at all, which is different from an empty string
+    (a real, if unusual, completion).
+    """
+    message = choice.get("message")
+    if isinstance(message, dict) and message.get("content") is not None:
+        return str(message["content"])
+    if choice.get("text") is not None:
+        return str(choice["text"])
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and delta.get("content") is not None:
+        return str(delta["content"])
+    return None
+
+
 def extract_captured_completion(
     response: dict[str, Any],
     *,
@@ -208,6 +250,7 @@ def extract_captured_completion(
         created_at=float(data.get("created") or time.time()),
         choice_index=choice_index,
         finish_reason=choice.get("finish_reason"),
+        text=_completion_text(choice),
     )
 
 
@@ -382,6 +425,10 @@ class CaptureProxy:
                     headers=headers,
                     method=method,
                 )
+                # Wall clock for joining against gpu_log.jsonl / passk_log.jsonl;
+                # perf_counter for the duration, because wall clock can step.
+                request_started_at = time.time()
+                t0 = time.perf_counter()
                 try:
                     with urllib.request.urlopen(req, timeout=600) as resp:
                         resp_body = resp.read()
@@ -412,13 +459,27 @@ class CaptureProxy:
                     try:
                         parsed = json.loads(resp_body.decode("utf-8"))
                         cap = extract_captured_completion(parsed)
+                        cap.request_started_at = request_started_at
+                        cap.latency_ms = (time.perf_counter() - t0) * 1000.0
                         with lock:
                             append_capture(capture_dir, cap)
-                    except (TokenCaptureError, json.JSONDecodeError, UnicodeDecodeError):
+                    except (
+                        TokenCaptureError,
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                    ) as exc:
                         # Never fail the client because capture failed — OPD will
                         # notice the missing file and refuse to train on re-tokenized
-                        # text when capture was requested.
-                        pass
+                        # text when capture was requested. But say so: a silently
+                        # empty capture file looks identical to a run that made no
+                        # model calls, and the whole point of the proxy is that
+                        # nothing goes unrecorded.
+                        _log.warning(
+                            "token capture failed for %s (%s): %s",
+                            path,
+                            type(exc).__name__,
+                            exc,
+                        )
 
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)

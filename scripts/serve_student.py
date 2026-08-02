@@ -9,7 +9,7 @@ endpoint from a shared box. This script keeps the block open.
 Run it inside tmux. The endpoint lives exactly as long as this process.
 
     tmux new -s serve
-    uv run python scripts/serve_student.py --gpu A10G --max-model-len 8192
+    uv run python scripts/serve_student.py --gpu L40S --max-model-len 40960
     # Ctrl-B D to detach; the endpoint stays up
 
 Then, in another window:
@@ -24,6 +24,7 @@ import argparse
 import json
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -37,14 +38,87 @@ from vektori_trace.serve import serve_model, served_to_harbor_kwargs
 KV_BYTES_PER_TOKEN = 2 * 36 * 8 * 128 * 2
 WEIGHTS_GIB = 15.3          # 8.19e9 params * 2 bytes (bf16)
 OVERHEAD_GIB = 1.3          # CUDA context, activations, cuda graphs
-GPU_VRAM_GIB = {"A10G": 24, "L40S": 48, "A100": 40, "A100-80GB": 80, "H100": 80}
+# Keys are Modal's own `gpu=` strings (modal.com/docs/guide/gpu). Note "A10",
+# not "A10G" — Modal renamed it, and the old spelling is rejected before any
+# container starts.
+GPU_VRAM_GIB = {
+    "T4": 16,
+    "L4": 24,
+    "A10": 24,
+    "L40S": 48,
+    "A100-40GB": 40,
+    "A100": 40,
+    "A100-80GB": 80,
+    "H100": 80,
+    "H200": 141,
+    "B200": 180,
+}
 
 
 def capacity(gpu: str, util: float) -> tuple[float, int]:
-    """(KV GiB, total KV tokens) available on `gpu` at `util`."""
-    vram = GPU_VRAM_GIB.get(gpu, 24)
-    kv_gib = vram * util - WEIGHTS_GIB - OVERHEAD_GIB
+    """(KV GiB, total KV tokens) available on `gpu` at `util`.
+
+    Unknown GPU is an error, not a default. This previously fell back to 24 GiB,
+    which silently computes an A10-sized budget for an H100 — the guard then
+    blocks a `--max-model-len` that would have fit fine, or worse, the reverse.
+    """
+    if gpu not in GPU_VRAM_GIB:
+        raise KeyError(
+            f"unknown GPU {gpu!r}; known: {', '.join(sorted(GPU_VRAM_GIB))}. "
+            "Use Modal's own gpu= strings (modal.com/docs/guide/gpu)."
+        )
+    kv_gib = GPU_VRAM_GIB[gpu] * util - WEIGHTS_GIB - OVERHEAD_GIB
     return kv_gib, int(kv_gib * (1024**3) / KV_BYTES_PER_TOKEN)
+
+
+class _GpuSampler:
+    """Poll the serving container's NVML on an interval into a JSONL on THIS box.
+
+    Sampling from here rather than from inside the container is deliberate: the
+    log has to survive the container dying, and a container dying is exactly the
+    event you want telemetry for. The file lives on EBS and outlives everything.
+
+    Runs in a daemon thread off the process that already holds the Modal session,
+    because `ServedModel.sample_gpu` is a handle into that session and cannot be
+    called from an unrelated process.
+    """
+
+    def __init__(self, served, path: Path, interval: float):
+        self._served = served
+        self._path = path
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.n_samples = 0
+        self.n_errors = 0
+
+    def start(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            record = {"logged_at": time.time()}
+            try:
+                sample = self._served.sample_gpu()
+                record.update(sample if isinstance(sample, dict) else {"raw": sample})
+            except Exception as e:  # telemetry must never kill the endpoint
+                record["error"] = f"{type(e).__name__}: {e}"
+                self.n_errors += 1
+            try:
+                with self._path.open("a") as fh:
+                    fh.write(json.dumps(record) + "\n")
+                    fh.flush()
+                self.n_samples += 1
+            except OSError:
+                pass
+            self._stop.wait(self._interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 def _smoke(api_base: str, model: str, timeout: float = 120.0) -> tuple[bool, str]:
@@ -82,8 +156,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-model", default="Qwen/Qwen3-8B")
-    ap.add_argument("--gpu", default="A10G",
-                    help="Modal GPU: A10G ($1.10/h, 24GB) | L40S ($1.95/h, 48GB)")
+    ap.add_argument("--gpu", default="L40S",
+                    help="Modal GPU: L40S ($1.95/h, 48GB) | A10 ($1.10/h, 24GB). "
+                         "L40S is the default because Qwen3-8B bf16 leaves only "
+                         "5 GiB of KV on an A10, below vLLM's own 40960 default")
     ap.add_argument("--adapter-path", default=None,
                     help="Volume path (/adapters/...) to a LoRA adapter")
     ap.add_argument("--max-model-len", type=int, default=8192,
@@ -95,6 +171,11 @@ def main() -> int:
                          "cannot bill indefinitely; 0 disables (default: 12)")
     ap.add_argument("--write-env", default=None,
                     help="also append STUDENT_API_BASE=<url> to this file")
+    ap.add_argument("--gpu-log", default="gpu_log.jsonl",
+                    help="NVML samples (util%%, memory, temp, power, SM clock) "
+                         "appended here on this box; empty string disables")
+    ap.add_argument("--gpu-log-interval", type=float, default=5.0,
+                    help="seconds between NVML samples (default: 5)")
     args = ap.parse_args()
 
     kv_gib, kv_tokens = capacity(args.gpu, args.gpu_memory_utilization)
@@ -175,12 +256,23 @@ def main() -> int:
         if args.max_hours:
             print(f"auto-shutdown in {args.max_hours}h "
                   f"(--max-hours 0 to disable)")
+
+        sampler = None
+        if args.gpu_log:
+            sampler = _GpuSampler(served, Path(args.gpu_log), args.gpu_log_interval)
+            sampler.start()
+            print(f"gpu telemetry     {args.gpu_log} "
+                  f"(every {args.gpu_log_interval}s)")
+
         print("\nendpoint is live. Ctrl-C to tear it down.\n", flush=True)
         while not stop:
             if deadline and time.time() > deadline:
                 print(f"\nmax-hours ({args.max_hours}h) reached — shutting down.")
                 break
             time.sleep(2)
+        if sampler is not None:
+            sampler.stop()
+            print(f"gpu samples written: {sampler.n_samples}")
     # serve_model's __exit__ has now run. Belt and braces: an ephemeral Modal app
     # that outlives this process is a GPU nobody is using, so say plainly how to
     # check rather than assuming the teardown worked.

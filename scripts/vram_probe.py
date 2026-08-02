@@ -170,7 +170,7 @@ def _remote_probe(cfg: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-8B")
-    p.add_argument("--gpu", default="A10G")
+    p.add_argument("--gpu", default="L40S")
     p.add_argument("--seq-len", type=int, default=8192)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--grad-accum", type=int, default=1)

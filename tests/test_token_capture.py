@@ -67,6 +67,25 @@ def test_extract_from_vllm_chat_shape():
     assert cap.model == "qwen3-8b"
     assert cap.request_id == "cmpl-1"
     assert cap.input_ids == [10, 11, 12, 20, 21]
+    # Ids and the text they decode to belong in the same record.
+    assert cap.text == "hi"
+
+
+def test_extract_text_from_completions_shape():
+    """`/v1/completions` puts the emitted text on `choice.text`, not a message."""
+    resp = {
+        "prompt_token_ids": [1],
+        "choices": [{"text": "def f():", "token_ids": [2, 3]}],
+    }
+    assert extract_captured_completion(resp).text == "def f():"
+
+
+def test_extract_text_absent_is_none_not_empty():
+    """No text field at all is distinct from a genuinely empty completion."""
+    resp = {"prompt_token_ids": [1], "choices": [{"token_ids": [2]}]}
+    assert extract_captured_completion(resp).text is None
+    empty = {"prompt_token_ids": [1], "choices": [{"token_ids": [], "text": ""}]}
+    assert extract_captured_completion(empty).text == ""
 
 
 def test_extract_prompt_ids_on_choice():
@@ -234,6 +253,29 @@ def test_capture_proxy_injects_and_persists(upstream_server, tmp_path: Path):
     assert len(loaded) == 1
     assert loaded[0].prompt_token_ids == [100, 101]
     assert loaded[0].token_ids == [200, 201]
+    # Only the proxy sees both ends of the call, so only it can time one.
+    # `created_at` is the upstream's whole-second `created` field and cannot.
+    assert loaded[0].request_started_at is not None
+    assert loaded[0].latency_ms is not None
+    assert loaded[0].latency_ms >= 0.0
+
+
+def test_capture_timing_survives_the_jsonl_roundtrip(tmp_path: Path):
+    job = tmp_path / "job"
+    append_capture(
+        job,
+        CapturedCompletion(
+            prompt_token_ids=[1],
+            token_ids=[2],
+            text="ok",
+            request_started_at=1_700_000_000.5,
+            latency_ms=12.5,
+        ),
+    )
+    (loaded,) = load_captures(job)
+    assert loaded.text == "ok"
+    assert loaded.request_started_at == pytest.approx(1_700_000_000.5)
+    assert loaded.latency_ms == pytest.approx(12.5)
 
 
 def test_served_to_harbor_kwargs_capture_flag():

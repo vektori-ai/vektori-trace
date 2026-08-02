@@ -208,16 +208,25 @@ def test_two_stage_sweep_reports_support_capabilities_and_infra(tmp_path: Path, 
     }
     calls: dict[str, int] = {}
 
-    class _Trial:
-        def __init__(self, passed):
-            self.passed = passed
+    # The real TrialResult, not a `.passed`-only stub: the sweep now records the
+    # job dir, reward and timing behind every rollout, and a stub that omits them
+    # would let a missing field pass here and fail on the box.
+    from vektori_trace.validity import TrialResult
 
-    def fake_run_trial(task_dir, **kw):
+    def fake_run_trial(task_dir, agent="a", jobs_dir=None, **kw):
         name = task_dir.name
         i = calls.get(name, 0)
         calls[name] = i + 1
-        seq = plan[name]
-        return _Trial(seq[i % len(seq)])
+        passed = plan[name][i % len(plan[name])]
+        return TrialResult(
+            agent=agent,
+            passed=passed,
+            reward=None if passed is None else float(passed),
+            jobs_dir=Path(jobs_dir) if jobs_dir else tmp_path / "jobs" / name,
+            raw_stdout="",
+            elapsed_sec=0.1,
+            started_at=1_700_000_000.0,
+        )
 
     monkeypatch.setattr(passk_mod, "run_trial", fake_run_trial)
     dirs = []
