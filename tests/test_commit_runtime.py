@@ -214,8 +214,10 @@ def test_leaked_identifiers_flags_names_the_patch_introduces() -> None:
     assert leaked_identifiers(leaky, _PATCH, _TEST_PATCH) == ["normalize_rrule_string"]
 
 
-def test_leaked_identifiers_flags_file_stems_and_test_names() -> None:
-    assert "validators" in leaked_identifiers("See validators for details.", _PATCH, "")
+def test_leaked_identifiers_flags_code_shaped_file_stems_and_test_names() -> None:
+    # `validators` is a plain word a bug report would use; not a leak.
+    assert leaked_identifiers("See validators for details.", _PATCH, "") == []
+    # A test name is code-shaped and is never something a reporter would write.
     assert "test_normalize_none" in leaked_identifiers(
         "Add test_normalize_none coverage.", "", _TEST_PATCH
     )
@@ -371,3 +373,35 @@ def test_bootstrap_cache_misses_when_the_image_is_gone(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(cache_mod, "_image_exists_locally", lambda tag: False)
     assert cache_mod.load("o/n", "a" * 40, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["server", "flows", "futures", "filters", "process", "validators", "pydantic"],
+)
+def test_leak_gate_ignores_plain_module_stems(word: str) -> None:
+    """Ordinary words must not count as leaks, or the gate drops good tasks.
+
+    Auditing the 18 pr_runtime tasks with a length-only rule flagged 16, and 10
+    of those hits were plain module stems that a problem statement uses in
+    normal prose. Over-filtering here is the same failure that made the first
+    commit_runtime run emit nothing from 25 commits.
+    """
+    patch = (
+        f"diff --git a/src/{word}.py b/src/{word}.py\n"
+        f"--- a/src/{word}.py\n+++ b/src/{word}.py\n"
+    )
+    assert leaked_identifiers(f"The {word} stopped responding after a restart.", patch, "") == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_workspace_resolver", "flow_engine", "block_registration", "StepExecutionError"],
+)
+def test_leak_gate_flags_code_shaped_identifiers(name: str) -> None:
+    """A leading/embedded underscore or an internal capital is fixer vocabulary."""
+    patch = (
+        "diff --git a/src/m.py b/src/m.py\n--- a/src/m.py\n+++ b/src/m.py\n"
+        f"@@ -1 +1 @@\n+def {name}():\n"
+    )
+    assert leaked_identifiers(f"Calling {name} raises immediately.", patch, "") == [name]

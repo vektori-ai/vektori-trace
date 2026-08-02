@@ -160,6 +160,19 @@ _DEF_RE = re.compile(
 # carries little solution signal anyway.
 _MIN_LEAK_TOKEN_LEN = 5
 
+# A name only counts as leaked if it *looks like code* rather than English.
+# Auditing the 18 pr_runtime tasks with a length-only rule flagged 16 of them,
+# and 10 of those hits were plain module stems — `server`, `flows`, `futures`,
+# `filters`, `process`, `validators`, `pydantic`. A problem statement about
+# prefect uses those words in ordinary prose, so flagging them would drop good
+# tasks for describing the symptom, which is the same over-filtering that made
+# the first commit_runtime run emit nothing.
+#
+# What survives is the shape a fixer's vocabulary has and a reporter's does
+# not: a leading underscore (private), an embedded underscore, or an internal
+# capital. `_workspace_resolver` and `flow_engine` are leaks; `server` is not.
+_CODE_SHAPED_RE = re.compile(r"^_|_|[a-z][A-Z]")
+
 
 def leaked_identifiers(instruction: str, patch: str, test_patch: str) -> list[str]:
     """Return solution identifiers that survived into the instruction.
@@ -185,6 +198,8 @@ def leaked_identifiers(instruction: str, patch: str, test_patch: str) -> list[st
     hits = []
     for name in names:
         if len(name) < _MIN_LEAK_TOKEN_LEN:
+            continue
+        if not _CODE_SHAPED_RE.search(name):
             continue
         if re.search(rf"\b{re.escape(name)}\b", instruction):
             hits.append(name)
