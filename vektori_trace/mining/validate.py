@@ -68,7 +68,18 @@ def _build_stage_script(
         f"git reset --hard {base_commit}",
         # Keep language dep/build dirs (node_modules, target, vendor, ...) so
         # the clean doesn't wipe deps the suite needs. See _GIT_CLEAN_EXCLUDES.
-        "git clean -fdx -e .venv -e venv -e __pycache__ -e .tox "
+        #
+        # NO `-x`. Ignored files are generated build artifacts, and removing
+        # them breaks any project that derives its version from git:
+        # prefect's `.gitignore` lists `src/prefect/_build_info.py`, written by
+        # `hatch_build.py` at install time. `git clean -fdx` deleted it, so
+        # `import prefect` failed, so pytest died during config parsing —
+        # before collecting a single test. The stage emitted an empty
+        # START/END block, `parse_logs` returned {}, and every PR skipped as
+        # `no_fail_to_pass`: a plausible bucket name for a validation that
+        # never ran. Measured on prefect: `-fd` removes nothing, `-fdx`
+        # removes exactly those two generated files.
+        "git clean -fd -e .venv -e venv -e __pycache__ -e .tox "
         "-e node_modules -e target -e vendor -e .gradle -e .next -e .pytest_cache || true",
     ]
     if apply_patch and apply_patch.strip():
