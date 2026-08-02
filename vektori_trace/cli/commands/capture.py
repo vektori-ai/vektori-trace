@@ -46,3 +46,43 @@ def cmd_capture_proxy(args: argparse.Namespace) -> int:
         while True:
             time.sleep(3600)
     return 0
+
+def register_capture_proxy(sub: argparse._SubParsersAction) -> None:
+    """Register the `capture-proxy` subcommand on `sub`."""
+    p_cap = sub.add_parser(
+        "capture-proxy",
+        help=(
+            "Phase 0.5: reverse-proxy a vLLM server, inject return_token_ids, and "
+            "persist sampled prompt/completion ids as JSONL"
+        ),
+        description=(
+            "Harbor agents we do not control still need sampled token ids for OPD. "
+            "This proxy sits in front of your vLLM OpenAI-compatible server, forces "
+            "`return_token_ids: true` on every chat/completions request, forwards "
+            "the response unchanged, and appends each capture to "
+            "<out>/token_captures.jsonl. Point harbor's api_base at the printed URL."
+        ),
+    )
+    p_cap.add_argument(
+        "--upstream",
+        required=True,
+        help="real vLLM api base, e.g. http://127.0.0.1:8000/v1",
+    )
+    p_cap.add_argument(
+        "--out",
+        default="./vektori-out/token-captures",
+        help="directory for token_captures.jsonl",
+    )
+    p_cap.add_argument("--host", default="127.0.0.1")
+    p_cap.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="local listen port (0 = ephemeral; the printed api_base always wins)",
+    )
+    p_cap.add_argument(
+        "--logprobs",
+        action="store_true",
+        help="also request per-token logprobs alongside token ids",
+    )
+    p_cap.set_defaults(func=cmd_capture_proxy)

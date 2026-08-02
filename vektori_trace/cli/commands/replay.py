@@ -13,6 +13,7 @@ from ...mining.miner import (
     discover_tasks,
 )
 from ...schema import Trace
+from .._args import _add_endpoint_args
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
@@ -101,3 +102,32 @@ def cmd_replay(args: argparse.Namespace) -> int:
         f"--frontier-model {args.frontier_model} --candidate-model {args.candidate_model}"
     )
     return 0
+
+def register_replay(sub: argparse._SubParsersAction) -> None:
+    """Register the `replay` subcommand on `sub`."""
+    p_replay = sub.add_parser(
+        "replay",
+        help=(
+            "run a frontier and a candidate model over the same already-mined tasks, "
+            "on one pinned scaffold, and report the pass-rate gap number"
+        ),
+    )
+    p_replay.add_argument(
+        "--tasks-dir", required=True, help="a previously-mined tasks dir (e.g. from `mine --no-replay`)"
+    )
+    p_replay.add_argument(
+        "--agent",
+        default="claude-code",
+        help=(
+            "harbor agent name — the ONE scaffold shared by both arms, since the gap is a "
+            "property of model x scaffold, not just the model (Harbor's names are hyphenated: "
+            "claude-code, codex, terminus-2; underscores are normalised)"
+        ),
+    )
+    p_replay.add_argument("--frontier-model", required=True, help="the frontier model, e.g. gpt-5")
+    p_replay.add_argument(
+        "--candidate-model", required=True, help="the candidate model under test, e.g. a 4B-8B open model"
+    )
+    p_replay.add_argument("--out", default="./vektori-out", help="output directory")
+    _add_endpoint_args(p_replay, prefix="candidate-")
+    p_replay.set_defaults(func=cmd_replay)

@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 from ...evaluate.diagnose import (
+    DEFAULT_MIN_GAP,
+    DEFAULT_MIN_SUPPORT,
     diagnose_replay,
     label_trace,
     propose_capabilities,
@@ -16,6 +18,7 @@ from ...evaluate.diagnose import (
 from ...evaluate.report import build_replay_report, build_report, write_report
 from ...evaluate.validity import prove_validity
 from ...taskgen import scaffold_task
+from .._args import _min_gap_arg, _min_support_arg
 from .._shared import _check_replay_models, _load_traces
 
 
@@ -152,3 +155,52 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
 
 def _fmt(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.2f}"
+
+def register_diagnose(sub: argparse._SubParsersAction) -> None:
+    """Register the `diagnose` subcommand on `sub`."""
+    p_diag = sub.add_parser(
+        "diagnose", help="diagnose a capability deficit from win/loss traces and generate a task"
+    )
+    p_diag.add_argument("--manifest", required=True, help="JSON manifest of trace files + outcomes")
+    p_diag.add_argument("--out", default="./vektori-out", help="output directory")
+    p_diag.add_argument("--model", default=None, help="OpenAI model override")
+    p_diag.add_argument(
+        "--prove", action="store_true", help="also run harbor to produce the validity proof"
+    )
+    p_diag.add_argument(
+        "--base-agent",
+        default=None,
+        help="harbor agent name to run as the 'base' attempt, e.g. codex, claude-code",
+    )
+    p_diag.add_argument("--base-model", default=None, help="model name for --base-agent")
+    p_diag.add_argument(
+        "--min-gap",
+        type=_min_gap_arg,
+        default=DEFAULT_MIN_GAP,
+        help="minimum win/loss gap for a capability to be reported as a deficit (uncalibrated)",
+    )
+    p_diag.add_argument(
+        "--min-support",
+        type=_min_support_arg,
+        default=DEFAULT_MIN_SUPPORT,
+        help="minimum relevant traces on each side of the gap",
+    )
+    # Both or neither. Given both, the manifest is read as a `replay` manifest
+    # and scored as two contrasts (cross-model, within-model) plus a same-task
+    # McNemar test; given neither, the manifest is one undifferentiated win/loss
+    # set exactly as before.
+    p_diag.add_argument(
+        "--frontier-model",
+        default=None,
+        help=(
+            "the frontier model in a `replay` manifest. With --candidate-model, scores "
+            "the cross-model contrast (frontier wins vs candidate losses) instead of "
+            "mixing both models into one win/loss set"
+        ),
+    )
+    p_diag.add_argument(
+        "--candidate-model",
+        default=None,
+        help="the candidate model under test; required alongside --frontier-model",
+    )
+    p_diag.set_defaults(func=cmd_diagnose)

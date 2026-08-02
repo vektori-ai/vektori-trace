@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .._args import _positive_int_arg
 from .._shared import _load_traces
 
 
@@ -256,3 +257,49 @@ def cmd_bisect(args: argparse.Namespace) -> int:
     print(f"bisection report: {path}")
     print(json.dumps(summary, indent=2))
     return 0
+
+def register_resume_check(sub: argparse._SubParsersAction) -> None:
+    """Register the `resume-check` subcommand on `sub`."""
+    p_resume = sub.add_parser(
+        "resume-check",
+        help="Step A: replay trajectory prefixes into fresh containers; report desync rate",
+    )
+    p_resume.add_argument("--manifest", required=True, help="replay manifest.json")
+    p_resume.add_argument("--tasks-dir", required=True)
+    p_resume.add_argument("--model", default=None, help="only replay this model's traces")
+    p_resume.add_argument("--limit", type=int, default=None)
+    p_resume.add_argument("--platform", default="linux/amd64")
+    p_resume.add_argument("--out", default="./vektori-out")
+    p_resume.set_defaults(func=cmd_resume_check)
+
+def register_bisect(sub: argparse._SubParsersAction) -> None:
+    """Register the `bisect` subcommand on `sub`."""
+    p_bisect = sub.add_parser(
+        "bisect",
+        help="Step D: verifier-guided bisection to the forking step of failed trajectories",
+    )
+    p_bisect.add_argument("--manifest", required=True)
+    p_bisect.add_argument("--tasks-dir", required=True)
+    p_bisect.add_argument("--model", default=None, help="only bisect this model's losses")
+    p_bisect.add_argument("--teacher-model", default=None)
+    p_bisect.add_argument(
+        "--continuation-cmd",
+        default=None,
+        help=(
+            "REQUIRED. Shell command run per probe, with {task_dir} and "
+            "{prefix_json} substituted; exit 0 iff the verifier passes. The "
+            "teacher must continue from the replayed prefix, and no harbor "
+            "entrypoint accepts a seeded container yet."
+        ),
+    )
+    p_bisect.add_argument(
+        "--replay-prefix",
+        action="store_true",
+        help="also replay the prefix into a container and assert consistency (Step A)",
+    )
+    p_bisect.add_argument("--samples-per-probe", type=_positive_int_arg, default=2)
+    p_bisect.add_argument("--verify-probes", type=int, default=2)
+    p_bisect.add_argument("--platform", default="linux/amd64")
+    p_bisect.add_argument("--limit", type=int, default=None)
+    p_bisect.add_argument("--out", default="./vektori-out")
+    p_bisect.set_defaults(func=cmd_bisect)

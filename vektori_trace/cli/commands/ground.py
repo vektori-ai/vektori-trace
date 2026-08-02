@@ -7,6 +7,9 @@ import json
 import sys
 from pathlib import Path
 
+from ...evaluate.diagnose import DEFAULT_MIN_GAP
+from .._args import _min_gap_arg
+
 
 def cmd_ground(args: argparse.Namespace) -> int:
     """Step E — compare diagnose labels against execution-located forking steps."""
@@ -76,3 +79,20 @@ def cmd_ground(args: argparse.Namespace) -> int:
     elif report.underpowered:
         print("warning: fewer than 10 judged pairs — underpowered", file=sys.stderr)
     return 0
+
+def register_ground(sub: argparse._SubParsersAction) -> None:
+    """Register the `ground` subcommand on `sub`."""
+    p_ground = sub.add_parser(
+        "ground",
+        help="Step E: compare diagnose labels against execution-located forking steps",
+    )
+    p_ground.add_argument("--bisection", required=True, help="bisection.json from `bisect`")
+    p_ground.add_argument("--diagnosis", required=True, help="report.json from `diagnose`")
+    p_ground.add_argument(
+        "--judgments",
+        default=None,
+        help='JSON {run_id: true|false} of hand-inspected agreement (AC #4)',
+    )
+    p_ground.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
+    p_ground.add_argument("--out", default="./vektori-out")
+    p_ground.set_defaults(func=cmd_ground)

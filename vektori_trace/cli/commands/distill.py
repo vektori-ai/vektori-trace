@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .._args import _positive_int_arg
+
 
 def _load_teacher_trajectories(source: Path) -> list[tuple[str, list[Any]]]:
     """Teacher trajectories from harbor job dirs or ATIF JSON traces.
@@ -209,3 +211,166 @@ def cmd_distill(args: argparse.Namespace) -> int:
         print(f"note: {result.skipped_empty_samples} example(s) sampled no tokens")
     print(f"report: {md}")
     return 0
+
+def register_distill(sub: argparse._SubParsersAction) -> None:
+    """Register the `distill` subcommand on `sub`."""
+    p_distill = sub.add_parser(
+        "distill",
+        help=(
+            "OPD: student samples at a teacher prefix, the teacher scores those "
+            "tokens, reverse-KL step. Same-vocab path: teacher/student share a "
+            "tokenizer. Cross-tokenizer path (--cross-tokenizer): byte-alignment "
+            "of Qwen3 + DeepSeek-V4-Flash (FINAL-PLAN.md)."
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-traces",
+        required=True,
+        help="dir of harbor job dirs and/or ATIF .json traces from the teacher",
+    )
+    p_distill.add_argument(
+        "--teacher-backend",
+        choices=("vllm", "fireworks", "bedrock"),
+        default="vllm",
+        help=(
+            "where the teacher runs. vllm (default) is the reference path and the "
+            "only unquantised one; fireworks and bedrock need no GPU but should "
+            "pass `probe-teacher` first (docs/HOSTED_TEACHERS.md)"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-api-base",
+        default=None,
+        help=(
+            "vllm: the self-hosted server (required, needs prompt_logprobs — "
+            "PLAN.md C1). fireworks: overrides the default gateway. bedrock: unused"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-model-id",
+        default=None,
+        help=(
+            "fireworks: `accounts/.../models/<id>` or a deployment path. "
+            "bedrock: the imported model's ARN (required)"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-region",
+        default="us-east-1",
+        help="bedrock only; must be a Custom Model Import region",
+    )
+    p_distill.add_argument(
+        "--teacher-served-name",
+        default=None,
+        help="name the teacher endpoint serves under (default: discovered)",
+    )
+    p_distill.add_argument("--teacher", default=None, help="teacher HF id for the tokenizer check")
+    p_distill.add_argument("--student", default=None, help="student HF id to train")
+    p_distill.add_argument("--out", default="./vektori-out/opd", help="output directory")
+    p_distill.add_argument("--max-steps", type=_positive_int_arg, default=200)
+    p_distill.add_argument("--learning-rate", type=float, default=1e-5)
+    p_distill.add_argument(
+        "--examples-per-step",
+        type=_positive_int_arg,
+        default=4,
+        help="examples accumulated per optimizer step (one teacher round-trip each)",
+    )
+    p_distill.add_argument(
+        "--steps-per-trajectory",
+        type=_positive_int_arg,
+        default=None,
+        help="cap ReOPD step-examples taken from each trajectory (default: all)",
+    )
+    p_distill.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="sampling temperature; 1.0 keeps the sample on-policy (see distill.py)",
+    )
+    p_distill.add_argument("--max-new-tokens", type=_positive_int_arg, default=256)
+    p_distill.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help=(
+            "0 (default) = reverse-KL surrogate over sampled tokens, the objective "
+            "PLAN.md declares. >0 = analytic top-K KL (thunlp/OPD uses 16): same "
+            "teacher cost, lower variance, but a different objective — pre-register "
+            "before switching. Recorded in the run's provenance either way."
+        ),
+    )
+    p_distill.add_argument("--seed", type=int, default=0)
+    p_distill.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="trade step time for activation memory on a smaller card",
+    )
+    # ── Cross-tokenizer flags (FINAL-PLAN.md) ──────────────────────────────
+    p_distill.add_argument(
+        "--cross-tokenizer",
+        action="store_true",
+        dest="cross_tokenizer",
+        help=(
+            "enable cross-tokenizer OPD: student and teacher have different "
+            "vocabularies; byte alignment maps both token streams. Requires "
+            "--bridge and typically --teacher-backend fireworks."
+        ),
+    )
+    p_distill.add_argument(
+        "--bridge",
+        default=None,
+        metavar="PATH",
+        help="CrossTokenizerBridge JSON artifact from `vektori-trace build-bridge`",
+    )
+    p_distill.add_argument(
+        "--thinking-mode",
+        default="chat",
+        choices=("chat", "thinking"),
+        dest="thinking_mode",
+        help=(
+            "teacher deployment inference mode; must match the bridge's thinking_mode "
+            "(default: chat)"
+        ),
+    )
+    p_distill.add_argument(
+        "--min-granularity",
+        type=float,
+        default=0.5,
+        dest="min_granularity",
+        help=(
+            "hard-fail if alignment granularity (spans/student tokens) is below this "
+            "for any example (pre-registered floor: 0.5, FINAL-PLAN.md §4)"
+        ),
+    )
+    p_distill.add_argument(
+        "--max-span-student-tokens",
+        type=int,
+        default=8,
+        dest="max_span_student_tokens",
+        help=(
+            "hard-fail if any aligned span covers more than this many student tokens "
+            "(FINAL-PLAN.md §10.5; default: 8)"
+        ),
+    )
+    p_distill.add_argument(
+        "--cross-top-k",
+        type=int,
+        default=5,
+        dest="cross_top_k",
+        help=(
+            "request top-K teacher logprobs per position for Estimator A "
+            "(Fireworks caps at 5; set 0 to disable Estimator A entirely)"
+        ),
+    )
+    p_distill.add_argument(
+        "--teacher-tokenizer",
+        default=None,
+        dest="teacher_tokenizer_id",
+        metavar="HF_ID",
+        help=(
+            "HF model id for the teacher tokenizer, used to re-tokenise the "
+            "student's sampled action text on the teacher side. Required for "
+            "--cross-tokenizer unless the teacher model id is already set."
+        ),
+    )
+    p_distill.set_defaults(func=cmd_distill)

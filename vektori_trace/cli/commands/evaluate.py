@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from .._args import _add_endpoint_args, _positive_int_arg
 from .._shared import _load_traces
 
 
@@ -105,3 +106,49 @@ def cmd_import_gym(args: argparse.Namespace) -> int:
         )
         return 1
     return 0
+
+def register_passk(sub: argparse._SubParsersAction) -> None:
+    """Register the `passk` subcommand on `sub`."""
+    p_passk = sub.add_parser(
+        "passk",
+        help="Step C: two-stage pass@k sweep (n=8, escalate zeros to n=32); never pools strata",
+    )
+    p_passk.add_argument("--tasks-dir", required=True)
+    p_passk.add_argument("--agent", required=True)
+    p_passk.add_argument("--model", required=True)
+    p_passk.add_argument("--out", default="./vektori-out")
+    p_passk.add_argument("--stage1-n", type=_positive_int_arg, default=8)
+    p_passk.add_argument("--stage2-n", type=_positive_int_arg, default=32)
+    # ~1,300 containerised rollouts of minutes each; serially that is days,
+    # which does not fit "nothing expensive precedes the gate".
+    p_passk.add_argument("--max-workers", type=_positive_int_arg, default=1)
+    p_passk.add_argument(
+        "--no-escalate",
+        action="store_true",
+        help=(
+            "run stage 1 only. Escalation fires on c == 0 regardless of how big "
+            "stage 1 was, so a small --stage1-n silently becomes --stage2-n "
+            "rollouts the moment a task fails"
+        ),
+    )
+    _add_endpoint_args(p_passk)
+    p_passk.add_argument(
+        "--diagnosis",
+        default=None,
+        help="report.json from `diagnose`; with --manifest, aggregates by (capability, model)",
+    )
+    p_passk.add_argument(
+        "--manifest", default=None, help="replay manifest.json (run_id → task)"
+    )
+    p_passk.set_defaults(func=cmd_passk)
+
+def register_import_gym(sub: argparse._SubParsersAction) -> None:
+    """Register the `import-gym` subcommand on `sub`."""
+    p_gym = sub.add_parser(
+        "import-gym",
+        help="Step B: import R2E-Gym/SWE-smith JSONL into harbor task dirs",
+    )
+    p_gym.add_argument("--source", required=True, help="JSONL of gym instances")
+    p_gym.add_argument("--out", required=True, help="output tasks directory")
+    p_gym.add_argument("--limit", type=int, default=None)
+    p_gym.set_defaults(func=cmd_import_gym)

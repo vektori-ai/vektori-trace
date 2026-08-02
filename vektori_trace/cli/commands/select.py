@@ -7,8 +7,9 @@ import json
 import sys
 from pathlib import Path
 
-from ...evaluate.passrate import measure_pass_rates
+from ...evaluate.passrate import DEFAULT_ROLLOUTS, PASSRATE_MAX, PASSRATE_MIN, measure_pass_rates
 from ...select import held_out_split, select_training_tasks, write_selection_report
+from .._args import _positive_int_arg
 from .._shared import _load_traces
 
 
@@ -114,3 +115,31 @@ def cmd_select(args: argparse.Namespace) -> int:
         )
         return 1
     return 0
+
+def register_select(sub: argparse._SubParsersAction) -> None:
+    """Register the `select` subcommand on `sub`."""
+    p_select = sub.add_parser(
+        "select",
+        help=(
+            "measure candidate pass rate on the diagnosed deficit's lacking-loss tasks "
+            "and select the ones in the trainable band (V0_PLAN.md Step 6)"
+        ),
+    )
+    p_select.add_argument("--manifest", required=True, help="the replay manifest `diagnose` was run against")
+    p_select.add_argument("--diagnosis", required=True, help="path to a diagnosis.json produced with --frontier-model/--candidate-model")
+    p_select.add_argument("--tasks-dir", required=True, help="mined tasks directory (each task has a task.toml)")
+    p_select.add_argument("--agent", required=True, help="the scaffold pinned across replay — reused for pass-rate rollouts")
+    p_select.add_argument("--out", default="./vektori-out", help="output directory")
+    p_select.add_argument(
+        "--rollouts", type=_positive_int_arg, default=DEFAULT_ROLLOUTS,
+        help="rollouts per lacking-loss task to measure candidate pass rate (plan: 8-16)",
+    )
+    p_select.add_argument("--passrate-min", type=float, default=PASSRATE_MIN)
+    p_select.add_argument("--passrate-max", type=float, default=PASSRATE_MAX)
+    p_select.add_argument("--holdout-frac", type=float, default=0.2, help="fraction of selected tasks carved out as held-out before training")
+    p_select.add_argument("--seed", type=int, default=0, help="held-out split seed — written to the report, re-derivable")
+    p_select.add_argument(
+        "--exclude", default=None,
+        help="file of task ids (one per line) to drop before splitting, e.g. SWE-bench Verified tasks",
+    )
+    p_select.set_defaults(func=cmd_select)

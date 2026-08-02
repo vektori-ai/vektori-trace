@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ...tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
+
 
 def cmd_probe_teacher(args: argparse.Namespace) -> int:
     """Does this hosted teacher return per-token logprobs for tokens we supply?
@@ -311,3 +313,120 @@ def cmd_align_report(args: argparse.Namespace) -> int:
                 f"min={min(vals):.4f}"
             )
     return 0
+
+def register_check_tokenizers(sub: argparse._SubParsersAction) -> None:
+    """Register the `check-tokenizers` subcommand on `sub`."""
+    p_tok = sub.add_parser(
+        "check-tokenizers",
+        help="Step 0: verify teacher/student share a tokenizer (hard-fail on mismatch)",
+    )
+    p_tok.add_argument(
+        "--teacher", default=None, help=f"defaults to the pilot teacher ({DEFAULT_TEACHER})"
+    )
+    p_tok.add_argument(
+        "--student", default=None, help=f"defaults to the pilot student ({DEFAULT_STUDENT})"
+    )
+    p_tok.set_defaults(func=cmd_check_tokenizers)
+
+def register_build_bridge(sub: argparse._SubParsersAction) -> None:
+    """Register the `build-bridge` subcommand on `sub`."""
+    p_bridge = sub.add_parser(
+        "build-bridge",
+        help=(
+            "build a CrossTokenizerBridge JSON artifact from a teacher/student "
+            "tokenizer pair (required for --cross-tokenizer distillation)"
+        ),
+    )
+    p_bridge.add_argument(
+        "--teacher-tokenizer",
+        required=True,
+        metavar="HF_ID",
+        help="HF model id for the teacher tokenizer, e.g. deepseek-ai/DeepSeek-V4-Flash-0731",
+    )
+    p_bridge.add_argument(
+        "--student-tokenizer",
+        required=True,
+        metavar="HF_ID",
+        help="HF model id for the student tokenizer, e.g. Qwen/Qwen3-8B",
+    )
+    p_bridge.add_argument(
+        "--thinking-mode",
+        default="chat",
+        choices=("chat", "thinking"),
+        help="teacher deployment inference mode (default: chat)",
+    )
+    p_bridge.add_argument(
+        "--out",
+        default="bridge.json",
+        help="output path for the bridge artifact (default: bridge.json)",
+    )
+    p_bridge.set_defaults(func=cmd_build_bridge)
+
+def register_align_report(sub: argparse._SubParsersAction) -> None:
+    """Register the `align-report` subcommand on `sub`."""
+    p_align = sub.add_parser(
+        "align-report",
+        help=(
+            "offline granularity report: encode text samples with both tokenizers "
+            "and align by bytes, printing granularity per sample"
+        ),
+    )
+    p_align.add_argument(
+        "--bridge",
+        required=True,
+        metavar="PATH",
+        help="CrossTokenizerBridge JSON artifact from `build-bridge`",
+    )
+    p_align.add_argument(
+        "--text",
+        default=None,
+        metavar="FILE",
+        help="file of text samples (one per line); defaults to stdin",
+    )
+    p_align.add_argument(
+        "--max-span-student-tokens",
+        type=int,
+        default=8,
+        dest="max_span_student_tokens",
+        help="hard-fail threshold for span width (default: 8)",
+    )
+    p_align.set_defaults(func=cmd_align_report)
+
+def register_probe_teacher(sub: argparse._SubParsersAction) -> None:
+    """Register the `probe-teacher` subcommand on `sub`."""
+    p_probe = sub.add_parser(
+        "probe-teacher",
+        help="one request: can this hosted teacher score tokens we supply?",
+        description=(
+            "Sends a single scoring request and reports what came back. This is "
+            "the empirical check that decides whether a hosted teacher can run OPD "
+            "at all — a 400 here is a finding, not a bug. Nothing else in the "
+            "pipeline should be run against a teacher that has not passed it."
+        ),
+    )
+    p_probe.add_argument(
+        "--backend", choices=("fireworks", "bedrock"), required=True
+    )
+    p_probe.add_argument(
+        "--model",
+        default=None,
+        help="Fireworks resource path, or the Bedrock imported-model ARN",
+    )
+    p_probe.add_argument("--api-base", default=None, help="fireworks only")
+    p_probe.add_argument("--region", default="us-east-1", help="bedrock only")
+    p_probe.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="also probe score_ids_topk at this K (Fireworks caps at 5)",
+    )
+    p_probe.add_argument("--out", default=None, help="write the result as JSON here")
+    p_probe.add_argument(
+        "--echo",
+        action="store_true",
+        help=(
+            "also run probe_echo_support() to verify the teacher can score "
+            "supplied token ids (the Fireworks echo=True capability OPD depends on)"
+        ),
+    )
+    p_probe.set_defaults(func=cmd_probe_teacher)

@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from ...evaluate.diagnose import DEFAULT_MIN_GAP, DEFAULT_MIN_SUPPORT
 from ...evaluate.planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
@@ -27,6 +28,7 @@ from ...runtime.envcheck import (
     evaluate_reward_hack,
     run_probe,
 )
+from .._args import _min_gap_arg, _min_support_arg
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
@@ -174,3 +176,69 @@ def cmd_prove(args: argparse.Namespace) -> int:
         print(f"{args.base_agent} passed: {validity['base'].passed}")
     print(f"valid: {validity['valid']}")
     return 0 if validity["valid"] else 1
+
+def register_selftest(sub: argparse._SubParsersAction) -> None:
+    """Register the `selftest` subcommand on `sub`."""
+    p_self = sub.add_parser(
+        "selftest",
+        help=(
+            "plant a known capability deficit in synthetic traces and measure how "
+            "often the ranker recovers it, across trace counts and prevalences"
+        ),
+    )
+    p_self.add_argument("--out", default="./vektori-selftest", help="output directory")
+    p_self.add_argument("--model", default=None, help="OpenAI model override")
+    p_self.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="runs per config; the proposer and labeller are sampled, so one run is one draw",
+    )
+    p_self.add_argument(
+        "--quick",
+        action="store_true",
+        help="a single easy config (6w/6l, prevalence 1.0) instead of the full sweep",
+    )
+    p_self.add_argument(
+        "--ceiling-only",
+        action="store_true",
+        help=(
+            "skip the LLM entirely and report only what a perfect proposer and "
+            "labeller would recover — free, offline, and an upper bound on any real run"
+        ),
+    )
+    # Same validators as `diagnose` — the sweep scores recovery against these
+    # thresholds, so a NaN here silently reports 100% recovery.
+    p_self.add_argument("--min-gap", type=_min_gap_arg, default=DEFAULT_MIN_GAP)
+    p_self.add_argument("--min-support", type=_min_support_arg, default=DEFAULT_MIN_SUPPORT)
+    p_self.add_argument("--seed", type=int, default=0)
+    p_self.set_defaults(func=cmd_selftest)
+
+def register_checkenv(sub: argparse._SubParsersAction) -> None:
+    """Register the `check-env` subcommand on `sub`."""
+    p_env = sub.add_parser(
+        "check-env",
+        help=(
+            "verify inside a real container that an emitted task's Dockerfile "
+            "(base commit + git scrub) and compose overlay (egress guard) both take effect"
+        ),
+    )
+    p_env.add_argument("--out", default="./vektori-envcheck", help="output directory")
+    p_env.add_argument(
+        "--reward-hack",
+        action="store_true",
+        help=(
+            "also run an agent that fixes nothing and forges its own reward, to "
+            "measure whether the shared-container verifier can be gamed"
+        ),
+    )
+    p_env.set_defaults(func=cmd_checkenv)
+
+def register_prove(sub: argparse._SubParsersAction) -> None:
+    """Register the `prove` subcommand on `sub`."""
+    p_prove = sub.add_parser("prove", help="run the validity proof for an already-generated task")
+    p_prove.add_argument("task_dir")
+    p_prove.add_argument("--out", default="./vektori-out")
+    p_prove.add_argument("--base-agent", default=None)
+    p_prove.add_argument("--base-model", default=None)
+    p_prove.set_defaults(func=cmd_prove)

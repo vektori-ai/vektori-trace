@@ -241,3 +241,158 @@ def cmd_mine(args: argparse.Namespace) -> int:
         print(f"  {skipped} task(s) skipped (unjudgeable — see the skip lines above)")
     print(f"\nNext: vektori-trace diagnose --manifest {manifest_path} --out {args.out}")
     return 0
+
+def register_mine(sub: argparse._SubParsersAction) -> None:
+    """Register the `mine` subcommand on `sub`."""
+    p_mine = sub.add_parser(
+        "mine",
+        help=(
+            "mine a repo's real PR history into sandbox-verified tasks, run an agent "
+            "against each, and write win/loss traces + a manifest for `diagnose`"
+        ),
+    )
+    p_mine.add_argument("--repo", required=True, help="'owner/name' or a full GitHub URL")
+    p_mine.add_argument(
+        "--dockerfile",
+        default=None,
+        help=(
+            "path to the repo's own working Dockerfile (skips the bootstrap agent). "
+            "Omit to let the agent auto-discover the build/test setup instead — needed "
+            "when there's no Dockerfile yet, or a mined PR predates what the current "
+            "one can build."
+        ),
+    )
+    p_mine.add_argument(
+        "--agent",
+        default="claude-code",
+        help=(
+            "harbor agent name to run against each task. Harbor's names are hyphenated "
+            "(claude-code, codex, terminus-2); underscores are normalised"
+        ),
+    )
+    p_mine.add_argument("--model", default=None, help="model name for --agent")
+    p_mine.add_argument(
+        "--llm-provider", default="openai", help="provider for the bootstrap agent's LLM calls"
+    )
+    p_mine.add_argument(
+        "--llm-model", default="gpt-5-nano", help="model for the bootstrap agent's LLM calls"
+    )
+    p_mine.add_argument("--out", default="./vektori-out", help="output directory")
+    p_mine.add_argument(
+        "--limit", type=int, default=50, help="how many merged PRs to consider (default 50)"
+    )
+    p_mine.add_argument(
+        "--test-cmd",
+        action="append",
+        default=[],
+        help=(
+            "how to run the suite, repeatable. Required with --dockerfile: skipping the "
+            "bootstrap agent means nothing discovers the test command, and F2P/P2P are derived "
+            "by running the suite, so without it every PR skips as no_fail_to_pass"
+        ),
+    )
+    p_mine.add_argument(
+        "--language",
+        default=None,
+        choices=["python", "node", "go", "rust", "java", "c_cpp"],
+        help="language hint for --dockerfile runs (selects the toolchain PATH prelude)",
+    )
+    p_mine.add_argument(
+        "--no-require-linked-issue",
+        action="store_true",
+        help=(
+            "keep PRs with no 'Fixes #N' trailer. The linked issue is what gives the task a "
+            "problem statement written before the fix existed; without one the PR body is the "
+            "only source and it describes the solution"
+        ),
+    )
+    p_mine.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help=(
+            "emit tasks without running the suite twice to derive F2P/P2P. Fast, and the result "
+            "is an UNVERIFIED task graded on exit code alone — never train on these"
+        ),
+    )
+    p_mine.add_argument(
+        "--no-replay",
+        action="store_true",
+        help="mine, audit and stop, without running an agent to collect traces",
+    )
+    p_mine.set_defaults(func=cmd_mine)
+
+def register_mine_commits(sub: argparse._SubParsersAction) -> None:
+    """Register the `mine-commits` subcommand on `sub`."""
+    p_mine_commits = sub.add_parser(
+        "mine-commits",
+        help=(
+            "mine a repo's COMMIT history into sandbox-verified tasks. Sibling of `mine`: "
+            # argparse runs help strings through %-formatting, so a literal
+            # percent must be doubled or "% o" is read as an octal format spec
+            # and `--help` dies with a TypeError.
+            "reaches fixes that never became a PR with a linked issue (54%% of candidates in "
+            "the prefect pilot), at the cost of an LLM-synthesized problem statement"
+        ),
+    )
+    p_mine_commits.add_argument("--repo", required=True, help="'owner/name' or a full GitHub URL")
+    p_mine_commits.add_argument(
+        "--dockerfile", default=None, help="the repo's own Dockerfile (skips the bootstrap agent)"
+    )
+    p_mine_commits.add_argument("--out", default="./vektori-out", help="output directory")
+    p_mine_commits.add_argument(
+        "--limit", type=int, default=50, help="how many commits to walk (default 50)"
+    )
+    p_mine_commits.add_argument(
+        "--branch", default="HEAD", help="branch to walk (default HEAD)"
+    )
+    p_mine_commits.add_argument(
+        "--clone-depth",
+        type=int,
+        default=200,
+        help=(
+            "clone depth for the log walk (default 200). Must exceed --limit or git log "
+            "runs out of history before the limit is reached"
+        ),
+    )
+    p_mine_commits.add_argument(
+        "--test-cmd",
+        action="append",
+        default=[],
+        help="how to run the suite, repeatable. Required with --dockerfile (see `mine`)",
+    )
+    p_mine_commits.add_argument(
+        "--language",
+        default=None,
+        choices=["python", "node", "go", "rust", "java", "c_cpp"],
+        help="language hint for --dockerfile runs",
+    )
+    p_mine_commits.add_argument(
+        "--llm-provider", default="openai", help="provider for bootstrap + synthesis LLM calls"
+    )
+    p_mine_commits.add_argument(
+        "--llm-model", default="gpt-5-nano", help="model for bootstrap + synthesis LLM calls"
+    )
+    p_mine_commits.add_argument(
+        "--no-synthesis",
+        action="store_true",
+        help=(
+            "use raw commit text as the problem statement instead of an LLM rewrite. "
+            "NOT RECOMMENDED: commit messages are written after the fix and routinely name "
+            "the changed function, so an agent can score 1.0 by reading the prompt"
+        ),
+    )
+    p_mine_commits.add_argument(
+        "--max-pass-to-pass",
+        type=int,
+        default=50,
+        help=(
+            "cap the P2P regression set (default 50, 0 disables). The graded reward is "
+            "f2p_rate*p2p_rate, so a whole-suite P2P scales correct solves down on any flake"
+        ),
+    )
+    p_mine_commits.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="emit without deriving F2P/P2P. UNVERIFIED tasks — never train on these",
+    )
+    p_mine_commits.set_defaults(func=cmd_mine_commits)

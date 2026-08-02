@@ -171,3 +171,57 @@ def cmd_plan_b_arms(args: argparse.Namespace) -> int:
     path.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"B-arm plan: {path}")
     return 0
+
+def register_route(sub: argparse._SubParsersAction) -> None:
+    """Register the `route` subcommand on `sub`."""
+    p_route = sub.add_parser(
+        "route",
+        help="Step F: apply routing rule to a passk JSON report → RL|OPD|QUARANTINE|NONE",
+    )
+    p_route.add_argument("--student-passk", required=True, help="passk JSON for the student")
+    p_route.add_argument("--teacher-passk", required=True, help="passk JSON for the teacher")
+    p_route.add_argument(
+        "--diagnosis",
+        default=None,
+        help="report.json from `diagnose` — cells become (task × LACKING capability)",
+    )
+    p_route.add_argument(
+        "--manifest",
+        default=None,
+        help="replay manifest.json, required with --diagnosis (run_id → task)",
+    )
+    p_route.add_argument(
+        "--chosen-deficit-only",
+        action="store_true",
+        help="route only the chosen deficit instead of every ranked capability",
+    )
+    p_route.add_argument(
+        "--capability",
+        default="default",
+        help="single label for every task; ignored when --diagnosis is given",
+    )
+    p_route.add_argument("--out", default="./vektori-out")
+    p_route.set_defaults(func=cmd_route)
+
+def register_plan_b_arms(sub: argparse._SubParsersAction) -> None:
+    """Register the `plan-b-arms` subcommand on `sub`."""
+    p_bplan = sub.add_parser(
+        "plan-b-arms",
+        help="Step I: build B1–B4 assignment plans from routing.json (pilot caps at 10)",
+    )
+    p_bplan.add_argument("--routing", required=True, help="routing.json from `route`")
+    p_bplan.add_argument("--out", default="./vektori-out")
+    p_bplan.add_argument("--resolvable-effect-size", type=float, default=None)
+    p_bplan.add_argument("--pilot", action="store_true")
+    p_bplan.add_argument("--seed", type=int, default=0)
+    p_bplan.add_argument(
+        "--holdout",
+        default=None,
+        help="file of held-out task ids, one per line — removed from every training arm",
+    )
+    p_bplan.add_argument(
+        "--preregistered-only",
+        action="store_true",
+        help="drop cells decided by a rule outside the pre-registration (mid band)",
+    )
+    p_bplan.set_defaults(func=cmd_plan_b_arms)
