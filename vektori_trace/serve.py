@@ -34,6 +34,10 @@ DEFAULT_HOSTED_VLLM_MODEL_INFO: dict[str, Any] = {
 
 _SERVE_APP_NAME = "vektori-trace-serve"
 
+# Pinned together — see the comment in serve_model before changing either.
+VLLM_VERSION = "0.21.0"
+VLLM_CUDA_IMAGE = "nvidia/cuda:12.9.0-devel-ubuntu22.04"
+
 
 def _require_modal():
     try:
@@ -57,6 +61,8 @@ class ServedModel:
     adapter_path: str | None = None
     gpu: str = "A10G"
     base_model: str = ""
+    max_model_len: int | None = None
+    gpu_memory_utilization: float | None = None
 
     @property
     def harbor_model(self) -> str:
@@ -97,24 +103,79 @@ def serve_model(
     adapter_path: str | None = None,
     gpu: str = "A10G",
     model_info: dict[str, Any] | None = None,
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    extra_vllm_args: list[str] | None = None,
 ) -> Iterator[ServedModel]:
     """Spin up Modal vLLM with optional LoRA; tear down on exit.
 
     Not unit-tested (needs GPU + real vLLM) — smoke-tested like measure_pass_rates.
+
+    `max_model_len` is not optional in practice on a small card. vLLM defaults it
+    to the model's own maximum — 40 960 for Qwen3-8B — and refuses to start when
+    that exceeds what the KV cache can hold. On a 24 GB A10G the arithmetic is:
+
+        24 GiB × 0.90 utilisation      = 21.6 GiB
+        − 15.3 GiB bf16 weights
+        − ~1.3 GiB CUDA context/workspace
+        =  ~5.0 GiB for KV
+
+    and Qwen3-8B costs 144 KiB per token of KV (36 layers × 8 GQA KV heads ×
+    128 head_dim × 2 for K and V × 2 bytes), so ~36 700 tokens fit *in total,
+    across all concurrent sequences*. Asking for 40 960 for a single sequence is
+    already more than the card has, and vLLM fails at startup rather than
+    silently degrading. Set this to the longest trajectory you actually need.
     """
     _require_modal()
     import modal
 
     info = dict(model_info or DEFAULT_HOSTED_VLLM_MODEL_INFO)
+    if model_info is None and max_model_len is not None:
+        # DEFAULT_HOSTED_VLLM_MODEL_INFO advertises 32768 input tokens. harbor
+        # and litellm believe it and will send prompts that large. If vLLM was
+        # started with a smaller --max-model-len those requests are rejected
+        # mid-sweep, after the rollout has already done its work. Advertise the
+        # window we actually launched with; reserve a little for the completion.
+        info["max_input_tokens"] = max(1, max_model_len - 512)
+        info["max_output_tokens"] = min(
+            int(info.get("max_output_tokens", 8192)), max(1, max_model_len - 512)
+        )
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
+    # Base image and vLLM version are PINNED TOGETHER, and must move together.
+    #
+    # vLLM publishes wheels for several CUDA lines and `pip install vllm`
+    # (unpinned) resolves to the newest, which currently drags in cu13 packages
+    # (nvidia-nccl-cu13, nvidia-cudnn-cu13, ...). Dropping those on a CUDA 12.8
+    # base is a version mismatch, and the earlier `debian_slim` image had no
+    # CUDA toolchain at all, so vLLM's V1 engine died on:
+    #   RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
+    #                 doesn't exist
+    # Both failures land *after* Modal has allocated a GPU and pulled ~16 GB of
+    # weights, and both surface as "Engine core initialization failed" with the
+    # real cause a hundred lines earlier.
+    #
+    # This is the pair Modal publishes in its own vLLM example, so it is a
+    # tested combination rather than an inference from the changelog. `-devel`
+    # (not `-runtime`) is required: it carries nvcc.
     image = (
-        modal.Image.debian_slim(python_version="3.12")
-        .pip_install("vllm", "huggingface_hub")
-        .env({"HF_HOME": HF_CACHE_MOUNT})
+        modal.Image.from_registry(
+            VLLM_CUDA_IMAGE, add_python="3.12"
+        )
+        .pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub")
+        .env(
+            {
+                "HF_HOME": HF_CACHE_MOUNT,
+                # Faster weight pulls from the Hub.
+                "HF_XET_HIGH_PERFORMANCE": "1",
+                # Emit engine stats every second so /metrics is actually live —
+                # scripts/vllm_monitor.py reads exactly these.
+                "VLLM_LOG_STATS_INTERVAL": "1",
+            }
+        )
     )
 
     app = modal.App(_SERVE_APP_NAME)
@@ -122,6 +183,13 @@ def serve_model(
     @app.cls(
         gpu=gpu,
         image=image,
+        # VllmServer is defined inside this function so it can close over
+        # `base_model`, `name`, `vol_adapter` and the vLLM flags. Modal
+        # normally requires globals-scope classes because it re-imports them by
+        # module path in the container; `serialized=True` makes it pickle the
+        # class instead, which is what a locally-defined one needs. Without it
+        # every call raised LocalFunctionError before reaching the GPU.
+        serialized=True,
         # HF_HOME is backed by a Volume so weights survive scale-to-zero. The
         # env var alone only relocated the cache inside an ephemeral container,
         # so every cold start paid to download the model again.
@@ -157,17 +225,38 @@ def serve_model(
                 "--served-model-name",
                 name,
             ]
+            if max_model_len is not None:
+                cmd += ["--max-model-len", str(max_model_len)]
+            if gpu_memory_utilization is not None:
+                cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+            if extra_vllm_args:
+                cmd += list(extra_vllm_args)
             if vol_adapter:
                 cmd += ["--enable-lora", "--lora-modules", f"{name}={vol_adapter}"]
-            subprocess.Popen(cmd)
+            # Inherit stdout/stderr so vLLM's own log reaches `modal app logs`.
+            proc = subprocess.Popen(cmd)
             deadline = time.time() + 60 * 25
             while time.time() < deadline:
+                # Fail the moment the process exits. Polling only /health meant a
+                # vLLM that died at second 30 — a missing nvcc, a CUDA mismatch —
+                # still burned the full 25-minute deadline on a GPU before
+                # raising, and the error said "failed to become healthy in time"
+                # rather than naming the cause.
+                rc = proc.poll()
+                if rc is not None:
+                    raise RuntimeError(
+                        f"vLLM exited with code {rc} before becoming healthy. "
+                        "The real cause is in this container's log above — "
+                        "engine-core tracebacks print it ~150 lines before the "
+                        "final 'Engine core initialization failed'."
+                    )
                 try:
                     urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)
                     return
                 except Exception:
                     time.sleep(2)
-            raise RuntimeError("vLLM failed to become healthy in time")
+            proc.terminate()
+            raise RuntimeError("vLLM failed to become healthy within 25 minutes")
 
     with app.run():
         server = VllmServer()
@@ -185,6 +274,8 @@ def serve_model(
             adapter_path=vol_adapter,
             gpu=gpu,
             base_model=base_model,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         yield served
 
