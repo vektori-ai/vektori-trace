@@ -1,0 +1,54 @@
+{
+  "mode": "stages",
+  "gpu": "NVIDIA A10",
+  "total_mib": 22588,
+  "stages_mib": {
+    "baseline": 0,
+    "after_from_pretrained": 5806,
+    "after_prepare_for_kbit": 8181,
+    "after_get_peft_model": 8239
+  },
+  "param_mib_by_dtype": {
+    "torch.bfloat16": 2375,
+    "torch.uint8": 3312
+  },
+  "largest_params": [
+    {
+      "name": "model.embed_tokens.weight",
+      "mib": 1187,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "name": "lm_head.weight",
+      "mib": 1187,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "name": "model.layers.0.mlp.gate_proj.weight",
+      "mib": 24,
+      "dtype": "torch.uint8"
+    },
+    {
+      "name": "model.layers.0.mlp.up_proj.weight",
+      "mib": 24,
+      "dtype": "torch.uint8"
+    },
+    {
+      "name": "model.layers.0.mlp.down_proj.weight",
+      "mib": 24,
+      "dtype": "torch.uint8"
+    },
+    {
+      "name": "model.layers.1.mlp.gate_proj.weight",
+      "mib": 24,
+      "dtype": "torch.uint8"
+    }
+  ],
+  "base_model": "Qwen/Qwen3-8B",
+  "seq_len": 8192,
+  "batch_size": 1,
+  "grad_accum": 1,
+  "max_steps": 2,
+  "gradient_checkpointing": true,
+  "load_in_4bit": true
+}

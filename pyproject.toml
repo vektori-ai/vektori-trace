@@ -27,6 +27,12 @@ train = [
     "accelerate",
     "datasets",
     "modal",
+    # 4-bit base weights. Not a tuning knob: measured on Modal, Qwen3-8B LoRA in
+    # bf16 peaks at ~20.5GB before the loss head and OOMs a 24GB A10G at both
+    # 8192 and 4096 context (docs/vram-probe*.json). 24GB is this project's
+    # permanent ceiling, so quantizing the frozen base is what makes training
+    # possible at all.
+    "bitsandbytes",
 ]
 
 # Bedrock Custom Model Import teacher (`teacher_bedrock.py`). Optional because

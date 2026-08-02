@@ -1,0 +1,15 @@
+{
+  "gpu": "NVIDIA A10",
+  "total_mib": 22588,
+  "peak_allocated_mib": 15459,
+  "peak_reserved_mib": 17514,
+  "headroom_mib": 5074,
+  "oom": null,
+  "base_model": "Qwen/Qwen3-8B",
+  "seq_len": 4096,
+  "batch_size": 1,
+  "grad_accum": 1,
+  "max_steps": 2,
+  "gradient_checkpointing": true,
+  "load_in_4bit": true
+}
