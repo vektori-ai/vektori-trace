@@ -7,8 +7,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from vektori_trace.evaluate.validity import run_trial
 
 
@@ -35,7 +33,7 @@ def test_timeout_persists_partial_output(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_trial(
+    run_trial(
         task_dir=tmp_path,
         agent="terminus-2",
         jobs_dir=tmp_path / "jobs",
