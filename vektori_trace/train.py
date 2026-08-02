@@ -89,6 +89,13 @@ class TrainConfig:
     # wastes an 80GB one. Ignored when CUDA is unavailable (offline tests train a
     # tiny model on CPU, where bf16 is slower and less numerically forgiving).
     bf16: bool = True
+    # Load the frozen base in 4-bit NF4 (QLoRA). Measured on Modal: Qwen3-8B in
+    # bf16 holds ~16.4GB of weights and peaks at ~20.5GB before the loss head is
+    # even allocated, so it OOMs a 24GB A10G at 8192 *and* at 4096 context —
+    # shortening sequences cannot fix a constant term (docs/vram-probe*.json).
+    # 4-bit takes the base to ~5.5GB. LoRA adapters stay bf16 and are what the
+    # optimizer actually updates, so the trained parameters are not quantized.
+    load_in_4bit: bool = False
     gradient_accumulation_steps: int = 1
     # Trades ~30% step time for a large activation-memory reduction. Off by
     # default so short pilot runs stay fast; turn it on when sequences are long.
@@ -187,12 +194,51 @@ def train_lora(
     use_bf16 = bool(
         config.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     )
+    # Quantization needs a CUDA device; on the CPU smoke tests it would either
+    # error or silently fall back, so it is ignored there rather than honoured
+    # halfway.
+    use_4bit = bool(config.load_in_4bit and torch.cuda.is_available())
     if model is None:
+        quant_kwargs: dict[str, Any] = {}
+        if use_4bit:
+            from transformers import BitsAndBytesConfig
+
+            quant_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                # Dequantize to bf16 for the matmul. fp32 compute would give
+                # back most of the memory 4-bit just bought.
+                bnb_4bit_compute_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+                # Quantizes the quantization constants too. Small further win,
+                # no measurable quality cost at r=16.
+                bnb_4bit_use_double_quant=True,
+            )
         model = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+            **quant_kwargs,
         )
+    if use_4bit:
+        from peft import prepare_model_for_kbit_training
+
+        # Casts layer norms and the lm_head to fp32 and enables input grads.
+        # Without it a 4-bit base trains to NaN or produces an empty backward
+        # pass, both of which look like a data bug rather than a setup bug.
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=config.gradient_checkpointing
+        )
+        # ...but it upcasts *every* non-quantized parameter to fp32, and on a
+        # 151k-vocab model the two it catches are the embedding and lm_head at
+        # ~1.2GB each. The weights are the small half: an fp32 lm_head emits
+        # fp32 logits, so at 8192 context the logit tensor and its gradient go
+        # 2.32GB -> 4.64GB each. Measured, that made 4-bit peak *higher* than
+        # bf16 (docs/vram-stages-*.json). Cast the two big tensors back; the
+        # layer norms this upcast exists to stabilise are tiny and stay fp32.
+        compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        for embed in (model.get_input_embeddings(), model.get_output_embeddings()):
+            if embed is not None:
+                embed.to(compute_dtype)
 
     target = list(config.lora.target_modules)
     named = {n.split(".")[-1] for n, _ in model.named_modules()}
@@ -322,6 +368,7 @@ def train_lora_modal(
         "volume_adapter_path": vol_path,
         "arm": config.arm,
         "bf16": config.bf16,
+        "load_in_4bit": config.load_in_4bit,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "gradient_checkpointing": config.gradient_checkpointing,
         "warmup_ratio": config.warmup_ratio,
@@ -335,7 +382,9 @@ def train_lora_modal(
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
     image = (
         modal.Image.debian_slim(python_version="3.12")
-        .pip_install("torch", "transformers", "peft", "accelerate", "datasets")
+        .pip_install(
+            "torch", "transformers", "peft", "accelerate", "datasets", "bitsandbytes"
+        )
         .env({"HF_HOME": HF_CACHE_MOUNT})
         .add_local_python_source("vektori_trace")
     )
@@ -373,6 +422,7 @@ def train_lora_modal(
                 use_modal=False,
                 arm=cfg.get("arm"),
                 bf16=cfg.get("bf16", True),
+                load_in_4bit=cfg.get("load_in_4bit", False),
                 gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
                 gradient_checkpointing=cfg.get("gradient_checkpointing", False),
                 warmup_ratio=cfg.get("warmup_ratio", 0.03),

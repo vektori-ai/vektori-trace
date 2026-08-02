@@ -119,13 +119,23 @@ def _pipeline(**opts) -> CommitRuntimePipeline:
         ({"parents": ["b" * 40, "c" * 40]}, "merge_commit"),
         ({"parent_sha": "", "parents": []}, "root_commit"),
         ({"author_name": "dependabot[bot]"}, "excluded_author"),
+        ({"author_name": "renovate[bot]"}, "excluded_author"),
         ({"subject": "wip"}, "message_too_short"),
         ({"subject": "feat: add a brand new exporting subsystem"}, "non_bug_type"),
-        ({"subject": "update the docs for the new release process"}, "not_a_bugfix"),
     ],
 )
 def test_metadata_filter_rejects(kwargs: dict, expected: str) -> None:
     assert _pipeline()._metadata_filter(_commit(**kwargs)) == expected
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"subject": "update the docs for the new release process"}, "not_a_bugfix"),
+    ],
+)
+def test_metadata_filter_rejects_with_keyword_gate_on(kwargs: dict, expected: str) -> None:
+    assert _pipeline(require_bugfix_keyword=True)._metadata_filter(_commit(**kwargs)) == expected
 
 
 @pytest.mark.parametrize(
@@ -146,13 +156,14 @@ def test_bugfix_signal_required_without_prefix_or_issue() -> None:
     Without a positive signal the candidate reaches validation, which costs a
     container run per commit — the expensive stage this filter exists to guard.
     """
+    pipe = _pipeline(require_bugfix_keyword=True)
     plain = _commit(subject="add support for exporting reports as PDF files")
-    assert _pipeline()._metadata_filter(plain) == "not_a_bugfix"
+    assert pipe._metadata_filter(plain) == "not_a_bugfix"
     linked = _commit(
         subject="add support for exporting reports as PDF files",
         body="Closes #42",
     )
-    assert _pipeline()._metadata_filter(linked) is None
+    assert pipe._metadata_filter(linked) is None
 
 
 def test_cap_pass_to_pass_is_bounded_and_deterministic() -> None:
@@ -279,3 +290,51 @@ def test_instruction_prefers_the_issue_over_the_commit_message() -> None:
     )
     assert "App crashes on startup" in text
     assert "validator" not in text
+
+
+def test_ai_agent_bots_are_not_excluded() -> None:
+    """`[bot]` is not a proxy for "not a real fix".
+
+    Measured on the last 25 prefect commits: a blanket `[bot]` pattern excluded
+    18, about half of them real fixes authored by `devin-ai-integration[bot]`.
+    One was "Reject unknown fields for FlowRunFilter" (#22659) — a change
+    pr_runtime had already emitted as a valid task, so the two pipelines
+    disagreed about the same commit.
+    """
+    agent = _commit(
+        author_name="devin-ai-integration[bot]",
+        author_email="158243242+devin-ai-integration[bot]@users.noreply.github.com",
+        subject="Reject unknown fields for FlowRunFilter and its nested criteria",
+        body="Unknown keys were silently accepted and dropped instead of raising.",
+    )
+    assert _pipeline()._metadata_filter(agent) is None
+
+    gha = _commit(
+        author_name="github-actions[bot]",
+        subject="fix: correct the stale lease-cleanup invariant",
+        body="The documented invariant no longer matches the implementation.",
+    )
+    assert _pipeline()._metadata_filter(gha) is None
+
+
+def test_dependency_bumps_are_rejected_on_content_not_just_author() -> None:
+    """The author list is a cheap pre-filter, not the actual gate.
+
+    A dependency bump from an unrecognised bot account must still be dropped,
+    or narrowing the author list would open a hole.
+    """
+    bump = _commit(
+        author_name="some-unknown-ci-account",
+        subject="chore(deps): bump docker/login-action from 4 to 4.5.2",
+    )
+    assert _pipeline()._metadata_filter(bump) == "non_bug_type"
+
+
+def test_exclude_authors_option_overrides_the_default_list() -> None:
+    custom = _pipeline(exclude_authors=["desertaxle"])
+    assert custom._metadata_filter(_commit(author_email="desertaxle@users.noreply.github.com")) == (
+        "excluded_author"
+    )
+    # Overriding replaces the defaults, so dependabot is no longer named —
+    # its `chore(deps)` content still is.
+    assert custom._metadata_filter(_commit(author_name="dependabot[bot]")) is None

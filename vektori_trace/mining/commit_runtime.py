@@ -111,13 +111,23 @@ _BUGFIX_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Bot authors. Their commits are real and their diffs are large, which is the
-# worst combination: they consume validation budget and never yield a bug fix.
+# Dependency-automation authors only — bots whose *every* commit is a version
+# bump, so excluding them by name costs nothing.
+#
+# Deliberately NOT `[bot]`. Measured on the last 25 prefect commits, a blanket
+# bot pattern excluded 18 of them, and roughly half were real fixes authored by
+# `devin-ai-integration[bot]` — an AI agent that lands substantive changes.
+# One of them was `Reject unknown fields for FlowRunFilter` (#22659), which
+# pr_runtime had already emitted as a valid task: the same change accepted by
+# one pipeline and discarded by the other.
+#
+# Dependency bumps are `chore(deps): …`, which `_NON_BUG_TYPE_RE` rejects on
+# content anyway. So author matching is redundant where it is right and
+# destructive where it is wrong; content filters are the principled gate and
+# this list stays as narrow as possible.
 _DEFAULT_BOT_PATTERNS = (
-    "[bot]",
     "dependabot",
     "renovate",
-    "github-actions",
     "pre-commit-ci",
 )
 
@@ -391,13 +401,16 @@ class CommitRuntimePipeline:
         if _NON_BUG_TYPE_RE.match(subject):
             return "non_bug_type"
 
-        # Positive evidence required: a `fix:` prefix, a linked issue, or a
-        # bugfix keyword somewhere in the message.
-        has_fix_prefix = bool(re.match(r"^fix(?:\([^)]+\))?!?:", subject, re.IGNORECASE))
-        has_issue_ref = bool(_CLOSES_RE.search(commit.message))
-        has_keyword = bool(_BUGFIX_KEYWORD_RE.search(subject))
-        if not (has_fix_prefix or has_issue_ref or has_keyword):
-            return "not_a_bugfix"
+        # Opt-in. A subject that doesn't say "fix" is not evidence the commit
+        # isn't one — see `require_bugfix_keyword` for the measurement. The
+        # structural filter (must add a new test function) and the F2P oracle
+        # are what actually establish that a task is real.
+        if self.options.require_bugfix_keyword:
+            has_fix_prefix = bool(re.match(r"^fix(?:\([^)]+\))?!?:", subject, re.IGNORECASE))
+            has_issue_ref = bool(_CLOSES_RE.search(commit.message))
+            has_keyword = bool(_BUGFIX_KEYWORD_RE.search(subject))
+            if not (has_fix_prefix or has_issue_ref or has_keyword):
+                return "not_a_bugfix"
 
         if (
             self.options.min_problem_statement_words > 0
