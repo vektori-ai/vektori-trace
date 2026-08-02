@@ -12,3 +12,18 @@ vektori-selftest/
 vektori-envcheck/
 # Bootstrap image cache (R2E_CACHE_DIR default) — per-machine build state
 workspace/
+
+# Mining/case-study output (48 harbor task dirs on the AWS box). Run artifacts,
+# same class as vektori-out-*: reproducible from `mine`, and 4.6MB of generated
+# task dirs does not belong in the history.
+cs/
+
+# Working notes, kept local. These are drafts and snapshots, not documentation:
+# mined-tasks-inventory.md in particular is a 2026-07-31 snapshot of the
+# vektori-out-* anyio/click/tenacity corpus, taken before the commit_runtime
+# pipeline (#26/#27) produced the prefect tasks that superseded it.
+docs/mined-tasks-inventory.md
+docs/PAPER_BRAINDUMP.md
+docs/TECHNICAL_NOTES.md
+docs/opd-aws-fireworks.md
+docs/AWS_PORT_PLAN.md

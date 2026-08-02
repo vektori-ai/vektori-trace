@@ -116,8 +116,12 @@ mid-build.
 | `docs/TECHNICAL_NOTES.md` *(untracked)* | Near-duplicate of `PAPER_BRAINDUMP.md`: same title, same six headings; `PAPER_BRAINDUMP.md` has a seventh ("Cost basis"). **Confirm with the author before bannering.** |
 
 **Valid, safe to reference:** `docs/OPD.md` (method reference, corrected in
-`bcf37c0`), `docs/HOSTED_TEACHERS.md`, `docs/mined-tasks-inventory.md`,
-`PLAN.md` / `V0_PLAN.md` (mining + diagnosis halves), `docs/network-policy.md`.
+`bcf37c0`), `docs/HOSTED_TEACHERS.md`, `PLAN.md` / `V0_PLAN.md` (mining +
+diagnosis halves), `docs/network-policy.md`.
+
+`docs/mined-tasks-inventory.md` *(untracked)* was on that list and no longer is:
+it inventories the `vektori-out-*` anyio/click/tenacity corpus, which the
+`commit_runtime` prefect tasks superseded. See the open item below.
 
 **Fix dangling pointers** so nothing routes a reader into a bannered doc:
 `cli.py` help strings citing `PLAN.md Step H` / `docs/PILOT.md`, and `docs/AWS.md`'s
@@ -757,12 +761,17 @@ uv run vektori-trace distill --cross-tokenizer --bridge … \
   or 1×A100-40G is the safe call.
 - **`TECHNICAL_NOTES.md` vs `PAPER_BRAINDUMP.md`** — confirm which is superseded
   before bannering.
-- **The mined tasks are unmeasured against the student.** 22 tasks / 18
-  audit-passed, from 4 small pure-Python libraries (anyio, click, tenacity,
-  structlog), all mining-only (`--no-replay`), **no pass-rate run**
-  (`docs/mined-tasks-inventory.md`). Separate from this plan but gates its value:
-  if the student already solves them there is no gap to distil into, and the
-  deficit-band selection in `select.py` exists precisely to answer this. Risks:
-  thin volume, narrow diversity, and contamination (popular libraries with public
-  PRs — a pass may be recall, not capability). **Run `passrate` + `select` before
-  spending on stage 5+.**
+- **The mined tasks are unmeasured against the student.** Still true, but the
+  corpus has changed. `docs/mined-tasks-inventory.md` *(untracked, and now
+  superseded)* describes 22 tasks from 4 small pure-Python libraries (anyio,
+  click, tenacity, structlog) — a 2026-07-31 snapshot of the local
+  `vektori-out-*` runs, taken before the `commit_runtime` pipeline (#26/#27).
+  What exists now is **48 task dirs / 46 unique ids, all `prefecthq/prefect`**,
+  under `cs/smoke/*/mined_tasks/` on the AWS box — untracked and present on that
+  EBS volume only. Both corpora are mining-only (`--no-replay`) with **no
+  pass-rate run**. This gates the plan's value: if the student already solves
+  them there is no gap to distil into, and the deficit-band selection in
+  `select.py` exists precisely to answer this. Risks are unchanged and if
+  anything sharper on prefect — contamination especially, since it is a popular
+  repo with public PRs, so a pass may be recall rather than capability.
+  **Run `passrate` + `select` before spending on stage 5+.**
