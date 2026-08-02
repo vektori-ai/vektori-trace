@@ -271,3 +271,28 @@ def test_replay_endpoint_flags_are_candidate_only() -> None:
     )
     assert args.candidate_api_base == "https://example.modal.run/v1"
     assert not hasattr(args, "frontier_api_base")
+
+
+def test_every_subcommand_help_renders() -> None:
+    """`--help` must format for every subparser.
+
+    argparse runs help strings through %-formatting when it renders them, so a
+    literal percent in help text ("54% of candidates") is read as a format spec
+    and `--help` dies with a TypeError. Nothing else exercises that path: the
+    parser builds fine, every other command works, and the break only shows up
+    when someone asks for help.
+    """
+    parser = build_parser()
+    parser.format_help()
+
+    actions = [
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    ]
+    assert actions, "expected a subparser group"
+    subparsers = actions[0].choices
+    assert "mine-commits" in subparsers
+    for name, sub in subparsers.items():
+        try:
+            sub.format_help()
+        except (TypeError, ValueError) as exc:  # pragma: no cover - failure path
+            raise AssertionError(f"`{name} --help` does not render: {exc}") from exc

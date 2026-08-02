@@ -21,6 +21,8 @@ from typing import Protocol
 from vektori_trace.mining import (
     AuthSpec,
     BootstrapSpec,
+    CommitRuntimeOptions,
+    CommitRuntimePipeline,
     LLMSpec,
     OutputSpec,
     PipelineInput,
@@ -88,6 +90,48 @@ def mine_tasks(
     )
     bootstrap = ensure_bootstrap(pipeline_input.repo, pipeline_input.bootstrap, llm)
     pipeline = PRRuntimePipeline(pipeline_input, options or PRRuntimeOptions(), bootstrap=bootstrap)
+    result = pipeline.run(out_dir)
+    return discover_tasks(out_dir), result
+
+
+def mine_commits(
+    repo: str,
+    out_dir: Path,
+    *,
+    llm: LLMSpec,
+    user_dockerfile: Path | None = None,
+    test_cmds: list[str] | None = None,
+    language: str | None = None,
+    org: str = "vektori",
+    options: CommitRuntimeOptions | None = None,
+) -> tuple[list[Path], PipelineResult]:
+    """Mine `repo`'s commit history into sandbox-verified Harbor tasks.
+
+    The commit-level sibling of `mine_tasks`. Same bootstrap, same validation
+    harness, same task shape — it differs only in where candidates come from
+    and in synthesizing the problem statement rather than quoting it.
+
+    Use it when `mine_tasks` yields too little: a PR mine can only see fixes
+    that arrived as a merged PR with a linked issue, and on repos that
+    squash-merge or commit to main directly, most fixes are invisible to it.
+    The two pipelines write the same `out_dir` shape, so their output can be
+    pooled.
+    """
+    pipeline_input = PipelineInput(
+        repo=RepoSpec(url=repo),
+        llm=llm,
+        output=OutputSpec(org=org),
+        auth=AuthSpec(),
+        bootstrap=BootstrapSpec(
+            user_dockerfile=user_dockerfile,
+            user_test_cmds=test_cmds or [],
+            user_language=language,
+        ),
+    )
+    bootstrap = ensure_bootstrap(pipeline_input.repo, pipeline_input.bootstrap, llm)
+    pipeline = CommitRuntimePipeline(
+        pipeline_input, options or CommitRuntimeOptions(), bootstrap=bootstrap
+    )
     result = pipeline.run(out_dir)
     return discover_tasks(out_dir), result
 
