@@ -442,3 +442,50 @@ def test_audit_reads_the_commit_runtime_metadata_table(tmp_path: Path) -> None:
     audit = audit_tasks([d])[0]
     for check in ("metadata_well_formed", "f2p_declared", "shipped_f2p_matches_task_toml"):
         assert audit.checks.get(check) is not False, f"{check}: {audit.details.get(check)}"
+
+
+def test_git_errors_never_carry_inline_credentials(tmp_path: Path) -> None:
+    """A clone failure must not print the access token.
+
+    `_run_git` builds its error from the argv it was given, and for a private
+    repo that argv is the clone URL with the token inlined. Without redaction,
+    any clone failure emits a live credential to the CLI and to every log
+    handler. `bootstrap/runner.py` already scrubs for this reason.
+    """
+    from vektori_trace.mining.git_local import GitError, clone_for_log
+
+    token = "ghp_thisIsASecretTokenValue1234567890"
+    url = f"https://x-access-token:{token}@github.com/owner/does-not-exist-xyz.git"
+
+    with pytest.raises(GitError) as exc:
+        clone_for_log(url, tmp_path / "clone", depth=1)
+
+    msg = str(exc.value)
+    assert token not in msg
+    assert "x-access-token" not in msg
+    # The useful part of the message must survive redaction.
+    assert "github.com/owner/does-not-exist-xyz" in msg
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        ("https://x-access-token:ghp_abc123@github.com/o/n.git", "ghp_abc123"),
+        ("http://user:hunter2@example.com/repo", "hunter2"),
+        # git echoes the remote back in its own stderr on auth failures
+        ("remote: fatal: https://u:tok_9@github.com/o/n denied", "tok_9"),
+    ],
+)
+def test_redact_strips_credentials_from_any_url_shape(raw: str, secret: str) -> None:
+    from vektori_trace.mining.git_local import _redact
+
+    assert secret not in _redact(raw)
+
+
+def test_redact_leaves_ordinary_text_alone() -> None:
+    """Redaction must not mangle normal messages, or errors become unreadable."""
+    from vektori_trace.mining.git_local import _redact
+
+    plain = "git 'log --max-count=50 HEAD' failed (exit 128): unknown revision"
+    assert _redact(plain) == plain
+    assert _redact("https://github.com/owner/name.git") == "https://github.com/owner/name.git"
