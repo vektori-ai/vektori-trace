@@ -145,13 +145,24 @@ def audit_task(task_dir: Path) -> TaskAudit:
         value = parent.get(key)
         return value if isinstance(value, dict) else {}
 
-    pr_meta = _table(_table(_table(cfg, "metadata"), "repo2env"), "pr_runtime")
+    # Each pipeline namespaces its validation outcome under its own name, so
+    # the audit must look for whichever one produced the task. Reading only
+    # `pr_runtime` made every commit_runtime task fail all five checks —
+    # "no F2P declared" on a task shipping a correct f2p.json — which reads as
+    # a broken emitter rather than an auditor looking in the wrong table.
+    repo2env = _table(_table(cfg, "metadata"), "repo2env")
+    pr_meta: dict = {}
+    for pipeline in ("pr_runtime", "commit_runtime"):
+        pr_meta = _table(repo2env, pipeline)
+        if pr_meta:
+            break
     if not pr_meta and isinstance(cfg.get("metadata"), dict):
         _record(
             audit,
             "metadata_well_formed",
             False,
-            "no readable [metadata.repo2env.pr_runtime] table",
+            "no readable [metadata.repo2env.<pipeline>] table "
+            "(looked for pr_runtime, commit_runtime)",
         )
     base_commit = pr_meta.get("base_commit", "")
     if not isinstance(base_commit, str):

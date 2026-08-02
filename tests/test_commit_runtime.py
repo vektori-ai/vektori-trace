@@ -405,3 +405,40 @@ def test_leak_gate_flags_code_shaped_identifiers(name: str) -> None:
         f"@@ -1 +1 @@\n+def {name}():\n"
     )
     assert leaked_identifiers(f"Calling {name} raises immediately.", patch, "") == [name]
+
+
+def test_audit_reads_the_commit_runtime_metadata_table(tmp_path: Path) -> None:
+    """The auditor must find whichever pipeline's table produced the task.
+
+    It originally read only `[metadata.repo2env.pr_runtime]`, so every
+    commit_runtime task failed all five checks — including "no F2P declared" on
+    a task shipping a correct f2p.json. That reads as a broken emitter rather
+    than an auditor looking in the wrong place.
+    """
+    import json as _json
+
+    from vektori_trace.mining.inspect import audit_tasks
+
+    d = tmp_path / "owner__repo-abc123"
+    (d / "tests").mkdir(parents=True)
+    (d / "environment").mkdir()
+    (d / "solution").mkdir()
+    base = "d" * 40
+    (d / "task.toml").write_text(
+        "schema_version = '1.3'\n\n"
+        "[task]\nname = 'x'\n\n"
+        "[metadata.repo2env.commit_runtime]\n"
+        f"base_commit = '{base}'\n"
+        "fail_to_pass = ['tests/test_a.py::test_one']\n"
+    )
+    (d / "tests" / "f2p.json").write_text(_json.dumps(["tests/test_a.py::test_one"]))
+    (d / "tests" / "p2p.json").write_text("[]")
+    (d / "tests" / "test.sh").write_text("#!/bin/sh\n")
+    (d / "environment" / "Dockerfile").write_text(
+        f"FROM scratch\nRUN git reset --hard {base}\n"
+    )
+    (d / "solution" / "patch.diff").write_text("diff --git a/x b/x\n")
+
+    audit = audit_tasks([d])[0]
+    for check in ("metadata_well_formed", "f2p_declared", "shipped_f2p_matches_task_toml"):
+        assert audit.checks.get(check) is not False, f"{check}: {audit.details.get(check)}"
