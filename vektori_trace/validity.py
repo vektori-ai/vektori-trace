@@ -5,10 +5,14 @@ capability) fails."""
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,6 +22,12 @@ class TrialResult:
     reward: float | None
     jobs_dir: Path
     raw_stdout: str
+    # Wall-clock seconds harbor took, and the wall-clock instant it started.
+    # Rollout duration is what sizes a sweep and what a GPU is billed for, and
+    # `started_at` is what lets a rollout be lined up against gpu_log.jsonl and
+    # the per-call token captures. Optional so existing constructions still work.
+    elapsed_sec: float | None = None
+    started_at: float | None = None
 
 
 def _newest_first(paths: list[Path]) -> list[Path]:
@@ -145,15 +155,41 @@ def run_trial(
     if extra_instruction_path is not None:
         cmd += ["--extra-instruction-path", str(extra_instruction_path.resolve())]
 
+    started_at = time.time()
+    t0 = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    elapsed_sec = time.perf_counter() - t0
     reward = _find_reward(job_dir)
     passed = None if reward is None else reward >= 1.0
+
+    # `raw_stdout` keeps only the last 4000+2000 chars, which is the wrong end
+    # when harbor fails: the cause sits far above the traceback. Persist the
+    # whole thing next to the job dir so a failure is diagnosable after the fact
+    # rather than only from a terminal nobody was watching.
+    if passed is not True:
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "harbor_stdout.txt").write_text(proc.stdout)
+            (job_dir / "harbor_stderr.txt").write_text(proc.stderr)
+        except OSError as exc:  # pragma: no cover - disk full / permissions
+            _log.warning("could not persist harbor output to %s: %s", job_dir, exc)
+
+    _log.info(
+        "trial task=%s agent=%s passed=%s reward=%s elapsed=%.1fs",
+        task_dir.name,
+        agent,
+        passed,
+        reward,
+        elapsed_sec,
+    )
     return TrialResult(
         agent=agent,
         passed=passed,
         reward=reward,
         jobs_dir=job_dir,
         raw_stdout=proc.stdout[-4000:] + proc.stderr[-2000:],
+        elapsed_sec=elapsed_sec,
+        started_at=started_at,
     )
 
 

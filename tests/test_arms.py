@@ -146,7 +146,7 @@ def test_run_arms_orchestration_with_mocks(tmp_path: Path) -> None:
         )
 
     @contextmanager
-    def fake_serve(base_model, adapter_path=None, gpu="A10G", model_info=None):
+    def fake_serve(base_model, adapter_path=None, gpu="A10", model_info=None):
         yield ServedModel(
             api_base="http://example.test/v1",
             model_name="Qwen3-8B",

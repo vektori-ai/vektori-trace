@@ -24,10 +24,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # Qwen3-8B: 36 layers x 8 GQA KV heads x 128 head_dim x 2 (K,V) x 2 bytes
 KV_BYTES_PER_TOKEN = 2 * 36 * 8 * 128 * 2
@@ -93,7 +95,22 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="print one sample and exit")
     ap.add_argument("--kv-total-tokens", type=int, default=None,
                     help="total KV token budget, to show tokens not just %%")
+    ap.add_argument("--log", default=None,
+                    help="append each sample as JSON to this file. The bar is "
+                         "for watching; this is for answering questions after "
+                         "the run, joined against passk_log.jsonl by timestamp")
     args = ap.parse_args()
+
+    log_path = Path(args.log) if args.log else None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _record(sample: dict) -> None:
+        if log_path is None:
+            return
+        with log_path.open("a") as fh:
+            fh.write(json.dumps(sample) + "\n")
+            fh.flush()
 
     prev_gen, prev_t = None, None
     print(f"watching {args.api_base}   (Ctrl-C to stop)\n")
@@ -104,6 +121,10 @@ def main() -> int:
             except urllib.error.URLError as e:
                 print(f"\r{time.strftime('%H:%M:%S')}  unreachable: {e.reason}",
                       end="", flush=True)
+                # An unreachable endpoint is a data point, not a gap. A hole in
+                # the log is ambiguous between "monitor was down" and "endpoint
+                # was down"; this records which.
+                _record({"logged_at": time.time(), "error": str(e.reason)})
                 if args.once:
                     return 1
                 time.sleep(args.interval)
@@ -116,11 +137,26 @@ def main() -> int:
 
             now = time.time()
             tps = ""
+            tok_per_s = None
             if prev_gen is not None and now > prev_t:
                 rate = (gen - prev_gen) / (now - prev_t)
                 if rate >= 0:
+                    tok_per_s = rate
                     tps = f"  {rate:6.1f} tok/s"
             prev_gen, prev_t = gen, now
+
+            _record({
+                "logged_at": now,
+                "kv_used_frac": kv,
+                "kv_used_tokens": (
+                    int(kv * args.kv_total_tokens) if args.kv_total_tokens else None
+                ),
+                "running": running,
+                "waiting": waiting,
+                "gen_tokens_total": gen,
+                "tokens_per_sec": tok_per_s,
+                "verdict": verdict(kv, waiting, running),
+            })
 
             kv_tokens = ""
             if args.kv_total_tokens:

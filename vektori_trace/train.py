@@ -80,7 +80,7 @@ class TrainConfig:
     seed: int = 0
     lora: LoraHyperparams = field(default_factory=LoraHyperparams)
     use_modal: bool = True
-    modal_gpu: str = "A10G"
+    modal_gpu: str = "L40S"
     # Distinguishes A2 vs A3 adapters on the shared Volume.
     arm: str | None = None
     # --- memory / throughput -------------------------------------------------

@@ -10,7 +10,10 @@ Aggregation unit is (capability, model). Luck control: only-passes-at-k>8 quaran
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import threading as _threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,9 +21,16 @@ from typing import Any, Literal
 
 from .validity import run_trial
 
+_log = logging.getLogger(__name__)
+
 K_VALUES = (1, 4, 8, 16, 32)
 STAGE1_N = 8
 STAGE2_N = 32
+
+# One line per rollout, flushed as it completes. Separate from the report, which
+# is only written once the sweep finishes: a sweep killed at rollout 27 of 32
+# still leaves 27 usable records here.
+PASSK_LOG_FILENAME = "passk_log.jsonl"
 
 Stratum = Literal["stage1", "stage2"]
 
@@ -50,6 +60,16 @@ class RolloutOutcome:
     task: str
     passed: bool
     stratum: Stratum = "stage1"
+    # Everything below is evidence, not estimator input. Without it a sweep
+    # reports a rate and throws away the run that produced it: which directory
+    # holds the trajectory, how long it took, how far the agent actually got.
+    rollout_index: int | None = None
+    reward: float | None = None
+    jobs_dir: Path | None = None
+    elapsed_sec: float | None = None
+    started_at: float | None = None
+    n_turns: int | None = None
+    n_tool_calls: int | None = None
 
 
 @dataclass
@@ -293,6 +313,47 @@ def pooled_estimate_is_biased(
     return False
 
 
+def _trajectory_shape(job_dir: Path) -> tuple[int | None, int | None]:
+    """(n_turns, n_tool_calls) from a harbor job dir's ATIF trajectory.
+
+    (None, None) when there is no parseable trajectory — which is itself worth
+    recording, since a rollout that produced no trajectory failed differently
+    from one that produced a trajectory ending in a wrong patch.
+    """
+    try:
+        from .mining.atif import TrajectoryParseError, parse_job_trajectory
+    except ImportError:  # pragma: no cover - harbor extra not installed
+        return None, None
+    try:
+        turns = parse_job_trajectory(job_dir)
+    except (TrajectoryParseError, FileNotFoundError, OSError):
+        return None, None
+    return len(turns), sum(len(t.tool_calls or []) for t in turns)
+
+
+def _outcome_record(outcome: RolloutOutcome) -> dict[str, Any]:
+    return {
+        "task": outcome.task,
+        "stratum": outcome.stratum,
+        "rollout_index": outcome.rollout_index,
+        "passed": outcome.passed,
+        "reward": outcome.reward,
+        "jobs_dir": str(outcome.jobs_dir) if outcome.jobs_dir else None,
+        "started_at": outcome.started_at,
+        "elapsed_sec": outcome.elapsed_sec,
+        "n_turns": outcome.n_turns,
+        "n_tool_calls": outcome.n_tool_calls,
+    }
+
+
+def _append_log(log_path: Path, record: dict[str, Any]) -> None:
+    """One JSON line, flushed. A killed sweep keeps everything up to the kill."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+        fh.flush()
+
+
 def measure_passk_stage(
     task_dirs: list[Path],
     agent: str,
@@ -306,35 +367,66 @@ def measure_passk_stage(
     agent_kwargs: dict[str, Any] | None = None,
     infra_failures: dict[str, int] | None = None,
     max_workers: int = 1,
+    log_path: Path | None = None,
 ) -> list[RolloutOutcome]:
     """Drive n harbor trials per task. Infra failures (passed is None) excluded
     from the denominator (V0_PLAN.md rule) but counted into `infra_failures`, so
     a task that produced no gradeable rollout at all is reportable rather than
     silently absent from the sweep.
 
-    `max_workers > 1` runs trials concurrently. The sweep is ~1,300 containerised
-    rollouts of minutes each (PLAN.md Stage 2); serially that is days, which does
-    not fit the "nothing expensive precedes the gate" economics. Rollouts are
-    independent — each gets its own container and its own job dir — so the only
-    shared state is the result list, which is assembled after the fact rather
-    than appended to from threads.
+    Every rollout gets **its own job dir**, at any `max_workers`. This used to be
+    conditional on `max_workers > 1`, on the reasoning that only concurrent
+    trials race for harbor's newest-by-mtime reward. The scalar did survive
+    serially — but all n rollouts of a task then wrote into one directory and
+    overwrote each other's trajectories, so a serial sweep kept the rate and
+    destroyed the evidence behind it. `rollout.collect_rollouts` had it right.
+
+    `max_workers > 1` runs trials concurrently. The full sweep is ~1,300
+    containerised rollouts of minutes each (PLAN.md Stage 2); serially that is
+    days. Rollouts are independent, so the only shared state is the result list,
+    assembled after the fact rather than appended to from threads.
+
+    `log_path` receives one JSON line per rollout as it completes.
     """
     jobs = [(task_dir, i) for task_dir in task_dirs for i in range(n)]
+    log_lock = _threading.Lock()
 
-    def _one(job: tuple[Path, int]) -> tuple[str, bool | None]:
+    def _one(job: tuple[Path, int]) -> RolloutOutcome | tuple[str, None]:
         task_dir, i = job
         trial = run_trial(
             task_dir,
             agent=agent,
-            # Per-rollout job dir: harbor picks the newest reward by mtime, and
-            # concurrent trials sharing one dir race for it.
-            jobs_dir=jobs_dir / f"{task_dir.name}-{i}" if max_workers > 1 else jobs_dir,
+            jobs_dir=jobs_dir / f"{task_dir.name}-{i}",
             model=model,
             api_base=api_base,
             model_info=model_info,
             agent_kwargs=agent_kwargs,
         )
-        return task_dir.name, trial.passed
+        n_turns, n_tool_calls = _trajectory_shape(trial.jobs_dir)
+        outcome = RolloutOutcome(
+            task=task_dir.name,
+            passed=bool(trial.passed),
+            stratum=stratum,
+            rollout_index=i,
+            reward=trial.reward,
+            jobs_dir=trial.jobs_dir,
+            elapsed_sec=trial.elapsed_sec,
+            started_at=trial.started_at,
+            n_turns=n_turns,
+            n_tool_calls=n_tool_calls,
+        )
+        if log_path is not None:
+            record = _outcome_record(outcome)
+            # `passed` is None for an infra failure, which the outcome's bool
+            # would flatten to False. The log keeps the distinction the
+            # denominator rule depends on.
+            record["passed"] = trial.passed
+            record["infra_failure"] = trial.passed is None
+            with log_lock:
+                _append_log(log_path, record)
+        if trial.passed is None:
+            return task_dir.name, None
+        return outcome
 
     if max_workers > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -345,12 +437,13 @@ def measure_passk_stage(
         outcomes = [_one(job) for job in jobs]
 
     results: list[RolloutOutcome] = []
-    for name, passed in outcomes:
-        if passed is None:
+    for item in outcomes:
+        if isinstance(item, tuple):
+            name, _ = item
             if infra_failures is not None:
                 infra_failures[name] = infra_failures.get(name, 0) + 1
             continue
-        results.append(RolloutOutcome(task=name, passed=passed, stratum=stratum))
+        results.append(item)
     return results
 
 
@@ -367,8 +460,17 @@ def two_stage_sweep(
     agent_kwargs: dict[str, Any] | None = None,
     task_to_capability: Mapping[str, str] | None = None,
     max_workers: int = 1,
+    escalate: bool = True,
+    log_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Stage 1 n=8 all tasks; stage 2 n=32 only for 0/8. Returns separate strata."""
+    """Stage 1 n=8 all tasks; stage 2 n=32 only for 0/8. Returns separate strata.
+
+    `escalate=False` runs stage 1 alone. Escalation triggers on `c == 0` with no
+    regard for how large stage 1 was, so a deliberately small `stage1_n` — a
+    4-rollout smoke test, say — turns into a 32-rollout stage 2 the moment the
+    model fails, which for an untested model is the expected outcome. Opting out
+    is how a small run stays small.
+    """
     infra: dict[str, int] = {}
     stage1_outcomes = measure_passk_stage(
         task_dirs,
@@ -382,14 +484,22 @@ def two_stage_sweep(
         agent_kwargs=agent_kwargs,
         infra_failures=infra,
         max_workers=max_workers,
+        log_path=log_path,
     )
     stage1 = {
         task: pr
         for (task, stratum), pr in compute_task_passk(stage1_outcomes).items()
         if stratum == "stage1"
     }
-    escalate_ids = set(tasks_needing_escalation(stage1))
+    escalate_ids = set(tasks_needing_escalation(stage1)) if escalate else set()
     escalate_dirs = [d for d in task_dirs if d.name in escalate_ids]
+    if escalate_dirs:
+        _log.info(
+            "escalating %d task(s) to stage 2 at n=%d: %s",
+            len(escalate_dirs),
+            stage2_n,
+            ", ".join(sorted(escalate_ids)),
+        )
     stage2_outcomes = measure_passk_stage(
         escalate_dirs,
         agent,
@@ -402,6 +512,7 @@ def two_stage_sweep(
         agent_kwargs=agent_kwargs,
         infra_failures=infra,
         max_workers=max_workers,
+        log_path=log_path,
     )
     stage2 = {
         task: pr
@@ -418,6 +529,12 @@ def two_stage_sweep(
         "stage1": {t: _task_to_dict(pr) for t, pr in stage1.items()},
         "stage2": {t: _task_to_dict(pr) for t, pr in stage2.items()},
         "escalated": sorted(escalate_ids),
+        "escalation_enabled": escalate,
+        # The rollouts behind the rates: one entry per gradeable rollout, naming
+        # the job dir that holds its trajectory and token captures.
+        "rollouts": [
+            _outcome_record(o) for o in (*stage1_outcomes, *stage2_outcomes)
+        ],
         "luck_quarantine": luck,
         # AC #2: every task carries a support classification, and tasks that
         # produced no gradeable rollout at all are named rather than missing.

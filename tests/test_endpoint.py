@@ -120,11 +120,11 @@ def test_attach_endpoint_registers_and_unregisters_an_adapter(server):
 def test_endpoint_serve_cm_matches_the_serve_model_signature(server):
     cm = endpoint_serve_cm(server)
     # arms.run_arms calls serve_cm(model, gpu=...) and serve_cm(model, adapter_path=..., gpu=...)
-    with cm("Qwen/Qwen3-8B", gpu="A10G") as served:
+    with cm("Qwen/Qwen3-8B", gpu="A10") as served:
         assert served.model_name == SERVED_NAME
         # The GPU string is recorded, never invented: the hardware was fixed at
         # instance launch, so arms.json must not claim Modal chose it.
-        assert served.gpu == "A10G"
+        assert served.gpu == "A10"
 
 
 def test_unreachable_endpoint_fails_fast_with_a_usable_message():

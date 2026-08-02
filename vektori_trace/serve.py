@@ -16,7 +16,7 @@ control still get the flag. Requires vLLM ≥ 0.10.2 in the serve image.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,10 +65,17 @@ class ServedModel:
         default_factory=lambda: dict(DEFAULT_HOSTED_VLLM_MODEL_INFO)
     )
     adapter_path: str | None = None
-    gpu: str = "A10G"
+    gpu: str = "L40S"
     base_model: str = ""
     max_model_len: int | None = None
     gpu_memory_utilization: float | None = None
+    # Callable returning one NVML sample from the serving container, or None
+    # outside a live Modal session. Lives on the object rather than being fetched
+    # over HTTP because only the process holding the Modal app can call into the
+    # container — which is the same process that holds the endpoint open.
+    sample_gpu: Callable[[], dict[str, Any]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def harbor_model(self) -> str:
@@ -107,7 +114,7 @@ def serve_model(
     base_model: str,
     *,
     adapter_path: str | None = None,
-    gpu: str = "A10G",
+    gpu: str = "L40S",
     model_info: dict[str, Any] | None = None,
     max_model_len: int | None = None,
     gpu_memory_utilization: float | None = None,
@@ -119,18 +126,28 @@ def serve_model(
 
     `max_model_len` is not optional in practice on a small card. vLLM defaults it
     to the model's own maximum — 40 960 for Qwen3-8B — and refuses to start when
-    that exceeds what the KV cache can hold. On a 24 GB A10G the arithmetic is:
+    that exceeds what the KV cache can hold. Qwen3-8B costs **144 KiB per token**
+    of KV (36 layers × 8 GQA KV heads × 128 head_dim × 2 for K and V × 2 bytes).
+    The 8 is load-bearing: 32 query heads share 8 KV heads, and under MHA this
+    would be 576 KiB/token and nothing usable would fit.
 
-        24 GiB × 0.90 utilisation      = 21.6 GiB
-        − 15.3 GiB bf16 weights
-        − ~1.3 GiB CUDA context/workspace
-        =  ~5.0 GiB for KV
+    What's left for KV, after weights, on the two cards this project uses:
 
-    and Qwen3-8B costs 144 KiB per token of KV (36 layers × 8 GQA KV heads ×
-    128 head_dim × 2 for K and V × 2 bytes), so ~36 700 tokens fit *in total,
-    across all concurrent sequences*. Asking for 40 960 for a single sequence is
-    already more than the card has, and vLLM fails at startup rather than
-    silently degrading. Set this to the longest trajectory you actually need.
+        L40S   48 GiB × 0.90 = 43.2  − 15.3 − 1.3 = 26.6 GiB → ~193 700 tokens
+        A10    24 GiB × 0.90 = 21.6  − 15.3 − 1.3 =  5.0 GiB →  ~36 400 tokens
+
+    (`gpu=` takes Modal's own strings — "A10", not the card's AWS name "A10G",
+    which Modal rejects before a container starts. See modal.com/docs/guide/gpu.)
+
+    (15.3 GiB is 8.19e9 params × 2 bytes; ~1.3 GiB is CUDA context, cuda graphs
+    and activation workspace — an *estimate*, and the term to distrust first if a
+    start fails near the boundary.)
+
+    Those budgets are totals across all concurrent sequences, not per sequence.
+    So on an A10 the vLLM default of 40 960 exceeds the entire cache and startup
+    fails; on an L40S it fits with ~4 concurrent full-length sequences. Set this
+    to the longest trajectory you actually need — `scripts/serve_student.py`
+    refuses impossible values before a GPU is allocated.
     """
     _require_modal()
     import modal
@@ -171,7 +188,11 @@ def serve_model(
         modal.Image.from_registry(
             VLLM_CUDA_IMAGE, add_python="3.12"
         )
-        .pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub")
+        # nvidia-ml-py is what `gpu_stats` reads. vLLM's /metrics reports engine
+        # state (KV blocks, queue depth, throughput) but nothing about the card
+        # itself, so "is the GPU busy or is it waiting on the verifier?" is
+        # unanswerable without NVML.
+        .pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub", "nvidia-ml-py")
         .env(
             {
                 "HF_HOME": HF_CACHE_MOUNT,
@@ -211,6 +232,52 @@ def serve_model(
         @modal.method()
         def health(self) -> str:
             return "ok"
+
+        @modal.method()
+        def gpu_stats(self) -> dict[str, Any]:
+            """One NVML sample of the card this container holds.
+
+            A `@modal.method()`, deliberately, rather than a second web endpoint:
+            `health` already proves this call shape works against a live
+            container, whereas Modal's docs do not state that one Cls may expose
+            two `@modal.web_server`s, and the serving path has too little
+            live mileage to spend on an unverified feature.
+
+            Never raises — a telemetry gap must not take down the endpoint that
+            is doing the actual work, so a failed sample is reported as data.
+            """
+            import time as _t
+
+            sample: dict[str, Any] = {"sampled_at": _t.time()}
+            try:
+                import pynvml
+
+                pynvml.nvmlInit()
+                h = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                sample.update(
+                    {
+                        "gpu_name": pynvml.nvmlDeviceGetName(h),
+                        # The headline number: percent of the last sampling
+                        # period during which a kernel was resident. Low util
+                        # with queued requests means the bottleneck is not here.
+                        "gpu_util_pct": util.gpu,
+                        "mem_util_pct": util.memory,
+                        "mem_used_mib": mem.used // (1024**2),
+                        "mem_total_mib": mem.total // (1024**2),
+                        "temperature_c": pynvml.nvmlDeviceGetTemperature(
+                            h, pynvml.NVML_TEMPERATURE_GPU
+                        ),
+                        "power_w": pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0,
+                        "sm_clock_mhz": pynvml.nvmlDeviceGetClockInfo(
+                            h, pynvml.NVML_CLOCK_SM
+                        ),
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - needs a real GPU
+                sample["error"] = f"{type(exc).__name__}: {exc}"
+            return sample
 
         @modal.web_server(port=8000, startup_timeout=60 * 30)
         def openai_compat(self):
@@ -282,6 +349,7 @@ def serve_model(
             base_model=base_model,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            sample_gpu=lambda: server.gpu_stats.remote(),
         )
         yield served
 

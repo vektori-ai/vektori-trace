@@ -232,3 +232,158 @@ def test_luck_resolution_requires_both_conditions() -> None:
     assert not LuckResolution("t", 32, 0, patch_matches_gold=True).resolved
     assert not LuckResolution("t", 32, 2, patch_matches_gold=False).resolved
     assert not LuckResolution("t", 32, 2).resolved
+
+
+# ---------------------------------------------------------------------------
+# Sweep mechanics: the evidence behind the rate, not the rate itself.
+# ---------------------------------------------------------------------------
+
+
+def _fake_trials(monkeypatch, *, passed: bool | None, calls: list):
+    """Replace run_trial with a recorder. No Docker, no harbor, no network."""
+    from pathlib import Path
+
+    from vektori_trace import passk as passk_mod
+    from vektori_trace.validity import TrialResult
+
+    def fake_run_trial(task_dir, agent, jobs_dir, model=None, **kwargs):
+        calls.append(Path(jobs_dir))
+        return TrialResult(
+            agent=agent,
+            passed=passed,
+            reward=None if passed is None else (1.0 if passed else 0.0),
+            jobs_dir=Path(jobs_dir),
+            raw_stdout="",
+            elapsed_sec=0.5,
+            started_at=1_700_000_000.0,
+        )
+
+    monkeypatch.setattr(passk_mod, "run_trial", fake_run_trial)
+
+
+def _task_dirs(tmp_path, names):
+    dirs = []
+    for name in names:
+        d = tmp_path / name
+        d.mkdir()
+        (d / "task.toml").write_text("[task]\n")
+        dirs.append(d)
+    return dirs
+
+
+def test_each_rollout_gets_its_own_job_dir_when_serial(tmp_path, monkeypatch):
+    """Serial sweeps used to funnel every rollout into one dir, so the n
+    trajectories overwrote each other and only the last survived."""
+    from vektori_trace.passk import measure_passk_stage
+
+    calls: list = []
+    _fake_trials(monkeypatch, passed=False, calls=calls)
+    measure_passk_stage(
+        _task_dirs(tmp_path, ["t1", "t2"]),
+        "terminus-2",
+        "qwen3-8b",
+        tmp_path / "jobs",
+        4,
+        stratum="stage1",
+        max_workers=1,
+    )
+    assert len(calls) == 8
+    assert len(set(calls)) == 8, "rollouts shared a job dir and clobbered each other"
+
+
+def test_no_escalate_keeps_a_small_run_small(tmp_path, monkeypatch):
+    """c == 0 triggers escalation regardless of stage-1 size, so a 4-rollout
+    smoke test would silently become 4 + 32."""
+    from vektori_trace.passk import two_stage_sweep
+
+    calls: list = []
+    _fake_trials(monkeypatch, passed=False, calls=calls)
+    report = two_stage_sweep(
+        _task_dirs(tmp_path, ["t1"]),
+        agent="terminus-2",
+        model="qwen3-8b",
+        jobs_dir=tmp_path / "jobs",
+        stage1_n=4,
+        stage2_n=32,
+        escalate=False,
+    )
+    assert len(calls) == 4
+    assert report["escalated"] == []
+    assert report["escalation_enabled"] is False
+
+
+def test_escalation_still_fires_when_enabled(tmp_path, monkeypatch):
+    from vektori_trace.passk import two_stage_sweep
+
+    calls: list = []
+    _fake_trials(monkeypatch, passed=False, calls=calls)
+    report = two_stage_sweep(
+        _task_dirs(tmp_path, ["t1"]),
+        agent="terminus-2",
+        model="qwen3-8b",
+        jobs_dir=tmp_path / "jobs",
+        stage1_n=4,
+        stage2_n=6,
+    )
+    assert len(calls) == 10
+    assert report["escalated"] == ["t1"]
+
+
+def test_rollout_log_is_written_per_rollout(tmp_path, monkeypatch):
+    """The log must survive a killed sweep, so it is flushed per rollout rather
+    than written with the report at the end."""
+    import json
+
+    from vektori_trace.passk import PASSK_LOG_FILENAME, measure_passk_stage
+
+    calls: list = []
+    _fake_trials(monkeypatch, passed=True, calls=calls)
+    log_path = tmp_path / PASSK_LOG_FILENAME
+    measure_passk_stage(
+        _task_dirs(tmp_path, ["t1"]),
+        "terminus-2",
+        "qwen3-8b",
+        tmp_path / "jobs",
+        3,
+        stratum="stage1",
+        max_workers=1,
+        log_path=log_path,
+    )
+    lines = [json.loads(x) for x in log_path.read_text().splitlines()]
+    assert len(lines) == 3
+    assert {x["rollout_index"] for x in lines} == {0, 1, 2}
+    assert all(x["elapsed_sec"] == 0.5 for x in lines)
+    assert all(x["started_at"] == 1_700_000_000.0 for x in lines)
+    assert all(x["jobs_dir"] for x in lines)
+    assert all(x["infra_failure"] is False for x in lines)
+
+
+def test_infra_failures_stay_out_of_the_denominator_but_reach_the_log(
+    tmp_path, monkeypatch
+):
+    """passed=None is a harness failure, not a model failure. Counting it as a
+    loss is the easiest way to report a wrongly-pessimistic baseline."""
+    import json
+
+    from vektori_trace.passk import PASSK_LOG_FILENAME, measure_passk_stage
+
+    calls: list = []
+    _fake_trials(monkeypatch, passed=None, calls=calls)
+    log_path = tmp_path / PASSK_LOG_FILENAME
+    infra: dict = {}
+    outcomes = measure_passk_stage(
+        _task_dirs(tmp_path, ["t1"]),
+        "terminus-2",
+        "qwen3-8b",
+        tmp_path / "jobs",
+        2,
+        stratum="stage1",
+        max_workers=1,
+        infra_failures=infra,
+        log_path=log_path,
+    )
+    assert outcomes == []
+    assert infra == {"t1": 2}
+    lines = [json.loads(x) for x in log_path.read_text().splitlines()]
+    assert len(lines) == 2
+    assert all(x["passed"] is None and x["infra_failure"] is True for x in lines)
