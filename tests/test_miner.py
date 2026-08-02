@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from vektori_trace.evaluate.validity import _find_reward
 from vektori_trace.mining.miner import (
     HarborTraceRunner,
     InfraFailure,
@@ -21,7 +22,6 @@ from vektori_trace.mining.miner import (
     collect_traces,
 )
 from vektori_trace.schema import Trace, Turn, load_manifest
-from vektori_trace.validity import _find_reward
 
 
 class FakeTraceRunner:

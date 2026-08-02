@@ -44,11 +44,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .dataset import turns_to_messages
-from .distill import IdScoringPool, OPDTrainResult
-from .opd import mean_log_ratio, reverse_kl_surrogate
-from .reopd import ReOPDStepExample
-from .tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
+from ...dataset import turns_to_messages
+from ...distill import IdScoringPool, OPDTrainResult
+from ...opd import mean_log_ratio, reverse_kl_surrogate
+from ...reopd import ReOPDStepExample
+from ...tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
 
 #: Student base model and its trainer shape. `qwen3-8b` is the pilot's student
 #: (`docs/PILOT.md`) and Fireworks' own quickstart base, so the shape is known good.
@@ -258,7 +258,7 @@ def run_fireworks_opd(
     if cfg.verify_tokenizers:
         # Sending student-sampled ids to the teacher is only meaningful if both
         # models read those ids as the same strings. Unchanged by hosting.
-        from .tokenizer_check import check_tokenizers
+        from ...tokenizer_check import check_tokenizers
 
         check_tokenizers(cfg.teacher_model, cfg.tokenizer_model)
 

@@ -14,17 +14,17 @@ from typing import ClassVar
 
 import pytest
 
-from vektori_trace.endpoint import (
+from vektori_trace.providers.teacher.base import (
+    TeacherScoringError,
+    VllmTeacherPool,
+    teacher_pool_from_endpoint,
+)
+from vektori_trace.runtime.endpoint import (
     EndpointError,
     attach_endpoint,
     discover_model_name,
     endpoint_serve_cm,
     wait_for_health,
-)
-from vektori_trace.teacher import (
-    TeacherScoringError,
-    VllmTeacherPool,
-    teacher_pool_from_endpoint,
 )
 
 SERVED_NAME = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
@@ -168,7 +168,7 @@ def test_missing_prompt_logprobs_refuses_rather_than_returning_zeros():
             return [1, 2]
 
     pool = _NoLogprobs(api_base="http://127.0.0.1:1")
-    import vektori_trace.teacher as teacher_mod
+    import vektori_trace.providers.teacher.base as teacher_mod
 
     original = teacher_mod._post_json
     teacher_mod._post_json = lambda url, payload, timeout: {"choices": [{}]}
@@ -181,7 +181,7 @@ def test_missing_prompt_logprobs_refuses_rather_than_returning_zeros():
 
 def test_scored_token_mismatch_is_an_error_not_a_guess():
     """If the teacher scored a different id than we sent, alignment is gone."""
-    import vektori_trace.teacher as teacher_mod
+    import vektori_trace.providers.teacher.base as teacher_mod
 
     pool = VllmTeacherPool(api_base="http://127.0.0.1:1")
     original = teacher_mod._post_json
@@ -201,7 +201,7 @@ def test_scored_token_mismatch_is_an_error_not_a_guess():
 
 
 def test_length_mismatch_is_an_error():
-    import vektori_trace.teacher as teacher_mod
+    import vektori_trace.providers.teacher.base as teacher_mod
 
     pool = VllmTeacherPool(api_base="http://127.0.0.1:1")
     original = teacher_mod._post_json

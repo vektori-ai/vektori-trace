@@ -7,7 +7,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from vektori_trace.validity import run_trial
+from vektori_trace.evaluate.validity import run_trial
 
 
 def test_timeout_does_not_raise(tmp_path: Path, monkeypatch) -> None:

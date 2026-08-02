@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace import diagnose
+from vektori_trace.evaluate import diagnose
 from vektori_trace.schema import ToolCall, Trace, Turn
 
 

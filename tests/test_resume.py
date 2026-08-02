@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.resume import (
+from vektori_trace.evaluate.resume import (
     ResumeDesyncError,
     measure_desync_rate,
     replay_prefix,

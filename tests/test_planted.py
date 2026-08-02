@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.diagnose import Capability, score_deficits
-from vektori_trace.planted import (
+from vektori_trace.evaluate.diagnose import Capability, score_deficits
+from vektori_trace.evaluate.planted import (
     DISTRACTOR_MODES,
     MATCH_NEAR,
     MATCH_NONE,
@@ -242,7 +242,7 @@ def test_perfect_labels_yield_the_expected_gap_and_prevalence() -> None:
     """A sanity check on the experiment's own arithmetic: if the labeller were
     perfect, the planted capability scores gap 1.0 at the planted prevalence.
     That is the ceiling every real run is measured against."""
-    from vektori_trace.diagnose import TraceLabels
+    from vektori_trace.evaluate.diagnose import TraceLabels
 
     corpus = build_corpus(n_wins=10, n_losses=10, prevalence=0.6)
     cap = Capability(id="planted", name="planted", description="…")
@@ -420,12 +420,12 @@ DISTRACTOR_CAP = Capability(
 
 def _stub_diagnosis(monkeypatch, proposed, label_fn):
     """Replace both LLM calls in the module under test."""
-    from vektori_trace import planted as mod
+    from vektori_trace.evaluate import planted as mod
 
     monkeypatch.setattr(mod, "propose_capabilities", lambda traces, model=None: proposed)
 
     def fake_label(trace, capabilities, model=None):
-        from vektori_trace.diagnose import TraceLabels
+        from vektori_trace.evaluate.diagnose import TraceLabels
 
         return TraceLabels(trace=trace, labels=label_fn(trace), evidence={})
 

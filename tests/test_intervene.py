@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from vektori_trace.intervene import bisect_forking_step
+from vektori_trace.evaluate.intervene import bisect_forking_step
 from vektori_trace.schema import ToolCall, Turn
 
 
@@ -131,7 +131,7 @@ def test_empty_trajectory() -> None:
 
 
 def _resume_result(T: int, *, verified: bool):
-    from vektori_trace.resume import ResumeResult
+    from vektori_trace.evaluate.resume import ResumeResult
 
     return ResumeResult(
         T=T,
@@ -186,7 +186,7 @@ def test_verified_resume_leaves_the_unverified_counters_at_zero() -> None:
 
 
 def test_desync_still_drops_and_is_not_counted_as_unverified() -> None:
-    from vektori_trace.resume import ResumeDesyncError
+    from vektori_trace.evaluate.resume import ResumeDesyncError
 
     def boom(_turns, T: int):
         raise ResumeDesyncError("git diff mismatch at T")

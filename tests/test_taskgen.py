@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from vektori_trace import taskgen
-from vektori_trace.diagnose import Capability, DeficitScore
+from vektori_trace.evaluate.diagnose import Capability, DeficitScore
 
 GENERATED = {
     "task_description": "Read the traceback before editing.",

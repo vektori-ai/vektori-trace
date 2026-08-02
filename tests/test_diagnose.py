@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vektori_trace.diagnose import (
+from vektori_trace.evaluate.diagnose import (
     Capability,
     TraceLabels,
     score_deficits,

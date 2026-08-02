@@ -35,12 +35,12 @@ train = [
     "bitsandbytes",
 ]
 
-# Bedrock Custom Model Import teacher (`teacher_bedrock.py`). Optional because
+# Bedrock Custom Model Import teacher (`providers/teacher/bedrock.py`). Optional because
 # the Fireworks and self-hosted teachers need no AWS SDK, and boto3 is a large
 # dependency for a diagnose-only install.
 aws = ["boto3>=1.35"]
-# Student on the Fireworks Training API (`student_fireworks.py`). The teacher-side
-# `teacher_fireworks.py` needs none of this — it is stdlib HTTP, like `teacher.py`.
+# Student on the Fireworks Training API (`providers/student/fireworks.py`). The teacher-side
+# `providers/teacher/fireworks.py` needs none of this — it is stdlib HTTP, like `providers/teacher/base.py`.
 fireworks = [
     "fireworks-ai[training]",
     "tinker-cookbook==0.4.1",

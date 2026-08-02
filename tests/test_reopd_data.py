@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vektori_trace.intervene import bisect_forking_step
+from vektori_trace.evaluate.intervene import bisect_forking_step
 from vektori_trace.reopd import (
     bisection_training_example,
     build_reopd_example,

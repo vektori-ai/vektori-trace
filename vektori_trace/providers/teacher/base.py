@@ -11,8 +11,8 @@ which is why PLAN.md C1 reaches for a self-hosted teacher.
 
 Two hosted endpoints do nonetheless expose the right quantity through their own
 extensions, and have their own pools rather than being forced through this one:
-`teacher_fireworks.FireworksTeacherPool` (`echo_last` over an integer-array
-prompt) and `teacher_bedrock.BedrockTeacherPool` (Custom Model Import's
+`providers.teacher.fireworks.FireworksTeacherPool` (`echo_last` over an integer-array
+prompt) and `providers.teacher.bedrock.BedrockTeacherPool` (Custom Model Import's
 `prompt_logprobs`). `docs/HOSTED_TEACHERS.md` covers the trade — quantisation and
 a top-K cap in exchange for no GPU to hold. This module remains the reference
 implementation and the only one with an unquantised teacher.
@@ -41,8 +41,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-from .endpoint import EndpointError, _normalise_base, _root_of
-from .tokenizer_check import DEFAULT_TEACHER
+from ...runtime.endpoint import EndpointError, _normalise_base, _root_of
+from ...tokenizer_check import DEFAULT_TEACHER
 
 
 class TeacherScoringError(RuntimeError):
@@ -63,7 +63,7 @@ def _post_json(
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            # Hosted teachers (`teacher_fireworks.py`) need an Authorization
+            # Hosted teachers (`providers/teacher/fireworks.py`) need an Authorization
             # header; a self-hosted vLLM server needs none.
             **(headers or {}),
         },
@@ -299,7 +299,7 @@ def teacher_pool_from_endpoint(
     garbage" into "OPD refuses to start", which is the trade V0_PLAN.md asks for
     everywhere else.
     """
-    from .endpoint import discover_model_name, wait_for_health
+    from ...runtime.endpoint import discover_model_name, wait_for_health
 
     wait_for_health(api_base)
     name = model or discover_model_name(api_base)

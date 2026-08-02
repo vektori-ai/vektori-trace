@@ -10,7 +10,7 @@ import json
 import random
 from pathlib import Path
 
-from .passrate import PASSRATE_MAX, PASSRATE_MIN, PassRate
+from .evaluate.passrate import PASSRATE_MAX, PASSRATE_MIN, PassRate
 
 
 def select_training_tasks(

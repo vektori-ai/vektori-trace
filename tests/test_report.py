@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from vektori_trace.diagnose import (
+from vektori_trace.evaluate.diagnose import (
     Capability,
     DeficitScore,
     McNemarResult,
     ReplayDiagnosis,
 )
-from vektori_trace.report import build_replay_report, build_report, write_report
+from vektori_trace.evaluate.report import build_replay_report, build_report, write_report
 
 
 def _score(gap: float | None) -> DeficitScore:

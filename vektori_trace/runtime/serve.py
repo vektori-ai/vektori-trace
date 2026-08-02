@@ -99,8 +99,8 @@ def _resolve_volume_adapter(adapter_path: str | None) -> str | None:
     if pointer.is_file():
         return pointer.read_text().strip()
     if local.is_dir() and any(local.iterdir()):
+        from ..train import stage_local_adapter_to_volume
         from .modal_env import volume_adapter_dir
-        from .train import stage_local_adapter_to_volume
 
         remote = volume_adapter_dir("local-staged", seed=0, arm=local.name)
         return stage_local_adapter_to_volume(local, remote)

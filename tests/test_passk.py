@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from vektori_trace.passk import (
+from vektori_trace.evaluate.passk import (
     K_VALUES,
     RolloutOutcome,
     TaskPassK,
@@ -127,7 +127,7 @@ def test_aggregate_by_capability_includes_n() -> None:
 
 
 def test_support_classification_needs_the_escalation() -> None:
-    from vektori_trace.passk import classify_support
+    from vektori_trace.evaluate.passk import classify_support
 
     s1_zero = TaskPassK.from_counts("t", 8, 0, stratum="stage1")
     s1_pass = TaskPassK.from_counts("t", 8, 2, stratum="stage1")
@@ -187,7 +187,7 @@ def test_capability_group_of_only_luck_tasks_reports_zero_n_not_a_rate() -> None
 def test_luck_quarantine_has_a_resolve_path() -> None:
     """PLAN.md holds a lucky task "pending patch-vs-gold diff and independent
     re-sample" — pending, not forever. Both conditions must be met to clear."""
-    from vektori_trace.passk import LuckResolution, resolve_luck_quarantine
+    from vektori_trace.evaluate.passk import LuckResolution, resolve_luck_quarantine
 
     stage2 = {
         "confirmed": TaskPassK.from_counts("confirmed", 32, 2, stratum="stage2"),
@@ -226,7 +226,7 @@ def test_luck_quarantine_has_a_resolve_path() -> None:
 
 
 def test_luck_resolution_requires_both_conditions() -> None:
-    from vektori_trace.passk import LuckResolution
+    from vektori_trace.evaluate.passk import LuckResolution
 
     assert LuckResolution("t", 32, 2, patch_matches_gold=True).resolved
     assert not LuckResolution("t", 32, 0, patch_matches_gold=True).resolved
@@ -243,8 +243,8 @@ def _fake_trials(monkeypatch, *, passed: bool | None, calls: list):
     """Replace run_trial with a recorder. No Docker, no harbor, no network."""
     from pathlib import Path
 
-    from vektori_trace import passk as passk_mod
-    from vektori_trace.validity import TrialResult
+    from vektori_trace.evaluate import passk as passk_mod
+    from vektori_trace.evaluate.validity import TrialResult
 
     def fake_run_trial(task_dir, agent, jobs_dir, model=None, **kwargs):
         calls.append(Path(jobs_dir))
@@ -274,7 +274,7 @@ def _task_dirs(tmp_path, names):
 def test_each_rollout_gets_its_own_job_dir_when_serial(tmp_path, monkeypatch):
     """Serial sweeps used to funnel every rollout into one dir, so the n
     trajectories overwrote each other and only the last survived."""
-    from vektori_trace.passk import measure_passk_stage
+    from vektori_trace.evaluate.passk import measure_passk_stage
 
     calls: list = []
     _fake_trials(monkeypatch, passed=False, calls=calls)
@@ -294,7 +294,7 @@ def test_each_rollout_gets_its_own_job_dir_when_serial(tmp_path, monkeypatch):
 def test_no_escalate_keeps_a_small_run_small(tmp_path, monkeypatch):
     """c == 0 triggers escalation regardless of stage-1 size, so a 4-rollout
     smoke test would silently become 4 + 32."""
-    from vektori_trace.passk import two_stage_sweep
+    from vektori_trace.evaluate.passk import two_stage_sweep
 
     calls: list = []
     _fake_trials(monkeypatch, passed=False, calls=calls)
@@ -313,7 +313,7 @@ def test_no_escalate_keeps_a_small_run_small(tmp_path, monkeypatch):
 
 
 def test_escalation_still_fires_when_enabled(tmp_path, monkeypatch):
-    from vektori_trace.passk import two_stage_sweep
+    from vektori_trace.evaluate.passk import two_stage_sweep
 
     calls: list = []
     _fake_trials(monkeypatch, passed=False, calls=calls)
@@ -334,7 +334,7 @@ def test_rollout_log_is_written_per_rollout(tmp_path, monkeypatch):
     than written with the report at the end."""
     import json
 
-    from vektori_trace.passk import PASSK_LOG_FILENAME, measure_passk_stage
+    from vektori_trace.evaluate.passk import PASSK_LOG_FILENAME, measure_passk_stage
 
     calls: list = []
     _fake_trials(monkeypatch, passed=True, calls=calls)
@@ -365,7 +365,7 @@ def test_infra_failures_stay_out_of_the_denominator_but_reach_the_log(
     loss is the easiest way to report a wrongly-pessimistic baseline."""
     import json
 
-    from vektori_trace.passk import PASSK_LOG_FILENAME, measure_passk_stage
+    from vektori_trace.evaluate.passk import PASSK_LOG_FILENAME, measure_passk_stage
 
     calls: list = []
     _fake_trials(monkeypatch, passed=None, calls=calls)

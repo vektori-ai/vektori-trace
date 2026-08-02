@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vektori_trace.passrate import PassRate
+from vektori_trace.evaluate.passrate import PassRate
 from vektori_trace.select import held_out_split, select_training_tasks, write_selection_report
 
 

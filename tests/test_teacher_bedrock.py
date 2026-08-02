@@ -21,8 +21,8 @@ import json
 
 import pytest
 
-from vektori_trace.teacher import TeacherScoringError
-from vektori_trace.teacher_bedrock import BedrockTeacherPool, _find_prompt_logprobs
+from vektori_trace.providers.teacher.base import TeacherScoringError
+from vektori_trace.providers.teacher.bedrock import BedrockTeacherPool, _find_prompt_logprobs
 
 
 class StubClient:

@@ -20,9 +20,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .mining.atif import TrajectoryParseError, parse_job_trajectory
-from .schema import Turn
-from .validity import run_trial
+from ..evaluate.validity import run_trial
+from ..mining.atif import TrajectoryParseError, parse_job_trajectory
+from ..schema import Turn
 
 
 @dataclass

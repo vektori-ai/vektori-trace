@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import LabelPreservingCollator, TokenizedExample, build_sft_dataset
-from .modal_env import (
+from .runtime.modal_env import (
     HF_CACHE_MOUNT,
     HF_CACHE_VOLUME_NAME,
     VOLUME_MOUNT,

@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .diagnose import DeficitScore
+from .evaluate.diagnose import DeficitScore
 from .llm import call_json
 from .mining.emitter import HarborTask, write_harbor_task
 

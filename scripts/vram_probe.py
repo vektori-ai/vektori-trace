@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vektori_trace.modal_env import HF_CACHE_MOUNT, HF_CACHE_VOLUME_NAME
+from vektori_trace.runtime.modal_env import HF_CACHE_MOUNT, HF_CACHE_VOLUME_NAME
 
 
 def _remote_stages(cfg: dict) -> dict:

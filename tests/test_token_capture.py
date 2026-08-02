@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from vektori_trace.dataset import IGNORE_INDEX, tokenize_from_captures, tokenize_from_ids
-from vektori_trace.token_capture import (
+from vektori_trace.runtime.token_capture import (
     CAPTURE_FILENAME,
     RETURN_TOKEN_IDS_KEY,
     CapturedCompletion,
@@ -279,7 +279,7 @@ def test_capture_timing_survives_the_jsonl_roundtrip(tmp_path: Path):
 
 
 def test_served_to_harbor_kwargs_capture_flag():
-    from vektori_trace.serve import ServedModel, served_to_harbor_kwargs
+    from vektori_trace.runtime.serve import ServedModel, served_to_harbor_kwargs
 
     served = ServedModel(
         api_base="http://127.0.0.1:8000/v1",
@@ -294,7 +294,7 @@ def test_served_to_harbor_kwargs_capture_flag():
 
 def test_tokenize_rollouts_for_opd_requires_captures(tmp_path: Path):
     from vektori_trace.arms import tokenize_rollouts_for_opd
-    from vektori_trace.rollout import CollectedRollout
+    from vektori_trace.runtime.rollout import CollectedRollout
 
     job = tmp_path / "job"
     job.mkdir()

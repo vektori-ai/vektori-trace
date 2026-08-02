@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from vektori_trace.intervene import bisect_forking_step
-from vektori_trace.passk import RolloutOutcome, compute_task_passk
-from vektori_trace.resume import replay_prefix
+from vektori_trace.evaluate.intervene import bisect_forking_step
+from vektori_trace.evaluate.passk import RolloutOutcome, compute_task_passk
+from vektori_trace.evaluate.resume import replay_prefix
 from vektori_trace.routing import CurveSummary, decision_to_dict, route_cell
 from vektori_trace.schema import ToolCall, Turn
 
@@ -85,7 +85,7 @@ def test_end_to_end_fixture_pipeline(tmp_path: Path) -> None:
 
 
 def _passk_report(model: str, rows: dict[str, tuple[int, int]]) -> dict:
-    from vektori_trace.passk import TaskPassK, _task_to_dict
+    from vektori_trace.evaluate.passk import TaskPassK, _task_to_dict
 
     return {
         "model": model,
@@ -135,7 +135,10 @@ def test_route_cli_builds_task_by_capability_cells(tmp_path: Path, monkeypatch) 
             self.run_id, self.task = run_id, task
 
     monkeypatch.setattr(
-        "vektori_trace.cli._load_traces",
+        # Patch where it is read, not where it is defined: `cmd_route` binds
+        # `_load_traces` into its own module namespace at import time, so
+        # patching the `vektori_trace.cli` re-export would silently do nothing.
+        "vektori_trace.cli.commands.route._load_traces",
         lambda _p: [_T("r1", "task1"), _T("r2", "task2")],
     )
 
@@ -199,7 +202,7 @@ def test_route_cli_rejects_diagnosis_without_manifest(tmp_path: Path) -> None:
 def test_two_stage_sweep_reports_support_capabilities_and_infra(tmp_path: Path, monkeypatch) -> None:
     """AC #2: every task carries a support classification; PLAN.md's aggregation
     unit is (capability, model); infra failures are reported, not vanished."""
-    from vektori_trace import passk as passk_mod
+    from vektori_trace.evaluate import passk as passk_mod
 
     plan = {
         "in_support": [True] + [False] * 7,   # passes at stage 1
@@ -211,7 +214,7 @@ def test_two_stage_sweep_reports_support_capabilities_and_infra(tmp_path: Path, 
     # The real TrialResult, not a `.passed`-only stub: the sweep now records the
     # job dir, reward and timing behind every rollout, and a stub that omits them
     # would let a missing field pass here and fail on the box.
-    from vektori_trace.validity import TrialResult
+    from vektori_trace.evaluate.validity import TrialResult
 
     def fake_run_trial(task_dir, agent="a", jobs_dir=None, **kw):
         name = task_dir.name

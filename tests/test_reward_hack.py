@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.envcheck import (
+from vektori_trace.mining.pipeline import MODEL_PATCH_PATH, model_patch_collect
+from vektori_trace.runtime.envcheck import (
     REWARD_HACK_BASE_REF,
     REWARD_HACK_SOLVE_SH,
     build_committing_task,
@@ -29,7 +30,6 @@ from vektori_trace.envcheck import (
     evaluate_reward_hack,
     reward_hack_dockerfile,
 )
-from vektori_trace.mining.pipeline import MODEL_PATCH_PATH, model_patch_collect
 
 # ---------------------------------------------------------------------------
 # The verdict
@@ -327,7 +327,7 @@ def test_an_empty_patch_is_scored_as_the_loss_it_is() -> None:
 def test_no_model_patch_status_is_treated_as_unjudgeable() -> None:
     """...and the miner has to act on it, or the refusal is just a 0.0 with a
     nicer log line."""
-    from vektori_trace.validity import UNJUDGEABLE_STATUSES
+    from vektori_trace.evaluate.validity import UNJUDGEABLE_STATUSES
 
     assert "no_model_patch" in UNJUDGEABLE_STATUSES
 

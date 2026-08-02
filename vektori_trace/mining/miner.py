@@ -18,6 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from vektori_trace.evaluate.validity import (
+    UNJUDGEABLE_STATUSES,
+    _ak_args,
+    _find_parse_status,
+    _find_reward,
+)
 from vektori_trace.mining import (
     AuthSpec,
     BootstrapSpec,
@@ -34,12 +40,6 @@ from vektori_trace.mining import (
 from vektori_trace.mining.atif import TrajectoryParseError, parse_job_trajectory
 from vektori_trace.mining.result import PipelineResult
 from vektori_trace.schema import Turn
-from vektori_trace.validity import (
-    UNJUDGEABLE_STATUSES,
-    _ak_args,
-    _find_parse_status,
-    _find_reward,
-)
 
 
 def discover_tasks(tasks_dir: Path) -> list[Path]:

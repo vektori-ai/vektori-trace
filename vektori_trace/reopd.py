@@ -31,12 +31,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .dataset import tokenize_teacher_continuation, turns_to_messages
-from .resume import assistant_tool_steps
+from .evaluate.resume import assistant_tool_steps
 from .schema import Turn
 from .tokenizer_check import DEFAULT_TEACHER
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .intervene import BisectionResult
+    from .evaluate.intervene import BisectionResult
 
 
 class TeacherPool(Protocol):
