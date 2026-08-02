@@ -1,0 +1,14 @@
+{
+  "gpu": "NVIDIA A10G",
+  "total_mib": 22588,
+  "peak_allocated_mib": 20595,
+  "peak_reserved_mib": 21562,
+  "headroom_mib": 1026,
+  "oom": "CUDA out of memory. Tried to allocate 4.64 GiB. GPU 0 has a total capacity of 22.06 GiB of which 1.26 GiB is free. Including non-PyTorch memory, this process has 20.79 GiB memory in use. Of the allocated memory 20.11 GiB is allocated by PyTorch, and 389.24 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+  "base_model": "Qwen/Qwen3-8B",
+  "seq_len": 8192,
+  "batch_size": 1,
+  "grad_accum": 1,
+  "max_steps": 2,
+  "gradient_checkpointing": true
+}
