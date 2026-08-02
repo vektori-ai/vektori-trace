@@ -369,49 +369,30 @@ def align_topk_rows(
     return ids_out, lps_out
 
 
-def run_opd_training(
-    examples: list[ReOPDStepExample],
-    pool: IdScoringPool,
+def _setup_cross_tokenizer(
     cfg: OPDTrainConfig,
     *,
-    model: Any | None = None,
-    tokenizer: Any | None = None,
-    bridge: Any | None = None,
-    teacher_tokenizer: Any | None = None,
-    prefix_cache: Any | None = None,
-) -> OPDTrainResult:
-    """Train the student against teacher scores. Writes an adapter under output_dir.
+    bridge: Any | None,
+    teacher_tokenizer: Any | None,
+    prefix_cache: Any | None,
+) -> tuple[Any | None, Any, Any | None]:
+    """Resolve and validate the cross-tokenizer inputs.
 
-    `model`/`tokenizer` are injectable so offline tests can run the real loop on a
-    tiny from-scratch model with a fake pool — the loop under test is the same one
-    that runs on the GPU.
+    Returns `(bridge, teacher_tokenizer, prefix_cache)`. Precedence for each is
+    the caller's kwarg, then `cfg`, then a load from `cfg.teacher_model`. On the
+    same-vocab path everything passes through untouched.
 
-    Cross-tokenizer kwargs:
-      bridge: CrossTokenizerBridge — overrides cfg.bridge_path when provided.
-      teacher_tokenizer: teacher-side HF tokenizer for encoding teacher prefixes
-          and retokenising the student's action text.  When None, loaded from
-          cfg.teacher_model (or taken from cfg.teacher_tokenizer).
-      prefix_cache: TeacherPrefixCache — caches rendered teacher prefix ids so
-          that the same (task, step_index) renders identically across all steps.
+    Split out of `run_opd_training` because it imports no torch: the two hard
+    failures here — no bridge, and a bridge built against a drifted
+    `encoding_dsv4` — are reachable offline, and both are worth failing on
+    before a GPU is allocated.
     """
-    _require_train()
-    import torch
-    from peft import LoraConfig, TaskType, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
-
-    if not examples:
-        raise ValueError("no ReOPD examples — nothing to distil from")
-
-    if cfg.verify_tokenizers and not cfg.cross_tokenizer:
-        from .tokenizer_check import check_tokenizers
-        check_tokenizers(cfg.teacher_model, cfg.student_model)
-
-    # ── Cross-tokenizer setup ─────────────────────────────────────────────────
     _bridge = bridge
     _teacher_tok: Any = teacher_tokenizer if teacher_tokenizer is not None else cfg.teacher_tokenizer
     _prefix_cache = prefix_cache
     if cfg.cross_tokenizer and _prefix_cache is None:
         from .providers.teacher.cross import TeacherPrefixCache
+
         _prefix_cache = TeacherPrefixCache()
 
     if cfg.cross_tokenizer:
@@ -439,11 +420,115 @@ def run_opd_training(
             # `load_tokenizer`, not AutoTokenizer: the teacher side only ever
             # needs encode/get_vocab, so a repo whose model config this
             # `transformers` cannot parse must not block training. The *student*
-            # below stays on AutoTokenizer — it needs `apply_chat_template`,
-            # which a bare `tokenizers.Tokenizer` does not have.
+            # stays on AutoTokenizer — it needs `apply_chat_template`, which a
+            # bare `tokenizers.Tokenizer` does not have.
             from .vocab_bridge import load_tokenizer
 
             _teacher_tok = load_tokenizer(cfg.teacher_model)
+
+    return _bridge, _teacher_tok, _prefix_cache
+
+
+def _resolve_student_model(cfg: OPDTrainConfig, model: Any | None) -> Any:
+    """Load the student and attach LoRA, unless the caller injected a model.
+
+    Offline tests pass a tiny from-scratch model, which is why the injected
+    path skips loading but still gets the gradient-checkpointing treatment —
+    that setting is about how the model is *run*, not where it came from.
+    """
+    import torch
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    use_bf16 = bool(cfg.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    if model is None:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.student_model,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+        )
+        if torch.cuda.is_available():
+            model = model.cuda()
+        target = list(cfg.lora.target_modules)
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=cfg.lora.r,
+                lora_alpha=cfg.lora.alpha,
+                lora_dropout=cfg.lora.dropout,
+                target_modules=target,
+            ),
+        )
+    if cfg.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        # LoRA freezes the base weights, so without this the checkpointed
+        # activations have nothing requiring grad and backward is empty.
+        model.enable_input_require_grads()
+    return model
+
+
+def _build_optimizer(cfg: OPDTrainConfig, model: Any) -> tuple[list[Any], Any, Any]:
+    """AdamW over the trainable (LoRA) parameters, plus a cosine schedule.
+
+    `params` is returned rather than kept local because the training loop needs
+    the same list for gradient clipping — recomputing it there would silently
+    diverge if anything ever froze or unfroze a parameter mid-run.
+    """
+    import torch
+    from transformers import get_cosine_schedule_with_warmup
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError("no trainable parameters — LoRA did not attach to the model")
+    optimizer = torch.optim.AdamW(params, lr=cfg.learning_rate)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=max(int(cfg.max_steps * cfg.warmup_ratio), 0),
+        num_training_steps=cfg.max_steps,
+    )
+    return params, optimizer, scheduler
+
+
+def run_opd_training(
+    examples: list[ReOPDStepExample],
+    pool: IdScoringPool,
+    cfg: OPDTrainConfig,
+    *,
+    model: Any | None = None,
+    tokenizer: Any | None = None,
+    bridge: Any | None = None,
+    teacher_tokenizer: Any | None = None,
+    prefix_cache: Any | None = None,
+) -> OPDTrainResult:
+    """Train the student against teacher scores. Writes an adapter under output_dir.
+
+    `model`/`tokenizer` are injectable so offline tests can run the real loop on a
+    tiny from-scratch model with a fake pool — the loop under test is the same one
+    that runs on the GPU.
+
+    Cross-tokenizer kwargs:
+      bridge: CrossTokenizerBridge — overrides cfg.bridge_path when provided.
+      teacher_tokenizer: teacher-side HF tokenizer for encoding teacher prefixes
+          and retokenising the student's action text.  When None, loaded from
+          cfg.teacher_model (or taken from cfg.teacher_tokenizer).
+      prefix_cache: TeacherPrefixCache — caches rendered teacher prefix ids so
+          that the same (task, step_index) renders identically across all steps.
+    """
+    _require_train()
+    import torch
+    from transformers import AutoTokenizer
+
+    if not examples:
+        raise ValueError("no ReOPD examples — nothing to distil from")
+
+    if cfg.verify_tokenizers and not cfg.cross_tokenizer:
+        from .tokenizer_check import check_tokenizers
+        check_tokenizers(cfg.teacher_model, cfg.student_model)
+
+    _bridge, _teacher_tok, _prefix_cache = _setup_cross_tokenizer(
+        cfg, bridge=bridge, teacher_tokenizer=teacher_tokenizer, prefix_cache=prefix_cache
+    )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     adapter_dir = cfg.output_dir / "adapter"
@@ -481,41 +566,8 @@ def run_opd_training(
         _student_specials = _special_ids(tokenizer)
         _teacher_specials = _special_ids(_teacher_tok)
 
-    use_bf16 = bool(cfg.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
-    if model is None:
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.student_model,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
-        )
-        if torch.cuda.is_available():
-            model = model.cuda()
-        target = list(cfg.lora.target_modules)
-        model = get_peft_model(
-            model,
-            LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=cfg.lora.r,
-                lora_alpha=cfg.lora.alpha,
-                lora_dropout=cfg.lora.dropout,
-                target_modules=target,
-            ),
-        )
-    if cfg.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        # LoRA freezes the base weights, so without this the checkpointed
-        # activations have nothing requiring grad and backward is empty.
-        model.enable_input_require_grads()
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    if not params:
-        raise RuntimeError("no trainable parameters — LoRA did not attach to the model")
-    optimizer = torch.optim.AdamW(params, lr=cfg.learning_rate)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=max(int(cfg.max_steps * cfg.warmup_ratio), 0),
-        num_training_steps=cfg.max_steps,
-    )
+    model = _resolve_student_model(cfg, model)
+    params, optimizer, scheduler = _build_optimizer(cfg, model)
 
     order = list(range(len(examples)))
     rng.shuffle(order)
