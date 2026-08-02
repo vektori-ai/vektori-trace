@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from vektori_trace.validity import run_trial
+from vektori_trace.evaluate.validity import run_trial
 
 
 def test_timeout_does_not_raise(tmp_path: Path, monkeypatch) -> None:
