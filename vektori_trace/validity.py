@@ -157,9 +157,26 @@ def run_trial(
 
     started_at = time.time()
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+    # `harbor run` can legitimately run the full timeout_sec without ever
+    # writing a result.json (agent stuck looping, never finishes in budget).
+    # subprocess.run raises TimeoutExpired in that case; left uncaught, that
+    # crashes the whole sweep instead of recording what actually happened --
+    # a real model failure ("never finished in time"), not an infra problem.
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        stdout, stderr = proc.stdout, proc.stderr
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        timed_out = True
     elapsed_sec = time.perf_counter() - t0
     reward = _find_reward(job_dir)
+    if reward is None and timed_out:
+        # No verdict because the agent ran out of time, not because harbor
+        # errored -- score it as a loss so it counts in the pass@k
+        # denominator instead of being excluded as an infra_failure.
+        reward = 0.0
     passed = None if reward is None else reward >= 1.0
 
     # `raw_stdout` keeps only the last 4000+2000 chars, which is the wrong end
@@ -169,8 +186,8 @@ def run_trial(
     if passed is not True:
         try:
             job_dir.mkdir(parents=True, exist_ok=True)
-            (job_dir / "harbor_stdout.txt").write_text(proc.stdout)
-            (job_dir / "harbor_stderr.txt").write_text(proc.stderr)
+            (job_dir / "harbor_stdout.txt").write_text(stdout)
+            (job_dir / "harbor_stderr.txt").write_text(stderr)
         except OSError as exc:  # pragma: no cover - disk full / permissions
             _log.warning("could not persist harbor output to %s: %s", job_dir, exc)
 
@@ -187,7 +204,7 @@ def run_trial(
         passed=passed,
         reward=reward,
         jobs_dir=job_dir,
-        raw_stdout=proc.stdout[-4000:] + proc.stderr[-2000:],
+        raw_stdout=stdout[-4000:] + stderr[-2000:],
         elapsed_sec=elapsed_sec,
         started_at=started_at,
     )
