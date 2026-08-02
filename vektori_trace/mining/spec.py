@@ -169,4 +169,76 @@ class PRRuntimeOptions(BaseModel):
     skip_ci_only: bool = True
 
 
+class CommitRuntimeOptions(BaseModel):
+    """Commit-level mining — the sibling of `pr_runtime`, not a replacement.
+
+    Walks `git log` instead of the PR list, then hands the resulting
+    (patch, test_patch, base_commit) tuple to the *same* validation harness.
+    Two reasons it exists:
+
+      1. Yield. A `pr_runtime` mine of 800 prefect PRs dropped 434 (54%) as
+         `no_linked_issue`. Those fixes are real and their tests are real; the
+         only thing missing was a GitHub issue link.
+      2. Reach. Repos that squash-merge or commit straight to main have fixes
+         that are not behind a PR at all and are invisible to `pr_runtime`.
+
+    The trade is signal quality: no reviewer approved a commit, so the filters
+    below have to do the work a PR template does for free. They are applied
+    before validation because validation costs a container run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Mining ---
+    limit: int = 50
+    since: date | None = None
+    until: date | None = None
+    branch: str = "HEAD"
+    # bootstrap clones --depth=1, which has nothing to walk. 200 covers roughly
+    # a month of an active repo; raise it for a wider --since window.
+    clone_depth: int = 200
+    first_parent: bool = True
+
+    # --- Filters (cheap, applied before validation) ---
+    skip_merge_commits: bool = True
+    min_message_words: int = 5  # drops "wip", "fmt", "typo", "address review"
+    max_source_files_per_commit: int = 10
+    exclude_authors: list[str] = []  # substring match on name or email; bots
+    require_new_test_funcs: bool = True
+    skip_ci_only: bool = True
+
+    # --- Validation (mirrors PRRuntimeOptions) ---
+    require_fail_to_pass: bool = True
+    min_fail_to_pass: int = 1
+    validation_timeout_sec: int = 600
+    skip_validation: bool = False
+    # Cap the PASS_TO_PASS guard. A whole-suite P2P of several hundred tests
+    # multiplies flake risk into the graded reward (reward = f2p_rate *
+    # p2p_rate) and lengthens every rollout, while adding little regression
+    # signal past the first few dozen. 0 disables the cap.
+    max_pass_to_pass: int = 50
+
+    # --- Instruction synthesis ---
+    # On by default, and the pipeline is unsound without it. Commit messages
+    # are written by the fixer *after* the fix, so they routinely name the
+    # function changed or paste a changelog bullet describing the solution —
+    # an agent can score 1.0 by reading the prompt rather than solving. The
+    # rewrite restates the symptom as a user would have reported it.
+    synthesize_with_llm: bool = True
+    # Deliberately low: with synthesis on, the LLM expands terse commits, so
+    # this only needs to exclude the near-empty ones that synthesis cannot
+    # rescue. A high floor here would re-create the yield problem this
+    # pipeline exists to solve.
+    min_problem_statement_words: int = 8
+    llm_temperature: float = 0.3
+    # Reasoning models bill thinking against this budget and emit the visible
+    # answer only from what is left. Measured on gpt-5-nano (the default
+    # synthesis model): 1024 produced empty content 3/3 times, 2048 succeeded
+    # 3/3. 4096 leaves margin for long commit bodies, which lengthen the
+    # reasoning. An empty completion is not an error — it arrives as a
+    # too-thin synthesis and the task is dropped, so too small a budget looks
+    # like "this repo has no clean instructions".
+    max_llm_tokens: int = 4096
+
+
 LLMSpec.model_rebuild()
