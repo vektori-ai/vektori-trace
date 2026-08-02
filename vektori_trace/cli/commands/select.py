@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from ...passrate import measure_pass_rates
+from ...evaluate.passrate import measure_pass_rates
 from ...select import held_out_split, select_training_tasks, write_selection_report
 from .._shared import _load_traces
 

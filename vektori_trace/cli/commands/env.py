@@ -17,7 +17,7 @@ from ...envcheck import (
     evaluate_reward_hack,
     run_probe,
 )
-from ...planted import (
+from ...evaluate.planted import (
     DEFAULT_SWEEP,
     DISTRACTOR_MODES,
     PLANTED_NAME,
@@ -26,7 +26,7 @@ from ...planted import (
     run_sweep,
     write_sweep_report,
 )
-from ...validity import _find_reward, prove_validity
+from ...evaluate.validity import _find_reward, prove_validity
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:

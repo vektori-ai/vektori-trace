@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from vektori_trace.arms import compare_b1_b2_paired, plan_b_arms
+from vektori_trace.evaluate.passrate import PassRate
 from vektori_trace.grounding import GroundingPair, ground_diagnosis
 from vektori_trace.opd import (
     OPDConfig,
@@ -13,7 +14,6 @@ from vektori_trace.opd import (
     grpo_advantage,
     mean_log_ratio,
 )
-from vektori_trace.passrate import PassRate
 from vektori_trace.reopd import (
     InMemoryTeacherPool,
     build_reopd_example,
@@ -330,7 +330,7 @@ def test_b_arm_plan_survives_json_round_trip() -> None:
 
 
 def _rates(**kw) -> dict:
-    from vektori_trace.passrate import PassRate
+    from vektori_trace.evaluate.passrate import PassRate
 
     return {t: PassRate(task=t, passed=p, n=n) for t, (p, n) in kw.items()}
 

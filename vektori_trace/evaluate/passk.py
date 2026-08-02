@@ -321,7 +321,7 @@ def _trajectory_shape(job_dir: Path) -> tuple[int | None, int | None]:
     from one that produced a trajectory ending in a wrong patch.
     """
     try:
-        from .mining.atif import TrajectoryParseError, parse_job_trajectory
+        from ..mining.atif import TrajectoryParseError, parse_job_trajectory
     except ImportError:  # pragma: no cover - harbor extra not installed
         return None, None
     try:

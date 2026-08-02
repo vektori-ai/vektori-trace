@@ -11,7 +11,7 @@ from .._shared import _load_traces
 
 
 def cmd_passk(args: argparse.Namespace) -> int:
-    from ...passk import PASSK_LOG_FILENAME, two_stage_sweep
+    from ...evaluate.passk import PASSK_LOG_FILENAME, two_stage_sweep
 
     tasks_dir = Path(args.tasks_dir)
     task_dirs = sorted(

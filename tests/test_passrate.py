@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vektori_trace.passrate import (
+from vektori_trace.evaluate.passrate import (
     PASSRATE_MAX,
     PASSRATE_MIN,
     PassRate,
@@ -57,7 +57,7 @@ def test_in_band_respects_a_custom_band() -> None:
 def test_measure_pass_rates_drives_run_trial_and_aggregates(tmp_path: Path, monkeypatch) -> None:
     """The orchestrator: N `run_trial` calls per task, aggregated by task name.
     Not real Docker — `run_trial` is monkeypatched to a scripted sequence."""
-    import vektori_trace.passrate as passrate_mod
+    import vektori_trace.evaluate.passrate as passrate_mod
 
     task_a = tmp_path / "task-a"
     task_a.mkdir()

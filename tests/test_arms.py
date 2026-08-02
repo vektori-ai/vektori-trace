@@ -20,7 +20,7 @@ from vektori_trace.arms import (
     run_arms,
     select_a2_tasks,
 )
-from vektori_trace.passrate import PassRate
+from vektori_trace.evaluate.passrate import PassRate
 from vektori_trace.rollout import CollectedRollout
 from vektori_trace.schema import Turn
 from vektori_trace.serve import ServedModel

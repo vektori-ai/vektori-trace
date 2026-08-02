@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..schema import Trace, load_manifest
 from .diagnose import (
     DEFAULT_MIN_GAP,
     DEFAULT_MIN_SUPPORT,
@@ -48,7 +49,6 @@ from .diagnose import (
     score_deficits,
     select_deficit,
 )
-from .schema import Trace, load_manifest
 
 # ---------------------------------------------------------------------------
 # The planted capability

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 
-from ..diagnose import (
+from ..evaluate.diagnose import (
     DEFAULT_MIN_GAP,
     DEFAULT_MIN_SUPPORT,
 )
-from ..passrate import DEFAULT_ROLLOUTS, PASSRATE_MAX, PASSRATE_MIN
+from ..evaluate.passrate import DEFAULT_ROLLOUTS, PASSRATE_MAX, PASSRATE_MIN
 from ..tokenizer_check import DEFAULT_STUDENT, DEFAULT_TEACHER
 from ._args import _add_endpoint_args, _min_gap_arg, _min_support_arg, _positive_int_arg
 from .commands.capture import cmd_capture_proxy

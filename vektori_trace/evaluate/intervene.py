@@ -16,8 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..schema import Turn
 from .resume import ResumeDesyncError, ResumeResult, replay_prefix
-from .schema import Turn
 
 
 @dataclass

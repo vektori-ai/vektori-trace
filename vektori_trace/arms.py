@@ -20,14 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import tokenize_from_captures, tokenize_sft_example
-from .diagnose import MIN_DISCORDANT_PAIRS, _exact_mcnemar_p
-from .nonregression import (
+from .evaluate.diagnose import MIN_DISCORDANT_PAIRS, _exact_mcnemar_p
+from .evaluate.nonregression import (
     IFEVAL_TOLERANCE,
     NonRegressionResult,
     evaluate_ifeval,
     load_ifeval_subset,
 )
-from .passrate import DEFAULT_ROLLOUTS, PassRate, measure_pass_rates
+from .evaluate.passrate import DEFAULT_ROLLOUTS, PassRate, measure_pass_rates
 from .rollout import CollectedRollout, collect_rollouts
 from .routing import Route, RoutingDecision
 from .serve import (

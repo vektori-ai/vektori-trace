@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vektori_trace.diagnose import (
+from vektori_trace.evaluate.diagnose import (
     Capability,
     McNemarResult,
     TraceLabels,
@@ -256,7 +256,7 @@ def test_diagnose_replay_returns_no_deficit_when_the_contrast_is_flat() -> None:
 def test_cross_model_contrast_differs_from_the_mixed_average() -> None:
     """The reason the filter exists. Mixed, the candidate's own wins pull the
     baseline up and shrink the gap; filtered, the contrast is the intended one."""
-    from vektori_trace.diagnose import score_deficits
+    from vektori_trace.evaluate.diagnose import score_deficits
 
     labels = _replay_labels(3)
     mixed = score_deficits([CAP], labels)[0]

@@ -44,7 +44,7 @@ def cmd_resume_check(args: argparse.Namespace) -> int:
     PLAN.md calls this the spike that gates the design: "High desync makes ReOPD
     mandatory rather than merely preferable — that must be known in week 1."
     """
-    from ...resume import assistant_tool_steps, measure_desync_rate, replay_prefix
+    from ...evaluate.resume import assistant_tool_steps, measure_desync_rate, replay_prefix
 
     traces = _load_traces(Path(args.manifest))
     if args.model:
@@ -122,7 +122,7 @@ def cmd_bisect(args: argparse.Namespace) -> int:
     import shlex
     import subprocess
 
-    from ...intervene import bisect_forking_step, make_resume_fn
+    from ...evaluate.intervene import bisect_forking_step, make_resume_fn
 
     # The teacher must continue *from the replayed prefix*. `validity.run_trial`
     # starts its own fresh container and cannot be handed one, so using it here
@@ -162,7 +162,7 @@ def cmd_bisect(args: argparse.Namespace) -> int:
             continue
 
         def continue_with_teacher(turns, T, _task_dir=task_dir, _trace=trace):
-            from ...resume import assistant_tool_steps
+            from ...evaluate.resume import assistant_tool_steps
 
             jobs.mkdir(parents=True, exist_ok=True)
             prefix_path = jobs / f"{_trace.run_id}-T{T}.json"

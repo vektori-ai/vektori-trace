@@ -6,8 +6,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .llm import call_json
-from .schema import Trace
+from ..llm import call_json
+from ..schema import Trace
 
 Label = str  # "NA" | "PRESENT" | "LACKING"
 

@@ -11,7 +11,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .schema import ToolCall, Turn
+from ..schema import ToolCall, Turn
 
 WRITE_TOOLS = ("write_file", "create_file", "write", "create")
 EXEC_TOOLS = ("bash", "shell", "run_terminal_cmd", "execute")

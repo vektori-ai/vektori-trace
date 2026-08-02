@@ -6,16 +6,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from ...diagnose import (
+from ...evaluate.diagnose import (
     diagnose_replay,
     label_trace,
     propose_capabilities,
     score_deficits,
     select_deficit,
 )
-from ...report import build_replay_report, build_report, write_report
+from ...evaluate.report import build_replay_report, build_report, write_report
+from ...evaluate.validity import prove_validity
 from ...taskgen import scaffold_task
-from ...validity import prove_validity
 from .._shared import _check_replay_models, _load_traces
 
 
