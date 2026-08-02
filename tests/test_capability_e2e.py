@@ -135,7 +135,10 @@ def test_route_cli_builds_task_by_capability_cells(tmp_path: Path, monkeypatch) 
             self.run_id, self.task = run_id, task
 
     monkeypatch.setattr(
-        "vektori_trace.cli._load_traces",
+        # Patch where it is read, not where it is defined: `cmd_route` binds
+        # `_load_traces` into its own module namespace at import time, so
+        # patching the `vektori_trace.cli` re-export would silently do nothing.
+        "vektori_trace.cli.commands.route._load_traces",
         lambda _p: [_T("r1", "task1"), _T("r2", "task2")],
     )
 
