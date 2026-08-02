@@ -338,3 +338,36 @@ def test_exclude_authors_option_overrides_the_default_list() -> None:
     # Overriding replaces the defaults, so dependabot is no longer named —
     # its `chore(deps)` content still is.
     assert custom._metadata_filter(_commit(author_name="dependabot[bot]")) is None
+
+
+def test_bootstrap_cache_misses_when_the_image_is_gone(tmp_path: Path, monkeypatch) -> None:
+    """A pruned image must read as a cache miss, not a registry auth failure.
+
+    `docker system prune` leaves bootstrap.json behind. The image tag is
+    local-only, so the sandbox tries to pull it and every task dies with
+    "pull access denied ... may require 'docker login'" — which looks like a
+    credentials problem and is actually a missing local image.
+    """
+    from vektori_trace.mining.bootstrap import cache as cache_mod
+    from vektori_trace.mining.bootstrap.spec import BootstrapResult, LanguageHint
+
+    result = BootstrapResult(
+        repo="o/n",
+        ref="a" * 40,
+        image_tag="local/r2e-bootstrap/o__n:aaaa",
+        image_digest="sha256:" + "b" * 64,
+        language=LanguageHint.PYTHON,
+        test_cmds=["pytest -q"],
+        rebuild_cmds=[],
+        smoke_passed=True,
+        iterations=0,
+        build_time_sec=1.0,
+        llm_provider="none",
+    )
+    cache_mod.save(result, tmp_path)
+
+    monkeypatch.setattr(cache_mod, "_image_exists_locally", lambda tag: True)
+    assert cache_mod.load("o/n", "a" * 40, tmp_path) is not None
+
+    monkeypatch.setattr(cache_mod, "_image_exists_locally", lambda tag: False)
+    assert cache_mod.load("o/n", "a" * 40, tmp_path) is None
