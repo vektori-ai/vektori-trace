@@ -42,27 +42,14 @@ import random
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from .dataset import turns_to_messages
 from .opd import mean_log_ratio, reverse_kl_surrogate, token_logprobs, topk_reverse_kl
+from .providers.teacher.protocol import IdScoringPool, TopKScoringPool
 from .reopd import ReOPDStepExample, reopd_loss_mask
 from .tokenizer_check import CROSS_TEACHER, DEFAULT_STUDENT, DEFAULT_TEACHER
 from .train import LoraHyperparams, _require_train
-
-
-class IdScoringPool(Protocol):
-    """A teacher that can score ids the caller supplies (`teacher.VllmTeacherPool`)."""
-
-    def score_ids(self, prompt_ids: list[int], tokens: list[int]) -> list[float]: ...
-
-
-class TopKScoringPool(Protocol):
-    """A teacher that also returns its top-K at each scored position."""
-
-    def score_ids_topk(
-        self, prompt_ids: list[int], tokens: list[int], top_k: int
-    ) -> list[dict[int, float]]: ...
 
 
 @dataclass

@@ -13,7 +13,7 @@ This module solves it by working entirely in *teacher ids*:
    teacher-side ids.
 3. The student's sampled action text is also rendered and tokenised on the
    teacher side.
-4. All of those ids are passed directly to the underlying ``IdScoringPool``
+4. All of those ids are passed directly to the underlying ``Teacher`` pool
    (today ``FireworksTeacherPool``), which speaks teacher ids natively.
 
 The vocabulary bridge (span alignment, cross-KL loss) lives elsewhere
@@ -26,26 +26,18 @@ Offline-safe: no network, no torch. All teacher-tokenizer calls are pure CPU.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from ...encoding_dsv4 import (
     ENCODING_DSV4_SHA256,
     encode_messages,
 )
 from ...schema import Turn
+from .protocol import Teacher
 
 # ---------------------------------------------------------------------------
 # Protocols (duck-typed, no torch/transformers import needed in this file)
 # ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class IdScoringPool(Protocol):
-    """Minimal teacher API required by CrossTokenizerTeacherPool."""
-
-    def score_ids(self, prompt_ids: list[int], tokens: list[int]) -> list[float]: ...
-
-    def provenance(self) -> dict[str, Any]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +236,7 @@ class TeacherPrefixCache:
 
 @dataclass
 class CrossTokenizerTeacherPool:
-    """Wraps any ``IdScoringPool`` to work with teacher-side tokenisation.
+    """Wraps any ``Teacher`` pool to work with teacher-side tokenisation.
 
     Caller contract
     ---------------
@@ -269,7 +261,11 @@ class CrossTokenizerTeacherPool:
       bare bool, so the probe can be checked programmatically.
     """
 
-    pool: Any  # IdScoringPool — Any to avoid a circular import on Protocol
+    # All four of Teacher's methods are called on this: score_ids,
+    # score_ids_topk, generate, provenance. It was annotated `Any` with a note
+    # about a circular import, but the Protocol now lives in its own leaf
+    # module, so there is nothing to cycle with.
+    pool: Teacher
     teacher_tokenizer: Any
     thinking_mode: str = "chat"
     bridge: Any | None = None  # CrossTokenizerBridge, optional
