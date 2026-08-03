@@ -424,3 +424,32 @@ def test_capture_proxy_leaves_authorization_alone_without_a_key(
             resp.read()
 
     assert _Upstream.last_auth == ["Bearer passthrough-key"]
+
+
+def test_capture_proxy_helper_couples_top_logprobs_to_logprobs(
+    upstream_server, tmp_path: Path
+):
+    """`top_logprobs=N` alone must still request logprobs.
+
+    `CaptureProxy.start` only emits `top_logprobs` inside the `inject_logprobs`
+    branch, so asking for alternatives without asking for logprobs returns
+    neither and says nothing about it. `cmd_capture_proxy` couples the two; this
+    pins the helper to the same meaning, so a test and the CLI cannot disagree
+    about what identical arguments do.
+    """
+    import urllib.request
+
+    with capture_proxy(upstream_server, tmp_path / "caps", top_logprobs=5) as proxy:
+        req = urllib.request.Request(
+            proxy.api_base + "/chat/completions",
+            data=json.dumps(
+                {"model": "stub", "messages": [{"role": "user", "content": "hi"}]}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    assert _Upstream.last_body["logprobs"] is True
+    assert _Upstream.last_body["top_logprobs"] == 5

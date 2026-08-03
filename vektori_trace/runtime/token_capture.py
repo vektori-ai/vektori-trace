@@ -757,6 +757,10 @@ def capture_proxy(
     A helper that silently drops one is worse than no helper: tests written
     against it then exercise a configuration the CLI never runs.
     """
+    # `start()` only injects `top_logprobs` alongside `logprobs: true`, so asking
+    # for alternatives without asking for logprobs returns neither -- silently.
+    # `cmd_capture_proxy` already couples them; the helper must too, or the two
+    # entry points disagree about what the same arguments mean.
     proxy = CaptureProxy(
         upstream_api_base=upstream_api_base,
         capture_dir=Path(capture_dir),
@@ -764,7 +768,7 @@ def capture_proxy(
         upstream_api_key=upstream_api_key,
         host=host,
         port=port,
-        inject_logprobs=inject_logprobs,
+        inject_logprobs=bool(inject_logprobs or top_logprobs is not None),
     )
     proxy.start()
     try:
