@@ -32,11 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vektori_trace.runtime.serve import serve_model, served_to_harbor_kwargs
 
-# Qwen3-8B, measured from its config.json:
-#   36 layers, 8 KV heads (GQA), head_dim 128
-#   KV/token = 2(K,V) * 36 * 8 * 128 * 2 bytes = 144 KiB
-KV_BYTES_PER_TOKEN = 2 * 36 * 8 * 128 * 2
-WEIGHTS_GIB = 15.3          # 8.19e9 params * 2 bytes (bf16)
+# Qwen3-14B, measured from its config.json:
+#   40 layers, 8 KV heads (GQA), head_dim 128
+#   KV/token = 2(K,V) * 40 * 8 * 128 * 2 bytes = 160 KiB
+KV_BYTES_PER_TOKEN = 2 * 40 * 8 * 128 * 2
+WEIGHTS_GIB = 27.6          # 14.8e9 params * 2 bytes (bf16)
 OVERHEAD_GIB = 1.3          # CUDA context, activations, cuda graphs
 # Keys are Modal's own `gpu=` strings (modal.com/docs/guide/gpu). Note "A10",
 # not "A10G" — Modal renamed it, and the old spelling is rejected before any
@@ -155,11 +155,12 @@ def _smoke(api_base: str, model: str, timeout: float = 120.0) -> tuple[bool, str
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--base-model", default="Qwen/Qwen3-14B")
     ap.add_argument("--gpu", default="L40S",
                     help="Modal GPU: L40S ($1.95/h, 48GB) | A10 ($1.10/h, 24GB). "
-                         "L40S is the default because Qwen3-8B bf16 leaves only "
-                         "5 GiB of KV on an A10, below vLLM's own 40960 default")
+                         "L40S is the default because Qwen3-14B bf16 (27.6 GiB) "
+                         "leaves negative KV on an A10 (21.6 GiB usable) — it "
+                         "does not fit on A10 at all")
     ap.add_argument("--adapter-path", default=None,
                     help="Volume path (/adapters/...) to a LoRA adapter")
     ap.add_argument("--max-model-len", type=int, default=8192,

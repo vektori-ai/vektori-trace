@@ -125,29 +125,33 @@ def serve_model(
     Not unit-tested (needs GPU + real vLLM) — smoke-tested like measure_pass_rates.
 
     `max_model_len` is not optional in practice on a small card. vLLM defaults it
-    to the model's own maximum — 40 960 for Qwen3-8B — and refuses to start when
-    that exceeds what the KV cache can hold. Qwen3-8B costs **144 KiB per token**
-    of KV (36 layers × 8 GQA KV heads × 128 head_dim × 2 for K and V × 2 bytes).
-    The 8 is load-bearing: 32 query heads share 8 KV heads, and under MHA this
-    would be 576 KiB/token and nothing usable would fit.
+    to the model's own maximum — 40 960 for Qwen3-8B and Qwen3-14B alike — and
+    refuses to start when that exceeds what the KV cache can hold. This budget is
+    per-model; below is Qwen3-14B (40 layers × 8 GQA KV heads × 128 head_dim × 2
+    for K and V × 2 bytes = **160 KiB/token**). Qwen3-8B (36 layers) is 144
+    KiB/token instead — see `scripts/serve_student.py`'s constants for whichever
+    model is actually being served. The 8 KV heads are load-bearing either way:
+    query heads share them, and under MHA this would be ~4x the KV/token and
+    nothing usable would fit.
 
-    What's left for KV, after weights, on the two cards this project uses:
+    What's left for KV, after weights, on the two cards this project uses
+    (Qwen3-14B, 27.6 GiB bf16 weights):
 
-        L40S   48 GiB × 0.90 = 43.2  − 15.3 − 1.3 = 26.6 GiB → ~193 700 tokens
-        A10    24 GiB × 0.90 = 21.6  − 15.3 − 1.3 =  5.0 GiB →  ~36 400 tokens
+        L40S   48 GiB × 0.90 = 43.2  − 27.6 − 1.3 = 14.3 GiB → ~93 900 tokens
+        A10    24 GiB × 0.90 = 21.6  − 27.6 − 1.3 = negative → does not fit at all
 
     (`gpu=` takes Modal's own strings — "A10", not the card's AWS name "A10G",
     which Modal rejects before a container starts. See modal.com/docs/guide/gpu.)
 
-    (15.3 GiB is 8.19e9 params × 2 bytes; ~1.3 GiB is CUDA context, cuda graphs
+    (27.6 GiB is 14.8e9 params × 2 bytes; ~1.3 GiB is CUDA context, cuda graphs
     and activation workspace — an *estimate*, and the term to distrust first if a
     start fails near the boundary.)
 
     Those budgets are totals across all concurrent sequences, not per sequence.
-    So on an A10 the vLLM default of 40 960 exceeds the entire cache and startup
-    fails; on an L40S it fits with ~4 concurrent full-length sequences. Set this
-    to the longest trajectory you actually need — `scripts/serve_student.py`
-    refuses impossible values before a GPU is allocated.
+    On an L40S the vLLM default of 40 960 fits ~2 concurrent full-length
+    sequences for Qwen3-14B (vs ~4 for Qwen3-8B). Set this to the longest
+    trajectory you actually need — `scripts/serve_student.py` refuses impossible
+    values before a GPU is allocated.
     """
     _require_modal()
     import modal
