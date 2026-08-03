@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 
@@ -14,17 +15,36 @@ def cmd_capture_proxy(args: argparse.Namespace) -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    top_logprobs = getattr(args, "top_logprobs", None)
+    if top_logprobs is not None and top_logprobs < 1:
+        raise SystemExit(f"--top-logprobs must be >= 1, got {top_logprobs}")
+    # Asking for alternatives without asking for logprobs returns neither.
+    inject_logprobs = bool(args.logprobs or top_logprobs is not None)
+    key_env = getattr(args, "upstream_api_key_env", None)
+    upstream_api_key = None
+    if key_env:
+        upstream_api_key = os.environ.get(key_env)
+        if not upstream_api_key:
+            raise SystemExit(
+                f"--upstream-api-key-env {key_env} is set but ${key_env} is empty"
+            )
     proxy = CaptureProxy(
         upstream_api_base=args.upstream,
         capture_dir=out,
         host=args.host,
         port=args.port,
-        inject_logprobs=args.logprobs,
+        inject_logprobs=inject_logprobs,
+        top_logprobs=top_logprobs,
+        upstream_api_key=upstream_api_key,
     )
     api_base = proxy.start()
     print(f"capture proxy listening at {api_base}")
     print(f"upstream: {proxy.upstream_api_base}")
     print(f"captures → {out / 'token_captures.jsonl'}")
+    if inject_logprobs:
+        print(f"logprobs   on, top_logprobs={top_logprobs}")
+    if upstream_api_key:
+        print(f"auth       overriding Authorization from ${key_env}")
     print("point harbor --api-base (or --ak api_base=...) at this URL")
     print("Ctrl-C to stop")
 
@@ -84,5 +104,26 @@ def register_capture_proxy(sub: argparse._SubParsersAction) -> None:
         "--logprobs",
         action="store_true",
         help="also request per-token logprobs alongside token ids",
+    )
+    p_cap.add_argument(
+        "--top-logprobs",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "request the top-K alternatives at each generated position (implies "
+            "--logprobs). Fireworks rejects K above the deployment's "
+            "--max-logprobs, which defaults to 5 on serverless; not clamped, "
+            "because K is part of the objective"
+        ),
+    )
+    p_cap.add_argument(
+        "--upstream-api-key-env",
+        default=None,
+        metavar="VAR",
+        help=(
+            "read the upstream bearer token from this env var and override the "
+            "client's Authorization header (e.g. FIREWORKS_API_KEY)"
+        ),
     )
     p_cap.set_defaults(func=cmd_capture_proxy)

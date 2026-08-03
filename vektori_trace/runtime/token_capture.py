@@ -39,6 +39,11 @@ _log = logging.getLogger(__name__)
 # Filename written under a harbor attempt dir (rollout.py / CaptureProxy).
 CAPTURE_FILENAME = "token_captures.jsonl"
 
+# Sibling ledger: one line per upstream success the proxy could *not* turn into a
+# capture. Without it an empty token_captures.jsonl is indistinguishable from a
+# run that made no model calls at all.
+CAPTURE_FAILURE_FILENAME = "capture_failures.jsonl"
+
 # Request body flag vLLM understands on chat + completions (v0.10.2+).
 RETURN_TOKEN_IDS_KEY = "return_token_ids"
 
@@ -54,6 +59,22 @@ class CapturedCompletion:
     prompt_token_ids: list[int]
     token_ids: list[int]
     logprobs: list[float] | None = None
+    #: Per-position full logprob record, one dict per *generated* token:
+    #: ``{"token_id": int|None, "token": str|None, "logprob": float,
+    #:    "top": [{"token_id": int|None, "token": str|None, "logprob": float}, ...]}``
+    #:
+    #: `logprobs` above keeps only the chosen token's logprob, which is enough for
+    #: plain reverse-KL but throws away the alternatives. The top-K rows are the
+    #: input `align.align_topk_rows` consumes, and they cannot be reconstructed
+    #: after the fact -- an un-captured alternative is gone for good. Kept as a
+    #: separate field rather than replacing `logprobs` so existing readers
+    #: (`dataset.tokenize_from_ids`, `scripts/verify_run_logs.py`) are unaffected.
+    #:
+    #: `token_id` is None when the provider returns the legacy string-keyed
+    #: format. That is recorded rather than rejected here: the proxy must never
+    #: fail a live agent turn over a logprob shape. `capture_failures.jsonl` and
+    #: the manifest's `logprob_token_id_coverage` are where that becomes visible.
+    logprob_detail: list[dict[str, Any]] | None = None
     model: str = ""
     request_id: str | None = None
     created_at: float = field(default_factory=time.time)
@@ -65,6 +86,22 @@ class CapturedCompletion:
     # silent disagreement between them is undetectable. Decoding `token_ids` must
     # reproduce this string — `scripts/verify_run_logs.py` asserts exactly that.
     text: str | None = None
+    #: A reasoning model's chain of thought, which `message.content` excludes.
+    #:
+    #: DeepSeek-V4-Flash splits its output: everything before `</think>` lands in
+    #: `message.reasoning_content` and only the part after it in
+    #: `message.content`. `token_ids`, meanwhile, spans **both** plus the
+    #: `</think>` token itself. So `text` alone accounts for a fraction of the
+    #: ids -- one measured call emitted 16 ids for a `text` of "391" -- and the
+    #: invariant this dataclass documents above (decoding `token_ids` reproduces
+    #: `text`) is false for any reasoning model unless the CoT is kept too.
+    #:
+    #: This is not cosmetic for OPD: the reasoning tokens are the majority of what
+    #: the student sampled and therefore the majority of what gets scored. Dropping
+    #: them here would leave the ids trainable but make every downstream text-side
+    #: check disagree with them, which reads as corruption rather than as a
+    #: rendering convention.
+    reasoning_text: str | None = None
     # Set by CaptureProxy, which is the only component that sees both ends of a
     # call. `created_at` comes from the upstream response's `created` field: whole
     # seconds, assigned by the server, and useless for measuring anything.
@@ -88,12 +125,18 @@ class CapturedCompletion:
                 if data.get("logprobs") is not None
                 else None
             ),
+            logprob_detail=(
+                [dict(x) for x in data["logprob_detail"]]
+                if data.get("logprob_detail") is not None
+                else None
+            ),
             model=str(data.get("model") or ""),
             request_id=data.get("request_id"),
             created_at=float(data.get("created_at") or time.time()),
             choice_index=int(data.get("choice_index") or 0),
             finish_reason=data.get("finish_reason"),
             text=data.get("text"),
+            reasoning_text=data.get("reasoning_text"),
             request_started_at=(
                 float(data["request_started_at"])
                 if data.get("request_started_at") is not None
@@ -184,6 +227,52 @@ def _completion_logprobs(choice: dict[str, Any]) -> list[float] | None:
     return None
 
 
+def _logprob_alt(entry: dict[str, Any]) -> dict[str, Any]:
+    """One `{token_id, token, logprob}` row from an OpenAI-shaped logprobs entry.
+
+    `token_id` is Fireworks' addition to the OpenAI schema (`NewLogProbsContent`
+    marks it required) and is the only field that makes an alternative usable
+    without re-tokenising. vLLM omits it. None here means "this provider did not
+    say", never "id 0".
+    """
+    tid = entry.get("token_id")
+    return {
+        "token_id": int(tid) if isinstance(tid, int) else None,
+        "token": entry.get("token") if isinstance(entry.get("token"), str) else None,
+        "logprob": float(entry["logprob"]),
+    }
+
+
+def _completion_logprob_detail(choice: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Full per-token logprob rows including the top-K alternatives.
+
+    Returns None when the response carries no usable per-token logprobs at all.
+    A position with logprobs but an empty `top_logprobs` yields `"top": []` --
+    the distinction between "no alternatives requested" and "alternatives
+    requested and none came back" is exactly what the coverage check needs.
+    """
+    lp = choice.get("logprobs")
+    if not isinstance(lp, dict):
+        return None
+    content = lp.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    out: list[dict[str, Any]] = []
+    for entry in content:
+        if not isinstance(entry, dict) or "logprob" not in entry:
+            return None
+        row = _logprob_alt(entry)
+        alts = entry.get("top_logprobs")
+        top: list[dict[str, Any]] = []
+        if isinstance(alts, list):
+            for alt in alts:
+                if isinstance(alt, dict) and "logprob" in alt:
+                    top.append(_logprob_alt(alt))
+        row["top"] = top
+        out.append(row)
+    return out
+
+
 def _completion_text(choice: dict[str, Any]) -> str | None:
     """The emitted text, from either OpenAI response shape.
 
@@ -201,6 +290,48 @@ def _completion_text(choice: dict[str, Any]) -> str | None:
     if isinstance(delta, dict) and delta.get("content") is not None:
         return str(delta["content"])
     return None
+
+
+def _completion_reasoning_text(choice: dict[str, Any]) -> str | None:
+    """The chain of thought, when the provider returns it out-of-band.
+
+    Fireworks/DeepSeek use `message.reasoning_content`; some providers use
+    `reasoning`. None means this response had no separate CoT channel, which is
+    the normal case for a non-reasoning model -- not an error.
+    """
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    for key in ("reasoning_content", "reasoning"):
+        val = message.get(key)
+        if isinstance(val, str):
+            return val
+    return None
+
+
+def detokenized_text(capture: CapturedCompletion) -> str | None:
+    """The full emitted string, rebuilt from the captured logprob tokens.
+
+    This is the only text in a capture that is guaranteed to correspond exactly
+    to `token_ids`, because it *is* the per-token strings the provider returned
+    alongside those ids -- no local tokenizer, no assumption about how the
+    provider splits reasoning from answer, no guess at the `</think>` separator.
+    `scripts/verify_run_logs.py`'s ids-vs-text check should compare against this
+    rather than against `text` for any reasoning model.
+
+    None when the capture carries no per-token detail, or when the provider
+    returned ids without their token strings.
+    """
+    detail = capture.logprob_detail
+    if not detail:
+        return None
+    parts = []
+    for row in detail:
+        tok = row.get("token")
+        if not isinstance(tok, str):
+            return None
+        parts.append(tok)
+    return "".join(parts)
 
 
 def extract_captured_completion(
@@ -245,12 +376,14 @@ def extract_captured_completion(
         prompt_token_ids=prompt_token_ids,
         token_ids=token_ids,
         logprobs=_completion_logprobs(choice),
+        logprob_detail=_completion_logprob_detail(choice),
         model=str(data.get("model") or ""),
         request_id=data.get("id"),
         created_at=float(data.get("created") or time.time()),
         choice_index=choice_index,
         finish_reason=choice.get("finish_reason"),
         text=_completion_text(choice),
+        reasoning_text=_completion_reasoning_text(choice),
     )
 
 
@@ -301,6 +434,34 @@ def load_captures(job_dir: Path) -> list[CapturedCompletion]:
     return out
 
 
+def _logprob_coverage(captures: list[CapturedCompletion]) -> dict[str, Any]:
+    """Aggregate top-K logprob coverage across a run's captures."""
+    positions = 0
+    with_top = 0
+    alts = 0
+    alts_with_id = 0
+    widths: set[int] = set()
+    for cap in captures:
+        for row in cap.logprob_detail or []:
+            positions += 1
+            top = row.get("top") or []
+            if top:
+                with_top += 1
+                widths.add(len(top))
+            for alt in top:
+                alts += 1
+                if alt.get("token_id") is not None:
+                    alts_with_id += 1
+    return {
+        "logprob_positions": positions,
+        "logprob_positions_with_topk": with_top,
+        "logprob_topk_coverage": (with_top / positions) if positions else 0.0,
+        "logprob_topk_widths": sorted(widths),
+        "logprob_alternatives": alts,
+        "logprob_token_id_coverage": (alts_with_id / alts) if alts else 0.0,
+    }
+
+
 def dump_capture_manifest(
     job_dir: Path,
     captures: list[CapturedCompletion],
@@ -315,6 +476,13 @@ def dump_capture_manifest(
         "n_completion_tokens": sum(len(c.token_ids) for c in captures),
         "models": sorted({c.model for c in captures if c.model}),
         "has_logprobs": any(c.logprobs is not None for c in captures),
+        "has_logprob_detail": any(c.logprob_detail is not None for c in captures),
+        "has_reasoning_text": any(c.reasoning_text is not None for c in captures),
+        # How many generated positions actually carried top-K alternatives, and
+        # how many of those alternatives were id-keyed. A run whose captures look
+        # full but whose coverage is 0.0 is not trainable for the top-K objective,
+        # and that has to be visible without re-reading 8 MB of JSONL.
+        **_logprob_coverage(captures),
         "capture_file": CAPTURE_FILENAME,
         **(extra or {}),
     }
@@ -342,6 +510,20 @@ class CaptureProxy:
     host: str = "127.0.0.1"
     port: int = 0  # 0 → ephemeral
     inject_logprobs: bool = False
+    #: Injected as `top_logprobs` alongside `logprobs: true`. None leaves it off,
+    #: which makes the provider return only the sampled token's logprob.
+    #:
+    #: Fireworks rejects any value above the serving deployment's `--max-logprobs`
+    #: (**default 5** on serverless) with a 400. That is a deployment property, not
+    #: a request one, so it is not clamped here: silently sending 5 when the run
+    #: asked for 10 would change the objective's K without saying so, exactly the
+    #: failure `teacher_fireworks.TOP_LOGPROBS_CAP` refuses. Probe first with
+    #: `scripts/probe_fireworks_logprobs.py`.
+    top_logprobs: int | None = None
+    #: Overrides the client's `Authorization` header on the way upstream. Harbor
+    #: hands litellm whatever key it was configured with; when the upstream is
+    #: Fireworks rather than an unauthenticated local vLLM, that key is wrong.
+    upstream_api_key: str | None = None
     _httpd: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
@@ -369,6 +551,8 @@ class CaptureProxy:
         upstream = self.upstream_api_base
         capture_dir = self.capture_dir
         inject_logprobs = self.inject_logprobs
+        top_logprobs = self.top_logprobs
+        upstream_api_key = self.upstream_api_key
         lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
@@ -413,6 +597,8 @@ class CaptureProxy:
                         payload[RETURN_TOKEN_IDS_KEY] = True
                         if inject_logprobs:
                             payload["logprobs"] = True
+                            if top_logprobs is not None:
+                                payload["top_logprobs"] = int(top_logprobs)
                         body = json.dumps(payload).encode("utf-8")
                         headers["Content-Type"] = "application/json"
                     headers["Content-Length"] = str(len(body))
@@ -480,6 +666,34 @@ class CaptureProxy:
                             type(exc).__name__,
                             exc,
                         )
+                        # A warning on stderr is not a record. Every call that
+                        # reached the model but produced no capture is written
+                        # here, so "N captures" can always be reconciled against
+                        # "M upstream 2xx responses" instead of being taken on
+                        # trust. Best-effort: a failure to log a failure must
+                        # still not break the agent's turn.
+                        try:
+                            with lock:
+                                fail_path = Path(capture_dir) / CAPTURE_FAILURE_FILENAME
+                                fail_path.parent.mkdir(parents=True, exist_ok=True)
+                                with fail_path.open("a", encoding="utf-8") as fh:
+                                    fh.write(
+                                        json.dumps(
+                                            {
+                                                "at": request_started_at,
+                                                "path": path,
+                                                "status": code,
+                                                "error_type": type(exc).__name__,
+                                                "error": str(exc),
+                                                "body_head": resp_body[:600].decode(
+                                                    "utf-8", "replace"
+                                                ),
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                        except OSError:
+                            _log.warning("could not append to %s", CAPTURE_FAILURE_FILENAME)
 
                 self.send_response(code)
                 self.send_header("Content-Type", content_type)
@@ -541,6 +755,7 @@ def capture_proxy(
 
 
 __all__ = [
+    "CAPTURE_FAILURE_FILENAME",
     "CAPTURE_FILENAME",
     "RETURN_TOKEN_IDS_KEY",
     "CaptureProxy",
@@ -549,6 +764,7 @@ __all__ = [
     "append_capture",
     "capture_path",
     "capture_proxy",
+    "detokenized_text",
     "dump_capture_manifest",
     "extract_captured_completion",
     "litellm_extra_body",

@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import subprocess as _subprocess
 import threading as _threading
+import time as _time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -354,6 +356,13 @@ def _append_log(log_path: Path, record: dict[str, Any]) -> None:
         fh.flush()
 
 
+#: Wall-clock ceiling for a single harbor rollout. `validity.run_trial`'s own
+#: default is 30 min, which a 40-step agentic trajectory on a slow model does not
+#: fit -- the first Qwen3-8B sweep lost every rollout to it. Overridable per run
+#: via `passk --timeout-sec`.
+DEFAULT_TRIAL_TIMEOUT_SEC = 5400
+
+
 def measure_passk_stage(
     task_dirs: list[Path],
     agent: str,
@@ -368,6 +377,7 @@ def measure_passk_stage(
     infra_failures: dict[str, int] | None = None,
     max_workers: int = 1,
     log_path: Path | None = None,
+    timeout_sec: int = DEFAULT_TRIAL_TIMEOUT_SEC,
 ) -> list[RolloutOutcome]:
     """Drive n harbor trials per task. Infra failures (passed is None) excluded
     from the denominator (V0_PLAN.md rule) but counted into `infra_failures`, so
@@ -393,15 +403,58 @@ def measure_passk_stage(
 
     def _one(job: tuple[Path, int]) -> RolloutOutcome | tuple[str, None]:
         task_dir, i = job
-        trial = run_trial(
-            task_dir,
-            agent=agent,
-            jobs_dir=jobs_dir / f"{task_dir.name}-{i}",
-            model=model,
-            api_base=api_base,
-            model_info=model_info,
-            agent_kwargs=agent_kwargs,
-        )
+        rollout_jobs_dir = jobs_dir / f"{task_dir.name}-{i}"
+        timed_out = False
+        started = _time.time()
+        try:
+            trial = run_trial(
+                task_dir,
+                agent=agent,
+                jobs_dir=rollout_jobs_dir,
+                model=model,
+                timeout_sec=timeout_sec,
+                api_base=api_base,
+                model_info=model_info,
+                agent_kwargs=agent_kwargs,
+            )
+        except _subprocess.TimeoutExpired:
+            # Previously this propagated and killed the entire sweep, so one slow
+            # rollout cost every rollout after it. A timeout is a *result about
+            # this rollout* -- record it, mark it ungradeable, keep going.
+            #
+            # It is deliberately not folded into the generic infra-failure count
+            # without a mark: "harbor could not start" and "the agent was still
+            # working after N seconds" have opposite fixes, and passk.json's
+            # `infra_failures: 4` cannot tell you which you had.
+            timed_out = True
+            _log.warning(
+                "rollout %s[%d] exceeded timeout_sec=%d -- recorded as a timeout, "
+                "not graded",
+                task_dir.name,
+                i,
+                timeout_sec,
+            )
+            if log_path is not None:
+                with log_lock:
+                    _append_log(
+                        log_path,
+                        {
+                            "task": task_dir.name,
+                            "stratum": stratum,
+                            "rollout_index": i,
+                            "passed": None,
+                            "reward": None,
+                            "jobs_dir": str(rollout_jobs_dir),
+                            "started_at": started,
+                            "elapsed_sec": _time.time() - started,
+                            "n_turns": None,
+                            "n_tool_calls": None,
+                            "infra_failure": True,
+                            "timed_out": True,
+                            "timeout_sec": timeout_sec,
+                        },
+                    )
+            return task_dir.name, None
         n_turns, n_tool_calls = _trajectory_shape(trial.jobs_dir)
         outcome = RolloutOutcome(
             task=task_dir.name,
@@ -422,6 +475,8 @@ def measure_passk_stage(
             # denominator rule depends on.
             record["passed"] = trial.passed
             record["infra_failure"] = trial.passed is None
+            # Always present, so a reader never has to infer absence-means-false.
+            record["timed_out"] = timed_out
             with log_lock:
                 _append_log(log_path, record)
         if trial.passed is None:
@@ -462,6 +517,7 @@ def two_stage_sweep(
     max_workers: int = 1,
     escalate: bool = True,
     log_path: Path | None = None,
+    timeout_sec: int = DEFAULT_TRIAL_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     """Stage 1 n=8 all tasks; stage 2 n=32 only for 0/8. Returns separate strata.
 
@@ -485,6 +541,7 @@ def two_stage_sweep(
         infra_failures=infra,
         max_workers=max_workers,
         log_path=log_path,
+        timeout_sec=timeout_sec,
     )
     stage1 = {
         task: pr
@@ -513,6 +570,7 @@ def two_stage_sweep(
         infra_failures=infra,
         max_workers=max_workers,
         log_path=log_path,
+        timeout_sec=timeout_sec,
     )
     stage2 = {
         task: pr
@@ -526,6 +584,9 @@ def two_stage_sweep(
         "agent": agent,
         "stage1_n": stage1_n,
         "stage2_n": stage2_n,
+        # Provenance: an infra_failures count means nothing without the wall the
+        # rollouts were run against.
+        "timeout_sec": timeout_sec,
         "stage1": {t: _task_to_dict(pr) for t, pr in stage1.items()},
         "stage2": {t: _task_to_dict(pr) for t, pr in stage2.items()},
         "escalated": sorted(escalate_ids),
