@@ -586,6 +586,16 @@ class CaptureProxy:
                     for k, v in self.headers.items()
                     if k.lower() not in {"host", "content-length", "transfer-encoding"}
                 }
+                if upstream_api_key:
+                    # Whatever key the client was configured with is for a
+                    # different service than the upstream this proxy actually
+                    # talks to. Drop every spelling of the inbound header before
+                    # setting ours -- HTTP header names are case-insensitive, a
+                    # dict is not, and sending both is how you get a 401 that
+                    # looks like a bad credential.
+                    for _k in [k for k in headers if k.lower() == "authorization"]:
+                        headers.pop(_k, None)
+                    headers["Authorization"] = f"Bearer {upstream_api_key}"
                 if method in {"POST", "PUT", "PATCH"} and body:
                     try:
                         payload = json.loads(body.decode("utf-8") or "{}")
@@ -736,13 +746,22 @@ def capture_proxy(
     capture_dir: Path | str,
     *,
     inject_logprobs: bool = False,
+    top_logprobs: int | None = None,
+    upstream_api_key: str | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> Iterator[CaptureProxy]:
-    """Context manager around `CaptureProxy.start` / `stop`."""
+    """Context manager around `CaptureProxy.start` / `stop`.
+
+    Mirrors every `CaptureProxy` field that changes what goes on the wire.
+    A helper that silently drops one is worse than no helper: tests written
+    against it then exercise a configuration the CLI never runs.
+    """
     proxy = CaptureProxy(
         upstream_api_base=upstream_api_base,
         capture_dir=Path(capture_dir),
+        top_logprobs=top_logprobs,
+        upstream_api_key=upstream_api_key,
         host=host,
         port=port,
         inject_logprobs=inject_logprobs,

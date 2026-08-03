@@ -190,6 +190,11 @@ class _Upstream(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         req = json.loads(raw.decode() or "{}")
         _Upstream.last_body = req
+        # Every spelling, so a duplicated header is visible rather than masked
+        # by dict lookup picking one of them.
+        _Upstream.last_auth = [
+            v for k, v in self.headers.items() if k.lower() == "authorization"
+        ]
         assert req.get(RETURN_TOKEN_IDS_KEY) is True
         resp = {
             "id": "upstream-1",
@@ -214,6 +219,7 @@ class _Upstream(BaseHTTPRequestHandler):
 @pytest.fixture()
 def upstream_server():
     _Upstream.last_body = None
+    _Upstream.last_auth = None
     httpd = HTTPServer(("127.0.0.1", 0), _Upstream)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -347,3 +353,74 @@ def test_cli_run_arms_capture_tokens_flag():
         ]
     )
     assert args.capture_tokens is True
+
+
+def test_capture_proxy_overrides_client_authorization(upstream_server, tmp_path: Path):
+    """`upstream_api_key` must actually reach the wire, replacing the client's.
+
+    Regression test. The field was declared on `CaptureProxy` and hoisted into
+    the request handler's closure, but the line applying it was lost in the move
+    to `vektori_trace/runtime/`. Nothing failed loudly: the CLI still printed
+    "auth overriding Authorization", so the proxy looked configured while the
+    client's own credential went upstream unchanged. Against a real provider
+    that is a 401 on every call, which reads as a bad key rather than as a bug —
+    it cost a full agent rollout before anyone looked at the header.
+
+    Asserting on the *list* of authorization headers, not a single lookup, is
+    deliberate: HTTP header names are case-insensitive but a dict is not, so
+    setting `Authorization` without removing an inbound `authorization` sends
+    both and the upstream may honour either.
+    """
+    import urllib.request
+
+    capture_dir = tmp_path / "caps"
+    with capture_proxy(
+        upstream_server, capture_dir, upstream_api_key="real-upstream-key"
+    ) as proxy:
+        payload = json.dumps(
+            {"model": "stub", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
+        req = urllib.request.Request(
+            proxy.api_base + "/chat/completions",
+            data=payload,
+            # Lowercase on purpose: urllib will title-case this, but a client
+            # that does not is exactly the case a plain dict assignment misses.
+            headers={"Content-Type": "application/json",
+                     "authorization": "Bearer client-key-for-a-different-service"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    assert _Upstream.last_auth == ["Bearer real-upstream-key"], (
+        f"upstream saw {_Upstream.last_auth!r}; expected exactly one header "
+        "carrying the configured upstream key"
+    )
+
+
+def test_capture_proxy_leaves_authorization_alone_without_a_key(
+    upstream_server, tmp_path: Path
+):
+    """No `upstream_api_key` means pass the client's credential through untouched.
+
+    The override must not fire unconditionally — a proxy in front of a server
+    that shares the client's auth (a local vLLM, say) would otherwise have its
+    credential silently stripped.
+    """
+    import urllib.request
+
+    with capture_proxy(upstream_server, tmp_path / "caps") as proxy:
+        payload = json.dumps(
+            {"model": "stub", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
+        req = urllib.request.Request(
+            proxy.api_base + "/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer passthrough-key"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+
+    assert _Upstream.last_auth == ["Bearer passthrough-key"]
