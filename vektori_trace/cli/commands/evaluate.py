@@ -59,6 +59,11 @@ def cmd_passk(args: argparse.Namespace) -> int:
         max_workers=args.max_workers,
         escalate=not args.no_escalate,
         log_path=out / PASSK_LOG_FILENAME,
+        **(
+            {"timeout_sec": args.timeout_sec}
+            if getattr(args, "timeout_sec", None)
+            else {}
+        ),
     )
     path = out / "passk.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
@@ -129,6 +134,16 @@ def register_passk(sub: argparse._SubParsersAction) -> None:
             "run stage 1 only. Escalation fires on c == 0 regardless of how big "
             "stage 1 was, so a small --stage1-n silently becomes --stage2-n "
             "rollouts the moment a task fails"
+        ),
+    )
+    p_passk.add_argument(
+        "--timeout-sec",
+        type=_positive_int_arg,
+        default=None,
+        help=(
+            "wall-clock ceiling per rollout (default 5400). A rollout that "
+            "exceeds it is logged with timed_out=true and excluded from the "
+            "denominator, instead of aborting the sweep"
         ),
     )
     _add_endpoint_args(p_passk)
