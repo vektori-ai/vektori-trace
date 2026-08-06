@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from vektori_trace.mining.bootstrap.docker import DockerSandbox
 from vektori_trace.mining.log_parsers import parse_logs
+from vektori_trace.mining.pipeline import _GIT_CLEAN_EXCLUDES
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,9 @@ def _build_stage_script(
         "git config --global --add safe.directory /workspace",
         f"git reset --hard {base_commit}",
         # Keep language dep/build dirs (node_modules, target, vendor, ...) so
-        # the clean doesn't wipe deps the suite needs. See _GIT_CLEAN_EXCLUDES.
+        # the clean doesn't wipe deps the suite needs — shared with
+        # pipeline.py's Dockerfile emitter via _GIT_CLEAN_EXCLUDES so the two
+        # can't drift apart again.
         #
         # NO `-x`. Ignored files are generated build artifacts, and removing
         # them breaks any project that derives its version from git:
@@ -79,8 +82,7 @@ def _build_stage_script(
         # `no_fail_to_pass`: a plausible bucket name for a validation that
         # never ran. Measured on prefect: `-fd` removes nothing, `-fdx`
         # removes exactly those two generated files.
-        "git clean -fd -e .venv -e venv -e __pycache__ -e .tox "
-        "-e node_modules -e target -e vendor -e .gradle -e .next -e .pytest_cache || true",
+        f"git clean -fd {_GIT_CLEAN_EXCLUDES} || true",
     ]
     if apply_patch and apply_patch.strip():
         parts.append(_heredoc_apply(apply_patch))
