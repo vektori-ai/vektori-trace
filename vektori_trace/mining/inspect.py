@@ -28,6 +28,33 @@ from pathlib import Path
 # `+++ b/path/to/test_x.py` — the post-image path of each file a patch touches.
 _PATCH_TARGET_RE = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
 
+# `git clean -fdx` (or `-X`, or `-x` in any short-flag combo, in any case)
+# removes git-ignored files, not just untracked ones. For any repo that writes
+# its version file into the source tree at install time (hatch-vcs,
+# setuptools_scm), that file is gitignored, so `-x`/`-X` deletes it and
+# `import <pkg>` fails before a single test collects — every rollout then
+# scores a false reward=0. This bit prefect and hatch through two
+# independently-hardcoded copies of the same `git clean` command (pipeline.py
+# and validate.py); a third copy-paste would reintroduce it silently, so the
+# audit checks the emitted artifact itself, token by token — a regex missed
+# `-f -d -x` as separate tokens and uppercase `-X` in an earlier version.
+_GIT_CLEAN_RE = re.compile(r"git clean\b(?P<rest>[^\n]*)")
+
+
+def _git_clean_deletes_ignored_files(dockerfile: str) -> str | None:
+    """First unsafe `git clean` invocation in `dockerfile`, or None if safe.
+
+    Long options are trusted as-is: git clean's only long flag containing an
+    `x` is `--exclude=<pattern>`, which does the opposite of `-x` (excludes
+    a pattern from the clean rather than including ignored files), so
+    matching on `x` in `--`-prefixed tokens would false-positive on it.
+    """
+    for m in _GIT_CLEAN_RE.finditer(dockerfile):
+        for token in m.group("rest").split():
+            if token.startswith("-") and not token.startswith("--") and "x" in token.lower():
+                return m.group(0).strip()
+    return None
+
 # Test-file extensions across the runners `--language` advertises. A node id
 # that names a file lets us check the *file* appears in the hidden test patch.
 _TEST_FILE_EXTS = (
@@ -214,6 +241,21 @@ def audit_task(task_dir: Path) -> TaskAudit:
         "git_history_scrubbed",
         not missing,
         "all scrub steps present" if not missing else f"missing: {', '.join(missing)}",
+    )
+
+    # --- 2b. git clean doesn't delete generated build artifacts ---------------
+    # `-x` deletes git-ignored files, which for git-versioned repos (hatch-vcs,
+    # setuptools_scm) includes the generated version file `import <pkg>` needs.
+    # A task whose Dockerfile has this scores a false reward=0 for every
+    # rollout, indistinguishable from a hard task. See _GIT_CLEAN_X_RE.
+    unsafe_clean = _git_clean_deletes_ignored_files(dockerfile)
+    _record(
+        audit,
+        "git_clean_preserves_build_artifacts",
+        unsafe_clean is None,
+        "no `-x`/`-X` flag on git clean"
+        if unsafe_clean is None
+        else f"git clean uses `-x`/`-X`, will delete gitignored build artifacts: {unsafe_clean!r}",
     )
 
     # --- 3. F2P names actually in the test patch ------------------------------

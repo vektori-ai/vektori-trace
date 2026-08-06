@@ -47,7 +47,7 @@ def _dockerfile(base: str = BASE) -> str:
     return (
         "FROM python:3.12-slim\n"
         "WORKDIR /workspace\n"
-        f"RUN git reset --hard {base} && git clean -fdx\n" + git_history_scrub(base)
+        f"RUN git reset --hard {base} && git clean -fd\n" + git_history_scrub(base)
     )
 
 
@@ -137,6 +137,60 @@ def test_a_partial_scrub_is_still_a_failure(tmp_path: Path) -> None:
     audit = audit_task(_write_task(tmp_path, dockerfile=partial))
 
     assert "git_history_scrubbed" in audit.failures
+
+
+# ---------------------------------------------------------------------------
+# 2b. git clean doesn't delete generated build artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_git_clean_dash_x_is_caught(tmp_path: Path) -> None:
+    """`-x` deletes git-ignored files. For hatch-vcs/setuptools_scm repos that
+    includes the generated version file `import <pkg>` needs — prefect's
+    `_build_info.py`, hatch's `_version.py` — so every rollout against that
+    task silently scores reward=0 no matter what the agent does."""
+    dockerfile = f"FROM python:3.12-slim\nRUN git reset --hard {BASE} && git clean -fdx\n"
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "git_clean_preserves_build_artifacts" in audit.failures
+
+
+def test_git_clean_dash_x_as_separate_token_is_caught(tmp_path: Path) -> None:
+    """`-f -d -x` as separate tokens is exactly as unsafe as `-fdx` combined."""
+    dockerfile = f"FROM python:3.12-slim\nRUN git reset --hard {BASE} && git clean -f -d -x\n"
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "git_clean_preserves_build_artifacts" in audit.failures
+
+
+def test_git_clean_dash_capital_x_is_caught(tmp_path: Path) -> None:
+    """`-X` removes only ignored files — strictly the same failure mode as
+    lowercase `-x` for this purpose."""
+    dockerfile = f"FROM python:3.12-slim\nRUN git reset --hard {BASE} && git clean -fd -X\n"
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "git_clean_preserves_build_artifacts" in audit.failures
+
+
+def test_git_clean_dash_fd_passes(tmp_path: Path) -> None:
+    """`-fd` (no `x`) is the safe form and must not be flagged."""
+    dockerfile = f"FROM python:3.12-slim\nRUN git reset --hard {BASE} && git clean -fd\n"
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "git_clean_preserves_build_artifacts" not in audit.failures
+
+
+def test_git_clean_dash_dash_exclude_is_not_a_false_positive(tmp_path: Path) -> None:
+    """`--exclude=<pattern>` contains the letter `x` but does the opposite of
+    `-x`: it protects a pattern from the clean rather than deleting ignored
+    files. Must not be flagged."""
+    dockerfile = (
+        f"FROM python:3.12-slim\n"
+        f"RUN git reset --hard {BASE} && git clean -fd --exclude=.venv\n"
+    )
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "git_clean_preserves_build_artifacts" not in audit.failures
 
 
 # ---------------------------------------------------------------------------

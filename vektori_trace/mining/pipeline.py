@@ -518,7 +518,15 @@ def build_environment_dockerfile(bootstrap_image: str, base_commit: str) -> str:
         f"RUN git config --global --add safe.directory /workspace \\\n"
         f"    && git fetch --depth 1 origin {base_commit} 2>/dev/null \\\n"
         f"       || git fetch --unshallow origin 2>/dev/null || true\n"
-        f"RUN git reset --hard {base_commit} && git clean -fdx {_GIT_CLEAN_EXCLUDES}\n"
+        # NO `-x`. `-x` also removes git-ignored files, which breaks any repo
+        # that generates an in-tree version file from git at install time
+        # (hatch-vcs, setuptools_scm): prefect's `src/prefect/_build_info.py`
+        # and hatch's `src/hatch/_version.py` are both gitignored, so `-fdx`
+        # deleted them and `import prefect`/`import hatch` failed before a
+        # single test could collect — every rollout against those tasks
+        # scored a false reward=0 regardless of what the agent did. Same bug,
+        # same fix as validate.py's `_build_stage_script` (see comment there).
+        f"RUN git reset --hard {base_commit} && git clean -fd {_GIT_CLEAN_EXCLUDES}\n"
         # ANTI-CHEAT: the working tree is at base_commit, but .git still holds
         # the future (origin/main, tags, the fix commit + its hidden test),
         # which an agent can read offline. Strip it down to base_commit.
