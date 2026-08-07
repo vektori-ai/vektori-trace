@@ -258,6 +258,35 @@ def audit_task(task_dir: Path) -> TaskAudit:
         else f"git clean uses `-x`/`-X`, will delete gitignored build artifacts: {unsafe_clean!r}",
     )
 
+    # --- 2c. tmux is baked into the image -------------------------------------
+    # terminus-2's *only* interaction mechanism is a tmux pane, so a task image
+    # without tmux kills every rollout at setup with "Failed to start tmux
+    # session. Error: None" — before the agent does anything. Harbor's own
+    # install-at-runtime fallback can't save it either: the task runs under
+    # `network_mode = "allowlist"` with no PyPI/GitHub host, so the install
+    # fails closed. It has to be in the Dockerfile, and this has already
+    # regressed once by living only in a hand-applied patch, so audit the
+    # emitted artifact rather than trusting the emitter.
+    # Match an actual install instruction, not the word "tmux". A substring
+    # check passes on the explanatory comment block alone, so deleting the RUN
+    # line and leaving the comment would keep this check green — precisely the
+    # silent regression it exists to prevent.
+    installs_tmux = any(
+        re.search(r"^\s*RUN\b.*\btmux\b", line)
+        for line in dockerfile.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    _record(
+        audit,
+        "dockerfile_installs_tmux",
+        installs_tmux,
+        "tmux installed at image-build time"
+        if installs_tmux
+        else "Dockerfile never installs tmux; terminus-2 rollouts will fail at "
+        "'Failed to start tmux session' and the runtime allowlist blocks "
+        "installing it later",
+    )
+
     # --- 3. F2P names actually in the test patch ------------------------------
     # The graded verifier looks up these exact node ids in the suite output. A
     # name the hidden test_patch never adds is never collected, never runs,
