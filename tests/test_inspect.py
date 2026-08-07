@@ -47,6 +47,7 @@ def _dockerfile(base: str = BASE) -> str:
     return (
         "FROM python:3.12-slim\n"
         "WORKDIR /workspace\n"
+        "RUN command -v tmux >/dev/null 2>&1 || apt-get install -y tmux || true\n"
         f"RUN git reset --hard {base} && git clean -fd\n" + git_history_scrub(base)
     )
 
@@ -191,6 +192,51 @@ def test_git_clean_dash_dash_exclude_is_not_a_false_positive(tmp_path: Path) -> 
     audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
 
     assert "git_clean_preserves_build_artifacts" not in audit.failures
+
+
+# ---------------------------------------------------------------------------
+# 2c. tmux baked into the image
+# ---------------------------------------------------------------------------
+
+
+def test_missing_tmux_is_caught(tmp_path: Path) -> None:
+    """terminus-2 drives the container through a tmux pane and nothing else, so
+    an image without tmux fails every rollout at "Failed to start tmux session"
+    — and the task's runtime allowlist has no PyPI/GitHub, so harbor's
+    install-at-runtime fallback can't recover it."""
+    dockerfile = f"FROM python:3.12-slim\nRUN git reset --hard {BASE} && git clean -fd\n"
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "dockerfile_installs_tmux" in audit.failures
+
+
+def test_tmux_mentioned_only_in_a_comment_is_not_enough(tmp_path: Path) -> None:
+    """The emitted Dockerfile carries a long comment explaining why tmux must be
+    baked in. A substring check would be satisfied by that comment alone, so
+    deleting the RUN line and keeping the prose would pass the very audit meant
+    to catch it."""
+    dockerfile = (
+        f"FROM python:3.12-slim\n"
+        f"# Defensive: terminus-2 drives the container through a tmux pane, so\n"
+        f"# tmux must be installed at build time or every rollout fails.\n"
+        f"RUN git reset --hard {BASE} && git clean -fd\n"
+    )
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "dockerfile_installs_tmux" in audit.failures
+
+
+def test_tmux_install_passes(tmp_path: Path) -> None:
+    """The defensive install line the pipeline emits satisfies the check."""
+    dockerfile = (
+        f"FROM python:3.12-slim\n"
+        f"RUN command -v tmux >/dev/null 2>&1 || \\\n"
+        f"    (apt-get update && apt-get install -y --no-install-recommends tmux) || true\n"
+        f"RUN git reset --hard {BASE} && git clean -fd\n"
+    )
+    audit = audit_task(_write_task(tmp_path, dockerfile=dockerfile))
+
+    assert "dockerfile_installs_tmux" not in audit.failures
 
 
 # ---------------------------------------------------------------------------
