@@ -16,6 +16,7 @@ control still get the flag. Requires vLLM ≥ 0.10.2 in the serve image.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from .modal_env import (
     VOLUME_MOUNT,
     VOLUME_NAME,
 )
+
+_log = logging.getLogger(__name__)
 
 # Default model_info harbor requires for hosted_vllm (token limits + costs).
 DEFAULT_HOSTED_VLLM_MODEL_INFO: dict[str, Any] = {
@@ -157,16 +160,35 @@ def serve_model(
     import modal
 
     info = dict(model_info or DEFAULT_HOSTED_VLLM_MODEL_INFO)
-    if model_info is None and max_model_len is not None:
-        # DEFAULT_HOSTED_VLLM_MODEL_INFO advertises 32768 input tokens. harbor
-        # and litellm believe it and will send prompts that large. If vLLM was
-        # started with a smaller --max-model-len those requests are rejected
-        # mid-sweep, after the rollout has already done its work. Advertise the
-        # window we actually launched with; reserve a little for the completion.
-        info["max_input_tokens"] = max(1, max_model_len - 512)
-        info["max_output_tokens"] = min(
-            int(info.get("max_output_tokens", 8192)), max(1, max_model_len - 512)
-        )
+    if max_model_len is not None:
+        # harbor and litellm believe whatever `model_info` advertises and will
+        # send prompts that large. If vLLM was started with a smaller
+        # --max-model-len those requests are rejected mid-sweep, after the
+        # rollout has already done its work.
+        #
+        # This used to run only when the caller passed no `model_info` at all,
+        # which is exactly backwards: `passk --model-info @file.json` is the
+        # common path (the box keeps a `model_info_14b.json`), and a
+        # hand-written file is far likelier to disagree with the served window
+        # than the default is. Clamp both cases.
+        #
+        # input + output must fit the window *together* -- they share it. The
+        # old arithmetic gave input `L-512` and output `min(8192, L-512)`, i.e.
+        # 15 360 tokens of advertised budget for an 8 192-token context.
+        out_cap = int(info.get("max_output_tokens", 8192))
+        out_cap = max(1, min(out_cap, max_model_len // 2))
+        in_cap = max(1, max_model_len - out_cap)
+        if int(info.get("max_input_tokens", 0)) > in_cap:
+            _log.warning(
+                "model_info advertises max_input_tokens=%s but the server was "
+                "started with --max-model-len=%s; clamping to %s so litellm "
+                "cannot send prompts vLLM will reject mid-sweep",
+                info.get("max_input_tokens"),
+                max_model_len,
+                in_cap,
+            )
+        info["max_input_tokens"] = min(int(info.get("max_input_tokens", in_cap)), in_cap)
+        info["max_output_tokens"] = out_cap
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)

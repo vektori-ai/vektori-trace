@@ -13,9 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import subprocess as _subprocess
 import threading as _threading
-import time as _time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -404,57 +402,31 @@ def measure_passk_stage(
     def _one(job: tuple[Path, int]) -> RolloutOutcome | tuple[str, None]:
         task_dir, i = job
         rollout_jobs_dir = jobs_dir / f"{task_dir.name}-{i}"
-        timed_out = False
-        started = _time.time()
-        try:
-            trial = run_trial(
-                task_dir,
-                agent=agent,
-                jobs_dir=rollout_jobs_dir,
-                model=model,
-                timeout_sec=timeout_sec,
-                api_base=api_base,
-                model_info=model_info,
-                agent_kwargs=agent_kwargs,
-            )
-        except _subprocess.TimeoutExpired:
-            # Previously this propagated and killed the entire sweep, so one slow
-            # rollout cost every rollout after it. A timeout is a *result about
-            # this rollout* -- record it, mark it ungradeable, keep going.
-            #
-            # It is deliberately not folded into the generic infra-failure count
-            # without a mark: "harbor could not start" and "the agent was still
-            # working after N seconds" have opposite fixes, and passk.json's
-            # `infra_failures: 4` cannot tell you which you had.
-            timed_out = True
+        # `run_trial` catches TimeoutExpired itself and scores the rollout as a
+        # loss (a timeout is a model failure -- "never finished in budget" --
+        # not an infra problem), reporting it back on `TrialResult.timed_out`.
+        # This function used to carry its own `except TimeoutExpired` block that
+        # marked the rollout ungradeable instead; it could never fire, and the
+        # two policies contradicted each other. `timed_out` was therefore
+        # unconditionally false in every log line ever written.
+        trial = run_trial(
+            task_dir,
+            agent=agent,
+            jobs_dir=rollout_jobs_dir,
+            model=model,
+            timeout_sec=timeout_sec,
+            api_base=api_base,
+            model_info=model_info,
+            agent_kwargs=agent_kwargs,
+        )
+        timed_out = trial.timed_out
+        if timed_out:
             _log.warning(
-                "rollout %s[%d] exceeded timeout_sec=%d -- recorded as a timeout, "
-                "not graded",
+                "rollout %s[%d] exceeded timeout_sec=%d -- scored as a loss",
                 task_dir.name,
                 i,
                 timeout_sec,
             )
-            if log_path is not None:
-                with log_lock:
-                    _append_log(
-                        log_path,
-                        {
-                            "task": task_dir.name,
-                            "stratum": stratum,
-                            "rollout_index": i,
-                            "passed": None,
-                            "reward": None,
-                            "jobs_dir": str(rollout_jobs_dir),
-                            "started_at": started,
-                            "elapsed_sec": _time.time() - started,
-                            "n_turns": None,
-                            "n_tool_calls": None,
-                            "infra_failure": True,
-                            "timed_out": True,
-                            "timeout_sec": timeout_sec,
-                        },
-                    )
-            return task_dir.name, None
         n_turns, n_tool_calls = _trajectory_shape(trial.jobs_dir)
         outcome = RolloutOutcome(
             task=task_dir.name,
@@ -477,6 +449,10 @@ def measure_passk_stage(
             record["infra_failure"] = trial.passed is None
             # Always present, so a reader never has to infer absence-means-false.
             record["timed_out"] = timed_out
+            # Why a verdict was withheld. Without it, `infra_failure: true` is
+            # indistinguishable between "harbor never started" and "the verifier
+            # ran but disclaimed its own reward".
+            record["parse_status"] = trial.parse_status
             with log_lock:
                 _append_log(log_path, record)
         if trial.passed is None:
@@ -600,7 +576,9 @@ def two_stage_sweep(
         # AC #2: every task carries a support classification, and tasks that
         # produced no gradeable rollout at all are named rather than missing.
         "support": {
-            d.name: classify_support(stage1.get(d.name), stage2.get(d.name))
+            d.name: classify_support(
+                stage1.get(d.name), stage2.get(d.name), stage2_n=stage2_n
+            )
             for d in task_dirs
         },
         "infra_failures": dict(sorted(infra.items())),
@@ -635,19 +613,37 @@ def two_stage_sweep(
 def classify_support(
     stage1: TaskPassK | None,
     stage2: TaskPassK | None,
+    *,
+    stage2_n: int = STAGE2_N,
 ) -> str:
     """`in_support` | `outside_support` | `undetermined` | `no_rollouts`.
 
     `outside_support` requires the n=32 escalation to have actually run: 0/8 on
     its own is underpowered, not evidence of absent support.
+
+    "Actually run" means the escalation produced (nearly) the sample it asked
+    for, not merely one gradeable rollout. Testing `stage2.n > 0` let 0/2 —
+    thirty of thirty-two rollouts lost to infra failures — be reported as
+    evidence that a task is unsolvable, which is exactly the underpowered
+    conclusion this function exists to prevent.
     """
     if stage1 is None and stage2 is None:
         return "no_rollouts"
     if (stage1 is not None and stage1.c > 0) or (stage2 is not None and stage2.c > 0):
         return "in_support"
-    if stage2 is not None and stage2.n > 0 and stage2.c == 0:
+    if stage2 is not None and stage2.c == 0 and stage2.n >= _min_stage2_n(stage2_n):
         return "outside_support"
     return "undetermined"
+
+
+def _min_stage2_n(stage2_n: int) -> int:
+    """How much of the escalation must survive before its zero counts as evidence.
+
+    Three quarters: enough tolerance that a couple of infra failures don't void
+    an otherwise complete escalation, tight enough that a mostly-failed stage 2
+    stays `undetermined`.
+    """
+    return max(1, (stage2_n * 3) // 4)
 
 
 def _task_to_dict(pr: TaskPassK) -> dict[str, Any]:
