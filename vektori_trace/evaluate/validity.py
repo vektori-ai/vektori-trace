@@ -28,6 +28,14 @@ class TrialResult:
     # the per-call token captures. Optional so existing constructions still work.
     elapsed_sec: float | None = None
     started_at: float | None = None
+    # True when harbor was killed at `timeout_sec`. The rollout is still scored
+    # as a loss (see `run_trial`), but "the agent was still working" and "harbor
+    # never started" have opposite fixes, and a bare 0.0 cannot tell them apart.
+    timed_out: bool = False
+    # The graded verifier's own `parse_status`, when it wrote one. Carried so a
+    # caller can see *why* a verdict was withheld rather than re-walking the
+    # job dir.
+    parse_status: str | None = None
 
 
 def _newest_first(paths: list[Path]) -> list[Path]:
@@ -68,7 +76,13 @@ def _find_reward(jobs_dir: Path) -> float | None:
 # work at all. The 0.0 beside them is a placeholder for "no verdict", not a
 # measurement of the agent — reading it as a loss puts a trace in the corpus
 # that the diagnosis then has to explain, and it will.
-UNJUDGEABLE_STATUSES = frozenset({"no_model_patch"})
+#
+# `fallback_exitcode` means the verifier could not parse the runner's output and
+# fell back to the process exit code. That is not a graded result: the Aug-3
+# Qwen3-14B sweep scored 0/4 on a task where pytest died at config load and never
+# collected a single test, and one of those rollouts submitted an empty patch and
+# "failed" identically. Both were reported as the model failing.
+UNJUDGEABLE_STATUSES = frozenset({"no_model_patch", "fallback_exitcode"})
 
 
 def _find_parse_status(jobs_dir: Path) -> str | None:
@@ -82,6 +96,28 @@ def _find_parse_status(jobs_dir: Path) -> str | None:
         if isinstance(status, str):
             return status
     return None
+
+
+def _eval_is_untrustworthy(jobs_dir: Path) -> bool:
+    """Did the verifier itself disclaim its own reward?
+
+    Two independent signals, either of which withholds the verdict:
+    `parse_status` in `UNJUDGEABLE_STATUSES`, or an explicit
+    `eval_trustworthy: false`. The verifier writes both, and a future verifier
+    may write only one.
+    """
+    if _find_parse_status(jobs_dir) in UNJUDGEABLE_STATUSES:
+        return True
+    for details in _newest_first(list(jobs_dir.rglob("reward-details.json"))):
+        try:
+            data = json.loads(details.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("eval_trustworthy") is False:
+            return True
+        # Only the newest parseable file speaks for this run.
+        break
+    return False
 
 
 def _ak_args(
@@ -179,6 +215,22 @@ def run_trial(
         reward = 0.0
     passed = None if reward is None else reward >= 1.0
 
+    # A reward the verifier itself disclaims is not a measurement of the agent.
+    # Withhold the verdict so `measure_passk_stage` counts it as an infra
+    # failure and drops it from the denominator, rather than recording a loss
+    # the model never earned. Deliberately after the timeout branch: a genuine
+    # timeout IS a model failure and keeps its 0.0.
+    parse_status = _find_parse_status(job_dir)
+    if passed is False and not timed_out and _eval_is_untrustworthy(job_dir):
+        _log.warning(
+            "task=%s agent=%s: verifier disclaimed its own reward "
+            "(parse_status=%s) -- recording as ungradeable, not a loss",
+            task_dir.name,
+            agent,
+            parse_status,
+        )
+        passed = None
+
     # `raw_stdout` keeps only the last 4000+2000 chars, which is the wrong end
     # when harbor fails: the cause sits far above the traceback. Persist the
     # whole thing next to the job dir so a failure is diagnosable after the fact
@@ -192,12 +244,13 @@ def run_trial(
             _log.warning("could not persist harbor output to %s: %s", job_dir, exc)
 
     _log.info(
-        "trial task=%s agent=%s passed=%s reward=%s elapsed=%.1fs",
+        "trial task=%s agent=%s passed=%s reward=%s elapsed=%.1fs timed_out=%s",
         task_dir.name,
         agent,
         passed,
         reward,
         elapsed_sec,
+        timed_out,
     )
     return TrialResult(
         agent=agent,
@@ -207,6 +260,8 @@ def run_trial(
         raw_stdout=stdout[-4000:] + stderr[-2000:],
         elapsed_sec=elapsed_sec,
         started_at=started_at,
+        timed_out=timed_out,
+        parse_status=parse_status,
     )
 
 
