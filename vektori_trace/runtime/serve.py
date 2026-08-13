@@ -248,7 +248,15 @@ def serve_model(
         # so every cold start paid to download the model again.
         volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
         scaledown_window=SCALEDOWN_WINDOW_SECONDS,
-        timeout=60 * 60,
+        # Hard cap on a single container's lifetime — Modal kills it at this
+        # point even while it is actively serving. One hour is shorter than the
+        # thing this server exists for: run6's pass@k sweep ran 4.5 h against
+        # one endpoint, and a 4-task n=4 eval is ~3 h. The old value was raised
+        # by hand on the box mid-run and never committed, so every clean
+        # checkout shipped a server that dies partway through its own sweep.
+        # `scaledown_window` is what stops an *idle* container from billing;
+        # this is only the ceiling for a busy one.
+        timeout=12 * 60 * 60,
     )
     class VllmServer:
         @modal.enter()
