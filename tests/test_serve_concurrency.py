@@ -63,20 +63,26 @@ def test_max_inputs_exceeds_target_inputs():
     assert max_i > target_i
 
 
-def test_default_max_model_len_covers_observed_prompts():
-    """Sized from real traffic, not a round number.
+def test_default_max_model_len_is_a_ceiling_not_a_budget():
+    """`--max-model-len` must stay high.
 
-    Largest single agent prompt across run6's 24 rollouts was 11,304 tokens.
-    A default below that rejects live requests mid-sweep; a very large one
-    starves concurrency, because vLLM plans how many sequences fit against
-    this value.
+    It is a ceiling, not a reservation: vLLM's PagedAttention allocates KV
+    blocks on demand, so a large value costs no concurrency, while a value
+    below a real prompt rejects that request mid-sweep. The `concurrent seqs`
+    line the script prints is our own `kv_tokens // max_model_len` arithmetic,
+    not a limit vLLM enforces — tuning this down against that number trades a
+    hard failure for an imaginary gain.
+
+    Floor is `model_info_14b.json`'s advertised `max_input_tokens`: the harness
+    tells litellm the model accepts that much, so the server must too.
     """
     spec = (REPO_ROOT / "scripts" / "serve_student.py").read_text()
-    ns = argparse.Namespace()
     # Parse the default out of the source rather than importing the script,
     # which pulls in modal at import time.
     chunk = spec.split('"--max-model-len"')[1]
     default = int(chunk.split("default=")[1].split(",")[0])
-    ns.max_model_len = default
-    assert default > 11_304, "below the largest observed prompt — would reject requests"
-    assert default <= 20_480, "so large that the scheduler admits too few sequences"
+    assert default >= 40_448, (
+        "below what model_info advertises to litellm — long agent prompts "
+        "would be rejected mid-sweep"
+    )
+    assert isinstance(argparse.Namespace(), argparse.Namespace)
