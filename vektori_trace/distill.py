@@ -610,10 +610,26 @@ def run_opd_training(
     # Per-example detail goes to its own file. `opd_log.jsonl` is one line per
     # optimiser step and other tools index it positionally, so interleaving a
     # second record type there would silently change an artifact that already
-    # has readers. Same run, two granularities, no schema change.
+    # has readers. Same run, three granularities, no schema change.
     examples_log_path = cfg.output_dir / "opd_examples.jsonl"
+    #: Per-token: what the student sampled, its logprob, the teacher's logprob
+    #: for the same token, and the teacher's top-K alternatives. Cross-tokenizer
+    #: only — the same-vocab path has no alignment to explain.
+    tokens_log_path = cfg.output_dir / "opd_tokens.jsonl"
 
-    with log_path.open("w") as log, examples_log_path.open("w") as ex_log:
+    def _teacher_tok_decode(tid: int) -> str | None:
+        """Decode one teacher id for the token log; never raise."""
+        try:
+            return _teacher_tok.decode([int(tid)])
+        except Exception:
+            return None
+
+    with (
+        log_path.open("w") as log,
+        examples_log_path.open("w") as ex_log,
+        tokens_log_path.open("w") as tok_log_f,
+    ):
+        tok_log = tok_log_f if cfg.cross_tokenizer else None
         for step in range(cfg.max_steps):
             optimizer.zero_grad(set_to_none=True)
             step_losses: list[Any] = []
@@ -647,6 +663,7 @@ def run_opd_training(
                 # example's token count and span stats, which is worse than no
                 # record at all.
                 _ex_action_tokens: int | None = None
+                _ex_action_text: str | None = None
                 _ex_cross_stats: Any = None
 
                 if cfg.cross_tokenizer:
@@ -948,6 +965,84 @@ def run_opd_training(
                     # Carry cross_stats for step aggregation below.
                     _last_cross_stats = cross_stats
                     _ex_cross_stats = cross_stats
+
+                    # ── Per-token forensics ──────────────────────────────────
+                    # The step and example logs say a step went badly; only this
+                    # says which tokens, what the student wrote, and what the
+                    # teacher wanted instead. That is the difference between
+                    # "loss was high" and a diagnosis. Written to its own file
+                    # so the two aggregate logs keep their schemas.
+                    if tok_log is not None:
+                        try:
+                            _s_lp = [float(x) for x in student_token_logprobs_vec.detach().tolist()]
+                            for _i, _tid in enumerate(
+                                [trimmed_ids[p] for p in student_aligned_positions]
+                            ):
+                                _rec: dict[str, Any] = {
+                                    "step": step,
+                                    "task": ex.task,
+                                    "example_step_index": ex.step_index,
+                                    "pos": _i,
+                                    "student_id": int(_tid),
+                                    "student_token": tokenizer.decode([int(_tid)]),
+                                    "student_logprob": _s_lp[_i] if _i < len(_s_lp) else None,
+                                    "teacher_logprob": (
+                                        teacher_lp_aligned[_i]
+                                        if _i < len(teacher_lp_aligned)
+                                        else None
+                                    ),
+                                }
+                                _row = teacher_topk_by_teacher_pos.get(_i)
+                                if _row:
+                                    # Coverage at this position: how much of the
+                                    # teacher's reported top-K mass maps to a
+                                    # byte-identical student token. Unmapped mass
+                                    # is exact but undirected — it lands in the
+                                    # `other` bucket and cannot say which token
+                                    # to prefer. Below ~0.9 the span is demoted
+                                    # from estimator A to B, so this is the
+                                    # number that decides which estimator ran.
+                                    _tot = sum(math.exp(v) for v in _row.values())
+                                    _mapped = sum(
+                                        math.exp(v)
+                                        for k, v in _row.items()
+                                        if _bridge is not None and int(k) in _bridge.exact_map
+                                    )
+                                    _rec["mapped_mass"] = (
+                                        round(_mapped / _tot, 4) if _tot > 0 else None
+                                    )
+                                    _rec["mapped_count"] = sum(
+                                        1
+                                        for k in _row
+                                        if _bridge is not None and int(k) in _bridge.exact_map
+                                    )
+                                    _rec["topk_width"] = len(_row)
+                                    # Teacher's K+1 partition at this position:
+                                    # what it would rather have said, and how
+                                    # strongly. Decoded so it is readable
+                                    # without the teacher tokenizer to hand.
+                                    _rec["teacher_topk"] = [
+                                        {
+                                            "id": int(k),
+                                            "logprob": round(float(v), 4),
+                                            "token": (
+                                                _teacher_tok_decode(k)
+                                                if _teacher_tok is not None
+                                                else None
+                                            ),
+                                        }
+                                        for k, v in sorted(
+                                            _row.items(), key=lambda kv: -kv[1]
+                                        )[:6]
+                                    ]
+                                tok_log.write(json.dumps(_rec) + "\n")
+                            tok_log.flush()
+                        except Exception as _e:  # forensics must never kill a run
+                            tok_log.write(
+                                json.dumps({"step": step, "task": ex.task,
+                                            "token_log_error": repr(_e)}) + "\n"
+                            )
+                            tok_log.flush()
                     step_n_A += cross_stats.n_A
                     step_n_B += cross_stats.n_B
                     step_n_spans += cross_stats.n_spans
@@ -1028,6 +1123,10 @@ def run_opd_training(
                     )
                     step_tokens += len(action_ids)
                     _ex_action_tokens = len(action_ids)
+                    try:
+                        _ex_action_text = tokenizer.decode(action_ids)
+                    except Exception:
+                        _ex_action_text = None
 
                 # One record per *example*, not just per optimiser step. The
                 # step line aggregates over `examples_per_step`, which is enough
@@ -1042,6 +1141,11 @@ def run_opd_training(
                     "action_tokens": _ex_action_tokens,
                     "loss": step_losses[-1] if step_losses else None,
                     "mean_log_ratio": step_ratios[-1] if step_ratios else None,
+                    # What the student actually wrote. Without it the numeric
+                    # columns describe a decision whose content is unrecoverable
+                    # — and "it edited the workflow file instead of the resolver"
+                    # is the kind of finding that only reads out of the text.
+                    "action_text": _ex_action_text,
                 }
                 if cfg.cross_tokenizer and _ex_cross_stats is not None:
                     _cs = _ex_cross_stats
@@ -1189,6 +1293,27 @@ def run_opd_training(
                 log_entry["cross_stats_note"] = "no aggregated cross examples this step"
             log.write(json.dumps(log_entry) + "\n")
             log.flush()
+
+            # Progress on stdout as well as in the log. On Modal the JSONL files
+            # live on container-local disk until the run ends, so `modal app
+            # logs` is the only live window into a run that costs money by the
+            # second — silence for two hours is not an acceptable view of it.
+            _gran = (
+                _run_granularity_sum / _run_granularity_n
+                if _run_granularity_n
+                else float("nan")
+            )
+            _ratio = log_entry.get("mean_log_ratio")
+            _ratio_s = f"{_ratio:.3f}" if _ratio is not None else "n/a"
+            _cs = log_entry.get("cross_stats")
+            _ent = _cs.get("student_entropy") if isinstance(_cs, dict) else None
+            _ent_s = f"{_ent:.3f}" if _ent is not None else "n/a"
+            print(
+                f"step {step + 1:3d}/{cfg.max_steps} loss={mean_loss:.4f} "
+                f"ratio={_ratio_s} tok={step_tokens} "
+                f"A={step_n_A} B={step_n_B} gran={_gran:.3f} ent={_ent_s}",
+                flush=True,
+            )
 
     # §10.6 at run level — "granularity below min_alignment_granularity → abort.
     # Near-zero granularity is *sequence-level* distillation being reported as
