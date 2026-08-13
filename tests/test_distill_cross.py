@@ -887,3 +887,75 @@ def test_explicit_teacher_model_is_respected_in_cross_mode():
         output_dir="/tmp/x", cross_tokenizer=True, teacher_model="some/other-teacher"
     )
     assert cfg.teacher_model == "some/other-teacher"
+
+
+def test_token_log_is_actually_written_with_both_sides(tmp_path, tiny, ascii_action):
+    """The per-token log must survive a real loop, not just exist in source.
+
+    Source-level assertions prove the code mentions `student_logprob`; they do
+    not prove a run emits a parseable record with both sides of the comparison
+    in it. This runs the loop and reads the file back.
+    """
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+
+    result = run_opd_training(
+        [ex],
+        _FakeCrossPool(),
+        _cfg(tmp_path, max_steps=1, cross_top_k=3),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    tokens_path = result.adapter_dir.parent / "opd_tokens.jsonl"
+    assert tokens_path.is_file(), "opd_tokens.jsonl was never written"
+    rows = [json.loads(x) for x in tokens_path.read_text().splitlines() if x.strip()]
+    assert rows, "token log is empty after a step that trained"
+    assert not any("token_log_error" in r for r in rows), (
+        f"token logging raised: {[r for r in rows if 'token_log_error' in r][:1]}"
+    )
+
+    r = rows[0]
+    # Both sides of the comparison the objective is built from.
+    assert isinstance(r["student_logprob"], float)
+    assert isinstance(r["teacher_logprob"], float)
+    assert r["student_logprob"] <= 0.0 and r["teacher_logprob"] <= 0.0
+    assert isinstance(r["student_token"], str)
+    assert r["task"] == "t"
+    assert r["pos"] == 0
+
+    # Teacher alternatives and the coverage that decides A vs B. cross_top_k=3
+    # here, so at least one row must carry them.
+    with_topk = [x for x in rows if "teacher_topk" in x]
+    assert with_topk, "no row carried the teacher's top-K"
+    t = with_topk[0]
+    assert t["teacher_topk"] and "logprob" in t["teacher_topk"][0]
+    assert 0.0 <= t["mapped_mass"] <= 1.0
+    assert t["mapped_count"] >= 0
+    assert t["topk_width"] >= 1
+
+
+def test_example_log_records_what_the_student_wrote(tmp_path, tiny, ascii_action):
+    """`action_text` must round-trip to a real string, not None."""
+    model, tok = tiny
+    ex = build_reopd_example(_turns(), task="t", action_index=1)
+
+    result = run_opd_training(
+        [ex],
+        _FakeCrossPool(),
+        _cfg(tmp_path, max_steps=1, cross_top_k=3),
+        model=model,
+        tokenizer=tok,
+        bridge=_make_bridge(tok),
+        teacher_tokenizer=_fake_teacher_tokenizer(tok),
+    )
+
+    ex_path = result.adapter_dir.parent / "opd_examples.jsonl"
+    assert ex_path.is_file(), "opd_examples.jsonl was never written"
+    rows = [json.loads(x) for x in ex_path.read_text().splitlines() if x.strip()]
+    assert rows
+    assert rows[0]["task"] == "t"
+    assert isinstance(rows[0]["action_text"], str) and rows[0]["action_text"]
+    assert rows[0]["action_tokens"] and rows[0]["action_tokens"] > 0
