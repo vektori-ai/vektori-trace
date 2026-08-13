@@ -211,3 +211,30 @@ def test_trace_loader_is_importable_without_the_cli():
     from vektori_trace.traces import load_teacher_trajectories
 
     assert callable(load_teacher_trajectories)
+
+
+def test_trace_loader_pulls_in_no_mining_dependencies():
+    """`vektori_trace.traces` must be importable on a training container.
+
+    `mining/atif.py` is a self-contained parser (json, pathlib, our schema),
+    but the package `__init__` used to eagerly re-export the whole pipeline —
+    so importing the parser pulled pydantic, docker and GitHub auth onto a GPU
+    that carries none of them. It surfaced as ModuleNotFoundError after the
+    image pull. The re-exports are lazy now; this asserts they stay that way.
+    """
+    import subprocess
+    import sys
+
+    # A subprocess so the check is real: this interpreter has everything
+    # imported already, which would mask the failure entirely.
+    code = (
+        "import sys;"
+        "import vektori_trace.traces;"
+        "bad=[m for m in sys.modules if m.split('.')[0] in "
+        "{'pydantic','docker','openai','github'}];"
+        "print(','.join(sorted(bad)))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out == "", f"importing traces pulled in: {out}"
