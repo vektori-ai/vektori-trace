@@ -11,41 +11,15 @@ from .._args import _positive_int_arg
 
 
 def _load_teacher_trajectories(source: Path) -> list[tuple[str, list[Any]]]:
-    """Teacher trajectories from harbor job dirs or ATIF JSON traces.
+    """Thin alias — the implementation lives in `vektori_trace.traces`.
 
-    Two shapes, because two things produce them: `replay` leaves harbor job
-    directories, and mined/example traces are JSON. Anything unreadable is
-    reported rather than skipped — a silently smaller corpus changes what the run
-    measured.
+    Kept as a name here because the CLI and its tests reference it, but the
+    loader itself must be importable without dragging the CLI package (and its
+    `openai` dependency) onto a GPU container.
     """
-    from ...mining.atif import TrajectoryParseError, parse_job_trajectory
-    from ...schema import Trace
+    from ...traces import load_teacher_trajectories
 
-    trajectories: list[tuple[str, list[Any]]] = []
-    if not source.is_dir():
-        raise FileNotFoundError(f"teacher trace source not found: {source}")
-
-    for path in sorted(source.iterdir()):
-        if path.is_dir():
-            try:
-                trajectories.append((path.name, parse_job_trajectory(path)))
-            except TrajectoryParseError as e:
-                raise ValueError(f"{path}: not a readable harbor job dir ({e})") from e
-        elif path.suffix == ".json":
-            try:
-                trace = Trace.load(path)
-            except Exception as e:
-                # Match the job-dir branch above: name the file that failed.
-                # Trace.load raises schema/decode errors the caller's
-                # FileNotFoundError/ValueError handler does not catch, so without
-                # this an unreadable trace escapes as a bare traceback.
-                raise ValueError(f"{path}: not a readable ATIF trace ({e})") from e
-            trajectories.append((trace.task or path.stem, trace.turns))
-    if not trajectories:
-        raise ValueError(
-            f"no trajectories under {source} — expected harbor job dirs or ATIF .json traces"
-        )
-    return trajectories
+    return load_teacher_trajectories(source)
 
 
 def _teacher_pool_for(args: argparse.Namespace) -> Any:
