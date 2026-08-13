@@ -188,3 +188,26 @@ def test_local_path_unchanged_when_no_modal_gpu(tmp_path):
     assert "if modal_gpu:" in src
     assert "run_opd_training(" in src
     assert Path("vektori_trace/cli/commands/distill.py")
+
+
+def test_remote_does_not_import_the_cli_package():
+    """A GPU container must not need the CLI's dependencies.
+
+    Importing anything under `vektori_trace.cli` executes that package's
+    `__init__`, which pulls in every command module — including `llm.py` and
+    its `openai` import. The training image carries torch/transformers/peft and
+    no API client, so this surfaced as `ModuleNotFoundError: No module named
+    'openai'` *after* the image pull, on a GPU billing by the second.
+    """
+    src = inspect.getsource(run_opd_training_modal)
+    assert "vektori_trace.cli" not in src, (
+        "remote imports the CLI package — that drags openai onto the GPU image"
+    )
+    assert "from vektori_trace.traces import load_teacher_trajectories" in src
+
+
+def test_trace_loader_is_importable_without_the_cli():
+    """The loader must live outside `cli/` so the container can reach it."""
+    from vektori_trace.traces import load_teacher_trajectories
+
+    assert callable(load_teacher_trajectories)

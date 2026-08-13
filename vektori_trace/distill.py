@@ -1618,7 +1618,6 @@ def run_opd_training_modal(
         from dataclasses import asdict as _asdict
         from pathlib import Path as P
 
-        from vektori_trace.cli.commands.distill import _load_teacher_trajectories
         from vektori_trace.distill import (
             LoraHyperparams as _Lora,
         )
@@ -1631,6 +1630,7 @@ def run_opd_training_modal(
         from vektori_trace.providers.teacher.cross import CrossTokenizerTeacherPool
         from vektori_trace.providers.teacher.fireworks import fireworks_pool_from_env
         from vektori_trace.reopd import iter_reopd_examples
+        from vektori_trace.traces import load_teacher_trajectories
         from vektori_trace.vocab_bridge import CrossTokenizerBridge, load_tokenizer
 
         c = dict(job["cfg"])
@@ -1653,7 +1653,7 @@ def run_opd_training_modal(
             bridge=bridge,
         )
 
-        trajectories = _load_teacher_trajectories(P(job["prefixes"]))
+        trajectories = load_teacher_trajectories(P(job["prefixes"]))
         examples = list(
             iter_reopd_examples(trajectories, steps_per_traj=job["steps_per_traj"])
         )
