@@ -398,6 +398,13 @@ def train_lora_modal(
         # fetch the same base model on a GPU billed by the second.
         volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
         timeout=4 * 60 * 60,
+        # `_remote` is defined inside this function so it can close over `vol`.
+        # Modal re-imports globals-scope functions by module path in the
+        # container and rejects locally-defined ones unless they are pickled
+        # instead. Without this the decorator raises InvalidError at call time,
+        # before any GPU is allocated — the same fix `runtime/serve.py` already
+        # carries for its locally-defined class.
+        serialized=True,
     )
     def _remote(payload: list[dict], cfg: dict) -> dict:
         from pathlib import Path as P
