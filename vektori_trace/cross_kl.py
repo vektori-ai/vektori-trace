@@ -67,6 +67,25 @@ class CrossStepStats:
     n_supervised_tokens: int = 0
 
 
+#: Smallest `other`-bucket mass the teacher's reported top-K can resolve.
+#:
+#: `other = 1 − Σ(top-K)` is a subtraction of FP8-served probabilities, each
+#: carrying ~2e-3 relative error, so the difference is meaningful only to about
+#: ±1e-3. Measured against deepseek-v4-flash-0731 on the first real run: max
+#: observed Σ − 1 was 9.07e-4, and 28.6% of Estimator-A positions produced an
+#: `other` mass below this floor. Below it the quantity is not small, it is
+#: unresolvable, and treating it as resolved injects a teacher term wrong by
+#: 7-14 nats.
+#:
+#: Provider-specific. An unquantised teacher would justify a much lower value;
+#: raising K would not, since the error is per-probability and accumulates.
+OTHER_MASS_FLOOR = 1e-3
+
+#: Σ − 1 above this is not rounding — it is a protocol or alignment fault, and
+#: no floor should paper over it. This is what §10.11 now guards.
+OTHER_MASS_FAULT = 1e-2
+
+
 # ── Estimator A: coarse-grained reverse KL ─────────────────────────────────────
 
 
@@ -75,7 +94,7 @@ def coarse_grained_reverse_kl(
     mapped_pairs: list[tuple[int, float]],
     teacher_topk: dict[int, float],
     coverage_threshold: float = 0.9,
-    other_floor: float = 1e-9,
+    other_floor: float = OTHER_MASS_FLOOR,
 ) -> tuple[Any, float, bool] | None:
     """Analytic coarse-grained reverse KL for a 1↔1 span (Estimator A).
 
@@ -97,14 +116,16 @@ def coarse_grained_reverse_kl(
         coverage_threshold: minimum ratio (mapped teacher mass / total top-K mass)
             required to proceed with Estimator A.  Below threshold, returns None and
             the caller should fall back to Estimator B.
-        other_floor: minimum probability for the "other" bucket.  When fp8
-            quantisation noise pushes Σexp(mapped_t) ≥ 1, clamping prevents NaN.
+        other_floor: smallest `other` mass the teacher's top-K can resolve.
+            Applied unconditionally as `log(max(1 − Σ, floor))`, not only when
+            the subtraction goes negative — see the note at the call site.
 
     Returns:
         ``(contribution_tensor, mapped_teacher_mass_fraction, other_clamped)`` on
-        success, or ``None`` when the coverage gate fires.  ``other_clamped`` is
-        True when Σexp(mapped_t) ≥ 1 forced the teacher "other" bucket to
-        ``other_floor`` (§10.11).  The contribution is the raw per-span term
+        success, or ``None`` when the coverage gate fires.  ``other_clamped``
+        is True only when Σexp(mapped_t) exceeds 1 by *more* than
+        ``other_floor`` — i.e. beyond what FP8 rounding explains, which is a
+        protocol or alignment fault rather than noise (§10.11).  The contribution is the raw per-span term
         (no global denominator); the caller divides by the total student-token
         count.
     """
@@ -124,10 +145,38 @@ def coarse_grained_reverse_kl(
         return None
 
     # ── Teacher side: K+1 log-probs (fp32, detached) ─────────────────────────
+    #
+    # `other` is obtained by subtraction — 1 − Σ(top-K) — from probabilities the
+    # provider serves in FP8. Each carries ~2e-3 relative error, so the
+    # difference is trustworthy only to ~±1e-3. Measured on the first real run:
+    # max observed Σ − 1 was 9.07e-4, and 28.6% of positions produced an
+    # `other` mass *below* that noise floor. Those are not small probabilities;
+    # they are unresolvable ones.
+    #
+    # So the floor is applied unconditionally rather than only when the
+    # subtraction goes negative. Two reasons:
+    #
+    #   1. A conditional floor is a cliff. Σ = 0.999999 gave other_t = −13.8
+    #      while Σ = 1.000001 gave log(1e-9) = −20.7 — a 7-nat swing in the
+    #      teacher term from a 2e-6 wobble in a noisy input. Since the loss is
+    #      π_s(other)·(log π_s(other) − other_t), that fabricates a large
+    #      repulsion away from everything outside the teacher's top-K, exactly
+    #      when the student still holds real mass there.
+    #   2. The old behaviour only noticed the ~3% that crossed zero, while the
+    #      ~29% that landed just above it were used as though resolved.
+    #
+    # This is not renormalisation, which §5 rejects: renormalising asserts the
+    # unmapped mass is *zero*, so the student pays nothing for leaving the
+    # shared support. A floor asserts the opposite — that it is at least the
+    # noise floor — and the bias it introduces is bounded by
+    # π_s(other)·log(true_other / floor) where true_other < floor.
     log_floor = math.log(other_floor)
-    # fp8 noise: Σexp ≥ 1.0 → clamp "other" to floor; count (§10.11).
-    other_clamped = mapped_t_total >= 1.0
-    other_t_val = log_floor if other_clamped else math.log1p(-mapped_t_total)
+    other_raw = 1.0 - mapped_t_total
+    # §10.11 now counts only what the floor could not honestly represent: a
+    # position whose reported mass exceeds 1 by *more* than the noise floor is
+    # not FP8 rounding, it is a protocol or alignment problem.
+    other_clamped = other_raw < -other_floor
+    other_t_val = math.log(max(other_raw, other_floor))
 
     mapped_t_lps = [lp for _, lp in mapped_pairs]
     teacher_lps = torch.tensor(
@@ -220,7 +269,7 @@ def cross_step_loss(
     teacher_topk_by_teacher_pos: dict[int, dict[int, float]],
     exact_map: dict[int, int],
     coverage_threshold: float = 0.9,
-    other_floor: float = 1e-9,
+    other_floor: float = OTHER_MASS_FLOOR,
     student_token_bytes: Sequence[bytes] | None = None,
     denominator: float | None = None,
 ) -> tuple[Any, CrossStepStats]:

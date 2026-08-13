@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .cross_kl import OTHER_MASS_FLOOR
 from .dataset import turns_to_messages
 from .opd import mean_log_ratio, reverse_kl_surrogate, token_logprobs, topk_reverse_kl
 from .providers.teacher.protocol import IdScoringPool, TopKScoringPool
@@ -1020,7 +1021,7 @@ def run_opd_training(
                                         if _bridge is not None and int(k) in _bridge.exact_map
                                     )
                                     _rec["mapped_mass"] = (
-                                        round(_mapped / _tot, 4) if _tot > 0 else None
+                                        round(_mapped / _tot, 6) if _tot > 0 else None
                                     )
                                     _rec["mapped_count"] = sum(
                                         1
@@ -1035,7 +1036,7 @@ def run_opd_training(
                                     _rec["teacher_topk"] = [
                                         {
                                             "id": int(k),
-                                            "logprob": round(float(v), 4),
+                                            "logprob": round(float(v), 6),
                                             "token": (
                                                 _teacher_tok_decode(k)
                                                 if _teacher_tok is not None
@@ -1296,8 +1297,12 @@ def run_opd_training(
                 if step_n_A > 0 and step_n_other_clamped / step_n_A > 0.01:
                     raise RuntimeError(
                         f"§10.11: {step_n_other_clamped}/{step_n_A} "
-                        "Estimator-A positions needed other_t clamp "
-                        "(>1%) — teacher logprobs too noisy for coarse-grained A"
+                        "Estimator-A positions reported top-K mass exceeding 1 "
+                        f"by more than the {OTHER_MASS_FLOOR:g} noise floor "
+                        "(>1%). FP8 rounding accounts for ~1e-3; beyond that "
+                        "the teacher's logprobs are not what we think they "
+                        "are — check alignment and the echo request shape "
+                        "rather than raising this threshold."
                     )
             elif cfg.cross_tokenizer and _last_cross_stats is not None:
                 # Defensive: an example produced stats but granularity_n stayed 0.
@@ -1357,6 +1362,7 @@ def run_opd_training(
             "loss": "cross_tokenizer_reverse_kl",
             "thinking_mode": cfg.thinking_mode,
             "cross_top_k": cfg.cross_top_k,
+            "other_mass_floor": OTHER_MASS_FLOOR,
             "temperature": cfg.temperature,
             "encoding_dsv4": ENCODING_DSV4_SHA256,
             # §10.10 / §10.11 run-level coverage (every run).
