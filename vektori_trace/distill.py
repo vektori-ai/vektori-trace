@@ -966,6 +966,17 @@ def run_opd_training(
                     _last_cross_stats = cross_stats
                     _ex_cross_stats = cross_stats
 
+                    # Per-example log state. Set here as well as in the
+                    # same-vocab branch below: the two paths do their own token
+                    # accounting, and a field assigned in only one of them is
+                    # null for every real cross-tokenizer run — which is exactly
+                    # what the offline fixture caught.
+                    _ex_action_tokens = len(trimmed_ids)
+                    try:
+                        _ex_action_text = tokenizer.decode(trimmed_ids)
+                    except Exception as _e:
+                        _ex_action_text = f"<decode failed: {_e!r}>"
+
                     # ── Per-token forensics ──────────────────────────────────
                     # The step and example logs say a step went badly; only this
                     # says which tokens, what the student wrote, and what the
@@ -1125,8 +1136,8 @@ def run_opd_training(
                     _ex_action_tokens = len(action_ids)
                     try:
                         _ex_action_text = tokenizer.decode(action_ids)
-                    except Exception:
-                        _ex_action_text = None
+                    except Exception as _e:
+                        _ex_action_text = f"<decode failed: {_e!r}>"
 
                 # One record per *example*, not just per optimiser step. The
                 # step line aggregates over `examples_per_step`, which is enough
