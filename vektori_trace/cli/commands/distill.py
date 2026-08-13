@@ -190,17 +190,50 @@ def cmd_distill(args: argparse.Namespace) -> int:
         f"OPD: {len(examples)} step-examples from {len(trajectories)} trajectories · "
         f"teacher {prov.get('teacher_model', '?')} @ {prov.get('teacher_api_base', '?')}"
     )
+    modal_gpu = getattr(args, "modal_gpu", None)
     try:
-        result = run_opd_training(
-            examples, pool, cfg,
-            bridge=_bridge,
-            teacher_tokenizer=_teacher_tok,
-        )
+        if modal_gpu:
+            # Everything above ran locally and is CPU/network only, so a bad
+            # config still fails before a GPU exists. Only the training itself
+            # goes remote. Modal is opt-in — never the default — because
+            # allocating a GPU is a spend decision, not a fallback.
+            if not cross_tokenizer:
+                print(
+                    "error: --modal-gpu currently covers the cross-tokenizer "
+                    "path only (it ships the bridge to the container)",
+                    file=sys.stderr,
+                )
+                return 2
+            from ...distill import run_opd_training_modal
+
+            result = run_opd_training_modal(
+                cfg,
+                prefixes_dir=Path(args.teacher_traces),
+                bridge_path=Path(bridge_path),
+                fireworks_model=args.teacher_model_id,
+                teacher_tokenizer_id=teacher_tok_id or cfg.teacher_model,
+                api_base=args.teacher_api_base,
+                steps_per_trajectory=args.steps_per_trajectory,
+                modal_gpu=modal_gpu,
+                expected_examples=len(examples),
+            )
+        else:
+            result = run_opd_training(
+                examples, pool, cfg,
+                bridge=_bridge,
+                teacher_tokenizer=_teacher_tok,
+            )
     except TokenizerMismatchError as e:
         print(f"error: teacher/student tokenizers differ: {e}", file=sys.stderr)
         return 2
-    except (RuntimeError, TeacherScoringError) as e:
+    except (RuntimeError, TeacherScoringError, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        # `align.AlignmentError` subclasses ValueError and is the likeliest
+        # cross-tokenizer failure. Modal re-raises the original type client
+        # side, so without this a multi-hour run ends as a bare traceback.
+        print(f"error: alignment/config failure: {e}", file=sys.stderr)
         return 1
 
     md = write_opd_report(result, out_dir)
@@ -263,6 +296,16 @@ def register_distill(sub: argparse._SubParsersAction) -> None:
         "--teacher-served-name",
         default=None,
         help="name the teacher endpoint serves under (default: discovered)",
+    )
+    p_distill.add_argument(
+        "--modal-gpu",
+        default=None,
+        metavar="GPU",
+        help=(
+            "run the training on this Modal GPU (e.g. L40S) instead of in this "
+            "process. Opt-in only: omitting it never allocates a GPU. Requires "
+            "--cross-tokenizer and FIREWORKS_API_KEY in the environment"
+        ),
     )
     p_distill.add_argument("--teacher", default=None, help="teacher HF id for the tokenizer check")
     p_distill.add_argument("--student", default=None, help="student HF id to train")

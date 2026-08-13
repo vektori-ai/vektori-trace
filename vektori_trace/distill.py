@@ -607,7 +607,13 @@ def run_opd_training(
     _run_student_entropy_sum = 0.0
     _run_student_entropy_n = 0
 
-    with log_path.open("w") as log:
+    # Per-example detail goes to its own file. `opd_log.jsonl` is one line per
+    # optimiser step and other tools index it positionally, so interleaving a
+    # second record type there would silently change an artifact that already
+    # has readers. Same run, two granularities, no schema change.
+    examples_log_path = cfg.output_dir / "opd_examples.jsonl"
+
+    with log_path.open("w") as log, examples_log_path.open("w") as ex_log:
         for step in range(cfg.max_steps):
             optimizer.zero_grad(set_to_none=True)
             step_losses: list[Any] = []
@@ -635,6 +641,13 @@ def run_opd_training(
 
             for _ in range(cfg.examples_per_step):
                 ex = next_example()
+                # Per-example log state. Both are reset here because the loop
+                # body reuses names across iterations: without this an example
+                # that aborts early would be logged with the *previous*
+                # example's token count and span stats, which is worse than no
+                # record at all.
+                _ex_action_tokens: int | None = None
+                _ex_cross_stats: Any = None
 
                 if cfg.cross_tokenizer:
                     # ── Cross-tokenizer path (FINAL-PLAN.md) ─────────────────
@@ -934,6 +947,7 @@ def run_opd_training(
                             )
                     # Carry cross_stats for step aggregation below.
                     _last_cross_stats = cross_stats
+                    _ex_cross_stats = cross_stats
                     step_n_A += cross_stats.n_A
                     step_n_B += cross_stats.n_B
                     step_n_spans += cross_stats.n_spans
@@ -1013,6 +1027,43 @@ def run_opd_training(
                         )
                     )
                     step_tokens += len(action_ids)
+                    _ex_action_tokens = len(action_ids)
+
+                # One record per *example*, not just per optimiser step. The
+                # step line aggregates over `examples_per_step`, which is enough
+                # to watch a run but not enough to explain one: with a corpus
+                # drawn from several tasks, "granularity fell" is only
+                # actionable if you can say which task's examples it fell on.
+                # Written for the cross path and the same-vocab path alike.
+                _ex_rec: dict[str, Any] = {
+                    "step": step,
+                    "task": ex.task,
+                    "example_step_index": ex.step_index,
+                    "action_tokens": _ex_action_tokens,
+                    "loss": step_losses[-1] if step_losses else None,
+                    "mean_log_ratio": step_ratios[-1] if step_ratios else None,
+                }
+                if cfg.cross_tokenizer and _ex_cross_stats is not None:
+                    _cs = _ex_cross_stats
+                    _ex_rec.update({
+                        "n_A": _cs.n_A,
+                        "n_B": _cs.n_B,
+                        "n_spans": _cs.n_spans,
+                        "granularity": _cs.granularity,
+                        "bytes_aligned": _cs.bytes_aligned,
+                        "bytes_total": _cs.bytes_total,
+                        "n_other_clamped": _cs.n_other_clamped,
+                        "special_tokens_masked": _cs.special_tokens_masked,
+                        "dropped_by_reason": _cs.dropped_by_reason or None,
+                        "dropped_by_content_type": _cs.dropped_by_content_type or None,
+                        "student_entropy": (
+                            None
+                            if math.isnan(_cs.student_entropy)
+                            else _cs.student_entropy
+                        ),
+                    })
+                ex_log.write(json.dumps(_ex_rec) + "\n")
+                ex_log.flush()
 
             if not step_losses:
                 # Every example in this step sampled nothing — no gradient to
@@ -1232,6 +1283,333 @@ def run_opd_training(
         lora=asdict(cfg.lora),
         seed=cfg.seed,
         log_path=log_path,
+        provenance=provenance,
+    )
+
+
+#: Seconds of wall clock to budget per supervised example, used to size the
+#: Modal timeout. One example is a student `generate` (~15-25 s for a 14B via HF
+#: eager), one teacher echo round-trip (~1-3 s), and a forward+backward over the
+#: full prefix (~2-4 s). 45 s is the pessimistic end of that, because the cost of
+#: overestimating is an idle container and the cost of underestimating is a
+#: killed run with no adapter.
+_MODAL_SECONDS_PER_EXAMPLE = 45
+
+#: Students at or above this many billions of parameters cannot train without
+#: gradient checkpointing on a 48 GB card: activations for a 3 840-token
+#: sequence are ~31 GB on top of ~29.6 GB of bf16 weights.
+_CHECKPOINTING_REQUIRED_FROM_B = 13.0
+
+
+def _student_size_b(student_model: str) -> float | None:
+    """Parameter count in billions parsed from an HF id, or None if absent.
+
+    Only used to *force safety on*, never to relax it, so a name we cannot parse
+    is not an error — it just means the caller's own setting stands.
+    """
+    import re
+
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])", student_model)
+    return float(m.group(1)) if m else None
+
+
+def modal_timeout_for(cfg: OPDTrainConfig) -> int:
+    """Wall-clock budget for one OPD run, derived from the work requested.
+
+    A fixed 4 h timeout silently kills a default-length run (`--max-steps 200`
+    × `examples_per_step 4` ≈ 7 h) after the GPU has already been paid for, and
+    Modal's kill takes the container's unflushed log with it. Size the timeout
+    from the work instead, with a floor for cold start and weight download.
+    """
+    work = cfg.max_steps * cfg.examples_per_step * _MODAL_SECONDS_PER_EXAMPLE
+    return int(min(max(work + 30 * 60, 60 * 60), 24 * 60 * 60))
+
+
+def force_gpu_safe_config(cfg: OPDTrainConfig) -> OPDTrainConfig:
+    """Turn on settings a large student cannot run without.
+
+    A 14B student is ~29.6 GB of bf16 weights; un-checkpointed activations for a
+    3 840-token sequence are ~31 GB on top of that, so a 48 GB card OOMs. The
+    CLI flag defaults to off, which means the safe configuration is the one you
+    have to remember. Fix that here rather than at minute forty of a paid run.
+
+    Only ever tightens: a student whose size cannot be parsed keeps the caller's
+    setting, and an already-enabled flag is left alone.
+    """
+    size_b = _student_size_b(cfg.student_model)
+    if (
+        size_b is not None
+        and size_b >= _CHECKPOINTING_REQUIRED_FROM_B
+        and not cfg.gradient_checkpointing
+    ):
+        from dataclasses import replace
+
+        print(
+            f"note: forcing gradient_checkpointing for a {size_b:g}B student — "
+            "without it activations alone exceed the card"
+        )
+        return replace(cfg, gradient_checkpointing=True)
+    return cfg
+
+
+def run_opd_training_modal(
+    cfg: OPDTrainConfig,
+    *,
+    prefixes_dir: Path,
+    bridge_path: Path,
+    fireworks_model: str,
+    teacher_tokenizer_id: str,
+    api_base: str | None = None,
+    steps_per_trajectory: int | None = None,
+    modal_gpu: str = "L40S",
+    expected_examples: int | None = None,
+) -> OPDTrainResult:
+    """Execute `run_opd_training` on a Modal GPU. Adapter lands on the Volume.
+
+    The machine that drives this project has no GPU, and `run_opd_training`
+    runs in whatever process invokes it, so without this there is nowhere for
+    cross-tokenizer OPD to run.
+
+    **Inputs travel as files, not as arguments.** `ReOPDStepExample` holds
+    `Turn` dataclasses that have a `from_dict` but no `to_dict`, and the bridge
+    is ~10 MB; hand-rolling either serialisation is a silent-corruption risk for
+    no gain. Both are uploaded to the shared Volume and the remote side rebuilds
+    them with the same helpers the CLI uses, so there is one code path, not two.
+
+    `fireworks_model` and `teacher_tokenizer_id` are separate on purpose: the
+    first is a Fireworks resource path (`accounts/fireworks/models/…`), the
+    second an HF repo id (`deepseek-ai/…`). They are different namespaces and
+    passing one where the other belongs fails on the GPU, after the image pull.
+    """
+    import os
+    import time
+
+    # Validate everything cheap *before* importing modal, so a missing key or a
+    # missing corpus reports itself as that, on any machine, rather than as an
+    # import error — and long before a container could exist.
+    prefixes_dir = Path(prefixes_dir)
+    bridge_path = Path(bridge_path)
+    if not prefixes_dir.is_dir():
+        raise FileNotFoundError(f"prefix corpus not found: {prefixes_dir}")
+    if not bridge_path.is_file():
+        raise FileNotFoundError(f"bridge not found: {bridge_path}")
+
+    api_key = os.environ.get("FIREWORKS_API_KEY")
+    if not api_key:
+        # The container costs money from the image pull onward, and this error
+        # would otherwise arrive after the weights had downloaded.
+        raise RuntimeError(
+            "FIREWORKS_API_KEY is not set — the Modal container needs it to "
+            "reach the teacher. Export it before launching."
+        )
+
+    cfg = force_gpu_safe_config(cfg)
+
+    try:
+        import modal
+    except ImportError as e:  # pragma: no cover - env guard
+        raise RuntimeError(
+            "modal is part of the train extra — `uv sync --extra train`"
+        ) from e
+
+    from .runtime.modal_env import (
+        HF_CACHE_MOUNT,
+        HF_CACHE_VOLUME_NAME,
+        VOLUME_MOUNT,
+        VOLUME_NAME,
+    )
+
+    run_id = f"{int(time.time())}-seed{cfg.seed}"
+    # Volume upload paths are relative to the volume ROOT, while reads inside a
+    # container are under VOLUME_MOUNT. Do not "fix" these to match
+    # `train.stage_local_adapter_to_volume`, which passes a mount-prefixed path
+    # and therefore lands its files one directory deeper than it reads them.
+    inputs_root = f"opd-inputs/{run_id}"
+    remote_prefixes = f"{VOLUME_MOUNT}/{inputs_root}/prefixes"
+    remote_bridge = f"{VOLUME_MOUNT}/{inputs_root}/bridge.json"
+    remote_out = f"{VOLUME_MOUNT}/opd-out/{run_id}"
+
+    vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+    hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
+    with vol.batch_upload(force=True) as batch:
+        batch.put_directory(str(prefixes_dir), f"{inputs_root}/prefixes")
+        batch.put_file(str(bridge_path), f"{inputs_root}/bridge.json")
+
+    image = (
+        modal.Image.debian_slim(python_version="3.12")
+        .pip_install("torch", "transformers", "tokenizers", "peft", "accelerate")
+        .env({"HF_HOME": HF_CACHE_MOUNT})
+        .add_local_python_source("vektori_trace")
+    )
+
+    remote_cfg = {
+        "student_model": cfg.student_model,
+        "teacher_model": cfg.teacher_model,
+        "max_steps": cfg.max_steps,
+        "learning_rate": cfg.learning_rate,
+        "examples_per_step": cfg.examples_per_step,
+        "seed": cfg.seed,
+        "temperature": cfg.temperature,
+        "max_new_tokens": cfg.max_new_tokens,
+        "max_prefix_tokens": cfg.max_prefix_tokens,
+        "top_k": cfg.top_k,
+        "bf16": cfg.bf16,
+        "gradient_checkpointing": cfg.gradient_checkpointing,
+        "cross_tokenizer": cfg.cross_tokenizer,
+        "thinking_mode": cfg.thinking_mode,
+        "min_alignment_granularity": cfg.min_alignment_granularity,
+        "max_span_student_tokens": cfg.max_span_student_tokens,
+        "cross_top_k": cfg.cross_top_k,
+        "lora": asdict(cfg.lora),
+    }
+    timeout_s = modal_timeout_for(cfg)
+    app = modal.App("vektori-trace-opd")
+
+    @app.function(
+        gpu=modal_gpu,
+        image=image,
+        secrets=[modal.Secret.from_dict({"FIREWORKS_API_KEY": api_key})],
+        volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+        timeout=timeout_s,
+        # `_remote` is defined here so it can close over the volume handles and
+        # the config. Modal re-imports globals-scope functions by module path in
+        # the container; `serialized=True` makes it pickle this one instead.
+        # Without it the decorator raises before any GPU is allocated.
+        serialized=True,
+    )
+    def _remote(job: dict) -> dict:
+        import shutil as _shutil
+        from dataclasses import asdict as _asdict
+        from pathlib import Path as P
+
+        from vektori_trace.cli.commands.distill import _load_teacher_trajectories
+        from vektori_trace.distill import (
+            LoraHyperparams as _Lora,
+        )
+        from vektori_trace.distill import (
+            OPDTrainConfig as _Cfg,
+        )
+        from vektori_trace.distill import (
+            run_opd_training as _run,
+        )
+        from vektori_trace.providers.teacher.cross import CrossTokenizerTeacherPool
+        from vektori_trace.providers.teacher.fireworks import fireworks_pool_from_env
+        from vektori_trace.reopd import iter_reopd_examples
+        from vektori_trace.vocab_bridge import CrossTokenizerBridge, load_tokenizer
+
+        c = dict(job["cfg"])
+        lora = _Lora(**c.pop("lora"))
+        # Log to container-local disk: `run_opd_training` flushes it every step,
+        # and per-step flushes onto a FUSE mount are slow. It is copied into the
+        # Volume in the `finally` below, so a crash still leaves the evidence.
+        local_out = P("/tmp/opd-out")
+        local_out.mkdir(parents=True, exist_ok=True)
+        cfg_r = _Cfg(output_dir=local_out, lora=lora, **c)
+
+        bridge = CrossTokenizerBridge.load(job["bridge"])
+        ttok = load_tokenizer(job["teacher_tokenizer_id"])
+        pool = CrossTokenizerTeacherPool(
+            pool=fireworks_pool_from_env(
+                model=job["fireworks_model"], api_base=job["api_base"]
+            ),
+            teacher_tokenizer=ttok,
+            thinking_mode=cfg_r.thinking_mode,
+            bridge=bridge,
+        )
+
+        trajectories = _load_teacher_trajectories(P(job["prefixes"]))
+        examples = list(
+            iter_reopd_examples(trajectories, steps_per_traj=job["steps_per_traj"])
+        )
+
+        dest = P(job["out"])
+        try:
+            result = _run(
+                examples, pool, cfg_r, bridge=bridge, teacher_tokenizer=ttok
+            )
+            payload = _asdict(result)
+            payload["adapter_dir"] = str(result.adapter_dir)
+            payload["log_path"] = str(result.log_path) if result.log_path else None
+            payload["n_trajectories"] = len(trajectories)
+            payload["error"] = None
+            return payload
+        except Exception as e:
+            return {
+                "error": f"{type(e).__name__}: {e}",
+                "n_examples": len(examples),
+                "n_trajectories": len(trajectories),
+            }
+        finally:
+            # Commit whatever exists. Every late abort in this loop — alignment,
+            # the clamp gate, the run-level granularity gate — happens after
+            # hours of GPU and teacher time, and `opd_log.jsonl` is the only
+            # artifact that says why. Losing it is losing the run twice.
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in local_out.rglob("*"):
+                rel = f.relative_to(local_out)
+                target = dest / rel
+                if f.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _shutil.copy2(f, target)
+            vol.commit()
+
+    job = {
+        "cfg": remote_cfg,
+        "bridge": remote_bridge,
+        "prefixes": remote_prefixes,
+        "out": remote_out,
+        "fireworks_model": fireworks_model,
+        "teacher_tokenizer_id": teacher_tokenizer_id,
+        "api_base": api_base,
+        "steps_per_traj": steps_per_trajectory,
+    }
+    print(
+        f"OPD on Modal: gpu={modal_gpu} timeout={timeout_s // 60}min "
+        f"run_id={run_id} → {remote_out}"
+    )
+    with app.run():
+        remote = _remote.remote(job)
+
+    if remote.get("error"):
+        raise RuntimeError(
+            f"remote OPD run failed: {remote['error']} — partial artifacts "
+            f"committed to {remote_out} inside Volume {VOLUME_NAME}"
+        )
+
+    # The remote rebuilds the corpus from uploaded files. If the upload was
+    # partial, the run silently trained on less than we measured; assert rather
+    # than discover it in the report. `find_trajectory` breaks ties on mtime,
+    # which Volume uploads do not preserve.
+    if expected_examples is not None and remote["n_examples"] != expected_examples:
+        raise RuntimeError(
+            f"remote built {remote['n_examples']} examples but the local "
+            f"pre-flight built {expected_examples} — the uploaded corpus does "
+            "not match the one that was checked"
+        )
+
+    provenance = dict(remote.get("provenance") or {})
+    provenance.update({"modal_gpu": modal_gpu, "run_id": run_id, "ran_on": "modal"})
+
+    # The weights live on the Volume; the local dir records where, and does not
+    # pretend to hold them.
+    adapter_dir = cfg.output_dir / "adapter"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    (adapter_dir / "modal_volume_path.txt").write_text(f"{remote_out}/adapter\n")
+    return OPDTrainResult(
+        adapter_dir=adapter_dir,
+        student_model=remote["student_model"],
+        teacher_model=remote["teacher_model"],
+        steps=remote["steps"],
+        final_loss=remote["final_loss"],
+        mean_log_ratio_final=remote["mean_log_ratio_final"],
+        n_examples=remote["n_examples"],
+        action_tokens_scored=remote["action_tokens_scored"],
+        skipped_empty_samples=remote["skipped_empty_samples"],
+        lora=remote["lora"],
+        seed=remote["seed"],
+        log_path=Path(f"{remote_out}/opd_log.jsonl"),
         provenance=provenance,
     )
 
