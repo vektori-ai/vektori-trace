@@ -103,22 +103,44 @@ N rollout workers
 incident both read `0` for the entire run. With 8 workers they should read
 `running: 8, waiting: 0`.
 
-## `--max-model-len`, sized from measured traffic
+## `--max-model-len` is a ceiling, not a budget — keep it high
 
-vLLM plans how many sequences fit against this value, so it directly sets
-concurrency. Across run6's 24 rollouts:
+This was initially "fixed" the wrong way, and the wrong version is instructive.
 
-| | tokens |
-|---|---:|
-| median prompt | 8,310 |
-| p90 | 9,408 |
-| **max observed** | **11,304** |
+The startup banner says:
 
-- `8192` (the old default) sits **below the observed maximum** — real requests
-  would be rejected mid-sweep.
-- `40960` (used by hand in run6, and repeated when launching this baseline)
-  makes the scheduler plan for 41k-token sequences and admit ~2.
-- **`16384`** clears the observed max with margin and admits ~10.
+```
+kv budget           14.30 GiB  =  93,716 tokens total
+→ concurrent seqs   2  at full length
+```
+
+That second line is **our own arithmetic** — `serve_student.py:191` computes
+`kv_tokens // max_model_len`. It is a worst-case display, not a limit vLLM
+enforces. **vLLM's PagedAttention allocates KV blocks on demand**
+(`ceil(tokens / block_size)`), so a sequence that uses 9k tokens consumes 9k
+worth of blocks regardless of whether the ceiling is 16k or 41k.
+
+Consequences:
+
+- Lowering `--max-model-len` buys **no** concurrency.
+- Lowering it below a real prompt **hard-rejects that request mid-sweep**.
+
+So the default is **40960**, matching `model_info_14b.json`'s advertised
+`max_input_tokens` (40,448) and what run6 actually served. The old default of
+`8192` was the genuine hazard.
+
+### A measurement error worth not repeating
+
+The first version of this fix cited "largest observed prompt: 11,304 tokens"
+and set the ceiling to 16384 on that basis. That number was
+`total_prompt_tokens ÷ n_steps` — the **average call** within a rollout, not
+the largest. Agent context grows across a rollout, so a rollout *averaging*
+11,304 plausibly ends with a call near 20k.
+
+Per-call prompt sizes are not recoverable from run6: `trajectory.json` steps
+carry only `step_id`, `timestamp`, `source`, `message`, and token captures were
+never collected for that run. **If you want this number, enable the capture
+proxy** — see the telemetry gaps noted in `docs/OPD-RUN-PLAN.md`.
 
 ## What was checked and found *not* to be a problem
 
