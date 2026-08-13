@@ -1573,7 +1573,15 @@ def run_opd_training_modal(
 
     image = (
         modal.Image.debian_slim(python_version="3.12")
-        .pip_install("torch", "transformers", "tokenizers", "peft", "accelerate")
+        # `harbor` is not incidental here: `parse_job_trajectory` validates ATIF
+        # with Harbor's own Pydantic models rather than duplicating the schema,
+        # and the remote rebuilds the corpus from uploaded job dirs. Pinned to
+        # the floor in pyproject so the container parses trajectories the same
+        # way the box does. Everything else the mining pipeline needs stays out
+        # — see `mining/__init__.py` on why this image is not a mining image.
+        .pip_install(
+            "torch", "transformers", "tokenizers", "peft", "accelerate", "harbor>=0.20"
+        )
         .env({"HF_HOME": HF_CACHE_MOUNT})
         .add_local_python_source("vektori_trace")
     )

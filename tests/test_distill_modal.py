@@ -238,3 +238,19 @@ def test_trace_loader_pulls_in_no_mining_dependencies():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == "", f"importing traces pulled in: {out}"
+
+
+def test_image_carries_harbor_but_not_the_mining_stack():
+    """The container parses ATIF, so it needs harbor — and nothing else.
+
+    `parse_job_trajectory` validates with Harbor's own Pydantic models instead
+    of duplicating the schema, and the remote rebuilds the corpus from uploaded
+    job dirs. That is a real dependency of the work being done there. It is
+    also the ONLY one beyond the training stack: pydantic/docker/github arrive
+    only by importing the mining package, which is what the lazy `__init__`
+    prevents.
+    """
+    src = inspect.getsource(run_opd_training_modal)
+    assert "harbor" in src, "container cannot parse trajectories without harbor"
+    for unwanted in ("openai", "bitsandbytes"):
+        assert f'"{unwanted}"' not in src, f"{unwanted} does not belong on a training image"
