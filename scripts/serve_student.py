@@ -163,9 +163,17 @@ def main() -> int:
                          "does not fit on A10 at all")
     ap.add_argument("--adapter-path", default=None,
                     help="Volume path (/adapters/...) to a LoRA adapter")
-    ap.add_argument("--max-model-len", type=int, default=8192,
+    ap.add_argument("--max-model-len", type=int, default=16384,
                     help="max tokens per sequence. MUST fit the KV budget or "
-                         "vLLM refuses to start (default: 8192)")
+                         "vLLM refuses to start. 16384 is sized from measured "
+                         "traffic: across run6's 24 rollouts the largest single "
+                         "agent prompt was 11,304 tokens (median 8,310, p90 "
+                         "9,408). The old default of 8192 sat below that "
+                         "observed maximum, so real requests would be rejected "
+                         "mid-sweep; 40960 (used by hand in run6) wastes "
+                         "scheduler headroom, since vLLM plans concurrency "
+                         "against this number and would admit ~2 sequences "
+                         "instead of ~10 (default: 16384)")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--max-hours", type=float, default=12.0,
                     help="auto-shutdown after N hours so a forgotten endpoint "

@@ -257,7 +257,25 @@ def serve_model(
         # `scaledown_window` is what stops an *idle* container from billing;
         # this is only the ceiling for a busy one.
         timeout=12 * 60 * 60,
+        # One engine, not N. Modal's unit of scaling is the in-flight *request*,
+        # and its default is one per container — so on 2026-08-13 a sweep with
+        # two rollout workers plus a /metrics poller had three requests open at
+        # once and Modal answered by booting three containers, each holding its
+        # own L40S and its own copy of the 27.6 GB model. 3x the bill, and vLLM
+        # never batched anything because no engine ever received more than one
+        # request. `max_containers=1` plus the concurrency below is what puts
+        # the scheduling back where it belongs: vLLM's continuous batching,
+        # which is the entire reason to run vLLM.
+        max_containers=1,
     )
+    # Applied to the class, per Modal's docs — all methods share the container,
+    # so this covers `web_server` (the OpenAI API) and the `method()` calls
+    # (`health`, `gpu_stats`) alike. `target_inputs` is autoscaler advice and is
+    # inert while `max_containers=1`; it matters only if that cap is ever
+    # raised. `max_inputs` is the hard ceiling on what enters one engine — set
+    # well above the KV capacity so Modal never queues ahead of vLLM, whose
+    # scheduler is the one that should decide what runs.
+    @modal.concurrent(max_inputs=32, target_inputs=8)
     class VllmServer:
         @modal.enter()
         def start(self) -> None:
