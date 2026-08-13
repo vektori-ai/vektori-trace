@@ -18,6 +18,9 @@ workspace/
 # task dirs does not belong in the history.
 cs/
 
+# Local copy of the 60-task golden corpus (from the box's cs/corpus50_v3).
+corpus60/
+
 # Working notes, kept local. These are drafts and snapshots, not documentation:
 # mined-tasks-inventory.md in particular is a 2026-07-31 snapshot of the
 # vektori-out-* anyio/click/tenacity corpus, taken before the commit_runtime
@@ -27,3 +30,8 @@ docs/PAPER_BRAINDUMP.md
 docs/TECHNICAL_NOTES.md
 docs/opd-aws-fireworks.md
 docs/AWS_PORT_PLAN.md
+baseline-qwen-run.tar.gz
+
+# Legacy Qwen3-14B artifacts and trajectory tarballs, local only.
+qwen-stuff-14B/
+qwen14b-trajectories.tar.gz
