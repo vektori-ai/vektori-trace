@@ -19,19 +19,18 @@ rather than incidental.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import modal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from vektori_trace.runtime.modal_env import (
-    HF_CACHE_MOUNT,
-    HF_CACHE_VOLUME_NAME,
-    VOLUME_MOUNT,
-    VOLUME_NAME,
-)
+# Mirrored from vektori_trace/runtime/modal_env.py rather than imported: Modal
+# re-imports this module *inside* the container, where the local package is not
+# installed, so a module-level import of it fails the run before any training
+# starts. Four constants are cheaper than shipping the package.
+VOLUME_NAME = "vektori-trace-adapters"
+VOLUME_MOUNT = "/adapters"
+HF_CACHE_VOLUME_NAME = "hf-model-cache"
+HF_CACHE_MOUNT = "/root/.cache/huggingface"
 
 GPU = "A100-80GB"
 DATA_IN_VOLUME = "sft/sft_train.jsonl"
