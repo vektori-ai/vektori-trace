@@ -23,6 +23,11 @@ harbor = ["harbor>=0.20"]
 train = [
     "torch",
     "transformers",
+    # TRL owns the agent-trace SFT path (`scripts/sft_train_modal.py`). Its
+    # `assistant_only_loss` derives the loss mask from the chat template, and
+    # it patches in the `{% generation %}` markers Qwen3's stock template
+    # lacks — without which the mask is silently all-zero.
+    "trl",
     "peft",
     "accelerate",
     "datasets",

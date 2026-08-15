@@ -1,4 +1,11 @@
-"""LoRA SFT loop for Step 6. Masking is baked into `labels` (-100) by
+"""LoRA SFT loop for Step 6.
+
+NOT THE ACTIVE TRAINING PATH. Agent-trace SFT runs through TRL —
+`scripts/sft_train_modal.py` — which derives the assistant mask from the chat
+template rather than from pre-tokenized `labels`. This module is kept as the
+fallback and is still used by `arms.py`.
+
+Masking is baked into `labels` (-100) by
 `dataset.py`, so the stock HF Trainer causal-LM loss needs no custom loss.
 
 Real runs execute on Modal GPU (`train_lora_modal`); offline unit tests call
