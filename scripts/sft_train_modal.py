@@ -40,15 +40,20 @@ app = modal.App("vektori-trace-sft-trl")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
+# Pinned to the versions the export and the mask check were verified against.
+# Unpinned, the container resolved a different TRL whose SFTConfig rejects
+# `warmup_ratio` — the run died on a kwarg after the image build and the model
+# download were already paid for. Behaviour verified on one version and shipped
+# on another is not verified at all.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "torch",
-        "transformers",
-        "trl",
-        "peft",
-        "accelerate",
-        "datasets",
+        "torch==2.13.0",
+        "transformers==5.5.3",
+        "trl==1.10.0",
+        "peft==0.19.1",
+        "accelerate==1.14.0",
+        "datasets==5.0.0",
         "bitsandbytes",
     )
     .env({"HF_HOME": HF_CACHE_MOUNT})
