@@ -288,3 +288,15 @@ def test_a_step_with_split_observations_ends_the_segment(tmp_path) -> None:
     step = _step(2, "agent", "Analysis: a\nPlan: p", tool_calls=[_bash("c", "ls\n")],
                  observation={"results": [{"content": "one"}, {"content": "two"}]})
     assert observation_text(step) is None
+
+
+def test_a_bare_newline_keystroke_gets_a_label_not_a_crash() -> None:
+    """Keystrokes go to a terminal verbatim, so pressing Enter is a real action
+    whose text strips to nothing and has no first line."""
+    from scripts.sft_repair_dataset import _command_label
+
+    assert _command_label("\n") == "<enter>"
+    assert _command_label("   ") == "<enter>"
+    assert _command_label("") == "<empty>"
+    assert _command_label("ls -la\n") == "ls -la"
+    assert _command_label("C-c") == "C-c"

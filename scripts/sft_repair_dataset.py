@@ -515,7 +515,7 @@ def audit(segments: list[Segment], capture_stats: dict) -> dict:
             if meta.get("kind") == ACTION:
                 ks = _keystrokes(msg["content"])
                 if ks:
-                    first_commands[ks[0].strip().splitlines()[0][:40]] += 1
+                    first_commands[_command_label(ks[0])] += 1
                 break
 
     by_source = Counter(t.get("target_source") for t in turns)
@@ -561,6 +561,20 @@ def audit(segments: list[Segment], capture_stats: dict) -> dict:
             if s.problems
         ],
     }
+
+
+def _command_label(keystrokes: str) -> str:
+    """A short label for the first-command histogram.
+
+    Keystrokes are sent to a terminal verbatim, so a perfectly ordinary command
+    is a bare `"\\n"` (press Enter) or `"C-c"` — both of which strip to nothing
+    and have no first line. Those are real actions and belong in the
+    distribution under their own name, not as a crash.
+    """
+    stripped = keystrokes.strip()
+    if not stripped:
+        return "<enter>" if keystrokes else "<empty>"
+    return stripped.splitlines()[0][:40]
 
 
 def _keystrokes(content: str) -> list[str]:
