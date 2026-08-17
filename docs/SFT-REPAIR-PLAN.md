@@ -28,17 +28,58 @@ corrected batch and the same seed, and exists only to price the continuation.
 
 ---
 
-## 0.0 Status — 2026-08-17
+## 0.0 Status — 2026-08-18
 
-Phases 1–4 are **done**. Nothing beyond them has run; Phase 5 needs approval.
+Phases 1–6 are **done**. The repaired adapter exists. Phase 7 is next and is
+not written yet.
 
 | | |
 |---|---|
 | Phase 1 | v1 frozen at `/data/v1-provenance/` with sha256s |
 | Phase 2 | built, exit 0 — `/data/sft-repaired/`, sha `7ecfee31…` |
 | Phase 3 | **PREFLIGHT PASSED** — targets, roles, masks, TRL agreement all clean |
-| Phase 4 | trainer written, 27 unit tests green, never run |
-| Phase 5 | **not started — needs approval** |
+| Phase 4 | trainer written, tests green |
+| Phase 5 | **passed** — 3 steps, longest rows, 560/560 LoRA tensors moved |
+| Phase 6 | **complete** — 63 steps, 3 epochs, 3.05 h, 7 checkpoints |
+| Phase 7 | **not written** — no way to select a checkpoint yet |
+
+### Phase 6 result
+
+```text
+63 steps · 3 epochs · 165 segments · nf4 · lr 1e-5 constant_with_warmup(5)
+elapsed 10,973 s (3.05 h) · 174.2 s/step
+peak VRAM 63.7 GiB allocated / 65.6 reserved of 79.25
+loss  0.6436 (step 1) -> 0.4856 (step 63), mean 0.5731
+grad_norms 0.621 -> ~0.016-0.020, finite and non-zero throughout
+lora_tensors_changed 560/560
+supervised 1,029,371 of 3,992,567 tokens
+```
+
+Checkpoints at 10/20/30/40/50/60/63 in
+`sft/qwen3-14b-dsv4-lora-repaired`. v1's `adapter_model.safetensors` still
+hashes to `893ca045…`, unchanged; the repaired adapter is `dda365c3…`.
+
+**Four defects were found in Phase 4, every one a flag or default that silently
+did nothing rather than failing:**
+
+1. `enable_input_require_grads()` missing — frozen base plus checkpointing gives
+   an empty backward that still logs a plausible loss.
+2. `device_map` missing — `--nf4` loaded full-precision weights and reported
+   success. Two "BF16 vs NF4" probes were really BF16 twice.
+3. **`loss_type` lost in the port** — the actual OOM cause. TRL defaults to
+   `chunked_nll`; a plain `Trainer` has no such concept and routes to
+   `ForCausalLMLoss`, which materialises `[36993, 151936]` logits and upcasts
+   them to fp32. That default is why v1 fit in 39.6 GiB.
+4. `skip_prepare_dataset` and `--memory-history` half-wired.
+
+Leaving TRL was never necessary: `assistant_only_loss` cannot express the mask,
+but `SFTTrainer` detects a pre-tokenized dataset and skips its whole masking
+pipeline (`sft_trainer.py:1397`), keeping our labels and collator. Conflating
+those two cost three probes.
+
+BF16 remains untested *with* chunked loss. It failed at 71.7 GiB with the full
+logits path; removing ~31 GiB of logits would likely bring it inside 79. It is a
+rerun option, not a blocker.
 
 ### Phase 2 audit
 
