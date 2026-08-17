@@ -1,0 +1,594 @@
+# Corrective SFT — repairing v1's protocol
+
+**Date:** 2026-08-17 · supersedes nothing · companion to
+`docs/CL-PLAN.md`, memory `v1-sft-protocol-mismatch`
+
+V2 is **not** part of this path. It appeared only as a proposed quantization
+diagnostic and has been dropped. No v2 adapter, no v2 dataset. It remains
+historical evidence only.
+
+The Base/V2 × NF4/BF16 experiment is dropped. The three-step NF4-vs-BF16 probe
+in Phase 5 is **not** that experiment: it uses the same v1 adapter, the same
+corrected batch and the same seed, and exists only to price the continuation.
+
+## Resolved decisions (2026-08-17)
+
+| | |
+|---|---|
+| target text | **hybrid** — raw capture where it joins and verifies, canonical ATIF rebuild otherwise; per-turn `target_source` provenance |
+| join key | **full semantic tuple**, not a 300-char prefix |
+| handoff turns | kept as **context**, masked from loss |
+| supervision | **pre-tokenized**, explicit per-message mask; not TRL `assistant_only_loss` |
+| base precision | **probe both** NF4 and BF16 at 3 steps, then decide; BF16 expected to win on deployment match |
+| dev split | **none** — train all 165 rows |
+| GPU | **A100-80GB** (L40S 48 GB is serving-only; BF16 at 40k will not fit, NF4 has no safe headroom) |
+| schedule | 21 optimizer steps/epoch × 3 epochs = **63 max steps** |
+| checkpoints | 10, 20, 30, 40, 50, 60, 63 |
+| selection | earliest checkpoint passing the native-JSON and behavior gates |
+
+---
+
+## 0. The sequence
+
+```text
+preserve v1
+→ reconstruct corrected raw-JSON dataset
+→ audit every row and mask
+→ build BF16 v1-continuation trainer
+→ approved three-step BF16 probe
+→ approved corrective SFT
+→ select earliest passing checkpoint
+→ approved native serving validation
+→ one guarded no-shim rollout
+→ OPD if interface and basic behavior are stable
+→ support measurement
+→ RL only after passes exist
+```
+
+## 0.1 The problem, restated
+
+v1 learned the right *objective* in the wrong *protocol*. It was trained on
+OpenAI-style `tool_calls` (Qwen3's template renders these as
+`<tool_call>{...}</tool_call>`) with `role="tool"` observations. Harbor's
+terminus-2 wants literal flat JSON —
+`{analysis, plan, commands[], task_complete}` — in assistant *text*, and sends
+observations as `role="user"` (`terminus_2.py:1142`). Hence 305 consecutive
+`Missing required fields` in the original run.
+
+v1 is not empty: 7,436 `bash_command` + 241 `mark_task_complete`; 148/165
+segments contain an edit; first command is `ls -la` 114x / `git status` 23x.
+The deficit is the envelope, not the intent. Repair by **continuing** the
+adapter, not retraining it.
+
+---
+
+## Phase 1: Preserve provenance
+
+Before changing anything:
+
+- v1 stays immutable.
+- Record its adapter checksum and `adapter_config.json`.
+- Record the exact Qwen base revision and tokenizer.
+- Preserve the original v1 dataset, logs and `run_summary.json`.
+- Repaired-v1 goes to a **new** output path.
+- Do not overwrite v1 or v2.
+
+### v1 as-built (recorded)
+
+| | |
+|---|---|
+| adapter | Modal volume `vektori-trace-adapters`, `sft/qwen3-14b-dsv4-lora` |
+| base | `Qwen/Qwen3-14B` |
+| dataset | `/data/sft/sft_train.jsonl` — 165 segments, 34 tasks |
+| LoRA | r 32, alpha 64, dropout 0.05, all-linear (7 proj types), CAUSAL_LM |
+| trained | 165 segments, 5 epochs, lr 1e-4, cosine, bs 1 × accum 8 → 106.9 steps |
+| loss | 0.657 |
+| peak VRAM | 39.6 GiB on A100-80GB |
+| **base precision** | **NF4** (`load_in_4bit`, nf4, double-quant, bf16 compute) — `sft_train_modal.py:104-110`, unconditional |
+| pinned image | torch 2.13.0 · transformers 5.5.3 · trl 1.10.0 · peft 0.19.1 · accelerate 1.14.0 · datasets 5.0.0 · bnb 0.50.1 |
+
+v1 was fitted against **NF4** weights and is **served** against BF16 weights.
+The corrective run uses a frozen **BF16** base to match deployment; that is a
+deliberate change of base precision, recorded here so it is not mistaken for
+preservation. If BF16 does not fit, **stop and reconsider NF4** — do not switch
+automatically.
+
+---
+
+## Phase 2: Build the protocol-corrected dataset
+
+### Sources
+
+The same teacher knowledge v1 originally learned. No new mined tasks. Not
+`/data/sft-clean` alone.
+
+- 117 successful DeepSeek-V4 rollouts
+- 165 source segments
+- 34 tasks
+- Both canonical teacher-run directories:
+  `/data/vektori-out/dsv4-corpus60` and `/data/vektori-out/dsv4-corpus60-b`
+
+### The two representations
+
+Every teacher action exists twice.
+
+**Raw capture** — what DeepSeek actually emitted, in
+`<run>/captures/token_captures.jsonl` (one global file per run, written by
+`CaptureProxy`; 6,351 + 5,144 = 11,495 records):
+
+```json
+{
+  "analysis": "The repository is already present...",
+  "plan": "Inspect the implementation...",
+  "commands": [{"keystrokes": "sed -n '180,420p' src/anyio/from_thread.py\n"}]
+}
+```
+
+**Harbor trajectory (ATIF)** — a logging representation created *after*
+parsing that response. `terminus_2.py:1338-1348` writes
+`message = f"Analysis: {analysis}\nPlan: {plan}"` and the commands as
+structured `tool_calls`. The raw JSON string is **not** stored: the
+`save_raw_content_in_trajectory` flag that would have stored it was off.
+
+### The join
+
+"Joining" means identifying which raw completion belongs to which trajectory
+action. The capture file carries **no rollout identity** — it is global across
+concurrent rollouts — so the join is on content and time:
+
+1. **Timestamp:** capture `request_started_at` / `created_at` against the ATIF
+   step `timestamp`.
+2. **Completion order:** first action response with first action turn, and so
+   on within a rollout.
+3. **Prompt/call order:** distinguish normal action calls from summarization
+   and other calls.
+4. **Command equivalence:** parse the raw JSON with Harbor's real Terminus
+   parser and confirm its commands equal the commands ATIF recorded.
+
+```text
+Raw response command: ls -la
+ATIF tool call:       bash_command("ls -la")   → match
+Raw response: pytest, ATIF: sed              → mismatch, join is wrong
+```
+
+An earlier naive join keyed on the first 300 chars of `analysis` reached
+97.3% (3,528/3,627) with 1 collision. That key is retired.
+
+**The key is the full semantic tuple**, because a full `Analysis/Plan` string
+removes the *known* collision but does not make collisions impossible — two
+responses can share analysis and plan and differ in commands:
+
+```text
+key = full rendered "Analysis: {a}\nPlan: {p}"
+    + normalized commands (keystrokes, duration)
+    + task_complete
+    + capture/call order
+```
+
+Note the rendered string is built by *inverting* `terminus_2.py:1345` on the raw
+side rather than splitting ATIF's `message` — splitting is ambiguous whenever
+an analysis itself contains `"\nPlan: "`, inverting never is.
+
+If duplicate tuples produce identical targets, the ambiguity is harmless and is
+recorded. Otherwise **fail loudly**.
+
+### Reconstruction — hybrid
+
+ATIF is **semantically** lossless here but not byte-for-byte: the original
+whitespace, key order and escaping are gone. Harmless, provided rebuilt targets
+use one canonical serializer matching the dominant raw style.
+
+For each parent-agent action:
+
+```text
+target = capture.text        if it parses AND its commands match ATIF
+                                AND its task_complete matches ATIF
+       = canonical rebuild    otherwise
+```
+
+1. Identify the matching raw teacher completion.
+2. Parse it with Harbor's real Terminus parser.
+3. Compare its commands **and `task_complete`** with ATIF's record.
+4. Store the complete raw JSON as assistant **content**.
+5. Store terminal output as the next `role="user"` message.
+6. Record provenance on every assistant turn:
+   `"target_source": "raw_capture" | "atif_rebuilt"`.
+
+**Justify the rebuild before trusting it.** On the ~97% of turns where both
+representations exist, assert
+
+```text
+parse(raw target) == parse(ATIF-rebuilt target)
+```
+
+over `analysis`, `plan`, `commands` (keystrokes *and* durations) and
+`task_complete`. If equivalence holds across the joined turns, rebuilding the
+remaining ~3% is justified. If it does not, the rebuild is wrong and the
+mismatch is the finding.
+
+Result: **165/165 segments, 3,627/3,627 turns**, with no guessing and no
+incoherent truncation.
+
+### Turn classification and supervision
+
+Every assistant turn is first classified:
+
+```text
+action             -> supervised
+handoff_question   -> context, masked
+summarization      -> context, masked
+unknown            -> FAIL THE AUDIT
+```
+
+Train **only** `action`. There are ~48 `handoff_question` turns (one per
+compaction boundary: 165 segments − 117 rollouts), carrying prose like
+*"Before I continue implementing, I need the following clarifications: ..."*
+from `trajectory.summarization-N-questions.json`. v1 was trained on those
+(`sft_export_traces.py:75-91` pulls the head in wholesale).
+
+They are not pure noise — they occur under a distinct handoff-question prompt,
+so a model could in principle learn the conditional (action prompt → JSON,
+handoff prompt → prose). But this run has one narrow objective, repair action
+serialization, and 48 non-action prose targets only broaden it. Keeping them as
+context preserves the genuine inference conversation structure and lets the
+following actions see the real questions and answers; v1 has already seen these
+examples and base Qwen can already write prose. Handoff and summarization
+behavior is tested **separately, after** the repair.
+
+Dropping them entirely (collapsing the head into one user message) was rejected:
+it leaves the "Here are the answers..." user message dangling against questions
+absent from the context.
+
+Explicit mappings:
+
+- `bash_command` → one `commands[]` entry.
+- `mark_task_complete` → `"task_complete": true`.
+- Never place `mark_task_complete` inside `commands`.
+- Preserve raw teacher `analysis` and `plan`.
+- Remove structured `tool_calls`, ids and tool roles.
+- Exclude subagent turns.
+- Exclude summarization completions as action targets.
+- Summaries may remain as context after compaction.
+- Pin `enable_thinking=False`.
+- Do not put `<think>` tags into targets. DeepSeek's CoT arrives out of band in
+  `reasoning_content` and is discarded.
+
+### Missing data
+
+The hybrid rule means an unmatched capture is **not** missing data — it falls
+back to the rebuild. Truncation is reserved for an action that cannot be
+represented at all (ATIF itself unparseable, or a tool call with no
+recoverable keystrokes):
+
+- Truncate immediately before that action.
+- Keep the valid prefix if it contains supervised assistant responses.
+- Otherwise drop the segment.
+
+Never leave an observation responding to a removed command.
+
+### Dataset audit report
+
+- 165 source segments
+- complete / truncated / dropped segments
+- recovered assistant turns / total
+- commands retained
+- edit / test / read operations retained
+- `task_complete` mappings
+- first-command distribution
+- join failures with provenance
+- token lengths
+- dataset checksum
+
+Final yield may be below 165. Acceptable if every retained conversation is
+coherent.
+
+---
+
+## Phase 3: Free preflight checks
+
+We pre-tokenize and own the labels, so preflight must additionally prove:
+
+- token ids render with the **exact serving chat template**
+- `enable_thinking=False` is explicit
+- labels are `-100` everywhere except selected action spans
+- no example truncates
+- every row has ≥1 supervised action
+- decoding the supervised spans reproduces the raw JSON
+- the custom mask **matches TRL's** mask on ordinary action-only rows
+
+That last one is the safety net: on any segment with no handoff turn the two
+methods must agree exactly, which is what makes the divergence on handoff rows
+attributable to intent rather than to a bug.
+
+Before a GPU:
+
+1. Every assistant target parses as Terminus JSON.
+2. Parsed commands match ATIF.
+3. No invented tool verbs.
+4. No assistant `tool_calls`.
+5. No `role="tool"` observations.
+6. No `<tool_call>` or `<think>` text in targets.
+7. `task_complete` mapped correctly.
+8. Every row renders below 40,960 Qwen tokens.
+9. No silent truncation.
+10. Every row has assistant supervision.
+11. Masks verified across **every** row, not just batch zero.
+12. Rendered with the exact chat template intended for serving.
+
+13. `parse(raw) == parse(rebuild)` on every joined turn (the rebuild
+    justification above).
+
+**No dev split.** Train all 165 rows. This is a protocol transplant over a tiny
+dataset; v1 has already seen every semantic demonstration, and holding out 10%
+would only prevent correcting the protocol on those rollouts. Dev loss is a
+weaker signal than generation validity for this objective — Phase 7 is the real
+selection criterion.
+
+---
+
+## Phase 4: The v1-continuation trainer
+
+The existing trainer starts a new adapter (`sft_train_modal.py:137` builds a
+fresh `LoraConfig`) and cannot be used unchanged.
+
+It also derives the loss mask from the chat template, which is per-**role** and
+all-or-nothing — there is no way to supervise one assistant turn and not
+another. So supervision moves off TRL: a standard Transformers trainer over a
+**pre-tokenized** dataset with a label-preserving collator.
+
+Benefits: selective masking of handoff turns; every label verifiable offline;
+no all-or-nothing role mask; no Liger mask drop (TRL #3781); no silent mask loss
+at truncation (TRL #3927); the exact supervised tokens auditable and
+reproducible.
+
+`vektori_trace/dataset.py:tokenize_sft_example` needs a small generalization —
+it supports assistant-role masking and prefix masking, not arbitrary per-turn
+classification. Add an explicit per-message supervision mask:
+
+```text
+False  user      handoff request
+False  assistant clarification questions
+False  user      answers
+True   assistant JSON action
+False  user      terminal output
+True   assistant JSON action
+```
+
+The repaired trainer must:
+
+1. Load `Qwen/Qwen3-14B` in BF16.
+2. Freeze all base weights.
+3. Load v1 through PEFT with `is_trainable=True`.
+4. Confirm only existing LoRA parameters require gradients.
+5. Not construct a new `LoraConfig`.
+6. Not stack a second LoRA.
+7. Disable model cache during training.
+8. Save to a new repaired-v1 directory.
+9. Checkpoint every ten optimizer steps.
+10. Evaluate each checkpoint on the fixed real-prefix suite.
+
+LoRA architecture is unchanged:
+
+```text
+rank: 32 · alpha: 64 · dropout: 0.05 · target modules: all-linear · dtype: BF16
+```
+
+---
+
+## Phase 5: NF4-vs-BF16 memory and correctness probe — **needs approval**
+
+Two arms, **three optimizer steps each**, on A100-80GB. Same v1 adapter, same
+corrected batch, same seed, nothing saved. Compare peak VRAM, sec/step, initial
+loss, gradient norm, stability. ~10–15 GPU-minutes total, against a 3-hour run.
+
+Expected outcome is BF16 — it matches deployment and step 0 is then exactly the
+model we measured as broken — but measuring beats guessing.
+
+### Why A100-80GB, and why not L40S
+
+|  | NF4 | BF16 |
+|---|---|---|
+| v1 measured peak | 39.6 GiB | — |
+| estimated peak | ~40 GiB | ~59–63 GiB |
+| A100-80GB headroom | ~40 GiB | ~17–21 GiB |
+
+~17–21 GiB is the right margin for allocator fragmentation, the 37,577-token
+example, and evaluation — appropriate, not excessive.
+
+L40S 48 GB is **serving hardware, not this run**: BF16 almost certainly does
+not fit at 40k context, NF4 would fit only barely with no safe headroom, and
+its memory bandwidth is substantially below A100's.
+
+### Speed expectation
+
+BF16 is likely only **5–25%** faster than NF4, not 2×. NF4 saves memory
+bandwidth but pays dequantization; BF16 gets optimized tensor-core kernels but
+reads larger weights, and at 40k context attention, activations and
+cross-entropy dominate enough that the gap may be small.
+
+For 63 steps, from v1's measured 167 s/step at NF4:
+
+- NF4: ~2h55m
+- BF16: plausibly ~2h20m–2h50m
+- with checkpoint evaluation: ~3–4h total
+
+Only a same-batch probe measures this reliably.
+
+### Both arms check
+
+- peak VRAM
+- finite loss
+- finite gradient norm
+- LoRA parameters change
+- base parameters stay frozen
+- assistant mask correct
+- no accidental fresh adapter
+- correct dataset loaded
+- no checkpoint published as a model candidate
+
+Tear down immediately. If BF16 does not fit safely, **stop and discuss** before
+falling back to NF4. Do not switch silently.
+
+---
+
+## Phase 6: Corrective SFT — **needs separate approval**
+
+```text
+base precision:      per Phase 5 probe (BF16 expected), frozen
+LoRA precision:      BF16
+optimizer:           AdamW fused
+learning rate:       1e-5
+betas:               0.9, 0.999
+epsilon:             1e-8
+weight decay:        0
+max grad norm:       1.0
+schedule:            constant_with_warmup
+warmup steps:        5
+batch size:          1
+gradient accumulation: 8
+max epochs:          3
+max length:          40960
+packing:             false
+assistant-only loss: true
+label smoothing:     0
+gradient checkpointing: true
+seed:                0
+```
+
+All 165 rows: `ceil(165 / 8) = 21` optimizer steps/epoch × 3 epochs =
+**63 max steps**. Checkpoint at **10, 20, 30, 40, 50, 60, 63**. Recompute if
+fewer rows survive the audit — do not force 63.
+
+If there is effectively no format improvement after ~20 steps: stop, return to
+original v1, do not raise LR mid-run. A separately approved `2e-5` branch can
+follow.
+
+---
+
+## Phase 7: Checkpoint evaluation
+
+At every saved checkpoint, **no shim**.
+
+### The fixed prefix suite
+
+A *prompt* is the complete conversation immediately before the teacher produced
+an action:
+
+```text
+Terminus instructions
+Task description
+Previous assistant actions
+Terminal observations
+```
+
+Extracted automatically from real teacher trajectories. Nobody invents the
+expected response — the captured DeepSeek response is the reference. Real
+prefixes covering:
+
+- initial orientation
+- repository already present
+- first source inspection
+- first edit
+- test execution
+- failed-command recovery
+- post-compaction behavior
+- long context
+
+"Fixed" means the rollout ids, turn numbers and exact messages are saved in a
+manifest so every checkpoint gets precisely the same inputs. Twenty is not
+sacred; use enough real prefixes to cover the categories.
+
+**Two suites, because there is no dev split:**
+
+1. **Acquisition** — exact real prefixes drawn from the corrected dataset.
+   Tests whether the protocol was learned at all.
+2. **Generalization** — real prompts from golden-corpus (`corpus50_v3`) tasks
+   **outside the 34 training tasks**. Tests whether format and orientation
+   transfer off the training distribution.
+
+Suite 1 leaking from training is fine and expected: prefixes are inputs, not
+labels. Suite 2 is where the honest signal lives.
+
+### Greedy suite
+
+```text
+temperature 0 · max new tokens 512 · timeout 120s · enable_thinking false
+```
+
+Gates: native JSON · required fields · correct command structure · no legacy
+tool envelopes · no invented tool names · initial orientation · no cloning when
+`.git` exists · edit emission · test emission · failed-command recovery ·
+non-repetition · EOS before the limit · post-compaction behavior.
+
+### Sampled suite
+
+Representative prompts at temperature 0.7, multiple seeds — catches a format
+that works greedily but collapses under sampling.
+
+Select the **earliest** checkpoint satisfying the gates. Not the final one, not
+the lowest training loss.
+
+---
+
+## Phase 8: Native serving validation — **needs an approved endpoint session**
+
+Repaired-v1 directly, no shim.
+
+1. Adapter appears in `/v1/models`.
+2. Requests explicitly select its model id.
+3. Bogus model ids return 404.
+4. Base and adapter outputs differ.
+5. Rank 32 supported explicitly.
+6. `enable_thinking=False` honored.
+7. Summarization requests produce summaries, not action JSON.
+8. Client cancellation reaches vLLM.
+9. Requests have output and wall-clock limits.
+10. No completion can hold the GPU indefinitely.
+
+---
+
+## Phase 9: One guarded Harbor rollout — **needs approval**
+
+One worker · one rollout · a known training task first · ten-minute cap ·
+`--no-escalate` · no shim.
+
+Kill after: two clone attempts · two identical command batches · two minutes
+without a response · a parser loop · a runaway completion.
+
+The rollout does **not** need to pass. Repair succeeds if: native JSON ·
+commands execute · correct orientation · no parser loop · no runaway
+generation · some source-level progress · edit emission when the state clearly
+calls for it.
+
+Valid JSON but strategic failure is exactly what OPD is for.
+
+---
+
+## Phase 10: OPD
+
+Proceed if repaired-v1 reliably emits native JSON, runs without middleware,
+does not wedge, can navigate and execute commands, and shows at least minimal
+edit behavior. Verifier passes are **not** required.
+
+Start with teacher-prefix / ReOPD:
+
+1. Real successful teacher prefixes.
+2. Student generates the next action.
+3. Teacher scores the same student-generated text.
+4. Cross-tokenizer alignment via the byte bridge.
+5. No converter changes text between sampling and scoring.
+6. Native JSON is a hard retention gate.
+
+Small approved probe first. Longer run only if alignment checks pass, loss is
+finite, gradients are nonzero, JSON format does not regress, and commands
+remain executable.
+
+---
+
+## Phase 11: Evaluate support
+
+Small approved pass@k sample. Check gradeability, infra failures, parser
+status, no `fallback_exitcode`, no escalation.
+
+≥1 passing rollout → RL has a usable reward difference. All fail → more OPD or
+revisit data/capability. **Never run reward-only RL on all-zero groups.**

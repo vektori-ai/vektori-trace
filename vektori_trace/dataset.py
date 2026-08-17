@@ -108,17 +108,27 @@ class TokenizedExample:
     attention_mask: list[int]
 
 
-def _encode_messages(tokenizer: Any, messages: list[dict[str, Any]]) -> list[int]:
-    """Tokenize a message prefix; empty prefix → empty ids."""
+def _encode_messages(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    template_kwargs: dict[str, Any] | None = None,
+) -> list[int]:
+    """Tokenize a message prefix; empty prefix → empty ids.
+
+    `template_kwargs` are forwarded to `apply_chat_template`. Qwen3's template
+    reads `enable_thinking` from there; leaving it unset takes the template's
+    own default, which is not the same thing as choosing it.
+    """
     if not messages:
         return []
+    extra = dict(template_kwargs or {})
     try:
         encoded = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=False
+            messages, tokenize=True, add_generation_prompt=False, **extra
         )
     except Exception:
         text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+            messages, tokenize=False, add_generation_prompt=False, **extra
         )
         encoded = tokenizer.encode(text, add_special_tokens=False)
     # Some tokenizers return a BatchEncoding (dict-like: input_ids/attention_mask)
@@ -131,6 +141,78 @@ def _encode_messages(tokenizer: Any, messages: list[dict[str, Any]]) -> list[int
     if not isinstance(encoded, list):
         encoded = list(encoded)
     return encoded
+
+
+def tokenize_messages(
+    messages: list[dict[str, Any]],
+    tokenizer: Any,
+    supervise: list[bool],
+    *,
+    max_length: int = 4096,
+    template_kwargs: dict[str, Any] | None = None,
+    truncate: bool = True,
+) -> TokenizedExample | None:
+    """Tokenize chat messages, supervising exactly the spans `supervise` selects.
+
+    The role-derived mask that `tokenize_sft_example` uses is all-or-nothing per
+    role, which is the same limitation TRL's `assistant_only_loss` has: it cannot
+    supervise one assistant turn and skip the next. `docs/SFT-REPAIR-PLAN.md`
+    needs exactly that — the ~48 post-compaction handoff turns are assistant
+    prose that must stay in context and out of the loss — so supervision is
+    passed in explicitly rather than inferred.
+
+    `truncate=False` returns None instead of cutting an over-length example.
+    Silently truncating is how a mask gets dropped without anyone noticing
+    (TRL #3927); the repair path would rather lose the row and say so.
+    """
+    if len(supervise) != len(messages):
+        raise ValueError(
+            f"supervise has {len(supervise)} entries for {len(messages)} messages"
+        )
+    if not messages or not any(supervise):
+        return None
+
+    full_ids = _encode_messages(tokenizer, messages, template_kwargs)
+    if not full_ids:
+        return None
+    if len(full_ids) > max_length and not truncate:
+        return None
+
+    labels = [IGNORE_INDEX] * len(full_ids)
+    prev_len = 0
+    for i in range(len(messages)):
+        prefix_ids = _encode_messages(tokenizer, messages[: i + 1], template_kwargs)
+        cur_len = len(prefix_ids)
+        # Non-prefix-stable templates can shrink; refuse rather than mis-mask.
+        if cur_len < prev_len:
+            raise RuntimeError(
+                "chat template is not prefix-stable — refusing to build labels "
+                "(masking would be silently wrong)"
+            )
+        if supervise[i]:
+            end = min(cur_len, len(full_ids))
+            for j in range(prev_len, end):
+                labels[j] = full_ids[j]
+        prev_len = cur_len
+
+    if len(full_ids) != prev_len:
+        raise RuntimeError(
+            "chat template prefix length != full length — refusing to build labels"
+        )
+
+    input_ids = full_ids
+    if len(input_ids) > max_length:
+        input_ids = input_ids[:max_length]
+        labels = labels[:max_length]
+
+    if not any(lab != IGNORE_INDEX for lab in labels):
+        return None
+
+    return TokenizedExample(
+        input_ids=input_ids,
+        labels=labels,
+        attention_mask=[1] * len(input_ids),
+    )
 
 
 def tokenize_sft_example(
