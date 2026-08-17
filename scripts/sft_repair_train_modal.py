@@ -1,38 +1,52 @@
 """Continue the v1 LoRA on the protocol-corrected set — Modal, one A100-80GB.
 
-`docs/SFT-REPAIR-PLAN.md` Phases 4-6. This is *not* `sft_train_modal.py` with
-different flags. Three things differ, and each one is why that script cannot be
-reused:
+`docs/SFT-REPAIR-PLAN.md` Phases 4-6. This is `sft_train_modal.py`'s successor,
+and three things differ:
 
   1. **It continues an adapter instead of creating one.** `sft_train_modal.py`
      always builds a fresh `LoraConfig` from base (line 137). Here v1 is loaded
      through PEFT with `is_trainable=True` and no new config is constructed, so
      there is exactly one LoRA and it is the one being repaired.
-  2. **It owns the loss mask.** TRL derives the mask from the chat template,
-     which is per-*role*: it cannot supervise one assistant turn and skip the
-     next. The ~48 post-compaction handoff turns are assistant prose that must
-     stay in context and out of the loss, so the dataset arrives pre-tokenized
-     with explicit labels and a label-preserving collator hands them through.
-     That also retires TRL #3781 (Liger drops the mask) and TRL #3927 (the mask
-     is silently lost past max_length).
-  3. **It can run either precision.** v1 was fitted against an NF4 base
-     (`sft_train_modal.py:104-110` is unconditional) but is *served* against
-     BF16. BF16 is the decision: step 0 of a BF16 continuation is exactly the
-     model that was measured as broken, and it absorbs v1's quantization drift
-     rather than freezing it in. `--nf4` exists as the fallback if BF16 will not
-     fit, which is a thing to measure and then discuss -- not to switch to
-     silently.
+  2. **It owns the loss mask.** `assistant_only_loss` derives the mask from the
+     chat template, which is per-*role*: it cannot supervise one assistant turn
+     and skip the next. The ~48 post-compaction handoff turns and 18 teacher
+     parse failures are assistant text that must stay in context and out of the
+     loss. So the dataset arrives pre-tokenized with explicit labels, which
+     `SFTTrainer` detects and passes straight through
+     (`is_processed = "input_ids" in column_names`, trl sft_trainer.py:1397) —
+     its whole template/masking pipeline is skipped, and our collator is kept
+     (:1190). Owning the mask never required leaving TRL; an earlier version of
+     this script assumed it did, and that assumption cost three OOMs (below).
+  3. **NF4, decided by measurement.** v1 was fitted against an NF4 base and is
+     served against BF16, so BF16 looked preferable: step 0 would then be
+     exactly the model measured as broken. It does not fit. Weights are not the
+     constraint here — a 36,993-token row over a 151,936 vocab is, and that cost
+     is identical at either precision.
 
-    modal run scripts/sft_repair_train_modal.py --probe          # 3 steps, BF16
-    modal run scripts/sft_repair_train_modal.py                  # the real run
-    modal run scripts/sft_repair_train_modal.py --probe --nf4    # only if BF16 OOMs
+**Why `SFTConfig` and not `TrainingArguments`.** A plain `Trainer` has no
+`loss_type`, so `model.forward()` routes to transformers' `ForCausalLMLoss`,
+which upcasts the entire `[seq, vocab]` logit tensor to fp32 — ~21 GiB at our
+longest row, with `cross_entropy`'s `log_softmax` backward wanting another of
+the same size immediately after. Three probes died on that line at 71.7 GiB
+allocated on a 13.1 GiB model.
 
-`--probe` runs on the *longest* rows, not a random sample: peak VRAM is
-dominated by sequence length, so a probe that saw only median rows would certify
-a footprint the real run then exceeds.
+TRL's `chunked_nll` (sft_trainer.py:117-234) drops every `-100` position
+*before* the lm_head matmul — our rows are ~74% masked — then projects what
+remains in 256-token chunks, each individually checkpointed: ~156 MB of logits
+at a time instead of ~21 GiB. It is TRL's default whenever Liger is off
+(sft_config.py:334-335), which is precisely why v1 fit in 39.6 GiB and why
+porting to a plain `Trainer` regressed. It is set explicitly here so nobody
+inherits it by accident again.
 
-Every invocation of this file costs GPU time and needs explicit per-run
-approval (CLAUDE.md). Tear the app down the moment it returns.
+    modal run scripts/sft_repair_train_modal.py --probe --nf4    # 3 steps
+    modal run scripts/sft_repair_train_modal.py --nf4            # the real run
+
+`--probe` runs on the *longest* rows, not a random sample: peak memory is
+dominated by sequence length. Note the sampler still shuffles within that
+selection, so the row that triggers a failure is not necessarily the longest.
+
+Every invocation costs GPU time and needs explicit per-run approval (CLAUDE.md).
+Tear the app down the moment it returns.
 """
 
 from __future__ import annotations
@@ -49,9 +63,10 @@ VOLUME_MOUNT = "/adapters"
 HF_CACHE_VOLUME_NAME = "hf-model-cache"
 HF_CACHE_MOUNT = "/root/.cache/huggingface"
 
-# BF16 at 40k context needs ~59-63 GiB; an L40S 48 GB cannot hold it, and NF4
-# on one leaves no safe headroom above v1's measured 39.6 GiB. Serving hardware
-# is not this run's hardware.
+# v1 measured 39.6 GiB here with the same mechanism. An L40S 48 GB is serving
+# hardware: even with chunked loss the checkpoint-boundary activations for a 37k
+# row are ~15 GiB on top of the model, and its memory bandwidth is well under
+# half an A100's.
 GPU = "A100-80GB"
 
 DATA_IN_VOLUME = "sft-repaired/sft_repaired.jsonl"
@@ -100,7 +115,8 @@ image = (
 )
 def train(
     probe: bool = False,
-    nf4: bool = False,
+    nf4: bool = True,
+    memory_history: bool = False,
     model: str = "Qwen/Qwen3-14B",
     epochs: float = 3.0,
     lr: float = 1e-5,
@@ -120,10 +136,9 @@ def train(
         AutoModelForCausalLM,
         AutoTokenizer,
         BitsAndBytesConfig,
-        Trainer,
         TrainerCallback,
-        TrainingArguments,
     )
+    from trl import SFTConfig, SFTTrainer
 
     marks: list[dict] = []
 
@@ -296,6 +311,18 @@ def train(
     non_lora = [n for n in trainable if "lora_" not in n]
     if non_lora:
         raise SystemExit(f"{len(non_lora)} non-LoRA params are trainable: {non_lora[:5]}")
+    # chunked_nll refuses to run when lm_head is itself LoRA-adapted
+    # (trl/trainer/sft_trainer.py:1310-1322), because it projects the hidden
+    # states through lm_head itself. PEFT's "all-linear" excludes
+    # get_output_embeddings() (peft/tuners/tuners_utils.py:1922-1930), so v1 is
+    # compatible -- asserted rather than trusted, since it is an exact match on
+    # adapter shape and a mismatch would surface as a ValueError deep in a run.
+    adapted = net.peft_config["default"].target_modules or []
+    if any("lm_head" in str(m) for m in adapted):
+        raise SystemExit(
+            f"lm_head is LoRA-adapted ({adapted}) — chunked_nll cannot be used"
+        )
+
     n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"continuing v1 from {v1_path}: {len(trainable)} LoRA tensors, "
           f"{n_trainable:,} trainable params, rank {net.peft_config['default'].r}",
@@ -326,8 +353,33 @@ def train(
               f"lengths {lengths[:8]}... (max {lengths[0]}, min {lengths[-1]})",
               flush=True)
 
-    args = TrainingArguments(
+    args = SFTConfig(
         output_dir=str(out_dir),
+        # The whole reason this is SFTConfig and not TrainingArguments. A plain
+        # Trainer has no loss_type: model.forward() routes to transformers'
+        # ForCausalLMLoss, which upcasts the full [seq, vocab] logits to fp32 --
+        # 36,993 x 151,936 x 4 is ~21 GiB, and cross_entropy's log_softmax
+        # backward wants another of the same immediately after. Three probes
+        # died there.
+        #
+        # chunked_nll (trl/trainer/sft_trainer.py:117-234) drops every -100
+        # position *before* the lm_head matmul and projects what remains in
+        # 256-token chunks, each individually checkpointed: ~156 MB of logits at
+        # a time instead of ~21 GiB. v1 got this silently, because it is TRL's
+        # default whenever Liger is off (sft_config.py:334-335) -- which is
+        # exactly why v1 fit in 39.6 GiB and the port to a plain Trainer did not.
+        # Set explicitly so the next person does not inherit it by accident.
+        loss_type="chunked_nll",
+        use_liger_kernel=False,
+        # Our labels are authoritative: built offline, verified per row against a
+        # sha256 fingerprint. SFTTrainer detects a pre-tokenized dataset
+        # (`is_processed = "input_ids" in column_names`, sft_trainer.py:1397) and
+        # skips its own chat-template and masking pipeline entirely, so
+        # assistant_only_loss never runs -- it could not express our mask anyway,
+        # being per-role and all-or-nothing across the ~48 handoff turns.
+        assistant_only_loss=False,
+        max_length=MAX_LENGTH,
+        packing=False,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         gradient_checkpointing=True,
@@ -369,14 +421,25 @@ def train(
             if "loss" in logs:
                 losses.append(float(logs["loss"]))
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=net,
         args=args,
         train_dataset=ds,
+        processing_class=tokenizer,
+        # Only replaced when None (sft_trainer.py:1190); refused only under
+        # padding_free, which is off.
         data_collator=label_preserving_collator(tokenizer.pad_token_id),
         callbacks=[_Collect()],
     )
+    print(f"loss_type={args.loss_type}, use_liger_kernel={args.use_liger_kernel}, "
+          f"assistant_only_loss={args.assistant_only_loss}", flush=True)
 
+    if memory_history:
+        # ~13 GiB of the 71.7 GiB in the failed probes was never attributed to a
+        # specific tensor from source reading alone. This turns that into a
+        # measurement instead of an inference; off by default because recording
+        # every allocation is not free.
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
     mark("pre_train")
     t0 = time.time()
     try:
@@ -581,5 +644,12 @@ def label_preserving_collator(pad_token_id: int):
 
 
 @app.local_entrypoint()
-def main(probe: bool = False, nf4: bool = False, epochs: float = 3.0):
-    print(train.remote(probe=probe, nf4=nf4, epochs=epochs))
+def main(
+    probe: bool = False,
+    nf4: bool = True,
+    memory_history: bool = False,
+    epochs: float = 3.0,
+):
+    print(train.remote(
+        probe=probe, nf4=nf4, memory_history=memory_history, epochs=epochs
+    ))
