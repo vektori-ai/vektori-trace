@@ -109,7 +109,7 @@ def train(
 
     import torch
     from datasets import Dataset
-    from peft import PeftModel
+    from peft import PeftModel, prepare_model_for_kbit_training
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -206,6 +206,14 @@ def train(
         )
     base = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
     base.config.use_cache = False
+    if nf4:
+        # SFTTrainer did this for us; a standard Trainer does not. Without it a
+        # quantized base leaves layer norms in a dtype the backward pass cannot
+        # use and the input embeddings produce no grad, which is the same empty
+        # backward the bf16 path avoids via enable_input_require_grads().
+        base = prepare_model_for_kbit_training(
+            base, use_gradient_checkpointing=True
+        )
     for p in base.parameters():
         p.requires_grad_(False)
 
