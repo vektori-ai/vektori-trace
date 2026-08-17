@@ -243,6 +243,19 @@ def iter_capture_texts(path: Path):
                 continue
 
 
+def is_bare_json(text: str) -> bool:
+    """True when the whole string is one JSON object and nothing else.
+
+    This is stricter than Harbor's parser on purpose. The parser's job at
+    runtime was to salvage whatever the teacher sent; ours is to decide what the
+    student should learn to send.
+    """
+    try:
+        return isinstance(json.loads(text), dict)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
 def parse_raw(text: str) -> Action | None:
     """Parse a raw teacher completion with Harbor's own Terminus parser.
 
@@ -494,6 +507,17 @@ def build_segment(
         equivalent = None
         if raw is not None:
             parsed = parse_raw(raw)
+            # Harbor's parser tolerates text around the object — it warns
+            # "Extra text detected before JSON object" and proceeds — so
+            # parsing is not the same as being a clean target. A raw response
+            # wrapped in prose is very nearly the failure this run repairs, and
+            # it must not become a target just because the runtime accepted it.
+            # The canonical rebuild is the right target for those.
+            if parsed is not None and not is_bare_json(raw):
+                seg.problems.append(
+                    f"step {step.get('step_id')}: raw capture is not bare JSON, rebuilding"
+                )
+                parsed = None
             if parsed is not None and parsed.signature() == action.signature():
                 content = raw
                 source_kind = "raw_capture"

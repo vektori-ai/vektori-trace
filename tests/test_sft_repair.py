@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.sft_repair_dataset import (
+    parse_raw,
     ACTION,
     HANDOFF_QUESTION,
     SUMMARIZATION,
@@ -373,3 +374,30 @@ def test_parse_error_prompt_matches_harbors_own_source() -> None:
     assert 'feedback += f"\\nWARNINGS: {result.warning}"' in src
     # `_get_error_response_type()` returns this for the json parser.
     assert 'return "JSON response"' in src
+
+
+def test_a_prose_wrapped_raw_capture_is_rebuilt_not_used(tmp_path) -> None:
+    """Harbor tolerates text around the object; a target must not.
+
+    The parser's job at runtime was to salvage whatever the teacher sent. Ours
+    is to decide what the student learns to send, and a prose-wrapped action is
+    most of the way back to the failure this run repairs.
+    """
+    from scripts.sft_repair_dataset import is_bare_json
+
+    steps = _rollout_steps()
+    action, _ = action_from_step(steps[1])
+    wrapped = (
+        "Here is my next step:\n\n"
+        '{"analysis": "a1", "plan": "p1", '
+        '"commands": [{"keystrokes": "ls -la\\n", "duration": 0.1}]}'
+    )
+    # Harbor accepts it; we do not.
+    assert parse_raw(wrapped) is not None
+    assert not is_bare_json(wrapped)
+
+    seg = build_segment(steps, {action.join_key(): wrapped}, task="t",
+                        jobs_dir=tmp_path, rollout_index=0, segment_index=0)
+    assert seg.turn_meta[1]["target_source"] == "atif_rebuilt"
+    assert is_bare_json(seg.messages[1]["content"])
+    assert any("not bare JSON" in p for p in seg.problems)

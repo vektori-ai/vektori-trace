@@ -79,7 +79,20 @@ def check_targets(rows: list[dict]) -> list[str]:
             if result.error:
                 failures.append(f"row {i} msg {j}: does not parse — {result.error[:120]}")
                 continue
-            obj = json.loads(content)
+            # Parsing is not enough. Harbor tolerates text around the object
+            # ("Extra text detected before JSON object"), which is what it had
+            # to do at runtime; a target must be the bare object, or the student
+            # learns to wrap its actions in prose.
+            try:
+                obj = json.loads(content)
+            except json.JSONDecodeError:
+                failures.append(
+                    f"row {i} msg {j}: parses only with salvage — target is not bare JSON"
+                )
+                continue
+            if not isinstance(obj, dict):
+                failures.append(f"row {i} msg {j}: target is {type(obj).__name__}, not an object")
+                continue
             for verb in INVENTED_VERBS:
                 if verb in obj:
                     failures.append(f"row {i} msg {j}: invented verb {verb!r}")
