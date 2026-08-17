@@ -186,9 +186,11 @@ def test_an_agent_turn_with_tool_calls_under_a_terminal_prompt_is_an_action() ->
     assert classify(step, "New Terminal Output:\n$ ") == ACTION
 
 
-def test_prose_under_a_terminal_prompt_is_unknown_not_action() -> None:
-    """No tool calls and no handoff prompt: the audit must fail, not guess."""
-    step = _step(2, "agent", "I think we should probably look at the tests.")
+def test_parseable_json_with_no_tool_calls_is_unknown() -> None:
+    """`unknown` is the bucket for a shape nobody predicted: the response parsed
+    as an action, yet terminus recorded no tool calls. That combination has no
+    explanation, so the audit fails rather than guessing."""
+    step = _step(2, "agent", '{"analysis": "a", "plan": "p", "commands": []}')
     assert classify(step, "New Terminal Output:\n$ ") == UNKNOWN
 
 
@@ -244,7 +246,7 @@ def test_handoff_turns_stay_as_context_and_out_of_the_loss(tmp_path) -> None:
 def test_unclassified_assistant_turns_fail_the_segment(tmp_path) -> None:
     steps = [
         _step(1, "user", "You are an AI assistant tasked with solving"),
-        _step(2, "agent", "just prose, no tool calls"),
+        _step(2, "agent", '{"analysis": "a", "plan": "p", "commands": []}'),
     ]
     seg = build_segment(steps, {}, task="t", jobs_dir=tmp_path,
                         rollout_index=0, segment_index=0)
@@ -300,3 +302,50 @@ def test_a_bare_newline_keystroke_gets_a_label_not_a_crash() -> None:
     assert _command_label("") == "<empty>"
     assert _command_label("ls -la\n") == "ls -la"
     assert _command_label("C-c") == "C-c"
+
+
+# --------------------------------------------------------------------------
+# The teacher's own protocol failures
+# --------------------------------------------------------------------------
+
+
+def test_prose_that_does_not_parse_is_a_parse_error_not_unknown() -> None:
+    """terminus records the raw response with no tool calls when the parser
+    rejects it. Those are the teacher's failures, not ours to guess about."""
+    from scripts.sft_repair_dataset import PARSE_ERROR
+
+    step = _step(2, "agent", "I'll now revert the change.\n\n```bash\ngrep -n foo\n```")
+    assert classify(step, "New Terminal Output:\n$ ") == PARSE_ERROR
+
+
+def test_parse_error_prompt_is_recomputed_not_invented() -> None:
+    """The error path writes no user step, so the reply must be re-derived from
+    the same input with terminus's own formatting."""
+    from scripts.sft_repair_dataset import parse_error_prompt
+
+    reply = parse_error_prompt("not json at all")
+    assert reply.startswith("Previous response had parsing errors:\nERROR: ")
+    assert reply.endswith("Please fix these issues and provide a proper JSON response.")
+    # A response that parses has no error reply.
+    assert parse_error_prompt(
+        '{"analysis": "a", "plan": "p", "commands": []}'
+    ) is None
+
+
+def test_parse_errors_stay_as_context_and_carry_no_loss(tmp_path) -> None:
+    from scripts.sft_repair_dataset import PARSE_ERROR
+
+    steps = [
+        _step(1, "user", "You are an AI assistant tasked with solving"),
+        _step(2, "agent", "prose with a ```bash fence, no JSON"),
+        _step(3, "agent", "Analysis: recovering\nPlan: retry",
+              tool_calls=[_bash("call_2_1", "ls\n")], observation=_obs("out")),
+    ]
+    seg = build_segment(steps, {}, task="t", jobs_dir=tmp_path,
+                        rollout_index=0, segment_index=0)
+    kinds = [m["kind"] for m in seg.turn_meta]
+    assert kinds == ["prompt", PARSE_ERROR, "parse_error_reply", ACTION]
+    assert seg.supervise == [False, False, False, True]
+    # The reconstructed reply keeps the conversation alternating, so the
+    # recovery turn is not left following another assistant turn.
+    assert [m["role"] for m in seg.messages] == ["user", "assistant", "user", "assistant"]

@@ -60,6 +60,7 @@ DEFAULT_DURATION = 1.0
 ACTION = "action"
 HANDOFF_QUESTION = "handoff_question"
 SUMMARIZATION = "summarization"
+PARSE_ERROR = "parse_error"
 UNKNOWN = "unknown"
 
 # The two prompts that mark a non-action exchange. Both are terminus literals
@@ -338,7 +339,40 @@ def classify(step: dict, prev_user_text: str) -> str:
         return SUMMARIZATION
     if step.get("tool_calls"):
         return ACTION
+    # No tool calls under an action prompt means the parser rejected the
+    # response and terminus recorded the raw text instead (terminus_2.py:1355-
+    # 1370). The teacher's own protocol failures: prose with a ```bash fence, or
+    # JSON cut off at the output limit. v1 trained on these as targets, which is
+    # 18 demonstrations of the exact malformed output this run repairs.
+    if parse_raw(step.get("message") or "") is None:
+        return PARSE_ERROR
     return UNKNOWN
+
+
+def parse_error_prompt(message: str) -> str | None:
+    """Re-derive the reply terminus sent after a rejected response.
+
+    The error path never writes a user step, so this prompt is absent from the
+    trajectory — but it is a deterministic function of the raw response
+    (terminus_2.py:1355-1360, with `_get_error_response_type()` returning
+    "JSON response" for the json parser). Recomputing it from the same input
+    with the same formatting is reconstruction, not fabrication; inventing a
+    plausible-sounding prompt would be the latter.
+    """
+    from harbor.agents.terminus_2.terminus_json_plain_parser import (
+        TerminusJSONPlainParser,
+    )
+
+    result = TerminusJSONPlainParser().parse_response(message)
+    if not result.error:
+        return None
+    feedback = f"ERROR: {result.error}"
+    if result.warning:
+        feedback += f"\nWARNINGS: {result.warning}"
+    return (
+        f"Previous response had parsing errors:\n{feedback}\n\n"
+        "Please fix these issues and provide a proper JSON response."
+    )
 
 
 def observation_text(step: dict) -> str | None:
@@ -423,6 +457,21 @@ def build_segment(
             seg.problems.append(f"unclassified assistant turn at step {step.get('step_id')}")
             seg.add("assistant", message, supervise=False, meta={"kind": UNKNOWN})
             prev_user_text = ""
+            continue
+
+        if kind == PARSE_ERROR:
+            # Kept as context, never a target. Dropping it would leave the next
+            # action's analysis ("the previous command batch was not executed
+            # due to invalid JSON in my response") referring to an event that is
+            # no longer there — and the recovery that follows is one of the
+            # behaviours Phase 7 tests for.
+            seg.add("assistant", message, supervise=False, meta={"kind": PARSE_ERROR})
+            reply = parse_error_prompt(message)
+            if reply is not None:
+                seg.add("user", reply, supervise=False, meta={"kind": "parse_error_reply"})
+                prev_user_text = reply
+            else:
+                prev_user_text = ""
             continue
 
         if kind != ACTION:
@@ -540,6 +589,7 @@ def audit(segments: list[Segment], capture_stats: dict) -> dict:
             "test": sum(1 for c in commands if TEST_RE.search(c)),
         },
         "task_complete_mappings": sum(1 for t in turns if t.get("task_complete")),
+        "teacher_parse_failures": kinds.get(PARSE_ERROR, 0),
         "segments_containing_edit": sum(
             1
             for s in segments
