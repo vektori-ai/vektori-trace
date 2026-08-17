@@ -349,3 +349,27 @@ def test_parse_errors_stay_as_context_and_carry_no_loss(tmp_path) -> None:
     # The reconstructed reply keeps the conversation alternating, so the
     # recovery turn is not left following another assistant turn.
     assert [m["role"] for m in seg.messages] == ["user", "assistant", "user", "assistant"]
+
+
+def test_parse_error_prompt_matches_harbors_own_source() -> None:
+    """The reconstruction is only reconstruction if it is terminus's template.
+
+    Asserting the wrapper's prefix and suffix proves nothing about whether the
+    wording is terminus's — it proves our own string is our own string. This
+    reads the literals out of the installed harbor and fails if either drifts,
+    which is what an upgrade would do silently. `result.error` itself cannot
+    drift, because it comes from the same parser this code calls.
+    """
+    import inspect
+
+    from harbor.agents.terminus_2 import terminus_2
+
+    src = inspect.getsource(terminus_2)
+    # terminus_2.py ~1355: the error prompt.
+    assert '"Previous response had parsing errors:\\n{feedback}\\n\\n"' in src
+    assert '"Please fix these issues and provide a proper "' in src
+    # terminus_2.py ~1173: how `feedback` is assembled.
+    assert 'feedback += f"ERROR: {result.error}"' in src
+    assert 'feedback += f"\\nWARNINGS: {result.warning}"' in src
+    # `_get_error_response_type()` returns this for the json parser.
+    assert 'return "JSON response"' in src

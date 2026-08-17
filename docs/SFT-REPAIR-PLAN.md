@@ -217,8 +217,29 @@ Every assistant turn is first classified:
 action             -> supervised
 handoff_question   -> context, masked
 summarization      -> context, masked
+parse_error        -> context, masked
 unknown            -> FAIL THE AUDIT
 ```
+
+`parse_error` was added after the first real run: 18 turns landed in `unknown`
+and failed the audit as designed, and all 18 turned out to be one known shape —
+a response terminus's parser **rejected**. DeepSeek emitted prose with a
+```` ```bash ```` fence, or JSON cut off at the output limit; terminus recorded
+the raw text with no tool calls (`terminus_2.py:1355-1370`) and asked it to try
+again. **v1 was trained on those 18 as targets**, i.e. on the exact malformed
+output this run repairs.
+
+They are masked but kept, because the next action's own analysis says *"the
+previous command batch was not executed due to invalid JSON in my response"* —
+dropping the failure would leave that referring to nothing, and the recovery
+that follows is one of the behaviours Phase 7 tests for. The error path writes
+no user step, so that reply is **recomputed** from the stored response with
+harbor's parser and terminus's own format string; a test pins both literals
+against harbor's source so an upgrade cannot drift them silently.
+
+`unknown` now means an agent step with no tool calls whose message nevertheless
+*parses* as an action — a combination with no explanation, which is what that
+bucket is for.
 
 Train **only** `action`. There are ~48 `handoff_question` turns (one per
 compaction boundary: 165 segments − 117 rollouts), carrying prose like
@@ -296,9 +317,20 @@ We pre-tokenize and own the labels, so preflight must additionally prove:
 - decoding the supervised spans reproduces the raw JSON
 - the custom mask **matches TRL's** mask on ordinary action-only rows
 
-That last one is the safety net: on any segment with no handoff turn the two
-methods must agree exactly, which is what makes the divergence on handoff rows
-attributable to intent rather than to a bug.
+That last one is the safety net, and it is deliberately **asymmetric** rather
+than exact equality. Both sides render with TRL's template — comparing counts
+across two different renders would measure delimiters, not masks — and then:
+
+- a position TRL supervises and we do not is a **hard failure**: that is a
+  target we masked;
+- positions we supervise beyond TRL's span are **expected and bounded**,
+  because TRL's `{% generation %}` markers stop before each turn's closing
+  delimiter and we include it.
+
+Exact positional equality would fail every row for that delimiter alone, so it
+would have to be switched off — a check that cannot pass is not a safety net.
+Rows carrying a handoff or parse-error turn are excluded from the comparison
+entirely, since there the two masks *must* differ.
 
 Before a GPU:
 
