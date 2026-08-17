@@ -17,11 +17,19 @@ reused:
      is silently lost past max_length).
   3. **It can run either precision.** v1 was fitted against an NF4 base
      (`sft_train_modal.py:104-110` is unconditional) but is *served* against
-     BF16. `--probe` measures both arms before the real run picks one.
+     BF16. BF16 is the decision: step 0 of a BF16 continuation is exactly the
+     model that was measured as broken, and it absorbs v1's quantization drift
+     rather than freezing it in. `--nf4` exists as the fallback if BF16 will not
+     fit, which is a thing to measure and then discuss -- not to switch to
+     silently.
 
     modal run scripts/sft_repair_train_modal.py --probe          # 3 steps, BF16
-    modal run scripts/sft_repair_train_modal.py --probe --nf4    # 3 steps, NF4
     modal run scripts/sft_repair_train_modal.py                  # the real run
+    modal run scripts/sft_repair_train_modal.py --probe --nf4    # only if BF16 OOMs
+
+`--probe` runs on the *longest* rows, not a random sample: peak VRAM is
+dominated by sequence length, so a probe that saw only median rows would certify
+a footprint the real run then exceeds.
 
 Every invocation of this file costs GPU time and needs explicit per-run
 approval (CLAUDE.md). Tear the app down the moment it returns.
@@ -95,6 +103,7 @@ def train(
     save_steps: int = 10,
     seed: int = 0,
 ) -> dict:
+    import hashlib
     import json
     import time
 
@@ -106,6 +115,7 @@ def train(
         AutoTokenizer,
         BitsAndBytesConfig,
         Trainer,
+        TrainerCallback,
         TrainingArguments,
     )
 
@@ -150,22 +160,40 @@ def train(
             "its fingerprint before training"
         )
     expected = json.loads(fp_path.read_text())
-    actual = [
-        [len(e["input_ids"]), sum(1 for x in e["labels"] if x != IGNORE_INDEX)]
-        for e in examples
-    ]
+    if expected.get("model") != model:
+        raise SystemExit(
+            f"fingerprint is for {expected.get('model')!r}, training {model!r}"
+        )
+    if expected.get("template_kwargs") != TEMPLATE_KWARGS:
+        raise SystemExit(
+            f"fingerprint rendered with {expected.get('template_kwargs')}, "
+            f"training with {TEMPLATE_KWARGS}"
+        )
+    if expected.get("max_length") != MAX_LENGTH:
+        raise SystemExit(
+            f"fingerprint used max_length {expected.get('max_length')}, "
+            f"training with {MAX_LENGTH}"
+        )
+    data_sha = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    if expected.get("dataset_sha256") not in (None, data_sha):
+        raise SystemExit(
+            f"fingerprint is for dataset {expected['dataset_sha256'][:16]}, "
+            f"this one is {data_sha[:16]}"
+        )
+    actual = [row_digest(e) for e in examples]
     if expected.get("per_row") != actual:
         bad = [
-            i for i, (a, b) in enumerate(zip(expected.get("per_row", []), actual))
+            i for i, (a, b) in enumerate(zip(expected.get("per_row", []), actual, strict=False))
             if a != b
         ]
         raise SystemExit(
             f"tokenization disagrees with preflight on {len(bad)} row(s) "
-            f"(first: row {bad[0] if bad else '?'}) — tokenize_row has drifted "
-            "from dataset.tokenize_messages"
+            f"(first: row {bad[0] if bad else '?'}; "
+            f"{len(expected.get('per_row', []))} vs {len(actual)} rows) — "
+            "tokenize_row has drifted from dataset.tokenize_messages"
         )
-    print(f"tokenization matches preflight fingerprint on all {len(actual)} rows",
-          flush=True)
+    print(f"tokenization matches preflight fingerprint exactly on all "
+          f"{len(actual)} rows (dataset {data_sha[:16]})", flush=True)
 
     # ---- model: frozen base, v1 continued ----------------------------------
     model_kwargs: dict = {"dtype": torch.bfloat16}
@@ -201,11 +229,26 @@ def train(
           f"{n_trainable:,} trainable params, rank {net.peft_config['default'].r}",
           flush=True)
 
+    # LoRA freezes the base weights, so without this the checkpointed
+    # activations have nothing requiring grad and the backward pass is empty --
+    # a run that reports a plausible loss and learns nothing. `train.py:311`
+    # carries the same call for the same reason.
+    net.enable_input_require_grads()
+
     before = {n: p.detach().clone() for n, p in net.named_parameters() if p.requires_grad}
 
     steps_per_epoch = -(-len(ds) // (batch_size * grad_accum))
     max_steps = 3 if probe else int(steps_per_epoch * epochs)
     out_dir = Path(VOLUME_MOUNT) / OUT_IN_VOLUME
+
+    if probe:
+        # Trainer's sampler is shuffled, so three steps may never touch the
+        # 36,993-token row -- and peak VRAM is dominated by sequence length
+        # (the logit tensor alone is len x 151,936). A probe that measured only
+        # median rows would certify a footprint the real run then exceeds.
+        ds = ds.select(_longest_first(examples, n=batch_size * grad_accum * max_steps))
+        print(f"probe: longest row forced first, {len(ds)} rows, "
+              f"max {max(len(e['input_ids']) for e in examples)} tokens", flush=True)
 
     args = TrainingArguments(
         output_dir=str(out_dir),
@@ -235,24 +278,45 @@ def train(
         remove_unused_columns=False,
     )
 
+    # Trainer logs grad_norm per step but keeps no summary of it, and
+    # `train_loss` being non-NaN says nothing about whether the backward pass
+    # produced gradients at all. Collect the real values.
+    grad_norms: list[float] = []
+    losses: list[float] = []
+
+    class _Collect(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kw):
+            if not logs:
+                return
+            if "grad_norm" in logs:
+                grad_norms.append(float(logs["grad_norm"]))
+            if "loss" in logs:
+                losses.append(float(logs["loss"]))
+
     trainer = Trainer(
         model=net,
         args=args,
         train_dataset=ds,
         data_collator=label_preserving_collator(tokenizer.pad_token_id),
+        callbacks=[_Collect()],
     )
 
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     result = trainer.train()
     elapsed = time.time() - t0
-    peak = torch.cuda.max_memory_allocated() / 2**30
+    peak_alloc = torch.cuda.max_memory_allocated() / 2**30
+    peak_reserved = torch.cuda.max_memory_reserved() / 2**30
 
     moved = sum(
         1
         for n, p in net.named_parameters()
         if p.requires_grad and not torch.equal(p.detach(), before[n])
     )
+    train_loss = result.metrics.get("train_loss")
+    def finite(x) -> bool:
+        return x is not None and x == x and abs(x) != float("inf")
+
     summary = {
         "probe": probe,
         "precision": "nf4" if nf4 else "bf16",
@@ -260,15 +324,41 @@ def train(
         "max_steps": max_steps,
         "steps_per_epoch": steps_per_epoch,
         "elapsed_sec": round(elapsed, 1),
-        "peak_vram_gib": round(peak, 1),
+        # Reserved, not just allocated: the allocator's reserved pool is what
+        # actually has to fit in the card, and it is what OOMs.
+        "peak_vram_allocated_gib": round(peak_alloc, 1),
+        "peak_vram_reserved_gib": round(peak_reserved, 1),
+        "longest_row_tokens": max(len(e["input_ids"]) for e in examples),
         "sec_per_optimizer_step": round(elapsed / max(max_steps, 1), 1),
-        "train_loss": result.metrics.get("train_loss"),
-        "grad_norm_finite": bool(result.metrics.get("train_loss") == result.metrics.get("train_loss")),
+        "train_loss": train_loss,
+        "losses": losses,
+        "grad_norms": grad_norms,
+        "loss_finite": finite(train_loss),
+        "grad_norms_finite": bool(grad_norms) and all(finite(g) for g in grad_norms),
+        "grad_norms_nonzero": bool(grad_norms) and all(g > 0 for g in grad_norms),
         "lora_tensors_changed": moved,
         "lora_tensors_total": len(before),
         "supervised_tokens": supervised,
         "total_tokens": total,
     }
+
+    # These are the probe's actual questions, so they are asked before it can
+    # report success -- not after an early return. A probe that says "fine" on
+    # an empty backward pass is worse than no probe.
+    problems = []
+    if not summary["loss_finite"]:
+        problems.append(f"train_loss is not finite: {train_loss!r}")
+    if not grad_norms:
+        problems.append("no gradient norms were logged — nothing to verify")
+    elif not summary["grad_norms_finite"]:
+        problems.append(f"non-finite gradient norm in {grad_norms}")
+    elif not summary["grad_norms_nonzero"]:
+        problems.append(f"zero gradient norm in {grad_norms} — backward pass is empty")
+    if moved == 0:
+        problems.append("no LoRA parameter changed — trained nothing")
+    if problems:
+        print(json.dumps(summary, indent=2), flush=True)
+        raise SystemExit("PROBE FAILED: " + "; ".join(problems))
 
     if probe:
         # Nothing is saved: a three-step checkpoint is not a model candidate,
@@ -280,14 +370,39 @@ def train(
         print(json.dumps(summary, indent=2), flush=True)
         return summary
 
-    if moved == 0:
-        raise SystemExit("no LoRA parameter changed — the run trained nothing")
-
     trainer.save_model(str(out_dir))
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2))
     vol.commit()
     print(json.dumps(summary, indent=2), flush=True)
     return summary
+
+
+def _longest_first(examples: list[dict], n: int) -> list[int]:
+    """Indices of the n longest rows, longest first.
+
+    Selecting *only* long rows makes the probe deliberately conservative: every
+    step is near worst case, so a peak measured here bounds the real run rather
+    than sampling somewhere under it.
+    """
+    order = sorted(range(len(examples)), key=lambda i: -len(examples[i]["input_ids"]))
+    return order[: min(n, len(order))]
+
+
+def row_digest(example: dict) -> str:
+    """Exact hash of one tokenized row.
+
+    Counts are not identity: two different token sequences, or two different
+    masks, can share a length and a supervised-token total. Since the trainer
+    re-tokenizes with its own copy of the logic, the guard has to compare the
+    tokens themselves or a drift that preserves counts slips through.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for key in ("input_ids", "labels", "attention_mask"):
+        h.update(key.encode())
+        h.update(b",".join(str(x).encode() for x in example[key]))
+    return h.hexdigest()
 
 
 def tokenize_row(row: dict, tokenizer):

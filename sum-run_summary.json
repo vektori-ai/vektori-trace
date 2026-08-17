@@ -1,0 +1,10 @@
+{
+  "probe": false,
+  "segments": 165,
+  "elapsed_sec": 17821.4,
+  "peak_vram_gib": 39.6,
+  "steps": 106.9,
+  "sec_per_optimizer_step": 166.7,
+  "train_loss": 0.6573916083290463,
+  "tokens_seen": null
+}

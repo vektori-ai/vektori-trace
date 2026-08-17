@@ -22,10 +22,10 @@ failure mode is silent:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
-from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -122,6 +122,20 @@ def check_roles(rows: list[dict]) -> list[str]:
     return failures
 
 
+def row_digest(example) -> str:
+    """Exact hash of one tokenized row — the trainer's drift guard compares this.
+
+    Counts are not identity: two different token sequences, or two different
+    masks, can share a length and a supervised-token total, so a fingerprint of
+    counts would let a count-preserving drift through.
+    """
+    h = hashlib.sha256()
+    for key in ("input_ids", "labels", "attention_mask"):
+        h.update(key.encode())
+        h.update(b",".join(str(x).encode() for x in getattr(example, key)))
+    return h.hexdigest()
+
+
 def supervised_spans(labels: list[int]) -> list[list[int]]:
     """Contiguous runs of supervised label ids — one per supervised turn."""
     spans: list[list[int]] = []
@@ -170,7 +184,7 @@ def check_masks(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
         supervised_counts.append(len(kept))
         # The trainer re-tokenizes with its own copy of this logic; this is what
         # it checks itself against.
-        fingerprint.append([n, len(kept)])
+        fingerprint.append(row_digest(example))
         if not kept:
             failures.append(f"row {i}: no supervised tokens")
         if len(example.labels) != n or len(example.attention_mask) != n:
@@ -275,8 +289,8 @@ def check_against_trl(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
         # before the turn's closing delimiter, which we include. Positions where
         # TRL supervises and we do not are the real failure: it means we masked
         # something that carries the target.
-        trl_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask)) if t and not o]
-        ours_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask)) if o and not t]
+        trl_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask, strict=True)) if t and not o]
+        ours_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask, strict=True)) if o and not t]
         if trl_only:
             failures.append(
                 f"row {i}: {len(trl_only)} positions TRL supervises and we mask "
@@ -350,6 +364,9 @@ def main() -> int:
             "model": args.model,
             "template_kwargs": TEMPLATE_KWARGS,
             "max_length": MAX_LENGTH,
+            "dataset_sha256": hashlib.sha256(
+                (args.data / "sft_repaired.jsonl").read_bytes()
+            ).hexdigest(),
             "per_row": fingerprint,
         }, indent=2))
         print(f"wrote {fp}")

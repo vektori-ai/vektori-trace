@@ -20,7 +20,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.sft_repair_dataset import (
-    parse_raw,
     ACTION,
     HANDOFF_QUESTION,
     SUMMARIZATION,
@@ -30,6 +29,7 @@ from scripts.sft_repair_dataset import (
     build_segment,
     classify,
     observation_text,
+    parse_raw,
     split_on_compaction,
     split_rendered_message,
 )
@@ -73,7 +73,7 @@ def test_rendered_message_round_trips_through_the_split() -> None:
 def test_split_flags_an_analysis_that_contains_the_plan_marker() -> None:
     """Splitting is ambiguous here; the code must say so rather than guess."""
     message = "Analysis: first\nPlan: smuggled\nPlan: the real plan"
-    a, p, problem = split_rendered_message(message)
+    a, _plan, problem = split_rendered_message(message)
     assert problem is not None and "2 occurrences" in problem
     # It still splits at the first marker — the flag is what makes it auditable.
     assert a == "first"

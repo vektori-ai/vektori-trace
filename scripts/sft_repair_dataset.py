@@ -36,7 +36,6 @@ import argparse
 import hashlib
 import json
 import re
-import statistics
 import sys
 from collections import Counter
 from dataclasses import dataclass, field

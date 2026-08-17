@@ -19,7 +19,7 @@ corrected batch and the same seed, and exists only to price the continuation.
 | join key | **full semantic tuple**, not a 300-char prefix |
 | handoff turns | kept as **context**, masked from loss |
 | supervision | **pre-tokenized**, explicit per-message mask; not TRL `assistant_only_loss` |
-| base precision | **probe both** NF4 and BF16 at 3 steps, then decide; BF16 expected to win on deployment match |
+| base precision | **BF16** (revised 2026-08-18 — see Phase 5); NF4 only as a measured fallback |
 | dev split | **none** — train all 165 rows |
 | GPU | **A100-80GB** (L40S 48 GB is serving-only; BF16 at 40k will not fit, NF4 has no safe headroom) |
 | schedule | 21 optimizer steps/epoch × 3 epochs = **63 max steps** |
@@ -456,14 +456,24 @@ rank: 32 · alpha: 64 · dropout: 0.05 · target modules: all-linear · dtype: B
 
 ---
 
-## Phase 5: NF4-vs-BF16 memory and correctness probe — **needs approval**
+## Phase 5: BF16 memory and correctness probe — **needs approval**
 
-Two arms, **three optimizer steps each**, on A100-80GB. Same v1 adapter, same
-corrected batch, same seed, nothing saved. Compare peak VRAM, sec/step, initial
-loss, gradient norm, stability. ~10–15 GPU-minutes total, against a 3-hour run.
+**Revised 2026-08-18: BF16 only.** The plan previously ran both arms. The NF4
+arm cannot change the decision — if BF16 fits we take it on deployment-match
+grounds, and if BF16 OOMs we measure NF4 *then*, as the fallback. Running it up
+front buys a number discarded in the likely case. Speed cannot flip the choice
+either: BF16 is taken because step 0 of a BF16 continuation is exactly the model
+measured as broken and because it absorbs v1's quantization drift, and a 20%
+step-time edge would not outweigh either.
 
-Expected outcome is BF16 — it matches deployment and step 0 is then exactly the
-model we measured as broken — but measuring beats guessing.
+(If the same-batch same-seed NF4-vs-BF16 step-time comparison is wanted as a
+*paper* number, run both — that is a writeup decision, not a training one.)
+
+**Three optimizer steps on A100-80GB**, on the **longest rows**, nothing saved.
+Peak VRAM is dominated by sequence length — the logit tensor alone is
+`len x 151,936` — so a probe on a shuffled sample would certify a footprint the
+real run then exceeds. Selecting only long rows makes the measurement
+deliberately conservative.
 
 ### Why A100-80GB, and why not L40S
 
