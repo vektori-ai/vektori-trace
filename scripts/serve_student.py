@@ -260,9 +260,14 @@ def main() -> int:
         print("harbor kwargs:")
         print(json.dumps(served_to_harbor_kwargs(served), indent=2))
         if args.write_env:
+            # The model string travels with the URL. With an adapter the served
+            # name is the LoRA's, not the base model's, and a sweep that hardcodes
+            # the base name would quietly measure the wrong weights.
             with open(args.write_env, "a") as fh:
                 fh.write(f"\nSTUDENT_API_BASE={served.api_base}\n")
-            print(f"\nappended STUDENT_API_BASE to {args.write_env}")
+                fh.write(f"STUDENT_MODEL={served.model_name}\n")
+                fh.write(f"STUDENT_HARBOR_MODEL={served.harbor_model}\n")
+            print(f"\nappended STUDENT_API_BASE/MODEL to {args.write_env}")
         if args.max_hours:
             print(f"auto-shutdown in {args.max_hours}h "
                   f"(--max-hours 0 to disable)")

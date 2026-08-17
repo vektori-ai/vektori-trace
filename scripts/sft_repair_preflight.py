@@ -109,11 +109,33 @@ def check_roles(rows: list[dict]) -> list[str]:
     return failures
 
 
+def supervised_spans(labels: list[int]) -> list[list[int]]:
+    """Contiguous runs of supervised label ids — one per supervised turn."""
+    spans: list[list[int]] = []
+    current: list[int] = []
+    for lab in labels:
+        if lab == IGNORE_INDEX:
+            if current:
+                spans.append(current)
+                current = []
+        else:
+            current.append(lab)
+    if current:
+        spans.append(current)
+    return spans
+
+
 def check_masks(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
     """Tokenize every row and verify the labels, not just batch zero."""
+    from harbor.agents.terminus_2.terminus_json_plain_parser import (
+        TerminusJSONPlainParser,
+    )
+
+    parser = TerminusJSONPlainParser()
     failures: list[str] = []
     lengths: list[int] = []
     supervised_counts: list[int] = []
+    fingerprint: list[list[int]] = []
 
     for i, row in enumerate(rows):
         example = tokenize_messages(
@@ -133,17 +155,35 @@ def check_masks(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
             failures.append(f"row {i}: {n} tokens over max_length {MAX_LENGTH}")
         kept = [lab for lab in example.labels if lab != IGNORE_INDEX]
         supervised_counts.append(len(kept))
+        # The trainer re-tokenizes with its own copy of this logic; this is what
+        # it checks itself against.
+        fingerprint.append([n, len(kept)])
         if not kept:
             failures.append(f"row {i}: no supervised tokens")
         if len(example.labels) != n or len(example.attention_mask) != n:
             failures.append(f"row {i}: label/mask length disagrees with input_ids")
 
-        # Decoding the supervised spans must reproduce the targets. Done on the
-        # first row only by default (it is a full decode per row otherwise).
-        if i == 0:
-            text = tokenizer.decode(kept)
-            if '"analysis"' not in text:
-                failures.append("row 0: supervised span does not decode to Terminus JSON")
+        # Every supervised span, on every row, must decode back to the Terminus
+        # JSON it was built from. This is the check that catches a mask whose
+        # boundaries are off — a span shifted by one turn still decodes to
+        # *something*, but not to a parseable action.
+        spans = supervised_spans(example.labels)
+        expected = [
+            msg["content"]
+            for msg, sup in zip(row["messages"], row["supervise"], strict=True)
+            if sup
+        ]
+        if len(spans) != len(expected):
+            failures.append(
+                f"row {i}: {len(spans)} supervised spans for {len(expected)} supervised turns"
+            )
+            continue
+        for k, (span, want) in enumerate(zip(spans, expected, strict=True)):
+            text = tokenizer.decode(span)
+            if parser.parse_response(text).error:
+                failures.append(f"row {i} span {k}: does not decode to Terminus JSON")
+            elif want.strip() not in text:
+                failures.append(f"row {i} span {k}: decoded span does not contain its target")
 
     stats = {
         "rows": len(rows),
@@ -159,15 +199,20 @@ def check_masks(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
             round(sum(supervised_counts) / sum(lengths), 4) if lengths else 0.0
         ),
     }
-    return failures, stats
+    return failures, stats, fingerprint
 
 
 def check_against_trl(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
-    """Our mask must equal TRL's on every row where every assistant turn is a target.
+    """Our mask must equal TRL's, position for position, on action-only rows.
 
     Where a row holds a handoff turn the two *must* differ, and by exactly that
-    turn's tokens. Agreement everywhere else is what proves the difference is
-    the intended one.
+    turn's tokens. Exact agreement everywhere else is what makes the difference
+    attributable to intent rather than to a bug in our masking.
+
+    Both sides render with **TRL's** training template, not one each. Comparing
+    token counts across two different renders would be a coincidence check, not
+    an equality check — the delimiters differ, so the counts would differ for
+    reasons that have nothing to do with the mask.
     """
     from trl.chat_template_utils import get_training_chat_template, has_generation_markers
 
@@ -176,6 +221,7 @@ def check_against_trl(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
         if has_generation_markers(tokenizer.chat_template)
         else get_training_chat_template(tokenizer)
     )
+    kwargs = dict(TEMPLATE_KWARGS, chat_template=template)
 
     failures: list[str] = []
     compared = agreed = 0
@@ -190,28 +236,44 @@ def check_against_trl(rows: list[dict], tokenizer) -> tuple[list[str], dict]:
         compared += 1
         enc = tokenizer.apply_chat_template(
             row["messages"],
-            chat_template=template,
             tokenize=True,
             return_dict=True,
             return_assistant_tokens_mask=True,
-            **TEMPLATE_KWARGS,
+            **kwargs,
         )
-        trl_supervised = sum(enc["assistant_masks"])
+        trl_mask = [bool(x) for x in enc["assistant_masks"]]
         ours = tokenize_messages(
             row["messages"], tokenizer, row["supervise"],
-            max_length=MAX_LENGTH, template_kwargs=TEMPLATE_KWARGS, truncate=False,
+            max_length=MAX_LENGTH, template_kwargs=kwargs, truncate=False,
         )
         if ours is None:
             failures.append(f"row {i}: ours produced nothing where TRL produced a mask")
             continue
-        our_supervised = sum(1 for lab in ours.labels if lab != IGNORE_INDEX)
-        # The two disagree by the per-turn template delimiters TRL includes and
-        # we do not; an exact match is not required, a close one is.
-        if trl_supervised == 0:
+        if not any(trl_mask):
             failures.append(f"row {i}: TRL mask is empty (missing generation markers?)")
-        elif abs(trl_supervised - our_supervised) > 0.05 * max(trl_supervised, 1):
+            continue
+        our_mask = [lab != IGNORE_INDEX for lab in ours.labels]
+        if len(our_mask) != len(trl_mask):
             failures.append(
-                f"row {i}: mask disagreement — TRL {trl_supervised}, ours {our_supervised}"
+                f"row {i}: length disagreement — TRL {len(trl_mask)}, ours {len(our_mask)}"
+            )
+            continue
+        # TRL's `{% generation %}` markers wrap the assistant *content* and stop
+        # before the turn's closing delimiter, which we include. Positions where
+        # TRL supervises and we do not are the real failure: it means we masked
+        # something that carries the target.
+        trl_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask)) if t and not o]
+        ours_only = [j for j, (t, o) in enumerate(zip(trl_mask, our_mask)) if o and not t]
+        if trl_only:
+            failures.append(
+                f"row {i}: {len(trl_only)} positions TRL supervises and we mask "
+                f"(first at {trl_only[0]})"
+            )
+        elif len(ours_only) > 4 * sum(trl_mask) // 100:
+            # We legitimately add each turn's closing delimiter; more than a few
+            # percent beyond that is a boundary that has slipped a whole turn.
+            failures.append(
+                f"row {i}: {len(ours_only)} positions we supervise beyond TRL's span"
             )
         else:
             agreed += 1
@@ -235,7 +297,7 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    mask_failures, stats = check_masks(rows, tokenizer)
+    mask_failures, stats, fingerprint = check_masks(rows, tokenizer)
     all_failures["masks"] = mask_failures
 
     trl_stats: dict = {"skipped": True}
@@ -265,6 +327,19 @@ def main() -> int:
     out = args.data / "preflight_report.json"
     out.write_text(json.dumps(report, indent=2))
     print(f"\nwrote {out}")
+
+    if not total:
+        # Only written when everything passed: a fingerprint from a failed
+        # preflight would let the trainer's drift guard pass against a set that
+        # was never actually validated.
+        fp = args.data / "tokenization_fingerprint.json"
+        fp.write_text(json.dumps({
+            "model": args.model,
+            "template_kwargs": TEMPLATE_KWARGS,
+            "max_length": MAX_LENGTH,
+            "per_row": fingerprint,
+        }, indent=2))
+        print(f"wrote {fp}")
 
     if total:
         print(f"PREFLIGHT FAILED: {total} problems — do not spend a GPU", file=sys.stderr)

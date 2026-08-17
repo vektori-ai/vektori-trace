@@ -122,6 +122,9 @@ def _encode_messages(
     if not messages:
         return []
     extra = dict(template_kwargs or {})
+    # `chat_template` rides in template_kwargs so a caller can render against a
+    # template other than the tokenizer's own — which is how the same messages
+    # can be masked our way and TRL's way and compared position by position.
     try:
         encoded = tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=False, **extra

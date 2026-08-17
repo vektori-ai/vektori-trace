@@ -70,7 +70,8 @@ image = (
         "peft==0.19.1",
         "accelerate==1.14.0",
         "datasets==5.0.0",
-        "bitsandbytes",
+        # 0.50.1 is what v1 resolved to and what docs/SFT-REPAIR-PLAN.md records.
+        "bitsandbytes==0.50.1",
     )
     .env({"HF_HOME": HF_CACHE_MOUNT})
 )
@@ -135,6 +136,37 @@ def train(
     if supervised == 0:
         raise SystemExit("no supervised tokens in the whole dataset")
 
+    # `tokenize_row` is a copy of `dataset.tokenize_messages`, not a call to it —
+    # Modal re-imports this module in a container without the local package. A
+    # copy can drift from its original, so preflight records what the real
+    # function produced per row and this refuses to train on any disagreement.
+    # Without it, the set that was validated and the set that trains could
+    # differ silently, which is the whole failure mode pre-tokenizing exists to
+    # remove.
+    fp_path = data_path.parent / "tokenization_fingerprint.json"
+    if not fp_path.exists():
+        raise SystemExit(
+            f"{fp_path} is missing — run scripts/sft_repair_preflight.py and stage "
+            "its fingerprint before training"
+        )
+    expected = json.loads(fp_path.read_text())
+    actual = [
+        [len(e["input_ids"]), sum(1 for x in e["labels"] if x != IGNORE_INDEX)]
+        for e in examples
+    ]
+    if expected.get("per_row") != actual:
+        bad = [
+            i for i, (a, b) in enumerate(zip(expected.get("per_row", []), actual))
+            if a != b
+        ]
+        raise SystemExit(
+            f"tokenization disagrees with preflight on {len(bad)} row(s) "
+            f"(first: row {bad[0] if bad else '?'}) — tokenize_row has drifted "
+            "from dataset.tokenize_messages"
+        )
+    print(f"tokenization matches preflight fingerprint on all {len(actual)} rows",
+          flush=True)
+
     # ---- model: frozen base, v1 continued ----------------------------------
     model_kwargs: dict = {"dtype": torch.bfloat16}
     if nf4:
@@ -189,7 +221,8 @@ def train(
         weight_decay=0.0,
         max_grad_norm=1.0,
         lr_scheduler_type="constant_with_warmup",
-        warmup_steps=5,
+        # A 3-step probe that spends all 3 in warmup measures the wrong step time.
+        warmup_steps=0 if probe else 5,
         bf16=True,
         logging_steps=1,
         # Every ten optimizer steps, so the earliest checkpoint that passes the
