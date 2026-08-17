@@ -378,6 +378,12 @@ def train(
         # assistant_only_loss never runs -- it could not express our mask anyway,
         # being per-role and all-or-nothing across the ~48 handoff turns.
         assistant_only_loss=False,
+        # Auto-detection preserves the labels but still runs truncation and
+        # column handling over rows that are already final. Nothing here needs
+        # it, and a silent truncation is precisely the failure the sha256
+        # fingerprint exists to rule out -- so it is turned off explicitly
+        # rather than relied upon to be harmless.
+        dataset_kwargs={"skip_prepare_dataset": True},
         max_length=MAX_LENGTH,
         packing=False,
         per_device_train_batch_size=batch_size,
@@ -463,6 +469,14 @@ def train(
             "batch_size": batch_size,
             "grad_accum": grad_accum,
         }
+        if memory_history:
+            snap = Path(VOLUME_MOUNT) / "sft-repaired" / (
+                f"memory_snapshot_{'nf4' if nf4 else 'bf16'}.pickle"
+            )
+            snap.parent.mkdir(parents=True, exist_ok=True)
+            torch.cuda.memory._dump_snapshot(str(snap))
+            report["memory_snapshot"] = str(snap)
+            print(f"memory snapshot written to {snap}", flush=True)
         out = Path(VOLUME_MOUNT) / "sft-repaired" / (
             f"probe_failure_{'nf4' if nf4 else 'bf16'}.json"
         )
@@ -471,6 +485,13 @@ def train(
         vol.commit()
         print(json.dumps(report, indent=2), flush=True)
         raise SystemExit(f"PROBE OOM — report written to {out}") from exc
+    if memory_history:
+        snap = Path(VOLUME_MOUNT) / "sft-repaired" / (
+            f"memory_snapshot_{'nf4' if nf4 else 'bf16'}.pickle"
+        )
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(str(snap))
+        print(f"memory snapshot written to {snap}", flush=True)
     elapsed = time.time() - t0
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
     peak_reserved = torch.cuda.max_memory_reserved() / 2**30
