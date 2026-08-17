@@ -204,8 +204,40 @@ def train(
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
+        # bitsandbytes quantizes weights as they are *placed*. Without a
+        # device_map the model loads on CPU in full precision and Trainer moves
+        # it to the GPU afterwards, unquantized -- the config silently does
+        # nothing. v1 never hit this because SFTTrainer constructed the model
+        # itself; porting to a standard Trainer moved that responsibility here.
+        model_kwargs["device_map"] = {"": 0}
+    print(f"precision: {'nf4' if nf4 else 'bf16'}, "
+          f"model_kwargs keys {sorted(model_kwargs)}", flush=True)
     base = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
     base.config.use_cache = False
+
+    # Report what actually loaded, before anything expensive. Two runs OOMed
+    # identically (52.16 vs 52.25 GiB allocated) and the logs could not say
+    # whether quantization had applied, because nothing measured it. A flag that
+    # silently does nothing is the failure this makes impossible.
+    footprint = base.get_memory_footprint() / 2**30
+    dtypes: dict[str, int] = {}
+    for prm in base.parameters():
+        key = str(prm.dtype)
+        dtypes[key] = dtypes.get(key, 0) + prm.numel()
+    print(f"base loaded: {footprint:.1f} GiB, param dtypes "
+          f"{ {k: f'{v / 1e9:.2f}B' for k, v in sorted(dtypes.items())} }", flush=True)
+    # 14B in nf4 is ~9.5 GiB; anything near the ~28 GiB bf16 figure means the
+    # quantization_config was inert.
+    if nf4 and footprint > 15.0:
+        raise SystemExit(
+            f"--nf4 was requested but the base is {footprint:.1f} GiB — "
+            "quantization did not apply, refusing to measure the wrong model"
+        )
+    if not nf4 and footprint < 20.0:
+        raise SystemExit(
+            f"bf16 was requested but the base is only {footprint:.1f} GiB — "
+            "something quantized it unexpectedly"
+        )
     if nf4:
         # SFTTrainer did this for us; a standard Trainer does not. Without it a
         # quantized base leaves layer norms in a dtype the backward pass cannot
