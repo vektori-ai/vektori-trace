@@ -81,7 +81,13 @@ image = (
         # 0.50.1 is what v1 resolved to and what docs/SFT-REPAIR-PLAN.md records.
         "bitsandbytes==0.50.1",
     )
-    .env({"HF_HOME": HF_CACHE_MOUNT})
+    # Set in the image so it is in place before torch initialises. Both OOMs
+    # left 9-11 GiB reserved-but-unallocated; expandable segments let the
+    # allocator reuse that instead of fragmenting a 19.5 GiB request out of it.
+    .env({
+        "HF_HOME": HF_CACHE_MOUNT,
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    })
 )
 
 
@@ -118,6 +124,22 @@ def train(
         TrainerCallback,
         TrainingArguments,
     )
+
+    marks: list[dict] = []
+
+    def mark(stage: str) -> None:
+        """Record CUDA memory at a boundary, so an OOM says *where* it grew."""
+        if not torch.cuda.is_available():
+            return
+        row = {
+            "stage": stage,
+            "allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
+            "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 2),
+            "max_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        }
+        marks.append(row)
+        print(f"MEM[{stage}]: allocated {row['allocated_gib']} GiB, "
+              f"reserved {row['reserved_gib']} GiB", flush=True)
 
     # ---- data: pre-tokenized, labels already decided -----------------------
     data_path = Path(VOLUME_MOUNT) / DATA_IN_VOLUME
@@ -228,6 +250,16 @@ def train(
           f"{ {k: f'{v / 1e9:.2f}B' for k, v in sorted(dtypes.items())} }", flush=True)
     # 14B in nf4 is ~9.5 GiB; anything near the ~28 GiB bf16 figure means the
     # quantization_config was inert.
+    n_4bit = sum(
+        1 for m in base.modules() if type(m).__name__ in {"Linear4bit", "Params4bit"}
+    )
+    print(f"bnb 4-bit modules: {n_4bit}", flush=True)
+    mark("base_loaded")
+    if nf4 and n_4bit == 0:
+        raise SystemExit(
+            "--nf4 was requested but the model contains zero bnb Linear4bit "
+            "modules — the quantization_config was inert"
+        )
     if nf4 and footprint > 15.0:
         raise SystemExit(
             f"--nf4 was requested but the base is {footprint:.1f} GiB — "
@@ -275,6 +307,7 @@ def train(
     # carries the same call for the same reason.
     net.enable_input_require_grads()
 
+    mark("adapter_loaded")
     before = {n: p.detach().clone() for n, p in net.named_parameters() if p.requires_grad}
 
     steps_per_epoch = -(-len(ds) // (batch_size * grad_accum))
@@ -286,9 +319,12 @@ def train(
         # 36,993-token row -- and peak VRAM is dominated by sequence length
         # (the logit tensor alone is len x 151,936). A probe that measured only
         # median rows would certify a footprint the real run then exceeds.
-        ds = ds.select(_longest_first(examples, n=batch_size * grad_accum * max_steps))
-        print(f"probe: longest row forced first, {len(ds)} rows, "
-              f"max {max(len(e['input_ids']) for e in examples)} tokens", flush=True)
+        picked = _longest_first(examples, n=batch_size * grad_accum * max_steps)
+        ds = ds.select(picked)
+        lengths = [len(examples[i]["input_ids"]) for i in picked]
+        print(f"probe: {len(picked)} longest rows, indices {picked[:8]}..., "
+              f"lengths {lengths[:8]}... (max {lengths[0]}, min {lengths[-1]})",
+              flush=True)
 
     args = TrainingArguments(
         output_dir=str(out_dir),
@@ -341,9 +377,37 @@ def train(
         callbacks=[_Collect()],
     )
 
-    torch.cuda.reset_peak_memory_stats()
+    mark("pre_train")
     t0 = time.time()
-    result = trainer.train()
+    try:
+        result = trainer.train()
+    except torch.cuda.OutOfMemoryError as exc:
+        # An OOM used to leave nothing but a traceback, because every summary was
+        # built after train() returned. The failure is the measurement here, so
+        # it gets written down like one.
+        report = {
+            "probe": probe,
+            "precision": "nf4" if nf4 else "bf16",
+            "outcome": "oom",
+            "error": str(exc)[:2000],
+            "elapsed_sec": round(time.time() - t0, 1),
+            "memory_marks": marks,
+            "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+            "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 2),
+            "base_footprint_gib": round(footprint, 2),
+            "bnb_4bit_modules": n_4bit,
+            "longest_row_tokens": max(len(e["input_ids"]) for e in examples),
+            "batch_size": batch_size,
+            "grad_accum": grad_accum,
+        }
+        out = Path(VOLUME_MOUNT) / "sft-repaired" / (
+            f"probe_failure_{'nf4' if nf4 else 'bf16'}.json"
+        )
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=2))
+        vol.commit()
+        print(json.dumps(report, indent=2), flush=True)
+        raise SystemExit(f"PROBE OOM — report written to {out}") from exc
     elapsed = time.time() - t0
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
     peak_reserved = torch.cuda.max_memory_reserved() / 2**30
@@ -380,6 +444,9 @@ def train(
         "lora_tensors_total": len(before),
         "supervised_tokens": supervised,
         "total_tokens": total,
+        "base_footprint_gib": round(footprint, 2),
+        "bnb_4bit_modules": n_4bit,
+        "memory_marks": marks,
     }
 
     # These are the probe's actual questions, so they are asked before it can
