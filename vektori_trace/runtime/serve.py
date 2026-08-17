@@ -191,15 +191,6 @@ def serve_model(
         info["max_output_tokens"] = out_cap
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
-    # The adapter gets its OWN served name, and that is what callers are handed.
-    # vLLM resolves a request's `model` against the served base name *before* it
-    # consults the LoRA table, so registering the adapter under `name` — as this
-    # did — makes every request fall through to the base weights. Nothing errors:
-    # the sweep runs, the adapter is never applied, and the result reads as "OPD
-    # changed nothing". Distinct names make that failure impossible, and make it
-    # visible in /v1/models and in `harbor_model`.
-    lora_name = f"{name}-lora" if vol_adapter else None
-    served_name = lora_name or name
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
@@ -366,7 +357,7 @@ def serve_model(
             if extra_vllm_args:
                 cmd += list(extra_vllm_args)
             if vol_adapter:
-                cmd += ["--enable-lora", "--lora-modules", f"{lora_name}={vol_adapter}"]
+                cmd += ["--enable-lora", "--lora-modules", f"{name}={vol_adapter}"]
             # Inherit stdout/stderr so vLLM's own log reaches `modal app logs`.
             proc = subprocess.Popen(cmd)
             deadline = time.time() + 60 * 25
@@ -403,7 +394,7 @@ def serve_model(
             )
         served = ServedModel(
             api_base=url.rstrip("/") + "/v1",
-            model_name=served_name,
+            model_name=name,
             model_info=info,
             adapter_path=vol_adapter,
             gpu=gpu,
