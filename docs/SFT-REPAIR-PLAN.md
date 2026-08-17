@@ -28,6 +28,55 @@ corrected batch and the same seed, and exists only to price the continuation.
 
 ---
 
+## 0.0 Status — 2026-08-17
+
+Phases 1–4 are **done**. Nothing beyond them has run; Phase 5 needs approval.
+
+| | |
+|---|---|
+| Phase 1 | v1 frozen at `/data/v1-provenance/` with sha256s |
+| Phase 2 | built, exit 0 — `/data/sft-repaired/`, sha `7ecfee31…` |
+| Phase 3 | **PREFLIGHT PASSED** — targets, roles, masks, TRL agreement all clean |
+| Phase 4 | trainer written, 27 unit tests green, never run |
+| Phase 5 | **not started — needs approval** |
+
+### Phase 2 audit
+
+```text
+117 rollouts -> 165 segments over 34 tasks
+action 3561 · handoff_question 48 · parse_error 18 · unknown 0
+target source: raw_capture 3528 · atif_rebuilt 33
+rebuild justification: 3528/3528 field-equivalent, 0 mismatched
+join index 11226, 0 benign duplicates, 0 conflicts
+commands 7436  ops {read 4343, edit 146, test 635}
+```
+
+Two independent corroborations that nothing was lost: **7,436 commands** equals
+v1's known `bash_command` count, and 3561 + 48 + 18 = **3,627** equals v1's
+assistant-turn count.
+
+The 33 rebuilds are teacher responses wrapped in prose, which harbor salvaged at
+runtime and which must not become targets. The join covered everything else, so
+the rebuild path is proven on 3,528 turns and used on 33.
+
+### Phase 3 preflight
+
+```text
+165 rows
+tokens: min 6681  median 24635  max 36993   (cap 40960 — nothing truncates)
+supervised: 1,029,371 / 3,992,567 (25.8%)
+TRL cross-check: 108/108 comparable rows agree
+targets ok · roles ok · masks ok · trl_agreement ok
+```
+
+Every supervised span on every row decodes to parseable Terminus JSON
+containing its own target. The 57 rows excluded from the TRL comparison are the
+ones carrying a handoff or parse-error turn, where the masks must differ.
+
+v1's saved `chat_template.jinja` is **byte-identical** to the Hub's
+(`a55ee1b1…`), so "renders with the exact serving template" holds literally
+rather than by assumption.
+
 ## 0. The sequence
 
 ```text
