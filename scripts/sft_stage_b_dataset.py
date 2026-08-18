@@ -112,6 +112,32 @@ def repo_of(task: str) -> str:
     return task.split("__", 1)[1].rsplit("-", 1)[0]
 
 
+def row_key(task: str, rollout: Any, seg: int, idx: int) -> str:
+    """A row identity that is actually unique.
+
+    Stage A's `source_id` is `task|segN|msgI`, which omits the rollout: the same
+    task and segment recur across rollouts, so its 165 rows carry only **60**
+    distinct ids, 46 of them duplicated. Anything keyed by it — sampler weights,
+    per-row supervised-token counts — silently collapses onto one entry per
+    collision. Stage A's dataset sha is pinned and its `source_id` is left
+    exactly as it is; Stage B keys on this instead and reconstructs Stage A's
+    exclusion keys in the same form.
+    """
+    return f"{task}|r{rollout}|seg{seg}|msg{idx}"
+
+
+def stage_a_key(row: dict) -> str:
+    """`row_key` for a row written by the Stage A builder.
+
+    The message index is recovered from its `source_id` tail rather than from
+    `len(messages) - 1`, so a row is identified by what it claims to be.
+    """
+    idx = int(str(row["source_id"]).rsplit("|msg", 1)[1])
+    return row_key(
+        row["task"], row.get("rollout_index"), row["segment_index"], idx
+    )
+
+
 def _is_native_action(text: str) -> tuple[bool, str]:
     """(ok, why). harbor's parser is the authority, plus the v1 envelope check."""
     for marker in ("<tool_call>", "</tool_call>"):
@@ -250,9 +276,10 @@ def slice_rows(
         contents = {i: row["messages"][i]["content"] for i in supervised}
         # Everything after the segment's first action. The first is Stage A's,
         # and `exclude` asserts that rather than assuming it.
+        roll = man.get("rollout_index")
         later = [
             i for i in supervised[1:]
-            if f"{task}|seg{seg}|msg{i}" not in exclude
+            if row_key(task, roll, seg, i) not in exclude
         ]
 
         targets: dict[int, str] = dict(pick_later(later, contents))
@@ -260,7 +287,7 @@ def slice_rows(
         # their label wins: the count is exact and must not be absorbed into a
         # `later_first_edit` that happens to sit at the same index.
         for idx in recovery_targets(meta, row["supervise"]):
-            if f"{task}|seg{seg}|msg{idx}" in exclude:
+            if row_key(task, roll, seg, idx) in exclude:
                 continue
             targets[idx] = PARSE_ERROR_RECOVERY
 
@@ -268,12 +295,12 @@ def slice_rows(
             messages = row["messages"][: idx + 1]
             read_op, edit_op, test_op = _ops(messages[-1]["content"])
             out.append({
-                "source_id": f"{task}|seg{seg}|msg{idx}",
+                "source_id": row_key(task, roll, seg, idx),
                 "task": task,
                 "repo": repo_of(task),
                 "kind": targets[idx],
                 "segment_index": seg,
-                "rollout_index": man.get("rollout_index"),
+                "rollout_index": roll,
                 "turn_ordinal": supervised.index(idx),
                 "n_prior_assistant_turns": sum(
                     1 for m in messages[:-1] if m["role"] == "assistant"
@@ -293,6 +320,8 @@ def load_cold(stage_a: Path) -> list[dict]:
     for r in rows:
         r = dict(r)
         r.pop("weight", None)
+        r["stage_a_source_id"] = r["source_id"]
+        r["source_id"] = stage_a_key(r)
         r["kind"] = COLD_REPLAY
         r["ops"] = dict(zip(
             ("read", "edit", "test"),
@@ -486,7 +515,12 @@ def main() -> int:
 
     cold_rows = load_cold(args.stage_a)
     exclude = {r["source_id"] for r in cold_rows}
-    print(f"excluding {len(exclude)} Stage A source_ids from the later pool")
+    if len(exclude) != len(cold_rows):
+        raise SystemExit(
+            f"{len(cold_rows)} Stage A rows collapse to {len(exclude)} keys — "
+            "row_key is not unique and every weight would collide"
+        )
+    print(f"excluding {len(exclude)} Stage A rows from the later pool")
 
     sliced = slice_rows(rows, manifest, exclude=exclude)
     print(f"sliced {len(sliced)} later rows from {len(rows)} segments: "
@@ -569,6 +603,15 @@ def main() -> int:
         **{k: v * (1.0 - cold_mass) for k, v in w_new.items()},
         **{k: v * cold_mass for k, v in w_cold.items()},
     }
+
+    # One key per row, or every number below is computed on a dict that quietly
+    # lost rows to collisions. This is exactly how the first build reported a
+    # mix over 60 keys for 165 rows.
+    if len(weights) != len(usable) or len(sup_by_id) != len(usable):
+        raise SystemExit(
+            f"{len(usable)} rows produced {len(weights)} weights and "
+            f"{len(sup_by_id)} token counts — source_id collision"
+        )
 
     rep = mix_report(usable, weights, sup_by_id, cold_mass=cold_mass)
     mix_problems = check_mix(rep)

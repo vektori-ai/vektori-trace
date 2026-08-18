@@ -8,6 +8,7 @@ fails loudly on CPU rather than a comment saying it should not happen.
 
 from __future__ import annotations
 
+import collections
 import json
 import sys
 
@@ -21,7 +22,7 @@ EDIT = ACTION % json.dumps("sed -i s/a/b/ f.py\n")
 TEST = ACTION % json.dumps("pytest -x\n")
 
 
-def _segment(task, seg, actions, *, parse_error_at=None):
+def _segment(task, seg, actions, *, parse_error_at=None, rollout=0):
     """A (row, manifest) pair with `actions` supervised assistant turns."""
     messages = [{"role": "user", "content": "spec"}]
     meta = [{"kind": "prompt"}]
@@ -41,16 +42,19 @@ def _segment(task, seg, actions, *, parse_error_at=None):
         meta.append({"kind": "observation"})
         supervise.append(False)
     row = {"messages": messages, "supervise": supervise}
-    man = {"task": task, "segment_index": seg, "turn_meta": meta, "rollout_index": 0}
+    man = {"task": task, "segment_index": seg, "turn_meta": meta,
+           "rollout_index": rollout}
     return row, man
 
 
 def _first_ids(rows, manifest):
-    """The source_ids Stage A would have taken: each segment's first action."""
+    """The keys Stage A would have taken: each segment's first action."""
     out = set()
     for row, man in zip(rows, manifest, strict=True):
         first = next(i for i, s in enumerate(row["supervise"]) if s)
-        out.add(f"{man['task']}|seg{man['segment_index']}|msg{first}")
+        out.add(sb.row_key(
+            man["task"], man.get("rollout_index"), man["segment_index"], first
+        ))
     return out
 
 
@@ -248,3 +252,59 @@ def test_the_expected_pin_is_the_repaired_corpus():
     assert sb.EXPECTED_SRC_SHA == "7ecfee31"
     assert sb.MAX_LENGTH == 40960
     assert sb.TEMPLATE_KWARGS == {"enable_thinking": True}
+
+
+# --------------------------------------------------------------------------
+# Row identity. Stage A's `source_id` omits the rollout and collides.
+# --------------------------------------------------------------------------
+
+
+def test_the_same_task_and_segment_in_two_rollouts_are_two_rows():
+    """Stage A's `task|segN|msgI` collapsed its 165 rows onto 60 keys, so every
+    sampler weight and per-row token count landed on one entry per collision."""
+    a = _segment("pallets__click-1", 0, [READ, READ, READ], rollout=0)
+    b = _segment("pallets__click-1", 0, [READ, READ, READ], rollout=1)
+    rows, mans = [a[0], b[0]], [a[1], b[1]]
+    out = sb.slice_rows(rows, mans, exclude=_first_ids(rows, mans))
+    ids = [r["source_id"] for r in out]
+    assert len(ids) == len(set(ids)), "row_key must separate rollouts"
+    assert {r["rollout_index"] for r in out} == {0, 1}
+
+
+def test_row_key_separates_every_coordinate():
+    base = sb.row_key("t", 0, 0, 1)
+    assert base != sb.row_key("t", 1, 0, 1)
+    assert base != sb.row_key("t", 0, 1, 1)
+    assert base != sb.row_key("t", 0, 0, 3)
+    assert base != sb.row_key("u", 0, 0, 1)
+
+
+def test_stage_a_key_reconstructs_the_rollout_aware_key():
+    row = {
+        "source_id": "pallets__click-1|seg2|msg5",
+        "task": "pallets__click-1",
+        "segment_index": 2,
+        "rollout_index": 3,
+    }
+    assert sb.stage_a_key(row) == sb.row_key("pallets__click-1", 3, 2, 5)
+
+
+def test_exclusion_only_removes_the_matching_rollout():
+    """Keyed on the colliding id, excluding rollout 0's action at msg 3 would
+    also have removed rollout 1's action at msg 3 — a different conversation.
+
+    Each segment's first action is dropped structurally (`supervised[1:]`), so
+    what the exclusion set governs is the *later* pool, and that is what this
+    pins.
+    """
+    a = _segment("pallets__click-1", 0, [READ, READ, READ], rollout=0)
+    b = _segment("pallets__click-1", 0, [READ, READ, READ], rollout=1)
+    rows, mans = [a[0], b[0]], [a[1], b[1]]
+    later_of_r0 = {sb.row_key("pallets__click-1", 0, 0, 3)}
+    out = sb.slice_rows(rows, mans, exclude=later_of_r0)
+    per_rollout = collections.Counter(r["rollout_index"] for r in out)
+    assert per_rollout[0] == 1, "rollout 0 loses the excluded later action"
+    assert per_rollout[1] == 2, "rollout 1 keeps both of its later actions"
+    assert sb.row_key("pallets__click-1", 1, 0, 3) in {
+        r["source_id"] for r in out
+    }
