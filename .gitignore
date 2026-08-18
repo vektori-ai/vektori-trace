@@ -35,3 +35,8 @@ baseline-qwen-run.tar.gz
 # Legacy Qwen3-14B artifacts and trajectory tarballs, local only.
 qwen-stuff-14B/
 qwen14b-trajectories.tar.gz
+
+# Stray adapter configs / run summaries copied off the box for inspection.
+# Provenance lives in /data/v1-provenance on the EC2 box, not in the tree.
+sum-*.json
+v2_*.json

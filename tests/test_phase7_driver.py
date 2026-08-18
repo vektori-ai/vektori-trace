@@ -248,3 +248,72 @@ def test_corpus_is_cached_across_prefixes(tmp_path):
 @pytest.mark.parametrize("suite", ["acquisition", "control", "generalization"])
 def test_every_manifest_suite_is_a_known_name(suite):
     assert suite in {"acquisition", "control", "generalization"}
+
+
+# --------------------------------------------------------------------------
+# The chat_template_kwargs preflight
+#
+# This check exists because the prompt-seed probe served a template nobody
+# chose. Its first version asserted "thinking on -> <think> present", which
+# passes on a server that drops the kwarg entirely — Qwen3's default is already
+# thinking-on. The evidence has to be in the prompt, not the completion.
+# --------------------------------------------------------------------------
+
+
+def _fake_complete(prompt_tokens_by_thinking):
+    """Stand in for the endpoint, reporting a rendered prompt length."""
+
+    def complete(api_base, model, messages, **kw):
+        thinking = kw["chat_template_kwargs"]["enable_thinking"]
+        payload = {"usage": {"prompt_tokens": prompt_tokens_by_thinking[thinking]},
+                   "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        return ("ok", "stop", None, payload) if kw.get("return_payload") else ("ok", "stop", None)
+
+    return complete
+
+
+def test_preflight_reads_the_rendered_prompt_length(monkeypatch):
+    """`enable_thinking=False` appends the four-token wrapper to the prompt."""
+    monkeypatch.setattr(driver, "complete", _fake_complete({True: 100, False: 104}))
+    on, err_on = driver._prompt_tokens("b", "m", [], timeout=1, retries=0,
+                                       chat_template_kwargs={"enable_thinking": True})
+    off, err_off = driver._prompt_tokens("b", "m", [], timeout=1, retries=0,
+                                         chat_template_kwargs={"enable_thinking": False})
+    assert (err_on, err_off) == (None, None)
+    assert off - on == driver.THINK_WRAPPER_TOKENS
+
+
+def test_a_server_ignoring_the_kwarg_renders_one_prompt_twice(monkeypatch):
+    """The failure the completion-text check could not see."""
+    monkeypatch.setattr(driver, "complete", _fake_complete({True: 100, False: 100}))
+    on, _ = driver._prompt_tokens("b", "m", [], timeout=1, retries=0,
+                                  chat_template_kwargs={"enable_thinking": True})
+    off, _ = driver._prompt_tokens("b", "m", [], timeout=1, retries=0,
+                                   chat_template_kwargs={"enable_thinking": False})
+    assert off - on == 0
+    assert off - on != driver.THINK_WRAPPER_TOKENS
+
+
+def test_missing_usage_is_an_error_not_a_zero(monkeypatch):
+    """A server that reports no usage must fail the preflight, not read as 0."""
+
+    def complete(api_base, model, messages, **kw):
+        payload = {"choices": [{"message": {"content": "ok"}}]}
+        return ("ok", "stop", None, payload)
+
+    monkeypatch.setattr(driver, "complete", complete)
+    count, err = driver._prompt_tokens("b", "m", [], timeout=1, retries=0,
+                                       chat_template_kwargs={"enable_thinking": True})
+    assert count == -1
+    assert err is not None and "usage" in err
+
+
+def test_wrapper_token_count_matches_the_tokenizer():
+    """The constant is only meaningful if it is what Qwen3 actually emits."""
+    transformers = pytest.importorskip("transformers")
+    from vektori_trace.dataset import THINK_WRAPPER_TEXT
+
+    tok = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
+    assert len(tok.encode(THINK_WRAPPER_TEXT, add_special_tokens=False)) == (
+        driver.THINK_WRAPPER_TOKENS
+    )

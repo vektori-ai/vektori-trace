@@ -77,6 +77,37 @@ def load_prefix_messages(entry: dict[str, Any], cache: dict[str, list]) -> list[
     return seg["messages"][: entry["message_index"]]
 
 
+#: `<think>`, `\n\n`, `</think>`, `\n\n` — what `enable_thinking=False` appends to
+#: the generation prompt. The preflight asserts exactly this difference.
+THINK_WRAPPER_TOKENS = 4
+
+
+def _prompt_tokens(
+    api_base: str,
+    model: str,
+    messages: list[dict],
+    *,
+    timeout: float,
+    retries: int,
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[int, str | None]:
+    """`usage.prompt_tokens` for one 1-token request. (count, error).
+
+    Reads what the server rendered rather than what it replied, so the check
+    does not depend on the model choosing to open a reasoning block.
+    """
+    _text, _finish, err, payload = complete(
+        api_base, model, messages, timeout=timeout, max_tokens=1, retries=retries,
+        chat_template_kwargs=chat_template_kwargs, return_payload=True,
+    )
+    if err is not None:
+        return -1, err
+    try:
+        return int(payload["usage"]["prompt_tokens"]), None
+    except (KeyError, TypeError, ValueError):
+        return -1, "response carried no usage.prompt_tokens"
+
+
 def complete(
     api_base: str,
     model: str,
@@ -88,7 +119,8 @@ def complete(
     max_tokens: int = 512,
     retries: int = 2,
     chat_template_kwargs: dict[str, Any] | None = None,
-) -> tuple[str, str | None, str | None]:
+    return_payload: bool = False,
+) -> tuple[str, str | None, str | None] | tuple[str, str | None, str | None, Any]:
     """(text, finish_reason, error). A transport failure is never a model failure.
 
     Retried, because an ungraded prefix now blocks its checkpoint from being
@@ -125,19 +157,20 @@ def complete(
             # A 4xx is the request being wrong, not the network being flaky.
             # Retrying it just repeats the same mistake more expensively.
             if 400 <= e.code < 500:
-                return "", None, last
+                return ("", None, last, None) if return_payload else ("", None, last)
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
         if attempt < retries:
             time.sleep(2 * (attempt + 1))
     if payload is None:
-        return "", None, last
+        return ("", None, last, None) if return_payload else ("", None, last)
     choice = (payload.get("choices") or [{}])[0]
-    return (
+    out = (
         (choice.get("message") or {}).get("content") or "",
         choice.get("finish_reason"),
         None,
     )
+    return (*out, payload) if return_payload else out
 
 
 def main() -> int:
@@ -243,26 +276,38 @@ def main() -> int:
         bad = False
         probe = [{"role": "user", "content": "Reply with the single word: ok"}]
         for label in order:
-            _on_text, _f, on_err = complete(
+            # The distinguishing evidence is in the *prompt*, not the
+            # completion. With thinking off the template appends
+            # `<think>\n\n</think>\n\n` to the generation prompt; with it on the
+            # prompt stops at `<|im_start|>assistant\n`. Those differ by exactly
+            # four tokens, and vLLM reports the count it actually rendered. A
+            # server that drops the kwarg renders one prompt twice and the
+            # counts match — which no assertion about completion text can see,
+            # because Qwen3's default is already thinking-on and a short reply
+            # may open no block either way.
+            on_ids, on_err = _prompt_tokens(
                 args.api_base, models[label], probe, timeout=args.timeout,
-                max_tokens=16, retries=args.retries,
-                chat_template_kwargs={"enable_thinking": True},
+                retries=args.retries, chat_template_kwargs={"enable_thinking": True},
             )
-            off_text, _f, off_err = complete(
+            off_ids, off_err = _prompt_tokens(
                 args.api_base, models[label], probe, timeout=args.timeout,
-                max_tokens=16, retries=args.retries,
-                chat_template_kwargs={"enable_thinking": False},
+                retries=args.retries, chat_template_kwargs={"enable_thinking": False},
             )
             err = on_err or off_err
-            # With thinking off the template writes the closed wrapper into the
-            # prompt, so the completion cannot open one. With it on, the model
-            # is free to. Identical behaviour means the kwarg went nowhere.
-            honoured = "<think>" not in off_text
+            delta = None if err else off_ids - on_ids
+            honoured = delta == THINK_WRAPPER_TOKENS
             ok = err is None and honoured
             bad = bad or not ok
-            why = err or ("ok" if honoured else
-                          "emitted <think> with enable_thinking=False — the "
-                          "server is ignoring chat_template_kwargs")
+            if err:
+                why = err
+            elif delta == 0:
+                why = ("prompt length identical with thinking on and off — the "
+                       "server is ignoring chat_template_kwargs")
+            elif not honoured:
+                why = (f"prompt grew by {delta} tokens with thinking off, "
+                       f"expected {THINK_WRAPPER_TOKENS}")
+            else:
+                why = "ok"
             print(f"  {label:8} {models[label]:44} {'OK' if ok else 'FAIL'}  {why}")
         if bad:
             print(

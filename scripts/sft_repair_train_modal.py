@@ -74,6 +74,9 @@ V1_IN_VOLUME = "sft/qwen3-14b-dsv4-lora"       # immutable — never written to
 OUT_IN_VOLUME = "sft/qwen3-14b-dsv4-lora-repaired"
 
 MAX_LENGTH = 40960
+# Qwen3 emits this before a *final* assistant turn's content. Mirrors
+# `dataset.THINK_WRAPPER_TEXT`; it is masked, never supervised.
+THINK_WRAPPER_TEXT = "<think>\n\n</think>\n\n"
 # Thinking stays on: the corpus is tokenized the way the model is served.
 # `False` writes `<think>\n\n</think>\n\n` into the generation prompt, so the
 # model would be asked to continue from a position no target starts at.
@@ -600,41 +603,97 @@ def row_digest(example: dict) -> str:
     return h.hexdigest()
 
 
+def _ids(encoded):
+    """Bare token ids from whatever apply_chat_template returned.
+
+    Mirrors `dataset._unwrap_ids`. `list()` on a BatchEncoding yields dict keys
+    and on a tokenizers.Encoding yields something opaque — either way a prefix
+    comparison over those values succeeds without comparing token ids, which is
+    how an assert becomes decoration.
+    """
+    if hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    elif hasattr(encoded, "get") and "input_ids" in encoded:
+        encoded = encoded["input_ids"]
+    if not isinstance(encoded, list):
+        encoded = list(encoded)
+    if len(encoded) == 1 and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    if encoded and not all(isinstance(i, int) for i in encoded):
+        raise RuntimeError(
+            "apply_chat_template did not yield token ids "
+            f"(first element is {type(encoded[0]).__name__})"
+        )
+    return encoded
+
+
 def tokenize_row(row: dict, tokenizer):
-    """Render one segment to input_ids/labels with the explicit per-turn mask.
+    """Render one row to input_ids/labels: last message supervised, wrapper masked.
 
     Inlined rather than imported from `vektori_trace.dataset` because Modal
     re-imports this module inside a container where the local package is not
     installed. The logic is `dataset.tokenize_messages`; the preflight runs the
-    real one over the same rows, and both must agree.
+    real one over the same rows and the per-row fingerprint refuses to train on
+    any disagreement — so a drift here is caught, not trained.
+
+    This was a per-message length loop, and that loop is the bug the whole plan
+    turns on. Qwen3's template wraps an assistant turn in `<think>\n\n</think>\n\n`
+    only when it is `loop.last`, so `render(messages[:i+1])` is four tokens
+    longer than the matching span of `render(messages)` for any non-final
+    assistant. Measuring lengths on the former and indexing them into the latter
+    ran every supervised span past `<|im_end|>` into the following user turn.
+    See `docs/SFT-SCRATCH-PLAN.md` step 1.
     """
     messages, supervise = row["messages"], row["supervise"]
-
-    def encode(msgs):
-        return tokenizer.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=False, **TEMPLATE_KWARGS
+    if len(supervise) != len(messages):
+        raise SystemExit(
+            f"supervise has {len(supervise)} entries for {len(messages)} messages"
+        )
+    if not messages or not any(supervise):
+        return None
+    bad = [i for i, sup in enumerate(supervise) if sup and i != len(messages) - 1]
+    if bad:
+        raise SystemExit(
+            f"row supervises messages {bad}, which are not the last "
+            f"(index {len(messages) - 1}). Only a final-message target can be "
+            "located in the full render; split the row per action."
+        )
+    if messages[-1].get("role") != "assistant":
+        raise SystemExit(
+            f"the supervised final message has role {messages[-1].get('role')!r}"
         )
 
-    full = encode(messages)
-    if hasattr(full, "get") and "input_ids" in full:
-        full = full["input_ids"]
-    labels = [IGNORE_INDEX] * len(full)
-    prev = 0
-    for i in range(len(messages)):
-        prefix = encode(messages[: i + 1])
-        if hasattr(prefix, "get") and "input_ids" in prefix:
-            prefix = prefix["input_ids"]
-        cur = len(prefix)
-        if cur < prev:
-            raise RuntimeError("chat template is not prefix-stable — refusing to mask")
-        if supervise[i]:
-            for j in range(prev, min(cur, len(full))):
-                labels[j] = full[j]
-        prev = cur
-    if len(full) != prev:
-        raise RuntimeError("prefix length != full length — refusing to mask")
+    full = _ids(
+        tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False, **TEMPLATE_KWARGS
+        )
+    )
+    prefix = _ids(
+        tokenizer.apply_chat_template(
+            messages[:-1], tokenize=True, add_generation_prompt=True, **TEMPLATE_KWARGS
+        )
+    )
+    if full[: len(prefix)] != prefix:
+        raise SystemExit(
+            "render(messages[:-1], add_generation_prompt=True) is not a token "
+            f"prefix of render(messages) ({len(prefix)} tokens) — refusing to mask"
+        )
+
+    start = len(prefix)
+    wrapper = _ids(tokenizer.encode(THINK_WRAPPER_TEXT, add_special_tokens=False))
+    if full[start : start + len(wrapper)] != wrapper:
+        raise SystemExit(
+            f"expected the reasoning wrapper {wrapper} at token {start}, found "
+            f"{full[start : start + len(wrapper)]} — the template no longer emits "
+            "<think></think> on a final assistant turn"
+        )
+    # Context, not target. Supervising these teaches an empty reasoning block on
+    # every row: enable_thinking=True with the behaviour trained out.
+    start += len(wrapper)
+
     if len(full) > MAX_LENGTH:
-        raise SystemExit(f"segment of {len(full)} tokens exceeds max_length {MAX_LENGTH}")
+        raise SystemExit(f"row of {len(full)} tokens exceeds max_length {MAX_LENGTH}")
+    labels = [IGNORE_INDEX] * start + full[start:]
     if not any(lab != IGNORE_INDEX for lab in labels):
         return None
     return {"input_ids": full, "labels": labels, "attention_mask": [1] * len(full)}
