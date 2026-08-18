@@ -1,6 +1,7 @@
-"""The trainer's inlined tokenizer must match `dataset.tokenize_messages` exactly.
+"""Each trainer's inlined tokenizer must match `dataset.tokenize_messages` exactly.
 
-`scripts/sft_repair_train_modal.py` carries a copy of the masking logic because
+`scripts/sft_repair_train_modal.py` and `scripts/sft_stage_a_train_modal.py`
+both carry a copy of the masking logic because
 Modal re-imports the module inside a container where the local package is not
 installed. A copy can drift, and this one did: the plan's step 1 rewrote
 `tokenize_messages` while `tokenize_row` kept the per-message length loop. The
@@ -16,8 +17,16 @@ import pytest
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("modal")
 
-from scripts.sft_repair_train_modal import TEMPLATE_KWARGS, tokenize_row  # noqa: E402
+from scripts import sft_repair_train_modal, sft_stage_a_train_modal  # noqa: E402
+from scripts.sft_repair_train_modal import tokenize_row  # noqa: E402
 from vektori_trace.dataset import tokenize_messages  # noqa: E402
+
+# Both copies, checked against the same source of truth. A second copy is a
+# second chance to drift.
+TRAINERS = [
+    pytest.param(sft_repair_train_modal, id="repair"),
+    pytest.param(sft_stage_a_train_modal, id="stage-a"),
+]
 
 MODEL = "Qwen/Qwen3-14B"
 ACTION = '{"analysis": "a", "plan": "p", "commands": [{"keystrokes": "ls -la\\n", "duration": 0.1}]}'
@@ -49,20 +58,6 @@ ROWS = [
 ]
 
 
-@pytest.mark.parametrize("messages", ROWS)
-def test_trainer_copy_matches_the_real_function(tok, messages):
-    supervise = [False] * (len(messages) - 1) + [True]
-    ours = tokenize_messages(
-        messages, tok, supervise, max_length=40960,
-        template_kwargs=TEMPLATE_KWARGS, truncate=False,
-    )
-    theirs = tokenize_row({"messages": messages, "supervise": supervise}, tok)
-    assert ours is not None and theirs is not None
-    assert theirs["input_ids"] == ours.input_ids
-    assert theirs["labels"] == ours.labels
-    assert theirs["attention_mask"] == ours.attention_mask
-
-
 def test_trainer_copy_refuses_a_packed_row(tok):
     """The shape the previous corpus used. Both sides must refuse it."""
     messages = [_u("spec"), _a(ACTION), _u("obs"), _a(ACTION)]
@@ -81,3 +76,72 @@ def test_trainer_copy_masks_the_think_wrapper(tok):
     assert row["input_ids"][first - len(wrapper) : first] == wrapper
     assert all(lab == IGNORE_INDEX for lab in row["labels"][first - len(wrapper) : first])
     assert tok.decode(row["input_ids"][first:]).startswith('{"analysis"')
+
+
+# --------------------------------------------------------------------------
+# Stage A's copy, and the constants that make it Stage A rather than the repair
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mod", TRAINERS)
+@pytest.mark.parametrize("messages", ROWS)
+def test_every_trainer_copy_matches_the_real_function(tok, mod, messages):
+    supervise = [False] * (len(messages) - 1) + [True]
+    ours = tokenize_messages(
+        messages, tok, supervise, max_length=mod.MAX_LENGTH,
+        template_kwargs=mod.TEMPLATE_KWARGS, truncate=False,
+    )
+    theirs = mod.tokenize_row({"messages": messages, "supervise": supervise}, tok)
+    assert ours is not None and theirs is not None
+    assert theirs["input_ids"] == ours.input_ids
+    assert theirs["labels"] == ours.labels
+    assert theirs["attention_mask"] == ours.attention_mask
+
+
+@pytest.mark.parametrize("mod", TRAINERS)
+def test_thinking_stays_on_in_every_trainer(mod):
+    assert mod.TEMPLATE_KWARGS == {"enable_thinking": True}
+
+
+def test_stage_a_trains_at_8192_not_the_repair_length():
+    """Amendment 2: the 18 recoveries that need ~33k are Stage B's. A Stage A
+    run at 40960 is the repair run's length and would silently readmit them."""
+    assert sft_stage_a_train_modal.MAX_LENGTH == 8192
+    assert sft_repair_train_modal.MAX_LENGTH == 40960
+
+
+def test_stage_a_defaults_to_bf16_and_the_repair_run_to_nf4():
+    """The 39.6 GiB peak that justifies --nf4 is NF4 @ 40960. Stage A is 8192,
+    so bf16 is probed first and the arm is decided by measurement (step 5)."""
+    import inspect
+
+    def default(mod, name):
+        return inspect.signature(mod.train.get_raw_f()).parameters[name].default
+
+    assert default(sft_stage_a_train_modal, "nf4") is False
+    assert default(sft_repair_train_modal, "nf4") is True
+
+
+def test_stage_a_hyperparameters_match_the_plan():
+    m = sft_stage_a_train_modal
+    assert (m.LORA_R, m.LORA_ALPHA, m.LORA_DROPOUT) == (32, 64, 0.05)
+    assert m.LORA_TARGET_MODULES == "all-linear"
+
+    import inspect
+
+    sig = inspect.signature(m.train.get_raw_f()).parameters
+    assert sig["epochs"].default == 4.0
+    assert sig["lr"].default == 1e-4
+    assert sig["grad_accum"].default == 8
+    assert sig["save_steps"].default == 10
+    assert sig["seed"].default == 0
+
+
+def test_stage_a_reads_its_own_dataset_and_writes_its_own_adapter():
+    """Pointing Stage A at the repaired jsonl, or writing over the repaired
+    adapter, are both silent ways to run a different experiment."""
+    a, r = sft_stage_a_train_modal, sft_repair_train_modal
+    assert a.DATA_IN_VOLUME == "sft-stage-a/stage_a.jsonl"
+    assert a.OUT_IN_VOLUME not in (r.OUT_IN_VOLUME, r.V1_IN_VOLUME)
+    assert a.DATA_IN_VOLUME != r.DATA_IN_VOLUME
+    assert not hasattr(a, "V1_IN_VOLUME")
