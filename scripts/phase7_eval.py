@@ -189,7 +189,15 @@ def main() -> int:
                     help="label=served_model_name pairs, in training order")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--timeout", type=float, default=120.0)
-    ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--max-tokens", type=int, default=2048,
+                    help="generation budget per prefix. 512 was v1's "
+                         "figure, when the think block was empty and the "
+                         "JSON started immediately. Thinking is on now "
+                         "and step 1 masks the wrapper, so the model "
+                         "reasons for real and 512 becomes a think "
+                         "budget, not a JSON budget — at 512 every one "
+                         "of ck84's 30 harbor_accepts failures had hit "
+                         "the cap, and none finished inside it.")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--sampled-seeds", type=int, default=0,
                     help="temperature-0.7 seeds per prefix, catching a format "
@@ -229,6 +237,10 @@ def main() -> int:
         if not prefixes:
             print(f"no prefixes in suites {args.suites}", file=sys.stderr)
             return 1
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = args.out.with_suffix(".partial.jsonl")
+    partial_fh = partial_path.open("w")
+    print(f"streaming results to {partial_path} as they are graded")
     order = [c.split("=", 1)[0] for c in args.checkpoints]
     models = dict(c.split("=", 1) for c in args.checkpoints)
     available_suites = {p["suite"] for p in prefixes}
@@ -390,6 +402,17 @@ def main() -> int:
                 continue
             results.append(res)
             got.append(res)
+            # Persist as we go. `results.json` is written once at the end, so a
+            # sweep killed at prefix 40 of 540 used to leave nothing at all —
+            # every completion, finish_reason and think_body it had already
+            # graded died with the process. Twice, on 2026-08-18. One line per
+            # result means a partial sweep is still evidence.
+            if partial_fh is not None:
+                partial_fh.write(json.dumps(
+                    {**asdict(res), "failed_gates": res.failed_gates,
+                     "passed": res.passed}
+                ) + "\n")
+                partial_fh.flush()
             print(
                 f"  [{label} {i}/{len(batch)}] {res.suite:22} {res.category:22} "
                 f"{'PASS' if res.passed else 'FAIL ' + ','.join(res.failed_gates)}"
@@ -532,6 +555,8 @@ def main() -> int:
           f"{len(infra_failures)} infra failures")
     for cell, v in report["summary"]["cells"].items():
         print(f"  {cell:34} {v['passed']}/{v['n']}")
+    if partial_fh is not None:
+        partial_fh.close()
     print(f"\nselected checkpoint: {chosen or 'NONE PASSED'}")
     if infra_failures:
         print("WARNING: infra failures present — rates are over what was "
