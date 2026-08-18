@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,17 @@ from typing import Any
 from harbor.agents.terminus_2.terminus_2 import Command, Terminus2
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.llms.chat import Chat
+
+# Deliberately terse. The assistant turn below carries the entire signal; this
+# message exists only to give it something to answer, since a demonstration is a
+# reply and a floating assistant turn is a shape the model never saw in training.
+# Longer format instructions here would be the exact prose Phase 7 proved this
+# checkpoint ignores at turn 1 -- tokens spent restating what does not work, and a
+# second candidate explanation to rule out if the result comes back ambiguous.
+CALIBRATION_USER = (
+    "Format calibration. Reply with a bare JSON object in your standard response "
+    "format. No task has started yet."
+)
 
 # The demonstration is deliberately task-neutral: it shows the envelope while
 # doing nothing.
@@ -43,16 +55,8 @@ from harbor.llms.chat import Chat
 # obvious rather than the variant whose copy flatters the result.
 #
 # The residual risk -- that the model copies the emptiness and stalls -- is not
-# left to inference: `first_action_has_keystrokes` below is a hard gate, so a
-# stalled first turn fails explicitly instead of passing quietly.
-CALIBRATION_USER = (
-    "Before the task begins, here is a format calibration example. "
-    "It is not a task instruction and requires no action from you. "
-    "It shows only the exact response format every one of your replies must use: "
-    "a bare JSON object, with no surrounding prose, no markdown code fence, and "
-    "no reasoning block. Reply to this message in that format."
-)
-
+# left to inference: `first_action_has_keystrokes` is a hard gate, so a stalled
+# first turn fails explicitly instead of passing quietly.
 CALIBRATION_ASSISTANT = json.dumps(
     {
         "analysis": "This is a format calibration turn. No task has been described "
@@ -112,7 +116,12 @@ class Terminus2PromptSeed(Terminus2):
 
     def __init__(self, *args: Any, probe_log: str | Path | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
-        self._probe_log = Path(probe_log) if probe_log else None
+        # `vektori passk` exposes no --agent-kwargs, and harbor constructs the agent
+        # itself, so the env var is the only channel that reaches this __init__
+        # without new CLI plumbing. The explicit kwarg still wins when harbor is
+        # driven directly via `--ak probe_log=...`.
+        resolved = probe_log or os.environ.get("PROMPT_SEED_PROBE_LOG")
+        self._probe_log = Path(resolved) if resolved else None
         self._probe_turn = 0
         self._seed_events: list[dict[str, Any]] = []
         self._first_completion: str | None = None
