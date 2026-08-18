@@ -5,7 +5,7 @@ action when the user message ends. So every row is a cold start — a prompt wit
 no prior *action* to copy a protocol from — and the target is the last message,
 which is the only shape Qwen3's template can mask correctly (step 1).
 
-183 rows, all sliced from `/data/sft-repaired`. Nothing is rebuilt: the message
+165 rows, all sliced from `/data/sft-repaired`. Nothing is rebuilt: the message
 bytes are the frozen hybrid the repair produced, and re-running the capture join
 would mean a new sha and a new argument. What changes is which turns a row
 contains and which one carries the loss.
@@ -18,10 +18,11 @@ contains and which one carries the loss.
 The 48 are already inside the 165 firsts (segments 1..N of a rollout), so they
 are not additional; counting them twice was an early error in the plan.
 
-**Parse-error recoveries are deferred to Stage B**, against the plan's original
-183. They were included because `parse_error_recovery` fails 2 of 3 prefixes at
-every checkpoint and reads as a cold start — no *valid* prior action to copy a
-protocol from. Measured, they are not cold starts by position:
+**Parse-error recoveries are deferred to Stage B** — signed off 2026-08-18 as
+amendment 2 of the plan, against its original 183. They were included because
+`parse_error_recovery` fails 2 of 3 prefixes at every checkpoint and reads as a
+cold start — no *valid* prior action to copy a protocol from. Measured, they
+are not cold starts by position:
 
     turn_1                 952 ..  2,234 tokens
     post_compaction_first  2,567 .. 6,494
