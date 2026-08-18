@@ -163,6 +163,20 @@ def main() -> int:
                          "does not fit on A10 at all")
     ap.add_argument("--adapter-path", default=None,
                     help="Volume path (/adapters/...) to a LoRA adapter")
+    ap.add_argument("--adapter", action="append", default=[], metavar="NAME=PATH",
+                    help="register an extra LoRA as <base>-NAME (repeatable). "
+                         "One base load can host many adapters, which is how "
+                         "Phase 7 grades seven checkpoints without paying the "
+                         "27.6 GiB base load seven times.")
+    ap.add_argument("--max-lora-rank", type=int, default=None,
+                    help="vLLM defaults this to 16 and every adapter here is "
+                         "rank 32 (adapter_config.json r: 32) — without it the "
+                         "engine refuses to start after the GPU is allocated. "
+                         "Pass 32 whenever serving one of this repo's adapters.")
+    ap.add_argument("--max-loras", type=int, default=None,
+                    help="distinct LoRAs live in one batch (vLLM default 1). A "
+                         "sweep that groups requests by adapter does not need "
+                         "more than 1.")
     ap.add_argument("--max-model-len", type=int, default=40960,
                     help="max tokens per sequence. MUST fit the KV budget or "
                          "vLLM refuses to start. Set this HIGH: it is a ceiling, "
@@ -233,9 +247,20 @@ def main() -> int:
     deadline = time.time() + args.max_hours * 3600 if args.max_hours else None
 
     t0 = time.time()
+    adapters: dict[str, str] = {}
+    for spec in args.adapter:
+        if "=" not in spec:
+            print(f"--adapter expects NAME=PATH, got {spec!r}", file=sys.stderr)
+            return 2
+        k, v = spec.split("=", 1)
+        adapters[k] = v
+
     with serve_model(
         args.base_model,
         adapter_path=args.adapter_path,
+        adapter_paths=adapters or None,
+        max_lora_rank=args.max_lora_rank,
+        max_loras=args.max_loras,
         gpu=args.gpu,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -256,13 +281,23 @@ def main() -> int:
 
         print(f"  STUDENT_API_BASE={served.api_base}")
         print(f"  model_name       {served.model_name}")
-        print(f"  harbor model     {served.harbor_model}\n")
+        print(f"  harbor model     {served.harbor_model}")
+        if len(served.adapter_models) > 1:
+            print("  adapters registered on this endpoint:")
+            for n, path in sorted(served.adapter_models.items()):
+                print(f"    {n:44} {path}")
+        print()
         print("harbor kwargs:")
         print(json.dumps(served_to_harbor_kwargs(served), indent=2))
         if args.write_env:
+            # The model string travels with the URL. With an adapter the served
+            # name is the LoRA's, not the base model's, and a sweep that hardcodes
+            # the base name would quietly measure the wrong weights.
             with open(args.write_env, "a") as fh:
                 fh.write(f"\nSTUDENT_API_BASE={served.api_base}\n")
-            print(f"\nappended STUDENT_API_BASE to {args.write_env}")
+                fh.write(f"STUDENT_MODEL={served.model_name}\n")
+                fh.write(f"STUDENT_HARBOR_MODEL={served.harbor_model}\n")
+            print(f"\nappended STUDENT_API_BASE/MODEL to {args.write_env}")
         if args.max_hours:
             print(f"auto-shutdown in {args.max_hours}h "
                   f"(--max-hours 0 to disable)")

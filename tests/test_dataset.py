@@ -229,3 +229,107 @@ def test_student_prefix_masked_teacher_continuation_not() -> None:
     cont_only = tokenize_sft_example(continuation, tok)
     assert cont_only is not None
     assert masked_loss == sum(1 for lab in cont_only.labels if lab != IGNORE_INDEX)
+
+
+# --------------------------------------------------------------------------
+# tokenize_messages — explicit per-message supervision
+#
+# The role-derived mask above cannot supervise one assistant turn and skip the
+# next, which is the same limitation TRL's `assistant_only_loss` has. The
+# protocol repair (docs/SFT-REPAIR-PLAN.md) needs exactly that: the ~48
+# post-compaction handoff turns are assistant prose that must stay in context
+# and out of the loss.
+# --------------------------------------------------------------------------
+
+
+def _repair_messages() -> list[dict]:
+    return [
+        {"role": "user", "content": "fix the bug"},
+        {"role": "assistant", "content": "I'll look at traceback."},
+        {"role": "user", "content": "FAILED test_x.py"},
+        {"role": "assistant", "content": "running pytest"},
+    ]
+
+
+def test_tokenize_messages_supervises_only_the_selected_turns() -> None:
+    from vektori_trace.dataset import tokenize_messages
+
+    tok = _tiny_tokenizer()
+    msgs = _repair_messages()
+    both = tokenize_messages(msgs, tok, [False, True, False, True], max_length=2048)
+    second_only = tokenize_messages(msgs, tok, [False, False, False, True], max_length=2048)
+    assert both is not None and second_only is not None
+
+    # Same text either way — only the labels move.
+    assert both.input_ids == second_only.input_ids
+    n_both = sum(1 for lab in both.labels if lab != IGNORE_INDEX)
+    n_one = sum(1 for lab in second_only.labels if lab != IGNORE_INDEX)
+    assert 0 < n_one < n_both
+
+    # The skipped assistant turn is masked over its whole span, and the kept one
+    # is untouched — this is the property the role-derived mask cannot express.
+    from vektori_trace.dataset import _encode_messages
+
+    start = len(_encode_messages(tok, msgs[:1]))
+    end = len(_encode_messages(tok, msgs[:2]))
+    assert any(lab != IGNORE_INDEX for lab in both.labels[start:end])
+    assert all(lab == IGNORE_INDEX for lab in second_only.labels[start:end])
+
+
+def test_tokenize_messages_labels_are_input_ids_at_the_same_position() -> None:
+    from vektori_trace.dataset import tokenize_messages
+
+    tok = _tiny_tokenizer()
+    ex = tokenize_messages(_repair_messages(), tok, [False, True, False, True], max_length=2048)
+    assert ex is not None
+    for i, lab in enumerate(ex.labels):
+        if lab != IGNORE_INDEX:
+            assert lab == ex.input_ids[i]
+
+
+def test_tokenize_messages_returns_none_when_nothing_is_supervised() -> None:
+    from vektori_trace.dataset import tokenize_messages
+
+    tok = _tiny_tokenizer()
+    assert tokenize_messages(_repair_messages(), tok, [False] * 4) is None
+
+
+def test_tokenize_messages_refuses_a_mismatched_supervise_length() -> None:
+    from vektori_trace.dataset import tokenize_messages
+
+    tok = _tiny_tokenizer()
+    with pytest.raises(ValueError, match="supervise has"):
+        tokenize_messages(_repair_messages(), tok, [True, False])
+
+
+def test_tokenize_messages_can_refuse_to_truncate() -> None:
+    """Silently cutting an over-length row is how a mask gets dropped without
+    anyone noticing (TRL #3927); the repair path drops the row and says so."""
+    from vektori_trace.dataset import tokenize_messages
+
+    tok = _tiny_tokenizer()
+    msgs = _repair_messages()
+    assert tokenize_messages(msgs, tok, [False, True, False, True],
+                             max_length=4, truncate=False) is None
+    cut = tokenize_messages(msgs, tok, [False, True, False, True],
+                            max_length=4, truncate=True)
+    if cut is not None:
+        assert len(cut.input_ids) == len(cut.labels) == 4
+
+
+def test_tokenize_messages_forwards_template_kwargs() -> None:
+    """`enable_thinking` must be a decision, not the template's default."""
+    from vektori_trace.dataset import _encode_messages
+
+    tok = _tiny_tokenizer()
+    seen = {}
+    original = tok.apply_chat_template
+
+    def spy(messages, **kwargs):
+        seen.update(kwargs)
+        kwargs.pop("enable_thinking", None)
+        return original(messages, **kwargs)
+
+    tok.apply_chat_template = spy
+    _encode_messages(tok, _repair_messages(), {"enable_thinking": False})
+    assert seen.get("enable_thinking") is False

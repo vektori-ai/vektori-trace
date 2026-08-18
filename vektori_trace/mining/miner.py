@@ -257,7 +257,10 @@ def collect_paired_traces(
             manifest = []
         done = {(m["task"], m["model"]) for m in manifest if m.get("task") and m.get("model")}
         if done:
-            print(f"Resuming: {len(done)} (task, model) pair(s) already in the manifest, skipping.", file=sys.stderr)
+            print(
+                f"Resuming: {len(done)} (task, model) pair(s) already in the manifest, skipping.",
+                file=sys.stderr,
+            )
 
     for task_dir in task_dirs:
         for model_name, runner in arms:
@@ -266,10 +269,15 @@ def collect_paired_traces(
             try:
                 result = runner.run(task_dir)
             except InfraFailure as e:
-                print(f"  skip {task_dir.name} [{model_name}]: infra failure — {e}", file=sys.stderr)
+                print(
+                    f"  skip {task_dir.name} [{model_name}]: infra failure — {e}", file=sys.stderr
+                )
                 continue
             except Exception as e:  # a bug in one arm's run must not kill the sweep
-                print(f"  skip {task_dir.name} [{model_name}]: {type(e).__name__}: {e}", file=sys.stderr)
+                print(
+                    f"  skip {task_dir.name} [{model_name}]: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
                 continue
 
             run_id = f"{task_dir.name}-{_slugify_model(model_name)}-{uuid.uuid4().hex[:8]}"
@@ -329,7 +337,10 @@ class HarborTraceRunner:
         # every task in the sweep is silently excluded and the manifest comes
         # back empty. The underscore form is the natural thing to type and was
         # this CLI's own default, so accept it and normalise.
-        self.agent = agent.replace("_", "-")
+        # Bare names only: a custom-agent import path (`module.path:ClassName`) or
+        # an ACP shorthand (`acp:...`) must survive verbatim, and hyphenating one
+        # makes it unimportable. A colon separates the two cases; see `run_trial`.
+        self.agent = agent if ":" in agent else agent.replace("_", "-")
         self.jobs_dir = jobs_dir
         self.model = model
         self.timeout_sec = timeout_sec
@@ -351,9 +362,7 @@ class HarborTraceRunner:
         task_dir = task_dir.resolve()
         # Unique per invocation: a reused job dir lets a previous run's
         # result.json be picked up as this run's reward.
-        job_dir = (
-            self.jobs_dir / f"{task_dir.name}-{self.agent}-{uuid.uuid4().hex[:8]}"
-        ).resolve()
+        job_dir = (self.jobs_dir / f"{task_dir.name}-{self.agent}-{uuid.uuid4().hex[:8]}").resolve()
         cmd = [
             "harbor",
             "run",
