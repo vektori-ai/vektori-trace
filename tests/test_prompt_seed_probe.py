@@ -77,10 +77,21 @@ def test_demonstration_is_native_json_and_carries_no_legacy_envelope():
     assert not has_legacy_envelope(CALIBRATION_ASSISTANT)
 
 
-def test_demonstration_sends_no_keystrokes_but_shows_command_structure():
+def test_demonstration_carries_no_commands():
     demo = json.loads(CALIBRATION_ASSISTANT)
-    assert demo["commands"] == [{"keystrokes": "", "duration": 0.1}]
+    assert demo["commands"] == []
     assert demo["task_complete"] is False
+
+
+def test_a_verbatim_copy_of_the_demonstration_fails_the_first_action_gate():
+    """The reason the demo carries no commands rather than one empty keystroke.
+
+    A copied `keystrokes: ""` would report n_commands == 1 and read as a working
+    protocol; a copied `commands: []` cannot satisfy the gate at all.
+    """
+    demo = json.loads(CALIBRATION_ASSISTANT)
+    keystrokes = [c.get("keystrokes", "") for c in demo["commands"]]
+    assert not any(k.strip() for k in keystrokes)
 
 
 def test_seed_lands_immediately_above_the_real_prompt(agent):
@@ -180,3 +191,38 @@ def test_legacy_envelope_detection_matches_v1_failure_shape():
 )
 def test_native_json_is_the_strict_tier(text, expected):
     assert is_native_json(text) is expected
+
+
+# ---- launch path -------------------------------------------------------------
+
+
+def test_import_path_survives_agent_name_normalization():
+    """`vektori passk` hyphenates agent names; an import path must be exempt.
+
+    Without this, `scripts.prompt_seed_probe:Terminus2PromptSeed` reaches harbor as
+    `scripts.prompt-seed-probe:Terminus2PromptSeed` and fails only after startup.
+    """
+    import inspect
+
+    from vektori_trace.evaluate import validity
+    from vektori_trace.evaluate.validity import run_trial  # noqa: F401
+
+    src = inspect.getsource(validity.run_trial)
+    assert 'if ":" not in agent:' in src, "normalization must be guarded on bare names"
+
+
+@pytest.mark.parametrize(
+    "agent,expected",
+    [
+        ("claude_code", "claude-code"),
+        ("terminus_2", "terminus-2"),
+        (
+            "scripts.prompt_seed_probe:Terminus2PromptSeed",
+            "scripts.prompt_seed_probe:Terminus2PromptSeed",
+        ),
+        ("acp:opencode@1.3.9", "acp:opencode@1.3.9"),
+    ],
+)
+def test_normalization_rule_matches_bare_names_only(agent, expected):
+    normalized = agent if ":" in agent else agent.replace("_", "-")
+    assert normalized == expected

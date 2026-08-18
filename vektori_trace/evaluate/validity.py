@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -164,14 +165,27 @@ def run_trial(
     here as well as in `HarborTraceRunner`, since `--base-agent` reaches this
     function without passing through that one.
 
+    That normalisation applies to bare agent *names* only. Harbor's `--agent` also
+    accepts a custom-agent import path (`module.path:ClassName`) and an ACP registry
+    shorthand (`acp:opencode@1.3.9`), and hyphenating those corrupts them —
+    `scripts.prompt_seed_probe:Cls` becomes an unimportable
+    `scripts.prompt-seed-probe:Cls`, which fails only once harbor is already
+    starting. Both forms carry a colon and a bare name never does, so that is the
+    discriminator. (`--agent-import-path` is deprecated in favour of `--agent`.)
+
     A2/A3 evaluate a Modal-hosted candidate via litellm's `hosted_vllm/` provider:
     pass `model="hosted_vllm/<name>"`, `api_base=<modal url>`, and `model_info`.
     A1's deficit-targeted prompt is harbor's `--extra-instruction-path`, not a
     terminus-2 system-prompt kwarg (that agent has none).
     """
     task_dir = task_dir.resolve()
-    agent = agent.replace("_", "-")
-    job_dir = (jobs_dir / f"{task_dir.name}-{agent}").resolve()
+    if ":" not in agent:
+        agent = agent.replace("_", "-")
+    # The agent string reaches the filesystem as part of the job directory name, and
+    # an import path carries `:` and `.` — legal on POSIX but a poor directory name
+    # and not portable. Slugify for the path only; harbor still receives the real one.
+    agent_slug = re.sub(r"[^A-Za-z0-9._-]", "-", agent)
+    job_dir = (jobs_dir / f"{task_dir.name}-{agent_slug}").resolve()
     cmd = [
         "harbor",
         "run",

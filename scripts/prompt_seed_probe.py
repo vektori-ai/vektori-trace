@@ -31,15 +31,20 @@ from harbor.agents.terminus_2.terminus_2 import Command, Terminus2
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.llms.chat import Chat
 
-# The demonstration is deliberately task-neutral: it shows the envelope and the
-# command *structure* while doing nothing. `keystrokes: ""` is a pure wait, which
-# is a shape ck63 already emits unprompted at high turn ordinals, so it is
-# in-distribution rather than a novel form.
+# The demonstration is deliberately task-neutral: it shows the envelope while
+# doing nothing.
 #
-# An empty `commands: []` was rejected for this role. The whole premise of the
-# probe is that this model copies what it sees; demonstrating an empty action
-# risks it copying the emptiness, executing nothing, and failing the protocol
-# gate for a reason unrelated to the protocol.
+# `commands: []` rather than a single `keystrokes: ""` entry. Both are inert, but
+# they fail differently when copied, and only one of them fails *legibly*. A
+# copied `keystrokes: ""` yields `n_commands == 1` with no action taken, which
+# reads as a working protocol in the aggregate; a copied `commands: []` yields
+# `n_commands == 0` and is unmistakable. Since the model's defining trait here is
+# copying what it sees, the demonstration must be the variant whose copy is
+# obvious rather than the variant whose copy flatters the result.
+#
+# The residual risk -- that the model copies the emptiness and stalls -- is not
+# left to inference: `first_action_has_keystrokes` below is a hard gate, so a
+# stalled first turn fails explicitly instead of passing quietly.
 CALIBRATION_USER = (
     "Before the task begins, here is a format calibration example. "
     "It is not a task instruction and requires no action from you. "
@@ -54,7 +59,7 @@ CALIBRATION_ASSISTANT = json.dumps(
         "yet and the terminal state is not yet known, so there is nothing to "
         "inspect and no action to take.",
         "plan": "Emit no commands and wait for the real task prompt, which follows this message.",
-        "commands": [{"keystrokes": "", "duration": 0.1}],
+        "commands": [],
         "task_complete": False,
     },
     indent=2,
@@ -229,6 +234,7 @@ class Terminus2PromptSeed(Terminus2):
             self._first_completion = raw
 
         parsed = self._parser.parse_response(raw)
+        keystrokes = [c.keystrokes for c in commands]
         record = {
             "turn": self._probe_turn,
             "seed_in_context": seed_in_context,
@@ -242,7 +248,14 @@ class Terminus2PromptSeed(Terminus2):
             "parser_warning": parsed.warning or None,
             "harbor_accepts": not parsed.error,
             "n_commands": len(commands),
-            "executed_keystrokes": [c.keystrokes for c in commands],
+            # Named for what this actually is. We sit between parsing and
+            # `_execute_commands`, so these are the keystrokes harbor *intends* to
+            # send; nothing here is evidence that any of them reached tmux. Real
+            # execution has to be read off the trajectory and terminal output.
+            "parsed_keystrokes": keystrokes,
+            # Guards the copied-emptiness failure mode. A first action that parses
+            # cleanly but sends nothing is a stall, not a working protocol.
+            "has_keystrokes": any(k.strip() for k in keystrokes),
             "task_complete": is_complete,
             "raw_completion": raw,
             "prompt_chars": len(prompt),
@@ -337,11 +350,18 @@ def preflight(out_dir: Path) -> int:
     demo = json.loads(CALIBRATION_ASSISTANT)
     checks.append(
         (
-            "demonstration_is_inert",
-            len(demo["commands"]) == 1
-            and demo["commands"][0]["keystrokes"] == ""
-            and demo["task_complete"] is False,
-            "the demonstration shows command structure but sends no keystrokes",
+            "demonstration_carries_no_commands",
+            demo["commands"] == [] and demo["task_complete"] is False,
+            "the demonstration issues no commands, so a copy of it is visibly empty",
+        )
+    )
+    checks.append(
+        (
+            "copied_demonstration_would_fail_the_gate",
+            # The check that matters: confirm the demo cannot satisfy the first-action
+            # gate. If this ever passes, a pure copy would score as a working protocol.
+            not any(c.get("keystrokes", "").strip() for c in demo["commands"]),
+            "a verbatim copy of the demonstration fails first_action_has_keystrokes",
         )
     )
     checks.append(
@@ -396,6 +416,58 @@ def preflight(out_dir: Path) -> int:
     return 0 if report["all_passed"] else 1
 
 
+def summarize(log_path: Path) -> int:
+    """Grade a probe log against the primary protocol gate.
+
+    Deliberately does not touch the secondary capability evidence (orientation,
+    edit/test behaviour, verifier outcome) -- those are read from the trajectory
+    and the verifier, and folding them in here would blur a protocol result into
+    a capability result.
+    """
+    records = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    if not records:
+        print(f"no records in {log_path}")
+        return 1
+
+    first = records[0]
+    gates = {
+        "first_response_is_native_json": first["native_json"],
+        "first_response_not_legacy_envelope": not first["legacy_envelope"],
+        "harbor_accepts_first_response": first["harbor_accepts"],
+        "first_response_is_not_a_seed_echo": not first["echoed_seed"],
+        "first_action_has_keystrokes": first["has_keystrokes"],
+        "no_parser_loop": not _has_parser_loop(records),
+    }
+
+    print(f"turns: {len(records)}   log: {log_path}")
+    print(
+        f"seed events: {sum(1 for r in records if r['seed_in_context'])} turns with seed in context"
+    )
+    print("\nprimary protocol gate (turn 1):")
+    for name, passed in gates.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {name}")
+
+    native = sum(1 for r in records if r["native_json"])
+    legacy = sum(1 for r in records if r["legacy_envelope"])
+    print(
+        f"\nacross all turns: native_json {native}/{len(records)}, legacy_envelope {legacy}/{len(records)}"
+    )
+    print("note: command *execution* is not graded here -- confirm from trajectory/terminal output")
+
+    print(f"\nPROTOCOL GATE: {'PASS' if all(gates.values()) else 'FAIL'}")
+    return 0 if all(gates.values()) else 1
+
+
+def _has_parser_loop(records: list[dict[str, Any]], threshold: int = 2) -> bool:
+    """Two consecutive parser failures is the stop condition, per the run plan."""
+    run = 0
+    for r in records:
+        run = run + 1 if r["parser_error"] else 0
+        if run >= threshold:
+            return True
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -408,9 +480,16 @@ def main() -> int:
         default="/data/prompt-seed-probe",
         help="where the preflight report is written",
     )
+    ap.add_argument(
+        "--summarize",
+        metavar="PROBE_LOG",
+        help="grade a probe JSONL against the primary protocol gate",
+    )
     args = ap.parse_args()
     if args.preflight:
         return preflight(Path(args.out_dir))
+    if args.summarize:
+        return summarize(Path(args.summarize))
     ap.print_help()
     return 0
 
