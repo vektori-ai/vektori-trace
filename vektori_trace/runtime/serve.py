@@ -534,6 +534,11 @@ def litellm_generate_captured(
 #: asked to continue from a position its targets never started at.
 CHAT_TEMPLATE_KWARGS: dict[str, Any] = {"enable_thinking": True}
 
+#: The agent-constructor parameter Terminus2 actually forwards to the LLM call.
+#: Named here because getting it wrong fails silently: unknown kwargs reach
+#: `BaseAgent.__init__(**kwargs)` and are dropped without an error.
+LLM_CALL_KWARGS_KEY = "llm_call_kwargs"
+
 
 def served_to_harbor_kwargs(
     served: ServedModel,
@@ -575,13 +580,23 @@ def served_to_harbor_kwargs(
                 return_token_ids=True, logprobs=capture_logprobs
             ).get("extra_body", {})
         )
-    out["agent_kwargs"] = {"extra_body": extra_body}
+    # `llm_call_kwargs`, not `extra_body` directly. Terminus2 declares
+    # `llm_call_kwargs` as a named parameter and splats it into
+    # `self._llm.call(...)` (terminus_2.py:713); litellm then deep-merges its
+    # `extra_body` into the request. Anything else falls into Terminus2's
+    # `**kwargs`, is forwarded to `BaseAgent.__init__`, which accepts `**kwargs`
+    # and never reads them — so a top-level `extra_body` is discarded in
+    # silence, with no error and no warning. That is the prompt-seed finding
+    # ("Harbor's terminus path dropped them"), and `LLM_CALL_KWARGS_KEY` exists
+    # so a rename in harbor breaks a test instead of a run.
+    out["agent_kwargs"] = {LLM_CALL_KWARGS_KEY: {"extra_body": extra_body}}
     return out
 
 
 __all__ = [
     "CHAT_TEMPLATE_KWARGS",
     "DEFAULT_HOSTED_VLLM_MODEL_INFO",
+    "LLM_CALL_KWARGS_KEY",
     "ServedModel",
     "dump_serve_record",
     "litellm_generate",

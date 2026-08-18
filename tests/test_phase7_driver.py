@@ -142,28 +142,6 @@ def test_serving_and_eval_pin_the_same_template_kwargs():
     assert serve_kwargs == driver.CHAT_TEMPLATE_KWARGS
 
 
-def test_harbor_kwargs_carry_chat_template_kwargs():
-    """Harbor's terminus path dropped these entirely; the rollout then ran on
-    the template default while Phase 7 pinned its own. Same request shape now."""
-    from vektori_trace.runtime.serve import ServedModel, served_to_harbor_kwargs
-
-    served = ServedModel(api_base="http://localhost:8000/v1", model_name="Qwen3-14B-x")
-    hk = served_to_harbor_kwargs(served)
-    assert hk["agent_kwargs"]["extra_body"]["chat_template_kwargs"] == {
-        "enable_thinking": True
-    }
-
-
-def test_token_capture_does_not_displace_chat_template_kwargs():
-    """Both ride in `extra_body`; the capture flags used to own it outright."""
-    from vektori_trace.runtime.serve import ServedModel, served_to_harbor_kwargs
-
-    served = ServedModel(api_base="http://localhost:8000/v1", model_name="Qwen3-14B-x")
-    eb = served_to_harbor_kwargs(served, capture_tokens=True)["agent_kwargs"]["extra_body"]
-    assert eb["chat_template_kwargs"] == {"enable_thinking": True}
-    assert len(eb) > 1, "capture flags should still be present alongside"
-
-
 def test_greedy_defaults_match_the_plan():
     assert driver.GREEDY["temperature"] == 0.0
     assert driver.GREEDY["max_tokens"] == 512

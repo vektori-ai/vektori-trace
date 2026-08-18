@@ -292,16 +292,18 @@ def test_served_to_harbor_kwargs_capture_flag():
         model_name="qwen",
         base_model="Qwen/Qwen3-8B",
     )
-    # `agent_kwargs` is always present now: it carries chat_template_kwargs so
-    # a rollout renders the way the corpus was tokenized. The capture flag is
-    # additive within the same `extra_body`, not a replacement for it.
-    plain = served_to_harbor_kwargs(served)
-    assert RETURN_TOKEN_IDS_KEY not in plain["agent_kwargs"]["extra_body"]
-    capped = served_to_harbor_kwargs(served, capture_tokens=True)
-    assert capped["agent_kwargs"]["extra_body"][RETURN_TOKEN_IDS_KEY] is True
-    assert capped["agent_kwargs"]["extra_body"]["chat_template_kwargs"] == {
-        "enable_thinking": True
-    }
+    # `agent_kwargs` is always present now: it carries chat_template_kwargs so a
+    # rollout renders the way the corpus was tokenized. Both ride under
+    # `llm_call_kwargs.extra_body`, which is the only slot Terminus2 forwards —
+    # see tests/test_harbor_kwarg_seam.py.
+    from vektori_trace.runtime.serve import LLM_CALL_KWARGS_KEY
+
+    plain = served_to_harbor_kwargs(served)["agent_kwargs"][LLM_CALL_KWARGS_KEY]
+    assert RETURN_TOKEN_IDS_KEY not in plain["extra_body"]
+    capped = served_to_harbor_kwargs(served, capture_tokens=True)["agent_kwargs"]
+    body = capped[LLM_CALL_KWARGS_KEY]["extra_body"]
+    assert body[RETURN_TOKEN_IDS_KEY] is True
+    assert body["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_tokenize_rollouts_for_opd_requires_captures(tmp_path: Path):

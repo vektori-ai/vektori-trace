@@ -41,18 +41,28 @@ def _merge_capture_agent_kwargs(
     *,
     capture_logprobs: bool,
 ) -> dict[str, Any]:
+    """Add the token-capture flags without displacing what is already there.
+
+    The capture flags and `chat_template_kwargs` both live under
+    `llm_call_kwargs.extra_body` — that nesting is what Terminus2 forwards to
+    the LLM call; a top-level `extra_body` is silently dropped (see
+    `serve.LLM_CALL_KWARGS_KEY`). Merging has to reach into it rather than
+    replacing the key, or requesting token ids would quietly un-pin the chat
+    template.
+    """
+    from .serve import LLM_CALL_KWARGS_KEY
     from .token_capture import token_capture_agent_kwargs
 
     base = dict(agent_kwargs or {})
-    for k, v in token_capture_agent_kwargs(
-        return_token_ids=True, logprobs=capture_logprobs
-    ).items():
-        if k == "extra_body" and isinstance(base.get("extra_body"), dict):
-            merged = dict(base["extra_body"])
-            merged.update(v)
-            base["extra_body"] = merged
-        else:
-            base[k] = v
+    call_kwargs = dict(base.get(LLM_CALL_KWARGS_KEY) or {})
+    extra_body = dict(call_kwargs.get("extra_body") or {})
+    extra_body.update(
+        token_capture_agent_kwargs(
+            return_token_ids=True, logprobs=capture_logprobs
+        ).get("extra_body", {})
+    )
+    call_kwargs["extra_body"] = extra_body
+    base[LLM_CALL_KWARGS_KEY] = call_kwargs
     return base
 
 
