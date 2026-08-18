@@ -104,9 +104,18 @@ regenerate. Then stop: step 5 is GPU and needs its own approval.
 | control | 5 | 5 | 5 | 4 — **no anyio** |
 | generalization | 5 | 5 | 5 | all 5 |
 
-Cross-category reuse fired 5 times, all of them where it was predicted and
-nowhere else — control `post_compaction`: `pypa__hatch-2127`,
-`pallets__click-3363`, `prefecthq__prefect-22591`, `pallets__click-3704`,
-`pallets__click-3534`. Acquisition and generalization never reached pass 2.
+Cross-category reuse stamped **10** entries, of which **5 select**. The
+selecting 5 are all control `post_compaction`, exactly where predicted:
+`pypa__hatch-2127`, `pallets__click-3363`, `prefecthq__prefect-22591`,
+`pallets__click-3704`, `pallets__click-3534`. The other 5 are tripwires
+(`acquisition/long_context`; `control/first_edit`, `test_exec`,
+`parse_error_recovery`, `long_context`), which never gate. No acquisition or
+generalization *selection* prefix reused a task.
+
+**Per-cell repo coverage — `post_compaction` is 3 repos in every suite**, not
+just control: acquisition click/hatch/jinja, control click/hatch/prefect,
+generalization click/hatch/prefect. Control `first_inspection` is also 3
+(click/jinja/prefect). Do not read repo coverage off any `post_compaction`
+cell at eval time; orientation and first_inspection carry it.
 
 Never regenerate. Step 5 is GPU and needs its own approval.
