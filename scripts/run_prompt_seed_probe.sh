@@ -97,29 +97,47 @@ done
 [ -f "$ENV_FILE" ] || { echo "STOP: no endpoint after 15 min" >&2; exit 3; }
 set -a && . "$ENV_FILE" && set +a
 API_BASE="${STUDENT_API_BASE:?no STUDENT_API_BASE in $ENV_FILE}"
-echo "endpoint $API_BASE"
+# serve_student.py prefixes the adapter name with the base model, so the id it
+# actually registers is `Qwen3-14B-<name>`, not `<name>`. Take the served id from
+# the env file it writes rather than reconstructing it here -- a reconstruction
+# that drifts produces a 404 only once the GPU is already running.
+SERVED_ID="${STUDENT_MODEL:?no STUDENT_MODEL in $ENV_FILE}"
+HARBOR_MODEL="${STUDENT_HARBOR_MODEL:?no STUDENT_HARBOR_MODEL in $ENV_FILE}"
+echo "endpoint     $API_BASE"
+echo "served id    $SERVED_ID"
+echo "harbor model $HARBOR_MODEL"
 
 # --- 4. smoke: the adapter is actually registered and selectable --------------
 echo
 echo "== smoke =="
-curl -sS "$API_BASE/models" | tee "$OUT/models.json" | head -c 800
-echo
-grep -q "$SERVED" "$OUT/models.json" \
-  || { echo "STOP: $SERVED not in /v1/models -- LoRA registration failed" >&2; exit 4; }
-echo "adapter $SERVED registered"
+curl -sS "$API_BASE/models" > "$OUT/models.json"
+# Exact id match, not a substring grep: `Qwen3-14B-ck63` is a substring of
+# `Qwen3-14B-Qwen3-14B-ck63`, so a grep passes on precisely the mismatch that
+# then 404s every request.
+uv run python - "$OUT/models.json" "$SERVED_ID" <<'PYEOF'
+import json, sys
+ids = [m["id"] for m in json.load(open(sys.argv[1]))["data"]]
+print("served ids:", ids)
+if sys.argv[2] not in ids:
+    sys.exit(f"STOP: {sys.argv[2]!r} not in /v1/models -- LoRA registration failed")
+print(f"adapter {sys.argv[2]} registered")
+PYEOF
 
 # --- 5. one guarded rollout --------------------------------------------------
 # The import path must reach harbor verbatim; validity.py only hyphenates bare
 # agent names, and a colon exempts this form.
 echo
 echo "== rollout =="
+echo "watch live:  ./scripts/watch_prompt_seed_probe.sh $RUN_ID"
+echo "  pane   $OUT/**/agent/terminus_2.pane   (the agent's actual terminal)"
+echo "  probe  $PROBE_LOG                      (per-turn protocol verdicts)"
 export PROMPT_SEED_PROBE_LOG="$PROBE_LOG"
 export PYTHONPATH=/data/vektori-trace:${PYTHONPATH:-}
 set +e
 timeout "$OUTER_TIMEOUT_SEC" uv run vektori-trace passk \
   --tasks-dir "$STAGE" \
   --agent scripts.prompt_seed_probe:Terminus2PromptSeed \
-  --model "hosted_vllm/$SERVED" \
+  --model "$HARBOR_MODEL" \
   --api-base "$API_BASE" \
   --model-info @/data/vektori-trace/model_info_14b.json \
   --stage1-n 1 \
