@@ -30,8 +30,10 @@ corrected batch and the same seed, and exists only to price the continuation.
 
 ## 0.0 Status — 2026-08-18
 
-Phases 1–6 are **done**. The repaired adapter exists. Phase 7 is next and is
-not written yet.
+Phases 1–6 are **done**. The repaired adapter exists. Phase 7 is **built and
+validated offline**; the only thing left in it is one approved endpoint session.
+Nothing yet demonstrates the repair works at generation time — every metric so
+far is teacher-forced.
 
 | | |
 |---|---|
@@ -39,9 +41,9 @@ not written yet.
 | Phase 2 | built, exit 0 — `/data/sft-repaired/`, sha `7ecfee31…` |
 | Phase 3 | **PREFLIGHT PASSED** — targets, roles, masks, TRL agreement all clean |
 | Phase 4 | trainer written, tests green |
-| Phase 5 | **passed** — 3 steps, longest rows, 560/560 LoRA tensors moved |
+| Phase 5 | **passed on NF4** — 3 steps, longest rows, 560/560 LoRA tensors moved. The BF16 arm the revised plan called for was never run; see below |
 | Phase 6 | **complete** — 63 steps, 3 epochs, 3.05 h, 7 checkpoints |
-| Phase 7 | **not written** — no way to select a checkpoint yet |
+| Phase 7 | **built** — corpora, frozen manifest (`735063bb…`, 24 prefixes), gates, driver, 41 tests. Needs one A100-80GB session |
 
 ### Phase 6 result
 
@@ -77,9 +79,36 @@ but `SFTTrainer` detects a pre-tokenized dataset and skips its whole masking
 pipeline (`sft_trainer.py:1397`), keeping our labels and collator. Conflating
 those two cost three probes.
 
-BF16 remains untested *with* chunked loss. It failed at 71.7 GiB with the full
-logits path; removing ~31 GiB of logits would likely bring it inside 79. It is a
-rerun option, not a blocker.
+### The precision the run actually used — **BF16 was not run**
+
+Phase 5 was revised on 2026-08-18 to **BF16 only**, with an explicit stop
+condition: *"If BF16 does not fit safely, stop and discuss before falling back
+to NF4. Do not switch silently."* The probe that ran was **NF4**
+(`docs/sft-probe-monitor-gpt-5.6-sol.md`: "NF4 base: 9.1 GiB footprint, 280
+bitsandbytes four-bit modules"), and so was the corrective run. The status table
+above said "passed" without recording the arm change.
+
+The fallback is right on the numbers; it is only the record that was wrong. The
+probe measured **63.7 GiB peak allocated with `chunked_nll` already restored**,
+against 79.25 usable. A BF16 base is 14.8e9 × 2 = 27.6 GiB where NF4 loaded at
+9.25 GiB, so the same run in BF16 lands at ≈ **82 GiB** — over the card, before
+allocator fragmentation.
+
+An earlier note here read *"It failed at 71.7 GiB with the full logits path;
+removing ~31 GiB of logits would likely bring it inside 79. It is a rerun
+option, not a blocker."* That is withdrawn: 71.7 GiB is where an allocation
+**failed**, not a peak requirement, so it cannot be used as a base to subtract
+from. Anchored on the probe's own measured NF4 peak, BF16 at 36,993 tokens does
+not fit an A100-80GB. It needs an H200/B200 or a shorter `max_length`.
+
+**Consequence, and it is not cosmetic.** Repaired-v1 was fitted against NF4 and
+will be served against BF16 — the *same* train/serve precision mismatch as v1,
+which Phase 1 named as a defect to fix. The BF16 rationale recorded there
+("step 0 of a BF16 continuation is exactly the model measured as broken", "it
+absorbs v1's quantization drift") is unrealized. Phase 7 must therefore
+evaluate **through the real serving stack** — vLLM, BF16 base, LoRA on top —
+because loading the adapter back onto an NF4 base would certify a configuration
+that will never be deployed.
 
 ### Phase 2 audit
 
@@ -597,9 +626,23 @@ follow.
 
 ---
 
-## Phase 7: Checkpoint evaluation
+## Phase 7: Checkpoint evaluation — **built; needs one approved endpoint session**
 
-At every saved checkpoint, **no shim**.
+At every saved checkpoint, **no shim**, and through the real serving stack:
+vLLM, BF16 base, LoRA on top. Not a PEFT load in the training precision — the
+run trained on NF4 (above), so anything else would certify a configuration that
+will never be deployed.
+
+Every number the corrective run produced is teacher-forced, which hands the
+model a correct prefix at every position — exactly the crutch that is absent at
+generation time, and generation time is where v1 failed. The probe log records
+**mean token accuracy 0.81 at step 1**: v1, the model that emitted 305
+consecutive `Missing required fields`, already reproduces 81% of the corrected
+protocol's tokens under teacher forcing, because the supervised span is mostly
+`analysis`/`plan` prose and keystrokes it already knows. The envelope is a small
+minority of the 1.03M supervised tokens. Loss 0.6436 → 0.4856 is therefore
+consistent with the envelope having flipped *and* with it not having flipped.
+Phase 7 is the first measurement that can tell the difference.
 
 ### The fixed prefix suite
 
@@ -613,33 +656,69 @@ Previous assistant actions
 Terminal observations
 ```
 
-Extracted automatically from real teacher trajectories. Nobody invents the
-expected response — the captured DeepSeek response is the reference. Real
-prefixes covering:
+Extracted automatically from real teacher trajectories, and read straight out of
+the corpora rather than re-rendered — a second renderer is a second chance to
+differ from what the adapter actually saw. Nobody invents the expected response;
+the captured DeepSeek response is the reference.
 
-- initial orientation
-- repository already present
-- first source inspection
-- first edit
-- test execution
-- failed-command recovery
-- post-compaction behavior
-- long context
+"Fixed" means the corpus, line number and message index of every prefix are
+frozen in a manifest with a sha256, so every checkpoint gets precisely the same
+inputs.
 
-"Fixed" means the rollout ids, turn numbers and exact messages are saved in a
-manifest so every checkpoint gets precisely the same inputs. Twenty is not
-sacred; use enough real prefixes to cover the categories.
+### Three cells, not two
 
-**Two suites, because there is no dev split:**
+The unit of variation is the **conversation state**, not the task. Emitting flat
+JSON has nothing to do with click versus jinja; it plausibly has everything to
+do with turn 1 at 3k of context versus turn 30 at 35k after a compaction.
+Sampling fifty tasks all at turn 1 would buy almost nothing over sampling five.
 
-1. **Acquisition** — exact real prefixes drawn from the corrected dataset.
-   Tests whether the protocol was learned at all.
-2. **Generalization** — real prompts from golden-corpus (`corpus50_v3`) tasks
-   **outside the 34 training tasks**. Tests whether format and orientation
-   transfer off the training distribution.
+Training consumed only *passing* rollouts. Measured on the box: **all 26
+held-out tasks have zero passing rollouts** — that is what put them outside the
+34. A held-out prefix can therefore only come from a rollout that failed, which
+moves two variables at once. So:
 
-Suite 1 leaking from training is fine and expected: prefixes are inputs, not
-labels. Suite 2 is where the honest signal lives.
+|                | passing rollout        | failing rollout    |
+|----------------|------------------------|--------------------|
+| trained task   | **acquisition** (117)  | **control** (18)   |
+| held-out task  | *does not exist* (0)   | **generalization** (103) |
+
+- `acquisition → control` moves only rollout outcome.
+- `control → generalization` moves only task familiarity.
+
+Without the control cell a low generalization number is unreadable: "did not
+generalize" and "these are messier conversations to continue" produce the same
+digit. Suite 1 leaking from training is fine and expected — prefixes are inputs,
+not labels — but it cannot answer the question on its own either, because with
+165 segments over 3 epochs a checkpoint can reproduce a memorised continuation.
+Suite 2 next to the control is where the honest signal lives.
+
+Suites are matched category-for-category; a category present in one and absent
+from another silently changes what the two numbers mean, and the manifest
+builder warns when that happens.
+
+### Categories
+
+`orientation` · `repo_present` · `first_inspection` · `first_edit` ·
+`test_exec` · `parse_error_recovery` · `post_compaction` · `long_context`.
+
+Prefixes are also spread across repos: the five differ in file layout, test
+invocation and terminal-output shape, and drawing every held-out prefix from
+click would test one repo's idiom and call it generalization.
+
+### Two format tiers, because harbor is lenient
+
+```text
+harbor_accepts  — TerminusJSONPlainParser returns no error. The rollout proceeds.
+native_json     — additionally the completion *is* the object: no ```json fence,
+                  no <think> block, no prose preamble.
+```
+
+Harbor salvages a fenced object with only a warning ("Extra text detected before
+JSON object"). Scoring that as a plain pass would hide a checkpoint that is
+nearly repaired but still wrapping its output, and would leave
+`enable_thinking=False` unverified; scoring it as a plain failure would claim a
+rollout breaks when it would in fact run. Both are recorded; selection reads the
+strict one.
 
 ### Greedy suite
 
@@ -647,18 +726,98 @@ labels. Suite 2 is where the honest signal lives.
 temperature 0 · max new tokens 512 · timeout 120s · enable_thinking false
 ```
 
-Gates: native JSON · required fields · correct command structure · no legacy
-tool envelopes · no invented tool names · initial orientation · no cloning when
-`.git` exists · edit emission · test emission · failed-command recovery ·
-non-repetition · EOS before the limit · post-compaction behavior.
+Format gates, applied to every prefix: `harbor_accepts` · `native_json` ·
+`required_fields` · `no_legacy_envelope` · `no_invented_fields` ·
+`command_structure` · `eos_before_limit` · `non_repetition`.
+
+Behavior gates, applied only where the prefix's state can test them:
+`orientation` · `no_clone_when_git_exists` · `edit_emission` · `test_emission` ·
+`recovery`.
+
+One prefix per category per suite is deliberate. The format gates — the question
+actually being asked — are graded on **every** prefix regardless of category, so
+each checkpoint gets 16–24 samples on those and 1–3 on the secondary behavior
+gates. Against a v1 baseline of 0/305 that is ample to separate "repaired" from
+"not"; it is not ample to rank two working checkpoints, which is not the job.
 
 ### Sampled suite
 
 Representative prompts at temperature 0.7, multiple seeds — catches a format
-that works greedily but collapses under sampling.
+that works greedily but collapses under sampling. Run **after** a checkpoint
+passes greedily, not before.
 
-Select the **earliest** checkpoint satisfying the gates. Not the final one, not
-the lowest training loss.
+### Selection
+
+```text
+suite:  generalization           (falls back to acquisition, loudly, if absent)
+gates:  native_json · required_fields · no_legacy_envelope
+rule:   earliest checkpoint clearing all three on EVERY prefix of that suite
+```
+
+The **earliest**, not the final one and not the lowest training loss — loss fell
+monotonically across all 63 steps, so a loss rule always returns checkpoint 63,
+the one most overfit to 34 tasks, and the checkpoints exist precisely so that
+choice can be made on behavior instead.
+
+**This narrows the gate list the plan originally carried.** Orientation,
+edit/test emission and no-clone were listed among the selection criteria; they
+are now *reported* but not selected on. At one prefix per category they are
+anecdotes — enough to notice a regression, nowhere near enough to reject a
+checkpoint — and the repair being measured is the envelope, not strategy.
+Strategy is Phase 9's question, and a rollout that fails strategically while
+emitting valid JSON is exactly what OPD is for.
+
+**An ungraded prefix blocks its checkpoint.** A request the endpoint dropped
+produces no result at all, so a checkpoint answering 7 of 8 prefixes perfectly
+and losing the eighth to an HTTP error would otherwise read as a clean sweep —
+silence scoring as success. The manifest's prefix ids are passed to the selector
+and a missing one fails the checkpoint outright, the same correction
+`no_gradeable_rollouts` needed in the pass@k reports. Transport is retried
+(4xx is not — that is the request being wrong, not the network being flaky), and
+the sweep is preflighted: one 16-token request per registered adapter, checked
+for reachability and for an absent `<think>` block, because
+`chat_template_kwargs` is a vLLM extension and a server that ignored it would
+leave `enable_thinking=False` unpinned.
+
+### Staging, and what it costs
+
+Selection is "earliest passing", so testing all seven checkpoints up front
+computes six answers that get discarded. The driver walks them in training order
+and stops at the first pass, after smoking the *last* checkpoint first — if the
+most-trained checkpoint cannot emit the protocol, nothing earlier will. Not a
+proof (the run could have overfit past a working middle checkpoint), which is
+what `--strategy all` is for, but it aborts a dead repair for the price of one
+checkpoint instead of seven.
+
+| outcome | generations | wall clock |
+|---|---|---|
+| smoke on ck63 fails → stop | 16 | ~3 min |
+| ck10 passes → done | 32 | ~5 min |
+| passes at ck30 | 64 | ~10 min |
+| nothing passes | 112–168 | ~25 min |
+
+Plus ~15 min endpoint boot, which dominates. **A100-80GB**, not L40S: the KV
+budget is 282k tokens against L40S's 93.7k, and prefixes run to ~37k.
+`--max-lora-rank 32` is mandatory — vLLM defaults to 16, every adapter here is
+rank 32, and the engine refuses to start *after* the GPU is allocated.
+
+### What was built
+
+| | |
+|---|---|
+| `vektori_trace/evaluate/phase7.py` | gates, summary, earliest-passing selection |
+| `scripts/phase7_manifest.py` | freezes the three suites with a sha256 |
+| `scripts/phase7_eval.py` | drives one endpoint, grades, reports |
+| `tests/test_phase7.py` | 27 tests: teacher output as positives, v1's `<tool_call>` envelope and the 18 rejected turns as negatives |
+| `scripts/sft_repair_dataset.py` | `--rollouts passing\|failing\|all`, `--tasks-in/--tasks-not-in`, `--audit-advisory` |
+| `vektori_trace/runtime/serve.py` | multiple LoRAs on one base load, `--max-lora-rank`, `--max-loras` |
+
+The grader is validated against fixtures before it is pointed at a GPU: an
+untested predicate is not evidence about a checkpoint.
+
+An endpoint that refused a request is recorded under `infra_failures`, never as
+a checkpoint that failed a gate — the same correction `fallback_exitcode`
+needed in the pass@k reports.
 
 ---
 

@@ -61,15 +61,34 @@ class Segment:
     problems: list[str] = field(default_factory=list)
 
 
-def passing_rollouts(run_dir: Path) -> list[dict]:
-    """Rollouts that passed. Prefer passk_log.jsonl — run A was killed before it
-    wrote a report, but every rollout is in the log with its jobs_dir."""
+def all_rollouts(run_dir: Path) -> list[dict]:
+    """Every recorded rollout. Prefer passk_log.jsonl — run A was killed before
+    it wrote a report, but every rollout is in the log with its jobs_dir."""
     log = run_dir / "passk_log.jsonl"
     if log.exists():
-        rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
-    else:
-        rows = json.loads((run_dir / "passk.json").read_text()).get("rollouts", [])
-    return [r for r in rows if r.get("passed")]
+        return [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+    return json.loads((run_dir / "passk.json").read_text()).get("rollouts", [])
+
+
+def select_rollouts(run_dir: Path, which: str = "passing") -> list[dict]:
+    """Rollouts of one outcome class.
+
+    Training only ever wanted `passing`. Phase 7 needs `failing` too: every one
+    of the 26 held-out tasks has zero passing rollouts, so a prefix from outside
+    the training distribution can only come from a rollout that failed. The
+    prefix is still a real prompt — an outcome label says nothing about whether
+    the conversation leading up to a turn is well formed.
+    """
+    rows = all_rollouts(run_dir)
+    if which == "all":
+        return rows
+    want = which == "passing"
+    return [r for r in rows if bool(r.get("passed")) is want]
+
+
+def passing_rollouts(run_dir: Path) -> list[dict]:
+    """Rollouts that passed."""
+    return select_rollouts(run_dir, "passing")
 
 
 def handoff_head(jobs_dir: Path, boundary_ordinal: int) -> list[Turn]:

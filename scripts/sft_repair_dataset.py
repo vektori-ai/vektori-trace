@@ -44,7 +44,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.sft_export_traces import BOUNDARY_MESSAGE, passing_rollouts
+from scripts.sft_export_traces import BOUNDARY_MESSAGE, select_rollouts
 
 # terminus clamps every command's duration before recording it
 # (`Command(duration_sec=min(parsed_cmd.duration, 60))`, terminus_2.py:1180).
@@ -669,12 +669,50 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--no-captures", action="store_true",
                     help="rebuild from ATIF only; skips the 6.2 GB scan")
+    ap.add_argument("--rollouts", choices=("passing", "failing", "all"),
+                    default="passing",
+                    help="which outcome class to rebuild. Training is always "
+                         "`passing`; `failing` builds the Phase 7 held-out "
+                         "prefix corpus, which has no other source.")
+    ap.add_argument("--tasks-not-in", type=Path, default=None,
+                    help="path to a repair_manifest.jsonl whose tasks to "
+                         "exclude — how the held-out corpus is kept disjoint "
+                         "from the trained 34")
+    ap.add_argument("--tasks-in", type=Path, default=None,
+                    help="path to a repair_manifest.jsonl whose tasks are the "
+                         "only ones kept — how the control corpus is held to "
+                         "the same 34 tasks as training while changing the "
+                         "rollout outcome")
+    ap.add_argument("--audit-advisory", action="store_true",
+                    help="report audit failures without a non-zero exit. Only "
+                         "for prefix corpora: an unclassified turn in a failed "
+                         "rollout is a fact about the teacher, not a defect in "
+                         "a training target. Never use this to build a "
+                         "training set.")
     args = ap.parse_args()
+
+    def _tasks(path: Path) -> set[str]:
+        return {
+            json.loads(ln)["task"]
+            for ln in path.read_text().splitlines()
+            if ln.strip()
+        }
+
+    exclude = _tasks(args.tasks_not_in) if args.tasks_not_in else set()
+    keep = _tasks(args.tasks_in) if args.tasks_in else None
+    if exclude:
+        print(f"excluding {len(exclude)} tasks from {args.tasks_not_in}")
+    if keep is not None:
+        print(f"keeping only {len(keep)} tasks from {args.tasks_in}")
 
     rollouts: list[dict] = []
     for run in args.run:
-        got = passing_rollouts(run)
-        print(f"{run}: {len(got)} passing rollouts")
+        got = select_rollouts(run, args.rollouts)
+        if exclude:
+            got = [r for r in got if r.get("task") not in exclude]
+        if keep is not None:
+            got = [r for r in got if r.get("task") in keep]
+        print(f"{run}: {len(got)} {args.rollouts} rollouts")
         rollouts.extend(got)
 
     index: dict[str, str] = {}
@@ -761,14 +799,18 @@ def main() -> int:
     (args.out_dir / "dataset_sha256.txt").write_text(digest + "\n")
     print(f"\nwrote {train}\ndataset sha256 {digest}")
 
+    failures = []
     if unknown:
-        print(f"\nAUDIT FAILED: {unknown} unclassified assistant turns", file=sys.stderr)
-        return 1
+        failures.append(f"{unknown} unclassified assistant turns")
     if rj["field_mismatch"]:
-        print(f"\nAUDIT FAILED: {rj['field_mismatch']} raw/rebuild field mismatches — "
-              "rebuilding the unjoined turns is not justified", file=sys.stderr)
-        return 1
-    return 0
+        failures.append(
+            f"{rj['field_mismatch']} raw/rebuild field mismatches — rebuilding "
+            "the unjoined turns is not justified"
+        )
+    for f in failures:
+        print(f"\nAUDIT {'WARNING' if args.audit_advisory else 'FAILED'}: {f}",
+              file=sys.stderr)
+    return 1 if failures and not args.audit_advisory else 0
 
 
 if __name__ == "__main__":
