@@ -83,7 +83,8 @@ never rebuild. Abort on sha mismatch.
 ## 4. Gate manifest (CPU)
 
 `orientation` / `first_inspection` / `post_compaction` x 5 x 3 suites = **45**,
-one prefix per task. Other five categories n=1 as tripwires.
+one prefix per task per category (amendment 3; cross-category reuse is a
+fallback for the 11-task control suite, never the default). Other five categories n=1 as tripwires.
 Fix `_ops` / `first_edit` to apply `EDIT_RE` **per command** before freezing.
 `EDIT_RE` has one home: `vektori_trace.evaluate.phase7`. Delete the duplicate in
 `sft_repair_dataset.py` (or bind it `= phase7.EDIT_RE`). Never a third copy.
@@ -187,6 +188,36 @@ down. Everything else in this file was agreed before it was written.
    supervised fraction 8.6%, tokens 952-6494.
 
 
+3. **Task distinctness in the gate manifest is per category, with reuse as a
+   fallback and not a default.** *Signed off 2026-08-18.* The 45 stands; no
+   `--allow-short`, no new rollouts, no GPU.
+
+   `pick()` now fills each category in two passes. Pass 1 draws only tasks
+   unused anywhere in the suite. A category still short then runs pass 2, which
+   allows a task already spent on a *different* category but never one already
+   in this category — that within-category reuse is the correlated draw the
+   old `fresh or bucket` fallback made, and it stays refused. `used_tasks` is
+   never reset, so acquisition (34 tasks) and generalization (26) never reach
+   pass 2 and cannot collapse onto five tasks. Pass-2 entries carry
+   `cross_category_reuse` and are printed at freeze time.
+
+   Reason: the control corpus is 38 segments over **11 tasks**, built from the
+   18 failing base-model rollouts in `/data/vektori-out/dsv4-corpus60{,-b}`.
+   Selection wants 15 prefixes from it. Enlarging it needs a new rollout sweep
+   (the other `vektori-out` dirs are v1/v2-adapter policies, which is a
+   different thing than a base-model control); that was declined.
+
+   **How to read control, then.** Its `post_compaction` cell is a *census* of
+   the 5 tasks that have one, across 3 repos — not a 5-repo sample. Control has
+   no `anyio` at all. Do not read repo coverage off control; acquisition and
+   generalization carry that. A control task may appear once in `orientation`
+   and once in `post_compaction`, at different turns.
+
+   Freeze goes to `/data/phase7-stage-a/manifest.json`.
+   `/data/phase7/manifest.json` is the v1 frozen manifest that
+   `/data/phase7/results.json` was graded against — never overwrite it.
+
+
 ## Fail closed — before any GPU
 
 Source sha != pin · packed repaired jsonl still tokenizes · any non-last
@@ -195,7 +226,8 @@ found at the head of a target span · target unparseable or `<tool_call>` · fir
 < 165 (recoveries are Stage B's, amendment 2 — do not gate Stage A on
 them) · pallets > 45% · any of anyio/hatch/prefect
 < 10% · any repo > 3x upsample · Stage B cold token share < 25% · manifest sha
-changed after freeze · a Phase 7 request without `enable_thinking=True`.
+changed after freeze · a selection prefix reusing a task within one
+suite category (across categories is allowed, amendment 3) · a Phase 7 request without `enable_thinking=True`.
 
 ## Budget
 

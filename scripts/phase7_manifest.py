@@ -209,6 +209,41 @@ def candidates(corpus: list[dict[str, Any]], corpus_name: str) -> list[dict[str,
     return out
 
 
+def _round_robin(
+    taken: list[dict[str, Any]],
+    *,
+    want: int,
+    order: list[str],
+    by_repo: dict[str, list[dict[str, Any]]],
+    blocked: set[str],
+    used_tasks: set[str],
+    repo_used: dict[str, int],
+    reuse: bool,
+) -> None:
+    """Fill `taken` up to `want`, one draw per repo per lap, skipping tasks in
+    `blocked`. Consumes from `by_repo`, so a second call resumes where the
+    first stopped. `reuse` stamps the entries it draws."""
+    progress = True
+    while len(taken) < want and progress:
+        progress = False
+        for repo in order:
+            if len(taken) >= want:
+                break
+            bucket = by_repo[repo]
+            fresh = [c for c in bucket if c["task"] not in blocked]
+            if not fresh:
+                continue
+            c = fresh[0]
+            bucket.remove(c)
+            blocked.add(c["task"])
+            used_tasks.add(c["task"])
+            repo_used[repo] += 1
+            if reuse:
+                c["cross_category_reuse"] = True
+            taken.append(c)
+            progress = True
+
+
 def pick(
     cands: list[dict[str, Any]],
     *,
@@ -223,12 +258,23 @@ def pick(
     `counts[cat] == 5` and five repos the round-robin gives exactly one prefix
     per repo.
 
-    One prefix per task, with no fallback. The old code fell back to reusing a
-    task once a repo's fresh pool ran out (`pickable = fresh or bucket`), which
-    turns "5 prefixes" into "5 prefixes, two of them the same conversation at
-    two turns" — correlated draws counted as independent evidence. A category
-    that cannot be filled from distinct tasks comes back short and `main`
-    refuses to freeze, rather than being quietly padded.
+    One prefix per task, in two passes. Pass 1 draws only tasks unused
+    anywhere in this suite. A category that still comes up short then runs
+    pass 2, which allows a task already spent on a *different* category but
+    never one already in this category. The old code fell back to reusing a
+    task within the category (`pickable = fresh or bucket`), which turns "5
+    prefixes" into "5 prefixes, two of them the same conversation at two
+    turns" — correlated draws counted as independent evidence. That is still
+    refused; what pass 2 permits is the same task at two turns in two
+    different categories, which is a different prefix answering a different
+    question.
+
+    Reuse is a fallback, not the rule: `used_tasks` is never reset, so a suite
+    with tasks to spare (acquisition has 34) never reaches pass 2 and cannot
+    collapse onto a handful of tasks. Control does — 11 tasks against 15
+    selection prefixes — and its post_compaction cell is a census of the 5
+    tasks that have one, over 3 repos. Entries drawn in pass 2 carry
+    `cross_category_reuse`.
 
     Returns `(chosen, shortfall)` where shortfall maps category -> how many
     prefixes were asked for and not found.
@@ -259,22 +305,18 @@ def pick(
         # the stratification exists to prevent.
         order = sorted(by_repo, key=lambda r: (repo_used[r], -len(by_repo[r])))
         taken: list[dict[str, Any]] = []
-        progress = True
-        while len(taken) < want and progress:
-            progress = False
-            for repo in order:
-                if len(taken) >= want:
-                    break
-                bucket = by_repo[repo]
-                fresh = [c for c in bucket if c["task"] not in used_tasks]
-                if not fresh:
-                    continue
-                c = fresh[0]
-                bucket.remove(c)
-                used_tasks.add(c["task"])
-                repo_used[repo] += 1
-                taken.append(c)
-                progress = True
+        _round_robin(
+            taken, want=want, order=order, by_repo=by_repo, blocked=used_tasks,
+            used_tasks=used_tasks, repo_used=repo_used, reuse=False,
+        )
+        if len(taken) < want:
+            # Fallback: tasks spent on other categories come back, tasks
+            # already in this one do not.
+            _round_robin(
+                taken, want=want, order=order, by_repo=by_repo,
+                blocked={c["task"] for c in taken},
+                used_tasks=used_tasks, repo_used=repo_used, reuse=True,
+            )
         if len(taken) < want:
             shortfall[cat] = want - len(taken)
         chosen.extend(taken)
@@ -358,6 +400,9 @@ def main() -> int:
             "repos": sorted({e["repo"] for e in got}),
             "selection_prefixes": sum(1 for e in got if e["selection"]),
             "distinct_tasks_selected": len({e["task"] for e in got}),
+            "cross_category_reuse": sum(
+                1 for e in got if e.get("cross_category_reuse")
+            ),
         }
         print(
             f"{suite:15} {len(corpus):3} segments, {stats[suite]['tasks']:2} tasks, "
@@ -384,11 +429,19 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    dup = len(sel) - len({(e["suite"], e["task"]) for e in sel})
+    # A task may answer two different categories inside a suite (see `pick`);
+    # it may never answer the same category twice.
+    dup = len(sel) - len({(e["suite"], e["category"], e["task"]) for e in sel})
     if dup:
-        print(f"\n{dup} selection prefix(es) reuse a task within their suite; "
-              "refusing to freeze", file=sys.stderr)
+        print(f"\n{dup} selection prefix(es) reuse a task within one suite "
+              "category; refusing to freeze", file=sys.stderr)
         return 1
+    reuse = [e for e in sel if e.get("cross_category_reuse")]
+    if reuse:
+        print(f"\n{len(reuse)} selection prefix(es) fell back to a task "
+              "already used by another category in the same suite:")
+        for e in sorted(reuse, key=lambda e: (e["suite"], e["category"])):
+            print(f"  {e['suite']:15} {e['category']:16} {e['task']}")
 
     if args.tokenizer:
         from transformers import AutoTokenizer

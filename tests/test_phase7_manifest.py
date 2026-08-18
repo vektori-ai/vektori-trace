@@ -130,6 +130,41 @@ def test_tripwire_categories_take_one_each():
     assert len({e["task"] for e in got}) == len(got)
 
 
+def test_a_used_up_suite_falls_back_to_another_category_s_tasks():
+    """Control's shape: 5 tasks carry every category, so orientation spends
+    them all and post_compaction has nothing fresh left. Reuse across
+    categories is allowed rather than freezing 5 prefixes short."""
+    tasks = [(REPOS[i % len(REPOS)], f"t{i}") for i in range(5)]
+    cands = [_cand("orientation", r, t, 0) for r, t in tasks]
+    cands += [_cand("post_compaction", r, t, 1) for r, t in tasks]
+    got, short = man.pick(
+        cands,
+        counts={"orientation": 5, "post_compaction": 5},
+        rng=random.Random(0),
+    )
+    assert short == {}
+    assert len(got) == 10
+    reused = [e for e in got if e.get("cross_category_reuse")]
+    assert len(reused) == 5
+    assert all(e["category"] == "post_compaction" for e in reused)
+    # still one prefix per task *within* each category
+    assert len({(e["category"], e["task"]) for e in got}) == 10
+
+
+def test_reuse_is_a_fallback_not_the_default():
+    """Acquisition has tasks to spare. Nothing may collapse onto the five
+    tasks orientation happened to draw."""
+    cands = _pool("orientation", per_repo=4) + _pool("post_compaction", per_repo=4)
+    got, short = man.pick(
+        cands,
+        counts={"orientation": 5, "post_compaction": 5},
+        rng=random.Random(0),
+    )
+    assert short == {}
+    assert not [e for e in got if e.get("cross_category_reuse")]
+    assert len({e["task"] for e in got}) == 10
+
+
 def test_categories_cover_exactly_the_selection_and_tripwire_split():
     assert set(SELECTION_CATEGORIES) <= set(man.CATEGORIES)
     assert len(SELECTION_CATEGORIES) * 5 * 3 == 45
