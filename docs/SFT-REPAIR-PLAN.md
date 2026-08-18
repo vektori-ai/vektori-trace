@@ -45,6 +45,7 @@ Phases 8–10.**
 | Phase 4 | trainer written, tests green |
 | Phase 5 | **passed on NF4** — 3 steps, longest rows, 560/560 LoRA tensors moved. The BF16 arm the revised plan called for was never run; see below |
 | Phase 6 | **complete** — 63 steps, 3 epochs, 3.05 h, 7 checkpoints |
+| Phase 6b | **not started — needs approval** — rebuild the mix so copying is punished; blocks 8-10 |
 | Phase 7 | **RUN** — 168 generations, 0 infra failures, `selected_checkpoint: None`. The protocol is copied from context, not learned; turn 1 still emits v1's envelope |
 
 ### Phase 6 result
@@ -628,6 +629,94 @@ follow.
 
 ---
 
+## Phase 6b: rebuild the mix so copying is wrong — **needs approval**
+
+Phase 7's answer was not "the repair failed". It was "the repair taught a
+shortcut". 95.4% of supervised actions had the correct answer visible above the
+target, so `continue the format you see` minimised loss without learning the
+protocol, and the ablation proved the model takes exactly that route. The fix is
+therefore the **composition of the supervision**, not the learning rate — a
+shortcut available at every step is not removed by taking more or larger steps.
+
+### Why oversampling alone is not enough
+
+There are only 165 turn-1 actions. Duplicating them to raise their share teaches
+165 memorised openers, not a format: the model can satisfy the loss by recalling
+"this task starts with `ls -la`" without ever generalising. Rarity is not the
+problem. **Availability** is. The shortcut has to produce the *wrong* answer,
+not merely appear less often.
+
+### The lever already exists on disk
+
+Every action has two recorded renderings, and Phase 2 proved them equivalent on
+3,528 joined turns:
+
+```text
+raw_capture        native Terminus JSON      -> what the target must be
+ATIF tool_calls    v1's <tool_call> envelope -> what the history can be
+```
+
+So a row can show the model a conversation whose visible assistant turns are in
+**v1's envelope** while the supervised target is **native JSON**. Copying the
+visible format then scores zero. The only way to fit the target is to follow the
+instruction block — which, as Phase 7 established, is present, complete and
+identical in every prefix, and is currently being ignored.
+
+### Proposed mix
+
+```text
+~30%  anti-copy   visible assistant history rendered in the v1 envelope,
+                  target native JSON. Copying is actively punished.
+~25%  cold start  segment truncated so the supervised action has NO prior
+                  assistant turn. Nothing to copy, correct or otherwise.
+~45%  as-is       unchanged native-throughout rows, preserving the turn-6+
+                  behaviour that already works and must not regress.
+```
+
+Read as supervision rather than rows: today 4.6% of supervised actions have
+nothing correct to copy; this puts that near 55%.
+
+Anti-copy rows are *not* mislabelled data. The history is a faithful rendering of
+what the same teacher action looked like in v1's protocol, and the target is the
+same action in the protocol harbor actually parses. Nothing is invented, and the
+pairing is exactly the discrimination the model has to make at rollout time —
+where the history will be full of its own rejected v1-envelope attempts.
+
+### Init
+
+Continue from **ck63**. Not base: that discards v1's real skills — 7,436
+`bash_command`, 241 `mark_task_complete`, edits in 148/165 segments — none of
+which were ever the problem. Not v1: turn 6+ is already correct at ck63 and
+there is nothing to gain by re-deriving it. v1 and ck63 both stay frozen so a
+from-v1 branch remains available if ck63 plateaus.
+
+### Acceptance test — decided before the run
+
+Re-run Phase 7 against the **same frozen manifest** (`735063bb…`, 24 prefixes),
+so the comparison is like for like. The turn-1 categories are the whole test:
+
+```text
+orientation · post_compaction · first_inspection
+```
+
+Today those are 0/3 on every checkpoint in every suite. Anything that does not
+move them has not addressed the finding, whatever it does to the aggregate.
+
+Re-run the context probe too. Success is the **ablation arm no longer flipping**:
+a model that has learned the protocol should keep emitting native JSON even when
+its visible history is in v1's envelope. That, not the pass rate, is what
+distinguishes learning from copying.
+
+### Stop condition
+
+If the turn-1 categories are still 0/3 after this, the problem is not the mix
+and the assumption to re-examine is continuation itself — a LoRA continued from
+an adapter trained 5 epochs into the wrong protocol may not be able to overwrite
+its own turn-1 prior at any mix, and the honest next step is a fresh adapter on
+the corrected data rather than a third correction on top of two.
+
+---
+
 ## Phase 7: Checkpoint evaluation — **RUN, 2026-08-18**
 
 At every saved checkpoint, **no shim**, and through the real serving stack:
@@ -930,35 +1019,6 @@ offer. It also cannot collect data: with turn 1 unparseable, no command
 executes and the rollout never advances. OPD remains the right tool for the
 step after this one — "valid JSON but strategic failure is exactly what OPD is
 for" — and we do not yet have valid JSON from cold.
-
-### Phase 6b: the mix that removes the shortcut
-
-Oversampling turn-1 rows is not sufficient on its own: there are only 165 of
-them, so duplicating them teaches 165 memorised openers rather than the format.
-The shortcut has to be made *wrong*, not merely rarer.
-
-Both representations of every action are already on disk — `raw_capture` is
-native JSON, the ATIF `tool_calls` form is the v1 envelope, for all 3,528 joined
-turns. So build rows whose **visible history is the v1 envelope** and whose
-**target is native JSON**. Copying then produces the wrong answer and the only
-way to score is to follow the instructions.
-
-```text
-~30%  anti-copy   history in v1 envelope, target native JSON
-~25%  cold start  no assistant history at all
-~45%  as-is       preserves the turn-6+ behaviour that already works
-```
-
-Continue from **ck63**, not from base and not from v1: turn 6+ is already
-correct and there is nothing to gain by re-deriving it, while base would also
-discard v1's real skills, which were never the problem. v1 stays frozen so a
-from-v1 branch remains available if ck63 plateaus.
-
-Re-run Phase 7 against the same frozen manifest afterwards. The turn-1
-categories — `orientation`, `post_compaction`, `first_inspection` — are the
-acceptance test.
-
----
 
 ## Phase 8: Native serving validation — **needs an approved endpoint session**
 
