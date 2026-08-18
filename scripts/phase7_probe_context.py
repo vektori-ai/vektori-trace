@@ -147,8 +147,8 @@ def main() -> int:
         v = verdict(text, finish, "orientation" if n == 1 else "first_inspection")
         v |= {"turn": n, "n_messages": len(msgs), "prior_assistant_turns": n - 1}
         report["dose_response"].append(v)
-        print(f"  turn {n:2}  prior_assistant={n - 1:2}  native_json={str(v['native_json']):5}"
-              f"  legacy={str(v['legacy_envelope']):5}  {v['head']!r}")
+        print(f"  turn {n:2}  prior_assistant={n - 1:2}  native_json={v['native_json']!s:5}"
+              f"  legacy={v['legacy_envelope']!s:5}  {v['head']!r}")
 
     # ---- B: ablation ------------------------------------------------------
     print("\n=== B. ABLATION (same prefix; visible assistant turns rewritten to v1)")
@@ -187,8 +187,8 @@ def main() -> int:
     report["ablation_turn"] = passing
 
     for v in (v0, v1):
-        print(f"  {v['arm']:32} native_json={str(v['native_json']):5}"
-              f"  legacy={str(v['legacy_envelope']):5}  {v['head']!r}")
+        print(f"  {v['arm']:32} native_json={v['native_json']!s:5}"
+              f"  legacy={v['legacy_envelope']!s:5}  {v['head']!r}")
 
     flipped = v0["native_json"] and not v1["native_json"]
     report["conclusion"] = (
