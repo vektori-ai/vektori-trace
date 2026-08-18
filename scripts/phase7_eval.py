@@ -176,6 +176,12 @@ def complete(
 
 
 def main() -> int:
+    # Line-buffer stdout. `print()` block-buffers in 4-8 KiB chunks the moment
+    # stdout is a file rather than a terminal, so a sweep redirected to a log
+    # writes nothing for its entire run and then everything at exit. A sweep you
+    # cannot watch is a sweep you cannot tell from a hung one — this cost a live
+    # eval its observability on 2026-08-18.
+    sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", type=Path, required=True)
     ap.add_argument("--api-base", required=True)
