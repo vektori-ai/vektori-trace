@@ -991,6 +991,174 @@ ablated (v1-envelope history)   native_json False  legacy True
 **The output follows the visible format.** The model is copying the protocol out
 of context, not producing it from parameters.
 
+### Evidence and reproduction
+
+Everything below is on the box; nothing here is reconstructed from memory.
+
+| artifact | path |
+|---|---|
+| frozen manifest | `/data/phase7/manifest.json`, sha256 `735063bb…` (24 prefixes) |
+| sweep results | `/data/phase7/results.json` (336 KB, all 168 completions verbatim) |
+| context probe | `/data/phase7/context_probe.json` |
+| run timeline | `/data/phase7/orchestrate.log`, `/data/phase7/probe.log` |
+| control corpus | `/data/phase7-corpora/trained-failing`, sha `7fc6162a…` |
+| held-out corpus | `/data/phase7-corpora/heldout-failing`, sha `bb70e676…` |
+| checkpoints | Volume `vektori-trace-adapters`, `sft/qwen3-14b-dsv4-lora-repaired/checkpoint-{10,20,30,40,50,60,63}` |
+
+Reproduce:
+
+```bash
+# corpora (the held-out set has no other source: all 26 held-out tasks are 0-pass)
+python scripts/sft_repair_dataset.py --run /data/vektori-out/dsv4-corpus60 \
+  --run /data/vektori-out/dsv4-corpus60-b --rollouts failing \
+  --tasks-not-in /data/sft-repaired/repair_manifest.jsonl --audit-advisory \
+  --out-dir /data/phase7-corpora/heldout-failing
+
+python scripts/phase7_manifest.py --acquisition /data/sft-repaired \
+  --control /data/phase7-corpora/trained-failing \
+  --generalization /data/phase7-corpora/heldout-failing \
+  --per-category 1 --seed 0 --tokenizer Qwen/Qwen3-14B \
+  --out /data/phase7/manifest.json
+
+python scripts/serve_student.py --gpu A100-80GB --max-model-len 40960 \
+  --max-hours 1 --max-lora-rank 32 --max-loras 1 \
+  --adapter ck63=/adapters/sft/qwen3-14b-dsv4-lora-repaired/checkpoint-63 ...
+
+python scripts/phase7_eval.py --manifest /data/phase7/manifest.json \
+  --api-base "$API" --checkpoints ck10=Qwen3-14B-ck10 ... --out /data/phase7/results.json
+python scripts/phase7_probe_context.py --api-base "$API"
+```
+
+**Run record.** Sweep: endpoint up 02:03:35 UTC, eval exit 0 at 02:15:33, torn
+down the same second. Probe: up 02:53:38, exit 0 at 02:54:42, torn down the same
+second. Both Modal apps confirmed `stopped`, 0 tasks. ~25 GPU-minutes total,
+under $2. Teardown is a bash `EXIT` trap, so it fires on a failed sweep and on a
+boot that never yields a URL, not only on success; `--max-hours 1` is the
+backstop behind it and was never needed.
+
+**The endpoint arithmetic held.** Predicted 43.1 GiB KV / 282,460 tokens /
+concurrency 6 on A100-80GB; the endpoint printed exactly that. During the sweep
+vLLM reported `Running: 4 reqs` (matching `--concurrency 4`) at 96-100% GPU
+util, with KV cache never above 16.5% — L40S, at 93,716 tokens, would have
+serialised these 34k-token prefixes at concurrency 2.
+
+**Both `serve.py` fixes verified on real vLLM, not only in tests.** All seven
+adapters appeared under distinct served names (`Qwen3-14B-ck10` …`-ck63`) over
+one base load, and the engine started at rank 32 — which it would not have on
+vLLM's default `max_lora_rank` of 16.
+
+#### Integrity of the sweep
+
+```text
+168 results = 24 prefixes × 7 checkpoints
+every checkpoint × suite graded 8/8   (no holes)
+infra_failures 0
+finish_reason  160 stop, 8 length
+```
+
+Because an ungraded prefix blocks its checkpoint from selection, a hole would
+have *suppressed* a pass, never manufactured one. There were none.
+
+**Seven adapters were measured, not one seven times.** 23 of 24 prefixes produce
+different text across the checkpoints — e.g. `repo_present-d010f020`: ck10
+`7fdc923f` (395 chars), ck20-ck63 `a743816b` (515 chars), converging as training
+saturates. Had LoRA switching silently failed, all seven would be identical and
+the whole run would be void.
+
+#### The instruction block is present, complete, and ignored
+
+Every turn-1 prefix opens with the full Terminus contract — this is verbatim
+from the failing `pallets__click-3328` prompt:
+
+```text
+Format your response as JSON with the following structure:
+{
+  "analysis": "...",
+  "plan": "...",
+  "commands": [{"keystrokes": "ls -la\n", "duration": 0.1}],
+  "task_complete": true
+}
+Required fields:
+- "analysis" ... - "plan" ... - "commands" ...
+```
+
+followed by the task text and the live terminal state
+(`root@36b4a1d6520e:/workspace#`). Nothing is missing or malformed. **This block
+is byte-identical in all 24 prefixes**, turn 1 and turn 39 alike, which is what
+rules out "the prompt was worse at turn 1" as an explanation and forces the
+conclusion that fine-tuning is overriding an instruction the model can plainly
+see. v1 was trained 5 epochs at lr 1e-4 to answer this exact prompt with
+`<tool_call>`; the correction was 63 steps at 1e-5, roughly 17× less pressure.
+
+#### Same checkpoint, two prefixes, verbatim
+
+ck63 on `pallets__click-3328`, turn 1, 899-token prefix — `native_json=False`:
+
+```text
+Analysis: We are in the workspace directory. The task is to fix a Click issue
+where `show_default` is not displayed in prompts even though it is used in help
+text. We need to inspect the repository structure and the relevant code.
+Plan: List the contents of the workspace to see the repository structure, then
+search for the prompt-related code in the Click source.
+<tool_call>
+{"name": "bash_command", "arguments": {"keystrokes": "ls -la\n", "duration": 0.1}}
+</tool_call>
+```
+
+ck63 on `pypa__hatch-2351`, turn 33, 34,142-token prefix — `native_json=True`:
+
+```json
+{
+  "analysis": "The focused test run is still in progress and has shown errors/failures...",
+  "plan": "Wait for the current pytest run to finish and display its final summary.",
+  "commands": [{"keystrokes": "", "duration": 10.0}],
+  "task_complete": false
+}
+```
+
+Note what is *right* in the failing case: it orients with `ls -la`, the analysis
+is accurate about the Click issue, the plan is sensible. The deficit is the
+envelope, not the intent — exactly as Phase 0.1 predicted, and the reason
+continuation rather than retraining was the correct starting call.
+
+#### The ablation, verbatim
+
+Same prefix, same checkpoint, one visible assistant turn rewritten from native
+JSON into v1's envelope using the model's own failure shape. Nothing else
+differs — not the instructions, not the task, not the terminal state:
+
+```text
+control  (native history)      -> {"analysis": "The terminal is currently showing a `--More--` pager …
+                                  native_json True
+
+ablated  (v1-envelope history) -> Analysis: The diff output is being paginated with --More--. I need to …
+                                  native_json False
+                                  Missing required fields: analysis, plan, commands
+```
+
+One rewritten turn flips the output. This is the whole finding: **the output
+follows the visible format.** The control arm rules out sampling noise — both
+arms are temperature 0, and the control reproduces its earlier answer exactly.
+
+#### Reasoning, and what would have falsified it
+
+The chain is: aggregate rate (47%) → the rate is not random but tracks turn
+ordinal → turn ordinal is confounded with several things → isolate them.
+
+- *"Held-out tasks are just harder."* Ruled out by the control cell: acquisition,
+  control and generalization all land in the same 2-5/8 band. Task familiarity
+  and rollout outcome move nothing.
+- *"Later turns are easier."* Ruled out by the ablation: turn is held constant
+  and only the history's format changes, and the answer still flips.
+- *"The turn-1 prompt is worse."* Ruled out by the instruction block being
+  byte-identical across all prefixes.
+- *"It needs a lot of context."* Ruled out by dose-response: the transition is
+  0 → 1 prior assistant turn, not gradual.
+
+Falsification was available at every step and did not occur. Had the ablation
+arm kept emitting native JSON, the copying explanation would have been dead and
+the turn-ordinal correlation would have needed another cause.
+
 ### Why, and what it means
 
 Training supervision composition:
