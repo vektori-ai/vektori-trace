@@ -39,11 +39,13 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vektori_trace.evaluate.phase7 import (
+    SELECTION_CATEGORIES,
     SELECTION_GATES,
-    SELECTION_SUITE,
+    SELECTION_SUITES,
     clears,
     grade,
     select_checkpoint,
+    selection_prefix_ids,
     summarize,
 )
 
@@ -393,26 +395,34 @@ def main() -> int:
     # instead would keep generating past the real winner whenever a non-selection
     # suite fails, and — worse — would stop early on a partial set when the
     # endpoint dropped a request.
-    sel_suite = SELECTION_SUITE if SELECTION_SUITE in available_suites else (
-        "acquisition" if "acquisition" in available_suites else sorted(available_suites)[0]
-    )
-    if sel_suite != SELECTION_SUITE:
+    sel_ids = selection_prefix_ids(prefixes)
+    missing_suites = sorted(set(SELECTION_SUITES) - available_suites)
+    if missing_suites:
         print(
-            f"\nNOTE: selecting on the {sel_suite!r} suite — {SELECTION_SUITE!r} "
-            "is not in this manifest. Acquisition prefixes are training inputs, "
-            "so a pass there proves the protocol was acquired, NOT that it "
-            "transfers. Do not read a held-out claim off this run.",
+            f"\nNOTE: selection suites {missing_suites} are not in this "
+            "manifest, so the selection set is smaller than the 45 the plan "
+            "specifies. Acquisition prefixes are training inputs: a pass on "
+            "them proves the protocol was acquired, NOT that it transfers. Do "
+            "not read a held-out claim off a run missing 'generalization'.",
             file=sys.stderr,
         )
-    sel_ids = [p["prefix_id"] for p in prefixes if p["suite"] == sel_suite]
-    print(f"selecting on suite {sel_suite!r} ({len(sel_ids)} prefixes), "
+    if not sel_ids:
+        print("no prefix in a selection category — nothing to select on",
+              file=sys.stderr)
+        return 1
+    by_suite = {
+        s: sum(1 for p in prefixes
+               if p["prefix_id"] in set(sel_ids) and p["suite"] == s)
+        for s in sorted(available_suites)
+    }
+    print(f"selecting on {len(sel_ids)} prefixes in categories "
+          f"{SELECTION_CATEGORIES} across suites {by_suite}, "
           f"gates {SELECTION_GATES}\n")
 
     def checkpoint_clears(label: str) -> tuple[bool, dict]:
         return clears(
             results,
             checkpoint=label,
-            suite=sel_suite,
             require=SELECTION_GATES,
             expected_prefix_ids=sel_ids,
         )
@@ -438,12 +448,12 @@ def main() -> int:
             alive = any(
                 all(r.gates.get(g, False) for g in SELECTION_GATES)
                 for r in smoke
-                if r.suite == sel_suite
+                if r.prefix_id in set(sel_ids)
             )
             if not alive and args.abort_on_smoke:
                 print(
                     f"\nSMOKE FAILED: {last} produced no completion on the "
-                    f"{sel_suite!r} suite passing {SELECTION_GATES}. Stopping "
+                    f"selection set passing {SELECTION_GATES}. Stopping "
                     f"before the remaining {len(order) - 1} checkpoints because "
                     "--abort-on-smoke was passed. This is a heuristic, not "
                     "proof they cannot work.",
@@ -453,7 +463,7 @@ def main() -> int:
                 if not alive:
                     print(
                         f"\nSMOKE: {last} cleared {SELECTION_GATES} on no "
-                        f"{sel_suite} prefix. Continuing anyway — it is the "
+                        f"selection prefix. Continuing anyway — it is the "
                         "most-trained checkpoint and therefore the most "
                         "overfit, so an earlier one can still emit the "
                         "protocol. ~20 minutes to rule that out is cheaper "
@@ -466,7 +476,7 @@ def main() -> int:
                     ok, detail = checkpoint_clears(label)
                     if ok:
                         print(f"\n{label} clears {SELECTION_GATES} on all "
-                              f"{detail['n_graded']} {sel_suite} prefixes — "
+                              f"{detail['n_graded']} selection prefixes — "
                               "stopping, it is the earliest.")
                         break
                     if detail.get("ungraded"):
@@ -478,7 +488,7 @@ def main() -> int:
         for r in results
     ]
     chosen, trace = select_checkpoint(
-        results, order=order, suite=sel_suite, expected_prefix_ids=sel_ids
+        results, order=order, expected_prefix_ids=sel_ids
     )
     report = {
         "manifest": str(args.manifest),
@@ -500,7 +510,8 @@ def main() -> int:
         # gate. Recording these separately is the same correction that
         # `fallback_exitcode` needed in the pass@k reports.
         "infra_failures": infra_failures,
-        "selection_suite": sel_suite,
+        "selection_categories": list(SELECTION_CATEGORIES),
+        "selection_suites": sorted(by_suite),
         "selection_gates": list(SELECTION_GATES),
         "selection_prefix_ids": sel_ids,
         "selected_checkpoint": chosen,

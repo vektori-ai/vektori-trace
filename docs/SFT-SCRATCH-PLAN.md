@@ -66,8 +66,10 @@ Selection stays `harbor_accepts + required_fields + no <tool_call>`.
 Source `/data/sft-repaired/` at pinned `dataset_sha256` (`7ecfee31...`). Slice,
 never rebuild. Abort on sha mismatch.
 
-- 165 firsts (117 turn-1 + 48 later-segment firsts) + 18 parse-error recovery
-  actions = **183 rows**. Row = `messages[:target_index+1]`, supervise last only.
+- **165 rows** = 117 turn-1 firsts + 48 post-compaction (later-segment) firsts.
+  Row = `messages[:target_index+1]`, supervise last only. The 18 parse-error
+  recovery actions are **not** in Stage A — see amendment 2 below; they are
+  Stage B's, and Stage B must take them.
 - Drop targets that fail `TerminusJSONPlainParser` (error, not warning) or carry
   `<tool_call>` / `tool_calls` / `role=tool`.
 - Sampler `weight ∝ 1/n_task × repo_weight`. Mass: pallets 45%, anyio 25%,
@@ -131,6 +133,10 @@ Continue the Stage A adapter. One supervised action per row, row ends on target.
 - ≈660 rows, x1.93 packed, ~1.9 h at v1's measured 1120 tok/s. Timeout 8 h.
 - Cold draws >= **253** (25% supervised-token floor); target **325** (30%).
   `mix_report` must clear the floor before launch.
+- **Plus the 18 parse-error recovery actions** deferred from Stage A
+  (amendment 2). They fit here and nowhere else: `max_length` is 40960. A
+  Stage B mix report showing fewer than 18 recovery rows is a fail, not a
+  rounding difference.
 - No anti-copy in the first mix. LR 5e-5, 1 epoch, accum 8,
   `max_length` 40960, likely NF4.
 - Judged vs **Stage A**: format on the 45 must not regress;
@@ -148,7 +154,7 @@ down. Everything else in this file was agreed before it was written.
    `[151667, 271, 151668, 271]`. Shipped as a runtime assert, not an assumption —
    if the template ever changes, every row fails on CPU.
 
-   Rationale: with the wrapper *in* the loss, all 183 Stage A targets teach
+   Rationale: with the wrapper *in* the loss, all 165 Stage A targets teach
    "open think, close it immediately, then JSON". That leaves
    `enable_thinking=True` set while training the behaviour out. Masking it keeps
    the JSON supervised and leaves think length to the IFT prior.
@@ -158,12 +164,36 @@ down. Everything else in this file was agreed before it was written.
    supervised span instead of `{"analysis"...`.
 
 
+2. **Stage A is 165 rows, not 183 — the 18 recoveries defer to Stage B.**
+   *Signed off 2026-08-18.* Built and on disk: `/data/sft-stage-a/`,
+   `dataset_sha256` `c2d4d2e7...`, source pinned at `7ecfee31...`.
+
+   Reason is measured, not preferential. The recoveries sit at turns 13-75 with
+   the whole trajectory behind them: 14 of 18 exceed 8k tokens, median ~15k,
+   max ~33k. Admitting them into Stage A means either `max_length` near 33k —
+   where ~10% of rows carry ~47% of the input tokens, and Stage A stops being
+   the short run it was costed as — or keeping only the 4 that fit, which
+   selects recoveries by trajectory length and therefore by task and repo.
+   Stage B already runs at `max_length` 40960, so they cost nothing there.
+
+   Consequences, applied above: step 3 reads 165; the fail-closed line no
+   longer requires 18 recoveries (a Stage A run must not abort for rows we
+   deliberately moved); step 8 now *requires* the 18. `max_length` stays 8192.
+   `--recoveries stage-a` still builds the 183-row variant and needs
+   `--max-length` raised; it is not the number of record.
+
+   Measured mix of the built 165: anyio .250 / click .221 / jinja .229 /
+   hatch .150 / prefect .150 by mass, pallets 45%, row upsample 0.31x-2.58x,
+   supervised fraction 8.6%, tokens 952-6494.
+
+
 ## Fail closed — before any GPU
 
 Source sha != pin · packed repaired jsonl still tokenizes · any non-last
 supervised message · prefix equality fails on a last-only row · think wrapper not
 found at the head of a target span · target unparseable or `<tool_call>` · firsts
-< 165 or recoveries < 18 after drops · pallets > 45% · any of anyio/hatch/prefect
+< 165 (recoveries are Stage B's, amendment 2 — do not gate Stage A on
+them) · pallets > 45% · any of anyio/hatch/prefect
 < 10% · any repo > 3x upsample · Stage B cold token share < 25% · manifest sha
 changed after freeze · a Phase 7 request without `enable_thinking=True`.
 

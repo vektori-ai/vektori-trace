@@ -16,11 +16,13 @@ from pathlib import Path
 import pytest
 
 from vektori_trace.evaluate.phase7 import (
+    SELECTION_CATEGORIES,
     SELECTION_GATES,
-    SELECTION_SUITE,
+    SELECTION_SUITES,
     GateResult,
     clears,
     select_checkpoint,
+    selection_prefix_ids,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,10 +57,8 @@ def test_ungraded_prefix_blocks_a_checkpoint():
     """The bug this exists to prevent: 7 of 8 prefixes perfect, the 8th lost to
     an HTTP error, and the checkpoint reads as a clean sweep."""
     expected = [f"p{i}" for i in range(8)]
-    got = [res("ck10", SELECTION_SUITE, True, prefix_id=f"p{i}") for i in range(7)]
-    ok, detail = clears(
-        got, checkpoint="ck10", suite=SELECTION_SUITE, expected_prefix_ids=expected
-    )
+    got = [res("ck10", "generalization", True, prefix_id=f"p{i}") for i in range(7)]
+    ok, detail = clears(got, checkpoint="ck10", expected_prefix_ids=expected)
     assert ok is False
     assert detail["ungraded"] == ["p7"]
     assert detail["n_graded"] == 7
@@ -67,10 +67,8 @@ def test_ungraded_prefix_blocks_a_checkpoint():
 
 def test_all_prefixes_graded_and_passing_clears():
     expected = [f"p{i}" for i in range(3)]
-    got = [res("ck10", SELECTION_SUITE, True, prefix_id=f"p{i}") for i in range(3)]
-    ok, detail = clears(
-        got, checkpoint="ck10", suite=SELECTION_SUITE, expected_prefix_ids=expected
-    )
+    got = [res("ck10", "generalization", True, prefix_id=f"p{i}") for i in range(3)]
+    ok, detail = clears(got, checkpoint="ck10", expected_prefix_ids=expected)
     assert ok is True
     assert detail["ungraded"] == []
 
@@ -78,9 +76,9 @@ def test_all_prefixes_graded_and_passing_clears():
 def test_selection_will_not_pick_a_checkpoint_with_a_hole():
     expected = ["p0", "p1"]
     got = [
-        res("ck10", SELECTION_SUITE, True, prefix_id="p0"),  # p1 dropped
-        res("ck20", SELECTION_SUITE, True, prefix_id="p0"),
-        res("ck20", SELECTION_SUITE, True, prefix_id="p1"),
+        res("ck10", "generalization", True, prefix_id="p0"),  # p1 dropped
+        res("ck20", "generalization", True, prefix_id="p0"),
+        res("ck20", "generalization", True, prefix_id="p1"),
     ]
     chosen, trace = select_checkpoint(
         got, order=["ck10", "ck20"], expected_prefix_ids=expected
@@ -94,30 +92,64 @@ def test_selection_will_not_pick_a_checkpoint_with_a_hole():
 # --------------------------------------------------------------------------
 
 
-def test_a_failing_non_selection_suite_does_not_block_the_stop():
-    """Acquisition and control are reported, not selected on. A checkpoint that
-    clears generalization is the winner even if the control suite is a mess."""
+def test_a_tripwire_category_failing_does_not_block_the_stop():
+    """The 45 are the three cold-start categories. `first_edit`, `test_exec`
+    and the rest are tripwires: reported, never gating — Stage A was not asked
+    to teach them."""
     expected = ["p0"]
     got = [
-        res("ck10", SELECTION_SUITE, True, prefix_id="p0"),
-        res("ck10", "control", False, prefix_id="c0"),
-        res("ck10", "acquisition", False, prefix_id="a0"),
+        res("ck10", "generalization", True, prefix_id="p0"),
+        res("ck10", "control", False, prefix_id="trip-edit"),
+        res("ck10", "acquisition", False, prefix_id="trip-test"),
     ]
-    ok, _ = clears(
-        got, checkpoint="ck10", suite=SELECTION_SUITE, expected_prefix_ids=expected
-    )
+    ok, _ = clears(got, checkpoint="ck10", expected_prefix_ids=expected)
     assert ok is True
 
 
-def test_selection_suite_falls_back_when_generalization_is_absent():
-    """A format-smoke run may carry acquisition only. That is a legitimate run,
-    but it answers a different question and must say so."""
-    assert SELECTION_SUITE == "generalization"
-    available = {"acquisition"}
-    sel = SELECTION_SUITE if SELECTION_SUITE in available else (
-        "acquisition" if "acquisition" in available else sorted(available)[0]
+def test_a_failing_acquisition_prefix_now_blocks_selection():
+    """The change from v1: selection spans all three suites. A checkpoint that
+    emits the protocol on held-out prefixes and fails on trained ones is not a
+    checkpoint to ship, and used to be selected anyway."""
+    expected = ["gen0", "acq0"]
+    got = [
+        res("ck10", "generalization", True, prefix_id="gen0"),
+        res("ck10", "acquisition", False, prefix_id="acq0"),
+        res("ck20", "generalization", True, prefix_id="gen0"),
+        res("ck20", "acquisition", True, prefix_id="acq0"),
+    ]
+    chosen, trace = select_checkpoint(
+        got, order=["ck10", "ck20"], expected_prefix_ids=expected
     )
-    assert sel == "acquisition"
+    assert chosen == "ck20"
+    assert trace["ck10"]["passed"] is False
+
+
+def test_selection_set_is_the_45_and_excludes_tripwires():
+    prefixes = [
+        {"prefix_id": f"{cat}-{suite}-{i}", "category": cat, "suite": suite}
+        for suite in SELECTION_SUITES
+        for cat in SELECTION_CATEGORIES
+        for i in range(5)
+    ] + [
+        {"prefix_id": f"trip-{suite}-{cat}", "category": cat, "suite": suite}
+        for suite in SELECTION_SUITES
+        for cat in ("first_edit", "test_exec", "long_context",
+                    "repo_present", "parse_error_recovery")
+    ]
+    ids = selection_prefix_ids(prefixes)
+    assert len(ids) == 45
+    assert not any(i.startswith("trip-") for i in ids)
+
+
+def test_a_sampled_suite_is_not_part_of_selection():
+    """`grade` labels sampled generations `<suite>-sampled`. Those are a
+    temperature probe, not the frozen set."""
+    prefixes = [
+        {"prefix_id": "s0", "category": "orientation", "suite": "generalization"},
+        {"prefix_id": "s1", "category": "orientation",
+         "suite": "generalization-sampled"},
+    ]
+    assert selection_prefix_ids(prefixes) == ["s0"]
 
 
 # --------------------------------------------------------------------------

@@ -28,7 +28,8 @@ Usage (on the box, where the corpora live):
         --acquisition   /data/sft-repaired \
         --control       /data/phase7-corpora/trained-failing \
         --generalization /data/phase7-corpora/heldout-failing \
-        --per-category 1 --out /data/phase7/manifest.json
+        --selection-per-category 5 --tripwire-per-category 1 \
+        --out /data/phase7/manifest.json
 """
 
 from __future__ import annotations
@@ -45,7 +46,14 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vektori_trace.evaluate.phase7 import EDIT_RE, READ_RE, TEST_RE
+from vektori_trace.evaluate.phase7 import (
+    SELECTION_CATEGORIES,
+    SELECTION_SUITES,
+    TRIPWIRE_CATEGORIES,
+    has_edit,
+    has_read,
+    has_test,
+)
 
 # Categories are *conversation states*, not tasks. The envelope failure is not
 # task-dependent — emitting flat JSON has nothing to do with click versus jinja
@@ -63,6 +71,12 @@ CATEGORIES = (
     "long_context",          # the longest prefixes, where drift is likeliest
 )
 
+# The split into "selects checkpoints" and "tripwire" belongs to
+# `evaluate.phase7` — the manifest builds what selection reads, so a category
+# in one and not the other is either an ungraded prefix or a gate with nothing
+# to grade.
+assert set(CATEGORIES) == set(SELECTION_CATEGORIES) | set(TRIPWIRE_CATEGORIES)
+
 GIT_PRESENT_RE = re.compile(r"\.git\b|On branch |nothing to commit|git status")
 
 
@@ -78,7 +92,14 @@ def _repo(task: str) -> str:
 
 
 def _ops(content: str) -> tuple[bool, bool, bool]:
-    """(read, edit, test) present in this action's commands."""
+    """(read, edit, test) present in this action's commands.
+
+    Per command, never on the newline-joined blob: `EDIT_RE` and `TEST_RE` are
+    `^`-anchored and compiled without MULTILINE, so a joined search only ever
+    tested command 0 and an action that read a file then patched it was
+    classified as a read. The classifiers live in `evaluate.phase7` — one home,
+    so the manifest's `first_edit` means what the gate's `edit_emission` means.
+    """
     try:
         obj = json.loads(content)
     except (json.JSONDecodeError, ValueError):
@@ -88,13 +109,7 @@ def _ops(content: str) -> tuple[bool, bool, bool]:
         for c in (obj.get("commands") or [])
         if isinstance(c, dict)
     ]
-    joined = "\n".join(ks)
-    firsts = [k.strip().splitlines()[0] if k.strip() else "" for k in ks]
-    return (
-        any(READ_RE.search(f) for f in firsts),
-        bool(EDIT_RE.search(joined)),
-        bool(TEST_RE.search(joined)),
-    )
+    return (has_read(ks), has_edit(ks), has_test(ks))
 
 
 def load_corpus(root: Path) -> list[dict[str, Any]]:
@@ -197,28 +212,42 @@ def candidates(corpus: list[dict[str, Any]], corpus_name: str) -> list[dict[str,
 def pick(
     cands: list[dict[str, Any]],
     *,
-    per_category: int,
+    counts: dict[str, int],
     rng: random.Random,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Stratify by category, then spread across repos and tasks.
 
     Repo spread is not decoration. The five repos differ in file layout, test
     invocation and terminal-output shape; drawing every held-out prefix from
-    click would test one repo's idiom and call it generalization.
+    click would test one repo's idiom and call it generalization. With
+    `counts[cat] == 5` and five repos the round-robin gives exactly one prefix
+    per repo.
+
+    One prefix per task, with no fallback. The old code fell back to reusing a
+    task once a repo's fresh pool ran out (`pickable = fresh or bucket`), which
+    turns "5 prefixes" into "5 prefixes, two of them the same conversation at
+    two turns" — correlated draws counted as independent evidence. A category
+    that cannot be filled from distinct tasks comes back short and `main`
+    refuses to freeze, rather than being quietly padded.
+
+    Returns `(chosen, shortfall)` where shortfall maps category -> how many
+    prefixes were asked for and not found.
     """
     by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for c in cands:
         by_cat[c["category"]].append(c)
 
     chosen: list[dict[str, Any]] = []
+    shortfall: dict[str, int] = {}
     used_tasks: set[str] = set()
     repo_used: dict[str, int] = defaultdict(int)
     for cat in CATEGORIES:
-        pool = by_cat.get(cat, [])
-        if not pool:
+        want = counts.get(cat, 0)
+        if want <= 0:
             continue
-        if cat == "long_context":
-            pool = sorted(pool, key=lambda c: -c["prefix_chars"])[: max(8, per_category * 4)]
+        pool = by_cat.get(cat, [])
+        if pool and cat == "long_context":
+            pool = sorted(pool, key=lambda c: -c["prefix_chars"])[: max(8, want * 4)]
         by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for c in pool:
             by_repo[c["repo"]].append(c)
@@ -226,26 +255,30 @@ def pick(
             rng.shuffle(by_repo[repo])
         # Start each category at the least-used repo so far. Ordering by bucket
         # size alone always starts at the largest, which puts all eight
-        # categories in one repo whenever per_category is 1 — the exact
-        # collapse the stratification exists to prevent.
+        # categories in one repo whenever the count is 1 — the exact collapse
+        # the stratification exists to prevent.
         order = sorted(by_repo, key=lambda r: (repo_used[r], -len(by_repo[r])))
         taken: list[dict[str, Any]] = []
-        while len(taken) < per_category and any(by_repo[r] for r in order):
+        progress = True
+        while len(taken) < want and progress:
+            progress = False
             for repo in order:
-                if len(taken) >= per_category:
+                if len(taken) >= want:
                     break
                 bucket = by_repo[repo]
                 fresh = [c for c in bucket if c["task"] not in used_tasks]
-                pickable = fresh or bucket
-                if not pickable:
+                if not fresh:
                     continue
-                c = pickable[0]
+                c = fresh[0]
                 bucket.remove(c)
                 used_tasks.add(c["task"])
                 repo_used[repo] += 1
                 taken.append(c)
+                progress = True
+        if len(taken) < want:
+            shortfall[cat] = want - len(taken)
         chosen.extend(taken)
-    return chosen
+    return chosen, shortfall
 
 
 def prefix_id(entry: dict[str, Any]) -> str:
@@ -262,7 +295,17 @@ def main() -> int:
                          "rollout-outcome confound from task familiarity")
     ap.add_argument("--generalization", type=Path, required=True,
                     help="held-out tasks (necessarily failing rollouts)")
-    ap.add_argument("--per-category", type=int, default=1)
+    ap.add_argument("--selection-per-category", type=int, default=5,
+                    help="prefixes per selection category per suite "
+                         f"({', '.join(SELECTION_CATEGORIES)}). 5 x 3 "
+                         "categories x 3 suites = the 45 the plan selects on.")
+    ap.add_argument("--tripwire-per-category", type=int, default=1,
+                    help="prefixes per non-selecting category per suite. These "
+                         "are tripwires: reported, never gating.")
+    ap.add_argument("--allow-short", action="store_true",
+                    help="freeze even if a selection category could not be "
+                         "filled from distinct tasks. Off by default — a short "
+                         "suite silently shrinks the selection set.")
     ap.add_argument("--tokenizer", default=None,
                     help="HF id or path. Records each prefix's exact token "
                          "count under the serving chat template and refuses to "
@@ -281,17 +324,28 @@ def main() -> int:
     if args.control:
         suites["control"] = args.control
 
+    counts = {
+        c: (args.selection_per_category if c in SELECTION_CATEGORIES
+            else args.tripwire_per_category)
+        for c in CATEGORIES
+    }
     rng = random.Random(args.seed)
+    shortfalls: dict[str, dict[str, int]] = {}
     entries: list[dict[str, Any]] = []
     stats: dict[str, Any] = {}
     for suite, root in suites.items():
         corpus = load_corpus(root)
         cands = candidates(corpus, suite)
-        got = pick(cands, per_category=args.per_category, rng=rng)
+        got, short = pick(cands, counts=counts, rng=rng)
+        if short:
+            shortfalls[suite] = short
         for e in got:
             e["suite"] = suite
             e["prefix_id"] = prefix_id(e)
             e["corpus_root"] = str(root)
+            e["selection"] = (
+                e["category"] in SELECTION_CATEGORIES and suite in SELECTION_SUITES
+            )
         entries.extend(got)
         stats[suite] = {
             "segments": len(corpus),
@@ -302,12 +356,39 @@ def main() -> int:
                 c: sum(1 for e in got if e["category"] == c) for c in CATEGORIES
             },
             "repos": sorted({e["repo"] for e in got}),
+            "selection_prefixes": sum(1 for e in got if e["selection"]),
+            "distinct_tasks_selected": len({e["task"] for e in got}),
         }
         print(
             f"{suite:15} {len(corpus):3} segments, {stats[suite]['tasks']:2} tasks, "
             f"{len(cands):4} candidates -> {len(got)} prefixes "
+            f"({stats[suite]['selection_prefixes']} selecting) "
             f"across {len(stats[suite]['repos'])} repos"
         )
+
+    sel = [e for e in entries if e["selection"]]
+    want_sel = len(SELECTION_CATEGORIES) * args.selection_per_category * len(
+        [s for s in suites if s in SELECTION_SUITES]
+    )
+    print(f"\nselection set: {len(sel)} prefixes "
+          f"({len({e['task'] for e in sel})} distinct tasks, "
+          f"{len({e['repo'] for e in sel})} repos); expected {want_sel}")
+    if shortfalls:
+        print(f"\nSHORT: {shortfalls}", file=sys.stderr)
+    if len(sel) != want_sel and not args.allow_short:
+        print(
+            f"\nselection set is {len(sel)}, not {want_sel}: refusing to "
+            "freeze. A short set is not a smaller number, it is a different "
+            "question — selection would be read off whatever survived. Pass "
+            "--allow-short only if you mean it.",
+            file=sys.stderr,
+        )
+        return 1
+    dup = len(sel) - len({(e["suite"], e["task"]) for e in sel})
+    if dup:
+        print(f"\n{dup} selection prefix(es) reuse a task within their suite; "
+              "refusing to freeze", file=sys.stderr)
+        return 1
 
     if args.tokenizer:
         from transformers import AutoTokenizer
@@ -361,7 +442,11 @@ def main() -> int:
     payload = {
         "version": 1,
         "seed": args.seed,
-        "per_category": args.per_category,
+        "selection_per_category": args.selection_per_category,
+        "tripwire_per_category": args.tripwire_per_category,
+        "selection_categories": list(SELECTION_CATEGORIES),
+        "selection_suites": sorted(s for s in suites if s in SELECTION_SUITES),
+        "selection_prefix_ids": sorted(e["prefix_id"] for e in sel),
         "suites": {k: str(v) for k, v in suites.items()},
         "matched_categories": sorted(common),
         "tokenizer": args.tokenizer,

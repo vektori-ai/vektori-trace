@@ -206,9 +206,22 @@ def test_edit_category_requires_an_edit():
     assert ok.gates["edit_emission"] is True
 
 
+def test_edit_in_a_later_command_still_counts():
+    """`EDIT_RE` is `^`-anchored and compiled without MULTILINE, so searching
+    the newline-joined keystroke blob only ever tested command 0. An action
+    that looked at the file and then patched it scored as no edit."""
+    res = g(action(["ls -la\n", "sed -i 's/a/b/' x.py\n"]), category="first_edit")
+    assert res.gates["edit_emission"] is True
+
+
 def test_test_category_requires_a_test():
     assert g(action(["ls\n"]), category="test_exec").gates["test_emission"] is False
     assert g(action(["pytest -q\n"]), category="test_exec").gates["test_emission"] is True
+
+
+def test_test_in_a_later_command_still_counts():
+    res = g(action(["cd /workspace\n", "pytest -q\n"]), category="test_exec")
+    assert res.gates["test_emission"] is True
 
 
 def test_clone_gate_only_binds_when_the_repo_is_present():

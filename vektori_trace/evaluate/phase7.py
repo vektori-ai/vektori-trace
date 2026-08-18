@@ -46,6 +46,29 @@ TEST_RE = re.compile(r"^\s*(pytest|python -m pytest|tox|nox|make test|python -m 
 
 CLONE_RE = re.compile(r"\bgit\s+clone\b")
 
+
+# `EDIT_RE` and `TEST_RE` are `^`-anchored and compiled without MULTILINE, so
+# searching a newline-joined blob of every keystroke only ever tests command 0:
+# an action whose first command is `ls` and whose second is `sed -i` scored as
+# "no edit". These three helpers are the only sanctioned way to ask the
+# question — one command at a time, exactly as the dataset audit counts it.
+def has_read(commands: Iterable[str]) -> bool:
+    """A read op in any command. Matched on the command's *first line* only:
+    `cat > f <<EOF` starts with `cat` but is an edit, and its heredoc body is
+    arbitrary text that would otherwise match anything."""
+    return any(READ_RE.search(_first_line(c)) for c in commands)
+
+
+def has_edit(commands: Iterable[str]) -> bool:
+    """An edit op in any command. Whole command, not just its first line — the
+    `<<EOF` alternative is deliberately unanchored."""
+    return any(EDIT_RE.search(c) for c in commands)
+
+
+def has_test(commands: Iterable[str]) -> bool:
+    """A test invocation in any command."""
+    return any(TEST_RE.search(c) for c in commands)
+
 # The v1 envelope. A *substring* check on the raw completion rather than a check
 # on the parsed object, because the whole point is to catch text the parser threw
 # away.
@@ -281,18 +304,16 @@ def grade(
         # v1 is not empty — it opens with `ls -la` 114x and `git status` 23x.
         # Orientation is therefore a behavior the repair must *preserve*, and a
         # checkpoint that lost it while gaining the envelope is a regression.
-        res.gates["orientation"] = bool(ks) and any(
-            READ_RE.search(_first_line(k)) for k in ks[:2]
-        )
+        res.gates["orientation"] = bool(ks) and has_read(ks[:2])
 
     if git_present:
         res.gates["no_clone_when_git_exists"] = not CLONE_RE.search(joined)
 
     if category == "first_edit":
-        res.gates["edit_emission"] = bool(EDIT_RE.search(joined))
+        res.gates["edit_emission"] = has_edit(ks)
 
     if category == "test_exec":
-        res.gates["test_emission"] = bool(TEST_RE.search(joined))
+        res.gates["test_emission"] = has_test(ks)
 
     if category == "parse_error_recovery":
         # The whole content of "recovery" is producing an action the parser
@@ -350,17 +371,46 @@ def summarize(results: Iterable[GateResult]) -> dict[str, Any]:
 #: Stage A was never asked to teach reasoning *content*.
 SELECTION_GATES = ("harbor_accepts", "required_fields", "no_legacy_envelope")
 
-# The suite selection is read from. Acquisition prefixes are training inputs: a
-# checkpoint can reproduce a memorised continuation there, so a pass proves
-# acquisition, not protocol.
-SELECTION_SUITE = "generalization"
+# What selection is read from. Step 4 of `docs/SFT-SCRATCH-PLAN.md`: the three
+# cold-start categories x 5 repos x 3 suites = 45 prefixes, all of them.
+#
+# Selecting on `generalization` alone was the v1 shape, when the question was
+# "did the repair transfer". Stage A's question is narrower — can the model
+# emit the protocol from a cold start — and it is asked of every suite at once
+# because the failure it exists to catch is turn-1 format, which is not
+# suite-dependent. Passing held-out prefixes while failing trained ones is not a
+# checkpoint anyone should ship.
+#
+# Acquisition prefixes are training inputs, so a pass *there alone* proves
+# acquisition rather than protocol; that is why they are one third of the set
+# and not the set.
+SELECTION_CATEGORIES = ("orientation", "first_inspection", "post_compaction")
+SELECTION_SUITES = ("acquisition", "control", "generalization")
+
+# The tripwires. n=1 each, never gating: reported so a checkpoint that clears
+# the 45 by collapsing onto one opener is visible rather than silently selected.
+TRIPWIRE_CATEGORIES = (
+    "repo_present", "first_edit", "test_exec",
+    "parse_error_recovery", "long_context",
+)
+
+
+def selection_prefix_ids(prefixes: Iterable[dict[str, Any]]) -> list[str]:
+    """The 45. Read off the frozen manifest, never recomputed from results —
+    a prefix nobody graded must still block its checkpoint."""
+    return [
+        p["prefix_id"]
+        for p in prefixes
+        if p.get("category") in SELECTION_CATEGORIES
+        and p.get("suite") in SELECTION_SUITES
+    ]
 
 
 def clears(
     results: Iterable[GateResult],
     *,
     checkpoint: str,
-    suite: str,
+    suite: str | None = None,
     require: Iterable[str] = SELECTION_GATES,
     expected_prefix_ids: Iterable[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
@@ -374,7 +424,14 @@ def clears(
     correction `no_gradeable_rollouts` needed in the pass@k reports.
     """
     require = tuple(require)
-    group = [r for r in results if r.suite == suite and r.checkpoint == checkpoint]
+    expected_set = None if expected_prefix_ids is None else set(expected_prefix_ids)
+    group = [
+        r
+        for r in results
+        if r.checkpoint == checkpoint
+        and (suite is None or r.suite == suite)
+        and (expected_set is None or r.prefix_id in expected_set)
+    ]
     graded = {r.prefix_id for r in group}
 
     detail: dict[str, Any] = {
@@ -402,7 +459,7 @@ def select_checkpoint(
     results: Iterable[GateResult],
     *,
     order: list[str],
-    suite: str = SELECTION_SUITE,
+    suite: str | None = None,
     require: Iterable[str] = SELECTION_GATES,
     expected_prefix_ids: Iterable[str] | None = None,
 ) -> tuple[str | None, dict[str, Any]]:

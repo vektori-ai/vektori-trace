@@ -35,7 +35,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -45,6 +44,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.sft_export_traces import BOUNDARY_MESSAGE, select_rollouts
+
+# One home for the op classifiers: `vektori_trace.evaluate.phase7`. They used to
+# be copy-pasted into this file, so "emitted an edit" in the gate report and
+# "edit" in this audit were two regexes that only happened to agree.
+from vektori_trace.evaluate.phase7 import EDIT_RE, READ_RE, TEST_RE, has_edit
 
 # terminus clamps every command's duration before recording it
 # (`Command(duration_sec=min(parsed_cmd.duration, 60))`, terminus_2.py:1180).
@@ -567,11 +571,6 @@ def build_segment(
 # Audit
 # --------------------------------------------------------------------------
 
-READ_RE = re.compile(r"^\s*(ls|cat|sed|grep|head|tail|find|rg|less|wc|git status|git diff|git log)\b")
-EDIT_RE = re.compile(r"^\s*(patch|git apply|python -c|cat\s*>|tee|sed -i|>\s*\S|>>)|<<\s*['\"]?EOF")
-TEST_RE = re.compile(r"^\s*(pytest|python -m pytest|tox|nox|make test|python -m unittest)\b")
-
-
 def audit(segments: list[Segment], capture_stats: dict) -> dict:
     turns = [m for s in segments for m in s.turn_meta if m.get("kind") == ACTION]
     commands = [
@@ -617,10 +616,9 @@ def audit(segments: list[Segment], capture_stats: dict) -> dict:
             1
             for s in segments
             if any(
-                EDIT_RE.search(c)
+                has_edit(_keystrokes(msg["content"]))
                 for msg, meta in zip(s.messages, s.turn_meta, strict=True)
                 if meta.get("kind") == ACTION
-                for c in _keystrokes(msg["content"])
             )
         ),
         "first_command_distribution": dict(first_commands.most_common(15)),
