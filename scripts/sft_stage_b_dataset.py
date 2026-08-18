@@ -405,6 +405,13 @@ def mix_report(
     cold_tok_mass = sum(
         weights[r["source_id"]] * supervised_tokens.get(r["source_id"], 0) for r in cold
     )
+    # What the floor is actually worth depends on who samples. No trainer in
+    # this repo reads `weight`: they build `Dataset.from_list` and let TRL
+    # shuffle uniformly. Under that sampler the cold share is the raw token
+    # ratio, which is far below the weighted figure — so both are reported and
+    # neither can be mistaken for the other.
+    uniform_total = sum(supervised_tokens.get(r["source_id"], 0) for r in rows)
+    uniform_cold = sum(supervised_tokens.get(r["source_id"], 0) for r in cold)
     # Draws per epoch-equivalent: what the sampler hands the trainer over `n`
     # draws. The plan's 253/325 are counts in these units.
     draws = sum(weights[r["source_id"]] for r in cold) * n
@@ -413,7 +420,11 @@ def mix_report(
         "by_kind": dict(collections.Counter(r["kind"] for r in rows)),
         "by_repo": by_repo,
         "tasks": len({r["task"] for r in rows}),
-        "segments": len({(r["task"], r["segment_index"]) for r in rows}),
+        # With the rollout, or this counts 60 where there are 165 — the same
+        # collision `row_key` exists to prevent, one level up.
+        "segments": len({
+            (r["task"], r.get("rollout_index"), r["segment_index"]) for r in rows
+        }),
         "max_row_upsample": max(weights.values()) * n,
         "min_row_upsample": min(weights.values()) * n,
         "pallets_mass": sum(by_repo.get(p, {}).get("mass", 0.0) for p in PALLETS),
@@ -424,6 +435,8 @@ def mix_report(
             "rows": len(cold),
             "component_mass": cold_mass,
             "token_share": (cold_tok_mass / tok_mass) if tok_mass else 0.0,
+            "token_share_uniform": (uniform_cold / uniform_total) if uniform_total else 0.0,
+            "requires_weighted_sampler": True,
             "draws_per_epoch": draws,
             "floor_token_share": COLD_TOKEN_FLOOR,
             "target_token_share": COLD_TOKEN_TARGET,
@@ -433,7 +446,7 @@ def mix_report(
     }
 
 
-def check_mix(rep: dict[str, Any]) -> list[str]:
+def check_mix(rep: dict[str, Any], *, allow_unweighted: bool = False) -> list[str]:
     """Every condition `docs/SFT-SCRATCH-PLAN.md` says aborts before a GPU."""
     bad = []
     if rep["pallets_mass"] > PALLETS_MASS + 1e-6:
@@ -455,6 +468,15 @@ def check_mix(rep: dict[str, Any]) -> list[str]:
             "requires them"
         )
     share = rep["cold"]["token_share"]
+    uniform = rep["cold"].get("token_share_uniform", 0.0)
+    if not allow_unweighted and uniform < COLD_TOKEN_FLOOR - 1e-6 <= share:
+        bad.append(
+            f"the {share:.1%} cold share holds only under a weighted sampler; "
+            f"uniformly it is {uniform:.1%}, under the {COLD_TOKEN_FLOOR:.0%} "
+            "floor. No trainer in this repo reads `weight` — a Stage B trainer "
+            "must sample by it, or the mix must be materialised. Pass "
+            "--allow-unweighted once that is decided."
+        )
     if share < COLD_TOKEN_FLOOR - 1e-6:
         bad.append(
             f"cold supervised-token share is {share:.1%}, floor is "
@@ -492,6 +514,10 @@ def main() -> int:
                     help="supervised-token share to solve the cold component's "
                          "mass for (floor "
                          + f"{COLD_TOKEN_FLOOR * 100:.0f} percent)")
+    ap.add_argument("--allow-unweighted", action="store_true",
+                    help="accept a mix whose cold floor holds only under a "
+                         "weighted sampler. Only once a Stage B trainer samples "
+                         "by `weight`, or the decision is recorded in the plan.")
     ap.add_argument("--no-cold-replay", action="store_true",
                     help="build without the cold component. The token-share "
                          "floor then cannot be met and the build will fail; for "
@@ -614,7 +640,7 @@ def main() -> int:
         )
 
     rep = mix_report(usable, weights, sup_by_id, cold_mass=cold_mass)
-    mix_problems = check_mix(rep)
+    mix_problems = check_mix(rep, allow_unweighted=args.allow_unweighted)
 
     args.out.mkdir(parents=True, exist_ok=True)
     jsonl = args.out / "stage_b.jsonl"
@@ -656,7 +682,8 @@ def main() -> int:
     ))
     c = rep["cold"]
     print(f"cold: {c['rows']} rows, mass {c['component_mass']:.3f}, "
-          f"token share {c['token_share']:.1%} (floor {COLD_TOKEN_FLOOR:.0%}), "
+          f"token share {c['token_share']:.1%} weighted / "
+          f"{c['token_share_uniform']:.1%} uniform (floor {COLD_TOKEN_FLOOR:.0%}), "
           f"draws/epoch {c['draws_per_epoch']:.0f} "
           f"(floor {COLD_DRAWS_FLOOR}, target {COLD_DRAWS_TARGET})")
     print(f"ops: {rep['ops']}")

@@ -308,3 +308,52 @@ def test_exclusion_only_removes_the_matching_rollout():
     assert sb.row_key("pallets__click-1", 1, 0, 3) in {
         r["source_id"] for r in out
     }
+
+
+# --------------------------------------------------------------------------
+# The cold floor is a property of the sampler, not of the file
+# --------------------------------------------------------------------------
+
+
+def _rep(**cold):
+    base = {
+        "pallets_mass": 0.4,
+        "by_repo": {"anyio": {"mass": 0.25, "upsample": 1.0},
+                    "hatch": {"mass": 0.15, "upsample": 1.0},
+                    "prefect": {"mass": 0.15, "upsample": 1.0}},
+        "by_kind": {sb.LATER_LAST: 600, sb.PARSE_ERROR_RECOVERY: 18,
+                    sb.COLD_REPLAY: 165},
+    }
+    base["cold"] = {"token_share": 0.30, "token_share_uniform": 0.30, **cold}
+    return base
+
+
+def test_a_weighted_only_cold_share_is_refused():
+    """No trainer in this repo reads `weight` — they shuffle uniformly. A mix
+    that clears the floor only under a sampler nobody implements is a mix that
+    trains at 14.5% cold, not 30%."""
+    bad = sb.check_mix(_rep(token_share_uniform=0.145))
+    assert any("holds only under a weighted sampler" in b for b in bad)
+    assert any("14.5%" in b for b in bad)
+
+
+def test_the_weighted_only_refusal_can_be_waived_deliberately():
+    assert not sb.check_mix(_rep(token_share_uniform=0.145), allow_unweighted=True)
+
+
+def test_a_mix_that_clears_uniformly_needs_no_waiver():
+    assert not sb.check_mix(_rep(token_share_uniform=0.31))
+
+
+def test_segments_are_counted_with_the_rollout():
+    """`(task, segment_index)` counts 60 where there are 165."""
+    rows = [
+        {"task": "t", "rollout_index": r, "segment_index": 0, "repo": "click",
+         "kind": sb.LATER_LAST, "source_id": f"t|r{r}|seg0|msg1",
+         "ops": {"read": True, "edit": False, "test": False}}
+        for r in range(3)
+    ]
+    weights = {r["source_id"]: 1 / 3 for r in rows}
+    sup = {r["source_id"]: 100 for r in rows}
+    rep = sb.mix_report(rows, weights, sup, cold_mass=0.0)
+    assert rep["segments"] == 3
