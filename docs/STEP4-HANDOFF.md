@@ -1,4 +1,9 @@
-# Step 4 handoff — gate manifest, blocked on one decision
+# Step 4 handoff — gate manifest
+
+> **RESOLVED 2026-08-18.** The decision below was taken (**A**, with reuse as a
+> fallback and not a default) and recorded as amendment 3 in
+> `docs/SFT-SCRATCH-PLAN.md`. The manifest is frozen — see "Frozen" at the
+> bottom. The rest of this file is the record of how it got there.
 
 State as of 2026-08-18, branch `sft-scratch` @ `cb986c0` (pushed; box is on it).
 Plan of record is `docs/SFT-SCRATCH-PLAN.md`. **No GPU. No Modal.** Step 4 is CPU only.
@@ -83,3 +88,25 @@ Recommendation: **A**, and record it in the plan as amendment 3 before freezing.
 
 Show sha + 45-count by suite and category + distinct tasks + repos. Never
 regenerate. Then stop: step 5 is GPU and needs its own approval.
+
+## Frozen
+
+    /data/phase7-stage-a/manifest.json
+    sha256 804771ca9243f983250a8125512669605374f155c8c2a0192dd35f32b65c6f92
+    60 prefixes, 45 selecting, 35 distinct tasks, 5 repos
+    prefix tokens: min 825  median 3,418  max 35,609  (budget 40,448)
+
+5 x 3 in every cell:
+
+| suite | orientation | first_inspection | post_compaction | repos |
+|---|---|---|---|---|
+| acquisition | 5 | 5 | 5 | all 5 |
+| control | 5 | 5 | 5 | 4 — **no anyio** |
+| generalization | 5 | 5 | 5 | all 5 |
+
+Cross-category reuse fired 5 times, all of them where it was predicted and
+nowhere else — control `post_compaction`: `pypa__hatch-2127`,
+`pallets__click-3363`, `prefecthq__prefect-22591`, `pallets__click-3704`,
+`pallets__click-3534`. Acquisition and generalization never reached pass 2.
+
+Never regenerate. Step 5 is GPU and needs its own approval.
