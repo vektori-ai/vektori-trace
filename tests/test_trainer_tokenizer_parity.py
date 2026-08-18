@@ -145,3 +145,48 @@ def test_stage_a_reads_its_own_dataset_and_writes_its_own_adapter():
     assert a.OUT_IN_VOLUME not in (r.OUT_IN_VOLUME, r.V1_IN_VOLUME)
     assert a.DATA_IN_VOLUME != r.DATA_IN_VOLUME
     assert not hasattr(a, "V1_IN_VOLUME")
+
+
+# --------------------------------------------------------------------------
+# The did-it-move check, which the first bf16 probe died in
+# --------------------------------------------------------------------------
+
+
+def test_moved_check_survives_a_model_that_changed_device_mid_run():
+    """The bf16 arm passes no device_map, so the snapshot is taken on the host
+    and Trainer moves the model to the GPU afterwards. A bare `.clone()` plus
+    `torch.equal` then compares cpu against cuda:0 and raises — which is what
+    killed the first probe *after* training had already succeeded.
+
+    No GPU here, so `.to()` is exercised against a meta-free CPU copy; what is
+    actually asserted is that neither side is trusted to already be on the same
+    device as the other.
+    """
+    torch = pytest.importorskip("torch")
+    from scripts.sft_stage_a_train_modal import _count_moved, _snapshot_trainable
+
+    net = torch.nn.Linear(4, 3)
+    net.bias.requires_grad_(False)  # only `weight` is "trainable"
+
+    before = _snapshot_trainable(net)
+    assert set(before) == {"weight"}
+    assert all(t.device.type == "cpu" for t in before.values())
+
+    assert _count_moved(net, before) == 0
+    with torch.no_grad():
+        net.weight.add_(1.0)
+    assert _count_moved(net, before) == 1
+
+
+def test_snapshot_does_not_alias_the_live_parameter():
+    """A snapshot that shares storage with the parameter compares equal no
+    matter what training did, and the probe would report `moved == 0` on a run
+    that trained perfectly well."""
+    torch = pytest.importorskip("torch")
+    from scripts.sft_stage_a_train_modal import _count_moved, _snapshot_trainable
+
+    net = torch.nn.Linear(4, 3)
+    before = _snapshot_trainable(net)
+    with torch.no_grad():
+        net.weight.mul_(2.0)
+    assert _count_moved(net, before) >= 1

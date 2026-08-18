@@ -348,7 +348,7 @@ def train(
     net.enable_input_require_grads()
 
     mark("adapter_loaded")
-    before = {n: p.detach().clone() for n, p in net.named_parameters() if p.requires_grad}
+    before = _snapshot_trainable(net)
 
     steps_per_epoch = -(-len(ds) // (batch_size * grad_accum))
     max_steps = 3 if probe else int(steps_per_epoch * epochs)
@@ -501,12 +501,15 @@ def train(
     elapsed = time.time() - t0
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
     peak_reserved = torch.cuda.max_memory_reserved() / 2**30
+    # Printed here, not only inside `summary`. The first bf16 probe measured the
+    # peak and then threw in the moved-check below, which sits between this line
+    # and the only place the number was reported — so ~6 GPU-minutes produced no
+    # measurement at all. Whatever fails after this point, the number is out.
+    print(f"PEAK: allocated {peak_alloc:.1f} GiB, reserved {peak_reserved:.1f} GiB "
+          f"(ceiling {BF16_PEAK_CEILING_GIB:.0f} GiB, arm "
+          f"{'nf4' if nf4 else 'bf16'})", flush=True)
 
-    moved = sum(
-        1
-        for n, p in net.named_parameters()
-        if p.requires_grad and not torch.equal(p.detach(), before[n])
-    )
+    moved = _count_moved(net, before)
     train_loss = result.metrics.get("train_loss")
 
     def finite(x) -> bool:
@@ -594,6 +597,43 @@ def train(
     vol.commit()
     print(json.dumps(summary, indent=2), flush=True)
     return summary
+
+
+def _snapshot_trainable(net) -> dict:
+    """CPU copies of every trainable parameter, for the did-it-move check.
+
+    Deliberately on the CPU. The bf16 arm passes no `device_map`, so at snapshot
+    time the model is still on the host and Trainer moves it to the GPU
+    afterwards — a snapshot taken with a bare `.clone()` then holds CPU tensors
+    that `torch.equal` refuses to compare against `cuda:0` ones. The first bf16
+    probe died exactly there, after training had already succeeded. The repair
+    trainer never hit it because its nf4 arm sets `device_map={"": 0}` and the
+    params are on the GPU before the snapshot is taken.
+
+    CPU is also the cheaper side: keeping ~128M bf16 params off the card is
+    ~257 MiB of VRAM that the measurement does not have to account for.
+    """
+    return {
+        n: p.detach().to("cpu", copy=True)
+        for n, p in net.named_parameters()
+        if p.requires_grad
+    }
+
+
+def _count_moved(net, before: dict) -> int:
+    """How many trainable tensors differ from the snapshot.
+
+    Both sides are forced to the CPU: a device-naive comparison is what broke
+    the first probe, and `before` may legitimately have been captured on either
+    device depending on the precision arm.
+    """
+    import torch
+
+    return sum(
+        1
+        for n, p in net.named_parameters()
+        if p.requires_grad and not torch.equal(p.detach().cpu(), before[n].cpu())
+    )
 
 
 def _artifact(name: str) -> Path:
