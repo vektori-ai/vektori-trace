@@ -29,6 +29,8 @@ everywhere. Scope ends at Stage B.
 | turn-1 fails on the **acquisition** (trained) suite -> not a diversity problem | same |
 | `EDIT_RE` is `^`-anchored, searched without MULTILINE -> only command 0 | `phase7.py:238`, `phase7_manifest.py:95` |
 | NF4 @ 40960 peaked 39.6 / 37.8 GiB | `v1-provenance/run_summary.json` |
+| **Stage A BF16 @ 8192 peaked 36.8 / 37.3 GiB — the arm is BF16** | probe 2026-08-18, `ap-vZwYXhOB` |
+| Stage A step time 26.2 s @ bs1 x accum8; 84 steps ~= 37 min | same |
 
 ## 1. Prefix assert + wrapper mask (CPU)
 
@@ -102,6 +104,19 @@ liger off, `assistant_only_loss=False`, pre-tokenized labels,
 LoRA tensors move, first supervised span decodes to `{"analysis"...` (JSON, not
 the wrapper). Peak > 60 GiB or OOM -> NF4 + `prepare_model_for_kbit_training`
 + `enable_input_require_grads()`. Record the arm; no re-litigating.
+
+**Ran 2026-08-18. The arm is BF16, settled.** Peak 36.8 allocated / 37.3
+reserved on the 24 longest rows — 23 GiB under the ceiling, so NF4 is not
+needed and is not to be revisited. `train_loss` 0.9578 over losses
+1.035 / 1.139 / 0.700; `grad_norm` 0.1261 / 0.1073 / 0.0518; all 560 LoRA
+tensors moved; first supervised span opened `{\n  "analysis": ...`. 26.2 s per
+optimizer step, so the 84-step full run is ~37 min. Nothing was saved.
+
+One bug found and fixed there rather than in the full run: the pre-train
+parameter snapshot was taken while the BF16 arm still had the model on the host
+(no `device_map`), so `torch.equal` refused the post-train comparison. The peak
+print now precedes that check — the first probe measured the peak and then threw
+before reporting it.
 
 Same session: score **base 14B (no adapter)** and the selected checkpoint on the
 45 + tripwires. That is Stage B's baseline.
