@@ -32,42 +32,60 @@ from harbor.agents.terminus_2.terminus_2 import Command, Terminus2
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.llms.chat import Chat
 
-# Deliberately terse. The assistant turn below carries the entire signal; this
-# message exists only to give it something to answer, since a demonstration is a
-# reply and a floating assistant turn is a shape the model never saw in training.
-# Longer format instructions here would be the exact prose Phase 7 proved this
-# checkpoint ignores at turn 1 -- tokens spent restating what does not work, and a
-# second candidate explanation to rule out if the result comes back ambiguous.
-CALIBRATION_USER = (
-    "Format calibration. Reply with a bare JSON object in your standard response "
-    "format. No task has started yet."
+# Harbor renders instructions, task and the live terminal state into ONE user
+# message. We split that rendered prompt exactly once, at the marker below, so the
+# demonstration lands between the instructions and the real terminal state:
+#
+#   user       instructions + task + "wait for the terminal state"
+#   assistant  calibration JSON, commands: []          <- synthetic few-shot
+#   user       the genuine live terminal state + "begin"
+#
+# This reproduces the geometry Phase 7 measured as working (action -> short
+# observation -> generate) WITHOUT fabricating an observation: the terminal state
+# in the final message is the real one harbor captured, merely relocated.
+#
+# The earlier version placed the pair *before* the whole prompt, which left the
+# 5,277-char instruction block as the final message -- byte-identical to the
+# unseeded turn-1 condition Phase 7 measured at 0/8 native. Same number of prior
+# assistant turns, opposite result: the operative variable is adjacency to the
+# generation point, not the count.
+SPLIT_MARKER = "Current terminal state:"
+
+WAIT_INSTRUCTION = (
+    "\n\nBefore you begin: do not act yet. The live terminal state follows in the "
+    "next message. Acknowledge with your standard response format and an empty "
+    "commands list."
 )
 
-# The demonstration is deliberately task-neutral: it shows the envelope while
-# doing nothing.
-#
-# `commands: []` rather than a single `keystrokes: ""` entry. Both are inert, but
-# they fail differently when copied, and only one of them fails *legibly*. A
-# copied `keystrokes: ""` yields `n_commands == 1` with no action taken, which
-# reads as a working protocol in the aggregate; a copied `commands: []` yields
-# `n_commands == 0` and is unmistakable. Since the model's defining trait here is
-# copying what it sees, the demonstration must be the variant whose copy is
-# obvious rather than the variant whose copy flatters the result.
-#
-# The residual risk -- that the model copies the emptiness and stalls -- is not
-# left to inference: `first_action_has_keystrokes` is a hard gate, so a stalled
-# first turn fails explicitly instead of passing quietly.
+BEGIN_INSTRUCTION = "\n\nBegin the task."
+
+# `commands: []` is the *correct* reply to the instruction above, not an
+# unmotivated no-op -- and "Begin the task." then supersedes it, so copying this
+# turn is visibly wrong. The non-empty-keystroke gate is the tripwire if the model
+# copies it anyway.
 CALIBRATION_ASSISTANT = json.dumps(
     {
-        "analysis": "This is a format calibration turn. No task has been described "
-        "yet and the terminal state is not yet known, so there is nothing to "
-        "inspect and no action to take.",
-        "plan": "Emit no commands and wait for the real task prompt, which follows this message.",
+        "analysis": "Acknowledged. I have the instructions and the task, but the "
+        "live terminal state has not been provided yet, so there is nothing to "
+        "inspect and no basis for choosing a command.",
+        "plan": "Take no action this turn. Wait for the terminal state in the next "
+        "message, then begin by orienting in the working directory.",
         "commands": [],
         "task_complete": False,
     },
     indent=2,
 )
+
+
+class FirstTurnProtocolFailure(RuntimeError):
+    """Turn 1 failed the protocol gate.
+
+    Raised to abort the rollout immediately rather than let harbor feed the parse
+    error back and start the loop that produced 8 identical `<tool_call>` turns in
+    the previous run. That loop costs GPU and teaches nothing: once turn 1 emits
+    the legacy envelope, every later turn has the model's own legacy output as the
+    nearest assistant turn to copy.
+    """
 
 
 def is_native_json(text: str) -> bool:
@@ -120,6 +138,10 @@ class Terminus2PromptSeed(Terminus2):
         # itself, so the env var is the only channel that reaches this __init__
         # without new CLI plumbing. The explicit kwarg still wins when harbor is
         # driven directly via `--ak probe_log=...`.
+        # Deterministic sampling, so a rerun of this exact geometry reproduces.
+        # NOTE: this means the run tests "new geometry + temperature 0", not
+        # position in isolation -- both moved relative to the previous run.
+        kwargs["temperature"] = float(os.environ.get("PROMPT_SEED_TEMPERATURE", "0"))
         resolved = probe_log or os.environ.get("PROMPT_SEED_PROBE_LOG")
         self._probe_log = Path(resolved) if resolved else None
         self._probe_turn = 0
@@ -143,9 +165,28 @@ class Terminus2PromptSeed(Terminus2):
     # ---- seeding -------------------------------------------------------------
 
     @staticmethod
-    def seed_pair() -> list[dict[str, str]]:
+    def split_initial_prompt(prompt: str) -> tuple[str, str]:
+        """Split harbor's rendered prompt into (instructions+task, terminal state).
+
+        Fails closed. A marker that is absent, or present more than once, means the
+        template changed or the task text happens to contain the phrase -- either
+        way the geometry we are testing is not the geometry we would build, and a
+        silently mis-split prompt would produce a result nobody could interpret.
+        """
+        count = prompt.count(SPLIT_MARKER)
+        if count != 1:
+            raise FirstTurnProtocolFailure(
+                f"expected exactly 1 {SPLIT_MARKER!r} in the rendered prompt, found {count}"
+            )
+        head, tail = prompt.split(SPLIT_MARKER)
+        return head.rstrip(), SPLIT_MARKER + tail
+
+    def seed_messages(self, head: str) -> list[dict[str, str]]:
+        """The synthetic few-shot context: harbor's real instructions + task, a
+        wait instruction, and a calibration reply. Only the assistant turn and the
+        two added sentences are ours; everything else is harbor's own text."""
         return [
-            {"role": "user", "content": CALIBRATION_USER},
+            {"role": "user", "content": head + WAIT_INSTRUCTION},
             {"role": "assistant", "content": CALIBRATION_ASSISTANT},
         ]
 
@@ -157,48 +198,36 @@ class Terminus2PromptSeed(Terminus2):
         )
 
     def _strip_seed(self, chat: Chat) -> int:
-        """Remove every calibration message from the history. Returns how many went.
-
-        Used to hand harbor a history that looks exactly like an unseeded one
-        before delegating to code that makes structural assumptions about it.
-        """
-        cal_user = _normalize(CALIBRATION_USER)
-        cal_asst = _normalize(CALIBRATION_ASSISTANT)
+        """Remove the synthetic assistant turn and the user turn carrying the wait
+        instruction, so harbor sees a history shaped like an unseeded one before we
+        delegate to code that makes structural assumptions about it."""
+        cal = _normalize(CALIBRATION_ASSISTANT)
+        wait = _normalize(WAIT_INSTRUCTION)
         before = len(chat.messages)
         chat._messages = [
             m
             for m in chat.messages
-            if _normalize(m.get("content") or "") not in (cal_user, cal_asst)
+            if _normalize(m.get("content") or "") != cal
+            and not _normalize(m.get("content") or "").endswith(wait)
         ]
         removed = before - len(chat.messages)
         if removed:
             chat.reset_response_chain()
         return removed
 
-    def _append_seed(self, chat: Chat, reason: str) -> None:
-        """Put the pair at the end, so the next real user message lands after it.
-
-        Appending (rather than prepending) is what reproduces the turn-1 geometry:
-        harbor's next `chat.chat(prompt)` extends the list, leaving the real prompt
-        as the final message with the demonstration immediately above it.
-        """
-        chat._messages = list(chat.messages) + self.seed_pair()
-        chat.reset_response_chain()
+    def _record_seed_event(self, chat: Chat, reason: str, geometry: str, **extra: Any) -> None:
         if reason == "post_compaction":
             self._reseed_turn = self._probe_turn
-        self._seed_events.append(
-            {
-                "reason": reason,
-                "episode": self._probe_episode,
-                "turn": self._probe_turn,
-                "n_messages": len(chat.messages),
-            }
-        )
-        self.logger.info(
-            "PROMPT-SEED: calibration pair installed (%s) at turn %d",
-            reason,
-            self._probe_turn,
-        )
+        event = {
+            "reason": reason,
+            "geometry": geometry,
+            "episode": self._probe_episode,
+            "turn": self._probe_turn,
+            "n_messages": len(chat.messages),
+            **extra,
+        }
+        self._seed_events.append(event)
+        self.logger.info("PROMPT-SEED: %s", json.dumps(event))
 
     # ---- hooks ---------------------------------------------------------------
 
@@ -208,13 +237,27 @@ class Terminus2PromptSeed(Terminus2):
         chat: Chat,
         original_instruction: str = "",
     ) -> None:
-        # `run()` hands us a freshly constructed, empty Chat. Seeding here -- rather
-        # than editing the prompt template -- is the whole point: the template
-        # renders into a *user* message, and user-role instructions are what Phase 7
-        # showed this checkpoint ignoring at turn 1.
-        self._append_seed(chat, reason="initial")
+        """Install the split geometry, then hand control back to harbor unchanged.
+
+        `run()` gives us an empty Chat and the rendered initial prompt. We seed the
+        head plus the calibration reply, and pass the *tail* on as the prompt harbor
+        will send -- so harbor's own `chat.chat(prompt)` appends the genuine terminal
+        state as the final user message, immediately after the demonstration.
+        """
+        head, tail = self.split_initial_prompt(initial_prompt)
+        chat._messages = self.seed_messages(head)
+        chat.reset_response_chain()
+        self._record_seed_event(
+            chat,
+            reason="initial",
+            geometry="split",
+            head_chars=len(head),
+            tail_chars=len(tail),
+            head_sha256=hashlib.sha256(head.encode()).hexdigest()[:16],
+            tail_sha256=hashlib.sha256(tail.encode()).hexdigest()[:16],
+        )
         return await super()._run_agent_loop(
-            initial_prompt=initial_prompt,
+            initial_prompt=tail + BEGIN_INSTRUCTION,
             chat=chat,
             original_instruction=original_instruction,
         )
@@ -224,23 +267,26 @@ class Terminus2PromptSeed(Terminus2):
 
         Harbor rebuilds history as `[chat.messages[0], question_prompt, questions]`
         (terminus_2.py:939) and treats `messages[0]` as the anchor carrying the
-        Terminus format spec and the task. With the seed installed, `messages[0]`
-        is the calibration message, so delegating directly would preserve *that*
-        as the anchor and drop the real instructions -- which would surface as
-        "the seed failed after compaction" when the actual cause is a hijacked
-        anchor.
+        Terminus contract and the task. With the seed installed, `messages[0]` is
+        our modified head, so we strip first and reinstate after.
 
-        Stripping first also keeps harbor's `steps_to_include = 1 + (n - 1) // 2`
-        arithmetic aligned with a trajectory that never contained the pair.
+        The handoff prompt carries no terminal-state marker, so the split geometry
+        cannot be reproduced there. We fall back to appending the pair and record
+        `geometry: fallback` -- a post-compaction turn is therefore NOT evidence
+        about the split hypothesis, and the log says so rather than leaving it to
+        be inferred.
         """
         removed = self._strip_seed(chat)
         self.logger.info("PROMPT-SEED: stripped %d seed messages before summarization", removed)
         try:
             return await super()._summarize(chat, original_instruction, session)
         finally:
-            # `finally`, so a summarization that raises still leaves a seeded history
-            # for harbor's own fallback paths to continue from.
-            self._append_seed(chat, reason="post_compaction")
+            chat._messages = [
+                *chat.messages,
+                {"role": "assistant", "content": CALIBRATION_ASSISTANT},
+            ]
+            chat.reset_response_chain()
+            self._record_seed_event(chat, reason="post_compaction", geometry="fallback")
 
     async def _handle_llm_interaction(
         self,
@@ -317,6 +363,25 @@ class Terminus2PromptSeed(Terminus2):
             "n_messages": len(chat.messages),
         }
         self._write_record(record)
+        # Abort on a failed first turn instead of letting harbor feed the parse
+        # error back: once turn 1 emits the legacy envelope, every later turn has
+        # the model's own legacy output as the nearest assistant turn to copy, and
+        # the loop burns GPU producing eight identical failures (previous run).
+        if self._probe_turn == 1:
+            gate = {
+                "harbor_accepts": record["harbor_accepts"],
+                "no_legacy_envelope": not record["legacy_envelope"],
+                "has_keystrokes": record["has_keystrokes"],
+                "not_a_seed_echo": not record["echoed_seed"],
+            }
+            record["first_turn_gate"] = gate
+            self.logger.info("PROMPT-SEED first-turn gate: %s", json.dumps(gate))
+            if not all(gate.values()):
+                failed = [k for k, v in gate.items() if not v]
+                raise FirstTurnProtocolFailure(
+                    f"turn 1 failed the protocol gate: {failed}; parser_error="
+                    f"{record['parser_error']!r}"
+                )
         self.logger.info(
             "PROMPT-SEED turn %d: seeded=%s native_json=%s legacy=%s cmds=%d err=%s",
             record["turn"],
@@ -340,12 +405,7 @@ class Terminus2PromptSeed(Terminus2):
 
 
 def preflight(out_dir: Path) -> int:
-    """Prove the message geometry without an environment, an endpoint, or a GPU.
-
-    Renders harbor's real template against a stub instruction and terminal state,
-    builds the exact message list the first request would carry, and asserts the
-    properties the run's conclusions depend on.
-    """
+    """Prove the split geometry without an environment, an endpoint, or a GPU."""
     out_dir.mkdir(parents=True, exist_ok=True)
     import harbor.agents.terminus_2.terminus_2 as t2mod
 
@@ -355,42 +415,49 @@ def preflight(out_dir: Path) -> int:
         terminal_state="root@0000000000:/workspace#",
     )
 
-    messages = [*Terminus2PromptSeed.seed_pair(), {"role": "user", "content": initial_prompt}]
+    head, tail = Terminus2PromptSeed.split_initial_prompt(initial_prompt)
+    messages = [
+        *Terminus2PromptSeed.seed_messages(Terminus2PromptSeed, head),
+        {"role": "user", "content": tail + BEGIN_INSTRUCTION},
+    ]
 
     checks: list[tuple[str, bool, str]] = []
-
-    checks.append(
-        (
-            "exactly_one_calibration_pair",
-            sum(
-                1 for m in messages if _normalize(m["content"]) == _normalize(CALIBRATION_ASSISTANT)
-            )
-            == 1
-            and sum(1 for m in messages if _normalize(m["content"]) == _normalize(CALIBRATION_USER))
-            == 1,
-            "one calibration user message and one calibration assistant message",
-        )
-    )
     checks.append(
         (
             "geometry_user_assistant_user",
             [m["role"] for m in messages] == ["user", "assistant", "user"],
-            "calibration pair precedes the real prompt",
+            "demonstration sits between the instructions and the terminal state",
         )
     )
     checks.append(
         (
-            "real_prompt_is_last_and_unchanged",
-            messages[-1]["content"] == initial_prompt,
-            "harbor's initial prompt is final and byte-unchanged",
+            "final_message_is_the_terminal_state",
+            messages[-1]["content"].startswith(SPLIT_MARKER)
+            and "root@0000000000:/workspace#" in messages[-1]["content"],
+            "generation happens right after the REAL terminal state, as in Phase 7",
         )
     )
     checks.append(
         (
-            "instruction_block_intact",
-            "Format your response as JSON" in messages[-1]["content"]
-            and "<TASK INSTRUCTION>" in messages[-1]["content"],
-            "the Terminus contract and the task both survive in the real prompt",
+            "final_message_is_short",
+            len(messages[-1]["content"]) < 500,
+            "the last message is a short observation, not the 5k instruction block",
+        )
+    )
+    checks.append(
+        (
+            "instructions_and_task_precede_the_demo",
+            "Format your response as JSON" in messages[0]["content"]
+            and "<TASK INSTRUCTION>" in messages[0]["content"],
+            "harbor's contract and the task survive, above the demonstration",
+        )
+    )
+    checks.append(
+        (
+            "split_round_trips",
+            (head + "\n\n" + tail).replace("\n", "").replace(" ", "")
+            == initial_prompt.replace("\n", "").replace(" ", ""),
+            "head + tail reconstruct harbor's rendered prompt exactly",
         )
     )
     checks.append(
@@ -401,63 +468,57 @@ def preflight(out_dir: Path) -> int:
             "the demonstration is a bare JSON object with no legacy envelope",
         )
     )
-
     demo = json.loads(CALIBRATION_ASSISTANT)
     checks.append(
         (
             "demonstration_carries_no_commands",
             demo["commands"] == [] and demo["task_complete"] is False,
-            "the demonstration issues no commands, so a copy of it is visibly empty",
+            "commands: [] is the correct reply to the wait instruction above it",
         )
     )
     checks.append(
         (
             "copied_demonstration_would_fail_the_gate",
-            # The check that matters: confirm the demo cannot satisfy the first-action
-            # gate. If this ever passes, a pure copy would score as a working protocol.
             not any(c.get("keystrokes", "").strip() for c in demo["commands"]),
-            "a verbatim copy of the demonstration fails first_action_has_keystrokes",
+            "a verbatim copy fails the non-empty-keystroke gate",
         )
     )
     checks.append(
         (
-            "demonstration_cannot_execute",
-            True,  # structural: seeds land in chat.messages; only parsed completions reach tmux
-            "seed is chat-history only; _trajectory_steps and tmux are untouched",
-        )
-    )
-    checks.append(
-        (
-            "summarization_prompts_unmodified",
-            not any(
-                hasattr(Terminus2PromptSeed, attr)
-                and getattr(Terminus2PromptSeed, attr) is not getattr(Terminus2, attr)
-                for attr in ("_run_subagent", "_get_prompt_template_path", "_query_llm")
-            ),
-            "subagent/summarization paths are inherited, not overridden",
+            "split_fails_closed",
+            _split_fails_closed(),
+            "a missing or duplicated marker raises instead of mis-splitting",
         )
     )
 
-    source = Path(__file__).read_bytes()
-    sha = hashlib.sha256(source).hexdigest()
-
+    sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     report = {
         "agent_sha256": sha,
         "agent_source": str(Path(__file__).resolve()),
         "template_path": str(template_path),
+        "split_marker": SPLIT_MARKER,
+        "head_sha256": hashlib.sha256(head.encode()).hexdigest(),
+        "tail_sha256": hashlib.sha256(tail.encode()).hexdigest(),
+        "head": head,
+        "tail": tail,
         "checks": [{"name": n, "passed": p, "detail": d} for n, p, d in checks],
         "all_passed": all(p for _, p, _ in checks),
         "first_request_messages": messages,
+        "synthetic": [
+            "messages[1] (assistant calibration)",
+            "WAIT_INSTRUCTION",
+            "BEGIN_INSTRUCTION",
+        ],
     }
     (out_dir / "preflight.json").write_text(json.dumps(report, indent=2))
 
     print(f"agent sha256: {sha}")
-    print(f"template:     {template_path}")
-    print()
     for name, passed, detail in checks:
         print(f"  [{'PASS' if passed else 'FAIL'}] {name} -- {detail}")
-    print()
-    print("--- first request, message sequence ---")
+    print("\nsynthetic content (everything else is harbor's own text):")
+    for item in report["synthetic"]:
+        print(f"  - {item}")
+    print("\n--- first request, message sequence ---")
     for i, m in enumerate(messages):
         body = m["content"]
         shown = (
@@ -469,6 +530,16 @@ def preflight(out_dir: Path) -> int:
         print("    " + shown.replace("\n", "\n    "))
     print(f"\nwrote {out_dir / 'preflight.json'}")
     return 0 if report["all_passed"] else 1
+
+
+def _split_fails_closed() -> bool:
+    for bad in ("no marker here", f"{SPLIT_MARKER} a {SPLIT_MARKER} b"):
+        try:
+            Terminus2PromptSeed.split_initial_prompt(bad)
+            return False
+        except FirstTurnProtocolFailure:
+            continue
+    return True
 
 
 def summarize(log_path: Path) -> int:

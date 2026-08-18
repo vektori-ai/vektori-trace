@@ -1,12 +1,11 @@
 """Tests for the calibration-seed probe agent.
 
-The load-bearing case is compaction: harbor rebuilds history as
-`[chat.messages[0], question_prompt, questions]` and treats `messages[0]` as the
-anchor carrying the Terminus contract and the task. A seeded history puts the
-calibration message at index 0, so delegating without stripping would preserve the
-calibration message as the anchor and silently drop the real instructions. That
-would read as "the seed failed after compaction" when the cause is elsewhere,
-which is exactly the misreading the probe's decision rule cannot afford.
+The load-bearing property is *adjacency*: the demonstration must be the assistant
+turn immediately preceding generation, with a short real terminal observation as
+the final message. The first run seeded the pair before harbor's whole rendered
+prompt, leaving a 5,277-char instruction block as the last message -- the same
+number of prior assistant turns as Phase 7's passing prefix, and the opposite
+result. Position, not count, is what these tests pin.
 """
 
 from __future__ import annotations
@@ -20,19 +19,23 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from prompt_seed_probe import (
+    BEGIN_INSTRUCTION,
     CALIBRATION_ASSISTANT,
-    CALIBRATION_USER,
+    SPLIT_MARKER,
+    WAIT_INSTRUCTION,
+    FirstTurnProtocolFailure,
     Terminus2PromptSeed,
     has_legacy_envelope,
     is_native_json,
 )
 
-REAL_PROMPT = "Format your response as JSON ... Task Description: fix anyio"
+RENDERED = (
+    "You are an AI assistant.\n\nFormat your response as JSON ...\n\n"
+    "Task Description:\nfix anyio\n\nCurrent terminal state:\nroot@abc:/workspace#"
+)
 
 
 class FakeChat:
-    """Minimal stand-in exposing the surface the seed helpers touch."""
-
     def __init__(self, messages=None):
         self._messages = list(messages or [])
         self.reset_calls = 0
@@ -45,18 +48,12 @@ class FakeChat:
         self.reset_calls += 1
 
     def chat_append(self, prompt, response):
-        """Mirror of Chat.chat's history extension."""
         self._messages.extend(
-            [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": response},
-            ]
+            [{"role": "user", "content": prompt}, {"role": "assistant", "content": response}]
         )
 
 
 class _Agent(Terminus2PromptSeed):
-    """Bypass Terminus2.__init__, which wants an LLM backend."""
-
     def __init__(self):
         import logging
 
@@ -74,6 +71,67 @@ def agent():
     return _Agent()
 
 
+# ---- the split ---------------------------------------------------------------
+
+
+def test_split_puts_the_terminal_state_in_the_tail():
+    head, tail = Terminus2PromptSeed.split_initial_prompt(RENDERED)
+    assert "Format your response as JSON" in head
+    assert "fix anyio" in head
+    assert SPLIT_MARKER not in head
+    assert tail.startswith(SPLIT_MARKER)
+    assert "root@abc:/workspace#" in tail
+
+
+def test_split_round_trips():
+    head, tail = Terminus2PromptSeed.split_initial_prompt(RENDERED)
+    norm = lambda s: s.replace("\n", "").replace(" ", "")  # noqa: E731
+    assert norm(head + tail) == norm(RENDERED)
+
+
+@pytest.mark.parametrize("bad", ["no marker at all", f"{SPLIT_MARKER} a {SPLIT_MARKER} b"])
+def test_split_fails_closed(bad):
+    """A mis-split prompt would produce a result nobody could interpret."""
+    with pytest.raises(FirstTurnProtocolFailure):
+        Terminus2PromptSeed.split_initial_prompt(bad)
+
+
+# ---- geometry ----------------------------------------------------------------
+
+
+def test_generation_point_follows_the_real_terminal_state(agent):
+    head, tail = agent.split_initial_prompt(RENDERED)
+    chat = FakeChat(agent.seed_messages(head))
+    chat.chat_append(tail + BEGIN_INSTRUCTION, "{}")
+
+    roles = [m["role"] for m in chat.messages]
+    assert roles == ["user", "assistant", "user", "assistant"]
+    # the demonstration is immediately above the generation point
+    assert chat.messages[1]["content"] == CALIBRATION_ASSISTANT
+    # and the last user message is the short real observation, not the 5k block
+    assert chat.messages[2]["content"].startswith(SPLIT_MARKER)
+    assert "root@abc:/workspace#" in chat.messages[2]["content"]
+    assert len(chat.messages[2]["content"]) < len(chat.messages[0]["content"])
+
+
+def test_no_terminal_output_is_fabricated(agent):
+    """Everything in the final message comes from harbor, bar one added sentence."""
+    _head, tail = agent.split_initial_prompt(RENDERED)
+    final = tail + BEGIN_INSTRUCTION
+    assert final.replace(BEGIN_INSTRUCTION, "") in RENDERED
+
+
+def test_only_three_things_are_synthetic(agent):
+    head, _ = agent.split_initial_prompt(RENDERED)
+    seeded = agent.seed_messages(head)
+    assert seeded[0]["content"] == head + WAIT_INSTRUCTION
+    assert seeded[0]["content"].replace(WAIT_INSTRUCTION, "") in RENDERED
+    assert seeded[1]["content"] == CALIBRATION_ASSISTANT
+
+
+# ---- the demonstration -------------------------------------------------------
+
+
 def test_demonstration_is_native_json_and_carries_no_legacy_envelope():
     assert is_native_json(CALIBRATION_ASSISTANT)
     assert not has_legacy_envelope(CALIBRATION_ASSISTANT)
@@ -85,136 +143,70 @@ def test_demonstration_carries_no_commands():
     assert demo["task_complete"] is False
 
 
-def test_a_verbatim_copy_of_the_demonstration_fails_the_first_action_gate():
-    """The reason the demo carries no commands rather than one empty keystroke.
-
-    A copied `keystrokes: ""` would report n_commands == 1 and read as a working
-    protocol; a copied `commands: []` cannot satisfy the gate at all.
-    """
+def test_a_verbatim_copy_fails_the_first_action_gate():
     demo = json.loads(CALIBRATION_ASSISTANT)
-    keystrokes = [c.get("keystrokes", "") for c in demo["commands"]]
-    assert not any(k.strip() for k in keystrokes)
+    assert not any(c.get("keystrokes", "").strip() for c in demo["commands"])
 
 
-def test_seed_lands_immediately_above_the_real_prompt(agent):
-    chat = FakeChat()
-    agent._append_seed(chat, reason="initial")
-    chat.chat_append(REAL_PROMPT, "{}")
-
-    roles = [m["role"] for m in chat.messages]
-    assert roles == ["user", "assistant", "user", "assistant"]
-    assert chat.messages[0]["content"] == CALIBRATION_USER
-    assert chat.messages[1]["content"] == CALIBRATION_ASSISTANT
-    assert chat.messages[2]["content"] == REAL_PROMPT
+# ---- seed lifecycle ----------------------------------------------------------
 
 
-def test_strip_removes_both_calibration_messages_and_nothing_else(agent):
-    chat = FakeChat()
-    agent._append_seed(chat, reason="initial")
-    chat.chat_append(REAL_PROMPT, "{}")
+def test_strip_removes_the_seed_and_restores_the_anchor(agent):
+    head, tail = agent.split_initial_prompt(RENDERED)
+    chat = FakeChat(agent.seed_messages(head))
+    chat.chat_append(tail + BEGIN_INSTRUCTION, "{}")
 
     removed = agent._strip_seed(chat)
 
     assert removed == 2
-    assert [m["content"] for m in chat.messages] == [REAL_PROMPT, "{}"]
-
-
-def test_strip_restores_the_real_prompt_as_the_compaction_anchor(agent):
-    """The whole reason `_summarize` strips before delegating."""
-    chat = FakeChat()
-    agent._append_seed(chat, reason="initial")
-    chat.chat_append(REAL_PROMPT, "{}")
-
-    assert chat.messages[0]["content"] == CALIBRATION_USER  # would hijack the anchor
-    agent._strip_seed(chat)
-    assert chat.messages[0]["content"] == REAL_PROMPT  # harbor keeps the right one
-
-
-def test_post_compaction_reseed_reproduces_turn_one_geometry(agent):
-    """Simulate harbor's rebuild at terminus_2.py:939, then the reseed."""
-    chat = FakeChat()
-    agent._append_seed(chat, reason="initial")
-    chat.chat_append(REAL_PROMPT, "{}")
-
-    agent._strip_seed(chat)
-    chat._messages = [  # harbor's replacement, verbatim in shape
-        chat.messages[0],
-        {"role": "user", "content": "question_prompt"},
-        {"role": "assistant", "content": "model_questions"},
-    ]
-    agent._append_seed(chat, reason="post_compaction")
-    chat.chat_append("handoff_prompt", "{}")
-
-    contents = [m["content"] for m in chat.messages]
-    assert contents[0] == REAL_PROMPT  # instructions survived compaction
-    # calibration pair sits directly above the next real prompt, as at turn 1
-    assert contents[-4] == CALIBRATION_USER
-    assert contents[-3] == CALIBRATION_ASSISTANT
-    assert contents[-2] == "handoff_prompt"
-
-
-def test_reseed_is_idempotent_no_duplicate_pairs(agent):
-    chat = FakeChat()
-    agent._append_seed(chat, reason="initial")
-    agent._strip_seed(chat)
-    agent._append_seed(chat, reason="post_compaction")
-
-    assert sum(1 for m in chat.messages if m["content"] == CALIBRATION_ASSISTANT) == 1
+    assert [m["role"] for m in chat.messages] == ["user", "assistant"]
+    assert chat.messages[0]["content"].startswith(SPLIT_MARKER)
 
 
 def test_seed_present_tracks_installation_and_removal(agent):
+    head, _ = agent.split_initial_prompt(RENDERED)
     chat = FakeChat()
     assert not agent._seed_present(chat)
-    agent._append_seed(chat, reason="initial")
+    chat._messages = agent.seed_messages(head)
     assert agent._seed_present(chat)
     agent._strip_seed(chat)
     assert not agent._seed_present(chat)
 
 
+# ---- format tiers ------------------------------------------------------------
+
+
 def test_legacy_envelope_detection_matches_v1_failure_shape():
-    v1_output = (
+    v1 = (
         "Analysis: We are in the workspace directory.\n"
         "Plan: List the contents.\n"
-        '<tool_call>\n{"name": "bash_command", "arguments": {"keystrokes": "ls -la\\n"}}\n</tool_call>'
+        '<tool_call>\n{"name": "bash_command", "arguments": {"keystrokes": "ls -la"}}\n</tool_call>'
     )
-    assert has_legacy_envelope(v1_output)
-    assert not is_native_json(v1_output)
+    assert has_legacy_envelope(v1)
+    assert not is_native_json(v1)
 
 
 @pytest.mark.parametrize(
     "text,expected",
     [
         ('{"analysis": "a", "plan": "p", "commands": []}', True),
-        ('```json\n{"analysis": "a"}\n```', False),  # fenced: harbor salvages, strict tier fails
-        ('Here is my answer:\n{"analysis": "a"}', False),  # prose preamble
-        ('<think>hm</think>{"analysis": "a"}', False),  # thinking block
-        ("[1, 2, 3]", False),  # valid JSON, wrong type
+        ('```json\n{"analysis": "a"}\n```', False),
+        ('Here is my answer:\n{"analysis": "a"}', False),
+        ('<think>hm</think>{"analysis": "a"}', False),
+        ("[1, 2, 3]", False),
     ],
 )
 def test_native_json_is_the_strict_tier(text, expected):
+    """Strict tier is recorded but no longer gates: harbor tolerates a think block
+    (warning only), so a rollout with `<think>` genuinely proceeds."""
     assert is_native_json(text) is expected
 
 
 # ---- launch path -------------------------------------------------------------
 
 
-def test_import_path_survives_agent_name_normalization():
-    """`vektori passk` hyphenates agent names; an import path must be exempt.
-
-    Without this, `scripts.prompt_seed_probe:Terminus2PromptSeed` reaches harbor as
-    `scripts.prompt-seed-probe:Terminus2PromptSeed` and fails only after startup.
-    """
-    import inspect
-
-    from vektori_trace.evaluate import validity
-    from vektori_trace.evaluate.validity import run_trial  # noqa: F401
-
-    src = inspect.getsource(validity.run_trial)
-    assert 'if ":" not in agent:' in src, "normalization must be guarded on bare names"
-
-
 @pytest.mark.parametrize(
-    "agent,expected",
+    "agent_name,expected",
     [
         ("claude_code", "claude-code"),
         ("terminus_2", "terminus-2"),
@@ -225,6 +217,14 @@ def test_import_path_survives_agent_name_normalization():
         ("acp:opencode@1.3.9", "acp:opencode@1.3.9"),
     ],
 )
-def test_normalization_rule_matches_bare_names_only(agent, expected):
-    normalized = agent if ":" in agent else agent.replace("_", "-")
+def test_normalization_rule_matches_bare_names_only(agent_name, expected):
+    normalized = agent_name if ":" in agent_name else agent_name.replace("_", "-")
     assert normalized == expected
+
+
+def test_import_path_survives_agent_name_normalization():
+    import inspect
+
+    from vektori_trace.evaluate import validity
+
+    assert 'if ":" not in agent:' in inspect.getsource(validity.run_trial)
