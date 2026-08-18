@@ -23,6 +23,11 @@ from .schema import Turn
 
 IGNORE_INDEX = -100
 
+# Qwen3 emits this before the content of a *final* assistant turn. It is part of
+# every supervised span and is deliberately kept out of the loss — see
+# `tokenize_messages`.
+THINK_WRAPPER_TEXT = "<think>\n\n</think>\n\n"
+
 # Minimal chat template for offline tests (from-scratch tokenizers have none).
 # Honours `add_generation_prompt` because the OPD loop depends on it: the student
 # must be positioned to *open* an assistant turn, and a template that ignored the
@@ -108,10 +113,41 @@ class TokenizedExample:
     attention_mask: list[int]
 
 
+def _unwrap_ids(encoded: Any) -> list[int]:
+    """Return a bare list of token ids from whatever apply_chat_template gave us.
+
+    `apply_chat_template(tokenize=True)` returns a plain list on some versions, a
+    `BatchEncoding` on others, and a `tokenizers.Encoding` on transformers 5.x.
+    `list()` on the first two yields *dict keys* / an opaque object, not ids — a
+    short wrong sequence that every downstream check happily accepts, which is
+    how a prefix assert becomes theatre. Unwrap explicitly and refuse anything
+    that is not a list of ints.
+    """
+    if hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    elif hasattr(encoded, "get") and "input_ids" in encoded:
+        encoded = encoded["input_ids"]
+    if not isinstance(encoded, list):
+        encoded = list(encoded)
+    # A BatchEncoding of one row nests: [[id, id, ...]].
+    if len(encoded) == 1 and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    if encoded and not all(isinstance(i, int) for i in encoded):
+        raise TypeError(
+            "apply_chat_template did not yield token ids "
+            f"(first element is {type(encoded[0]).__name__}) — unwrap is wrong "
+            "for this transformers version, and a prefix assert over these "
+            "values would pass without checking anything"
+        )
+    return encoded
+
+
 def _encode_messages(
     tokenizer: Any,
     messages: list[dict[str, Any]],
     template_kwargs: dict[str, Any] | None = None,
+    *,
+    add_generation_prompt: bool = False,
 ) -> list[int]:
     """Tokenize a message prefix; empty prefix → empty ids.
 
@@ -127,23 +163,39 @@ def _encode_messages(
     # can be masked our way and TRL's way and compared position by position.
     try:
         encoded = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=False, **extra
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt, **extra
         )
     except Exception:
         text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, **extra
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt, **extra
         )
         encoded = tokenizer.encode(text, add_special_tokens=False)
-    # Some tokenizers return a BatchEncoding (dict-like: input_ids/attention_mask)
-    # from apply_chat_template(tokenize=True) rather than a bare list. Iterating
-    # a dict with list(...) silently yields its *keys*, not token ids — which
-    # tokenize_sft_example can't distinguish from real (short, wrong) ids, so it
-    # masks everything and returns None instead of erroring. Unwrap explicitly.
-    if hasattr(encoded, "get") and "input_ids" in encoded:
-        encoded = encoded["input_ids"]
-    if not isinstance(encoded, list):
-        encoded = list(encoded)
-    return encoded
+    return _unwrap_ids(encoded)
+
+
+class NonLastSupervisionError(ValueError):
+    """A row supervises a message that is not the last one.
+
+    Qwen3's chat template renders an assistant turn differently depending on
+    whether it is last (see `tokenize_messages`), so a supervised span that is
+    not the final message cannot be located in the full render. Such a row is
+    refused, never masked approximately.
+    """
+
+
+class PrefixInstabilityError(RuntimeError):
+    """`render(messages[:-1])` is not a token-prefix of `render(messages)`."""
+
+
+def _think_wrapper_ids(tokenizer: Any) -> list[int]:
+    """Token ids for the empty reasoning block Qwen3 emits on a final turn.
+
+    Derived from the tokenizer rather than hardcoded — on Qwen3-14B this is
+    `[151667, 271, 151668, 271]` (`<think>`, `\n\n`, `</think>`, `\n\n`) and the
+    caller asserts against what the template actually produced, so a tokenizer
+    that disagrees fails on CPU instead of training something else.
+    """
+    return _unwrap_ids(tokenizer.encode(THINK_WRAPPER_TEXT, add_special_tokens=False))
 
 
 def tokenize_messages(
@@ -154,19 +206,46 @@ def tokenize_messages(
     max_length: int = 4096,
     template_kwargs: dict[str, Any] | None = None,
     truncate: bool = True,
+    mask_think_wrapper: bool = True,
 ) -> TokenizedExample | None:
-    """Tokenize chat messages, supervising exactly the spans `supervise` selects.
+    """Tokenize a row whose **last** message is its one supervised target.
 
-    The role-derived mask that `tokenize_sft_example` uses is all-or-nothing per
-    role, which is the same limitation TRL's `assistant_only_loss` has: it cannot
-    supervise one assistant turn and skip the next. `docs/SFT-REPAIR-PLAN.md`
-    needs exactly that — the ~48 post-compaction handoff turns are assistant
-    prose that must stay in context and out of the loss — so supervision is
-    passed in explicitly rather than inferred.
+    Two encodes, not a per-message loop, and the reason is a property of Qwen3's
+    template rather than a style preference. That template wraps an assistant
+    turn in `<think>\n\n</think>\n\n` only when the turn is `loop.last`;
+    `enable_thinking` gates the *generation prompt* and nothing else. So
+    `render(messages[:i+1])` is **not** a token-prefix of `render(messages)` for
+    any non-final assistant `i` — it is four tokens longer. A loop that measures
+    prefix lengths and indexes them into the full render therefore walks each
+    supervised span four tokens past `<|im_end|>` and into the next user turn.
+    That is not hypothetical: it is what the previous corpus trained on, for
+    3,396 of its 3,561 actions, and neither the length-monotonicity guard nor
+    the TRL cross-check (which tolerates <4% extra) noticed.
+
+    The construction that cannot have the bug is a row whose only supervised
+    message is the last one:
+
+        prefix = render(messages[:-1], add_generation_prompt=True)
+        full   = render(messages)
+        assert prefix == full[:len(prefix)]
+
+    History stays visible and unsupervised; nothing about it needs to be
+    locatable in the full render.
+
+    `mask_think_wrapper` (default on) additionally keeps the four wrapper tokens
+    out of the loss. They stay in `input_ids`, so the target is still
+    conditioned on `</think>\n\n`, but supervising them would teach "open the
+    reasoning block and close it immediately" on every single row — which sets
+    `enable_thinking=True` while training the behaviour out. Think *length*
+    belongs to the instruction-tuned prior; this function supervises the action.
+    See `docs/SFT-SCRATCH-PLAN.md`.
 
     `truncate=False` returns None instead of cutting an over-length example.
     Silently truncating is how a mask gets dropped without anyone noticing
-    (TRL #3927); the repair path would rather lose the row and say so.
+    (TRL #3927); this path would rather lose the row and say so.
+
+    Raises `NonLastSupervisionError` if anything but the final message is
+    supervised, and `PrefixInstabilityError` if the two encodes disagree.
     """
     if len(supervise) != len(messages):
         raise ValueError(
@@ -174,6 +253,20 @@ def tokenize_messages(
         )
     if not messages or not any(supervise):
         return None
+    bad = [i for i, sup in enumerate(supervise) if sup and i != len(messages) - 1]
+    if bad:
+        raise NonLastSupervisionError(
+            f"messages {bad} are supervised but are not the last message "
+            f"(index {len(messages) - 1}). Qwen3's template renders a non-final "
+            "assistant turn without its <think> wrapper, so such a span cannot "
+            "be located in the full render. Split the row so each supervised "
+            "action is its own final message."
+        )
+    if messages[-1].get("role") != "assistant":
+        raise NonLastSupervisionError(
+            f"the supervised final message has role {messages[-1].get('role')!r}, "
+            "not 'assistant'"
+        )
 
     full_ids = _encode_messages(tokenizer, messages, template_kwargs)
     if not full_ids:
@@ -181,27 +274,39 @@ def tokenize_messages(
     if len(full_ids) > max_length and not truncate:
         return None
 
-    labels = [IGNORE_INDEX] * len(full_ids)
-    prev_len = 0
-    for i in range(len(messages)):
-        prefix_ids = _encode_messages(tokenizer, messages[: i + 1], template_kwargs)
-        cur_len = len(prefix_ids)
-        # Non-prefix-stable templates can shrink; refuse rather than mis-mask.
-        if cur_len < prev_len:
-            raise RuntimeError(
-                "chat template is not prefix-stable — refusing to build labels "
-                "(masking would be silently wrong)"
-            )
-        if supervise[i]:
-            end = min(cur_len, len(full_ids))
-            for j in range(prev_len, end):
-                labels[j] = full_ids[j]
-        prev_len = cur_len
-
-    if len(full_ids) != prev_len:
-        raise RuntimeError(
-            "chat template prefix length != full length — refusing to build labels"
+    # `add_generation_prompt=True` is what puts the prefix exactly where the
+    # model will be asked to generate at serving time. Under
+    # `enable_thinking=True` that render ends at `<|im_start|>assistant\n`, so
+    # the whole target span — wrapper included — falls inside `full_ids` after it.
+    prefix_ids = _encode_messages(
+        tokenizer, messages[:-1], template_kwargs, add_generation_prompt=True
+    )
+    if full_ids[: len(prefix_ids)] != prefix_ids:
+        diverge = next(
+            (j for j in range(min(len(prefix_ids), len(full_ids)))
+             if prefix_ids[j] != full_ids[j]),
+            min(len(prefix_ids), len(full_ids)),
         )
+        raise PrefixInstabilityError(
+            "render(messages[:-1], add_generation_prompt=True) is not a token "
+            f"prefix of render(messages): they diverge at token {diverge} of "
+            f"{len(prefix_ids)}. Refusing to build labels — this is the failure "
+            "the two-encode construction exists to catch, not to work around."
+        )
+
+    start = len(prefix_ids)
+    if mask_think_wrapper:
+        wrapper = _think_wrapper_ids(tokenizer)
+        if full_ids[start : start + len(wrapper)] != wrapper:
+            raise PrefixInstabilityError(
+                f"expected the reasoning wrapper {wrapper} at token {start}, "
+                f"found {full_ids[start : start + len(wrapper)]}. The template "
+                "no longer emits <think></think> on a final assistant turn; "
+                "re-derive the mask rather than training through this."
+            )
+        start += len(wrapper)
+
+    labels = [IGNORE_INDEX] * start + full_ids[start:]
 
     input_ids = full_ids
     if len(input_ids) > max_length:

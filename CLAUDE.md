@@ -62,3 +62,22 @@ EC2 `i-0a348ff3d7be9769a` (ap-south-1), reachable **only via AWS SSM** —
 `aws ssm send-command --document-name AWS-RunShellScript`. No direct SSH.
 Repo lives at `/data/vektori-trace`. Heredocs are unreliable over SSM and the
 box's python3 has no `tomllib`; keep remote commands simple.
+
+## The SFT plan of record
+
+**`docs/SFT-SCRATCH-PLAN.md` is authoritative.** Read it before touching
+anything SFT — dataset, tokenizer, trainer, Phase 7 gates, or a GPU run. It
+supersedes `PLAN.md`, `V0_PLAN.md`, `FINAL-PLAN.md`, `docs/SFT-REPAIR-PLAN.md`
+and `docs/CL-PLAN.md`, which are provenance only.
+
+Two invariants that cost three runs to find, both verified 2026-08-18:
+
+- Qwen3's chat template wraps `<think>\n\n</think>\n\n` around the **last**
+  assistant turn only, and `enable_thinking` gates nothing but the generation
+  prompt. Per-message prefix encoding is therefore **not** prefix-stable —
+  labels overshoot 4 tokens into the next user turn. Supervise the last message
+  only, with a two-encode equality assert.
+- Thinking stays **on**. Because the template puts the wrapper in every target
+  span, supervising it would train empty thinking. Masking it is the plan's
+  proposal, pending explicit sign-off — see "Decisions taken here" in that file
+  rather than treating it as settled.

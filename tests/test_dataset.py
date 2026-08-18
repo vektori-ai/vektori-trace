@@ -232,13 +232,18 @@ def test_student_prefix_masked_teacher_continuation_not() -> None:
 
 
 # --------------------------------------------------------------------------
-# tokenize_messages — explicit per-message supervision
+# tokenize_messages — one supervised target, always the last message
 #
 # The role-derived mask above cannot supervise one assistant turn and skip the
-# next, which is the same limitation TRL's `assistant_only_loss` has. The
-# protocol repair (docs/SFT-REPAIR-PLAN.md) needs exactly that: the ~48
-# post-compaction handoff turns are assistant prose that must stay in context
-# and out of the loss.
+# next. This path can, but only in one direction: history is context, and the
+# single target is the final message. That restriction is not a simplification,
+# it is the only shape Qwen3's template can mask correctly — see
+# `tests/test_last_supervised_tokenization.py`, which pins the template property
+# against the real tokenizer, and `docs/SFT-SCRATCH-PLAN.md` step 1.
+#
+# The offline stub template here *is* prefix-stable, so these tests cover the
+# contract (which spans are supervised, what is refused) and not the template
+# hazard, which a stub cannot reproduce.
 # --------------------------------------------------------------------------
 
 
@@ -251,36 +256,50 @@ def _repair_messages() -> list[dict]:
     ]
 
 
-def test_tokenize_messages_supervises_only_the_selected_turns() -> None:
-    from vektori_trace.dataset import tokenize_messages
+def test_tokenize_messages_supervises_the_last_turn_and_masks_the_earlier_one() -> None:
+    """The earlier assistant turn stays visible and out of the loss.
+
+    This is the property the role-derived mask cannot express: two assistant
+    turns, only one supervised.
+    """
+    from vektori_trace.dataset import _encode_messages, tokenize_messages
 
     tok = _tiny_tokenizer()
     msgs = _repair_messages()
-    both = tokenize_messages(msgs, tok, [False, True, False, True], max_length=2048)
-    second_only = tokenize_messages(msgs, tok, [False, False, False, True], max_length=2048)
-    assert both is not None and second_only is not None
+    ex = tokenize_messages(msgs, tok, [False, False, False, True], max_length=2048,
+                           mask_think_wrapper=False)
+    assert ex is not None
+    assert any(lab != IGNORE_INDEX for lab in ex.labels)
 
-    # Same text either way — only the labels move.
-    assert both.input_ids == second_only.input_ids
-    n_both = sum(1 for lab in both.labels if lab != IGNORE_INDEX)
-    n_one = sum(1 for lab in second_only.labels if lab != IGNORE_INDEX)
-    assert 0 < n_one < n_both
+    end_of_first_action = len(_encode_messages(tok, msgs[:2]))
+    assert all(lab == IGNORE_INDEX for lab in ex.labels[:end_of_first_action])
 
-    # The skipped assistant turn is masked over its whole span, and the kept one
-    # is untouched — this is the property the role-derived mask cannot express.
-    from vektori_trace.dataset import _encode_messages
 
-    start = len(_encode_messages(tok, msgs[:1]))
-    end = len(_encode_messages(tok, msgs[:2]))
-    assert any(lab != IGNORE_INDEX for lab in both.labels[start:end])
-    assert all(lab == IGNORE_INDEX for lab in second_only.labels[start:end])
+def test_tokenize_messages_refuses_a_non_final_target() -> None:
+    """The packed shape the previous corpus used. Refused, not approximated."""
+    from vektori_trace.dataset import NonLastSupervisionError, tokenize_messages
+
+    tok = _tiny_tokenizer()
+    with pytest.raises(NonLastSupervisionError, match="not the last message"):
+        tokenize_messages(_repair_messages(), tok, [False, True, False, True],
+                          max_length=2048)
+
+
+def test_tokenize_messages_refuses_a_non_assistant_target() -> None:
+    from vektori_trace.dataset import NonLastSupervisionError, tokenize_messages
+
+    tok = _tiny_tokenizer()
+    msgs = [*_repair_messages(), {"role": "user", "content": "still failing"}]
+    with pytest.raises(NonLastSupervisionError, match="not 'assistant'"):
+        tokenize_messages(msgs, tok, [False, False, False, False, True], max_length=2048)
 
 
 def test_tokenize_messages_labels_are_input_ids_at_the_same_position() -> None:
     from vektori_trace.dataset import tokenize_messages
 
     tok = _tiny_tokenizer()
-    ex = tokenize_messages(_repair_messages(), tok, [False, True, False, True], max_length=2048)
+    ex = tokenize_messages(_repair_messages(), tok, [False, False, False, True],
+                           max_length=2048, mask_think_wrapper=False)
     assert ex is not None
     for i, lab in enumerate(ex.labels):
         if lab != IGNORE_INDEX:
@@ -309,10 +328,11 @@ def test_tokenize_messages_can_refuse_to_truncate() -> None:
 
     tok = _tiny_tokenizer()
     msgs = _repair_messages()
-    assert tokenize_messages(msgs, tok, [False, True, False, True],
-                             max_length=4, truncate=False) is None
-    cut = tokenize_messages(msgs, tok, [False, True, False, True],
-                            max_length=4, truncate=True)
+    assert tokenize_messages(msgs, tok, [False, False, False, True],
+                             max_length=4, truncate=False,
+                             mask_think_wrapper=False) is None
+    cut = tokenize_messages(msgs, tok, [False, False, False, True],
+                            max_length=4, truncate=True, mask_think_wrapper=False)
     if cut is not None:
         assert len(cut.input_ids) == len(cut.labels) == 4
 
