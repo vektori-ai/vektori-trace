@@ -125,8 +125,43 @@ def test_selection_suite_falls_back_when_generalization_is_absent():
 # --------------------------------------------------------------------------
 
 
-def test_enable_thinking_is_pinned_off_in_every_request():
-    assert driver.CHAT_TEMPLATE_KWARGS == {"enable_thinking": False}
+def test_enable_thinking_is_pinned_on_in_every_request():
+    """The sweep must render the way the corpus was tokenized.
+
+    Qwen3's template default is already thinking-on, so this is pinning a
+    decision rather than changing behaviour — but a sweep that leaves it to the
+    default and a rollout that does the same are only accidentally comparable.
+    """
+    assert driver.CHAT_TEMPLATE_KWARGS == {"enable_thinking": True}
+
+
+def test_serving_and_eval_pin_the_same_template_kwargs():
+    """One value, two call sites. A drift here is a silent train/serve split."""
+    from vektori_trace.runtime.serve import CHAT_TEMPLATE_KWARGS as serve_kwargs
+
+    assert serve_kwargs == driver.CHAT_TEMPLATE_KWARGS
+
+
+def test_harbor_kwargs_carry_chat_template_kwargs():
+    """Harbor's terminus path dropped these entirely; the rollout then ran on
+    the template default while Phase 7 pinned its own. Same request shape now."""
+    from vektori_trace.runtime.serve import ServedModel, served_to_harbor_kwargs
+
+    served = ServedModel(api_base="http://localhost:8000/v1", model_name="Qwen3-14B-x")
+    hk = served_to_harbor_kwargs(served)
+    assert hk["agent_kwargs"]["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": True
+    }
+
+
+def test_token_capture_does_not_displace_chat_template_kwargs():
+    """Both ride in `extra_body`; the capture flags used to own it outright."""
+    from vektori_trace.runtime.serve import ServedModel, served_to_harbor_kwargs
+
+    served = ServedModel(api_base="http://localhost:8000/v1", model_name="Qwen3-14B-x")
+    eb = served_to_harbor_kwargs(served, capture_tokens=True)["agent_kwargs"]["extra_body"]
+    assert eb["chat_template_kwargs"] == {"enable_thinking": True}
+    assert len(eb) > 1, "capture flags should still be present alongside"
 
 
 def test_greedy_defaults_match_the_plan():

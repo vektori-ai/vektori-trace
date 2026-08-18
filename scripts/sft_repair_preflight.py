@@ -39,7 +39,11 @@ MAX_LENGTH = 40960
 
 # Pinned here, not left to the template's default. Qwen3 reads this from
 # apply_chat_template kwargs, and serving must use the identical value.
-TEMPLATE_KWARGS = {"enable_thinking": False}
+# Thinking stays on: the corpus is tokenized the way the model is served.
+# `False` writes `<think>\n\n</think>\n\n` into the generation prompt, so the
+# model would be asked to continue from a position no target starts at.
+# `docs/SFT-SCRATCH-PLAN.md` step 2.
+TEMPLATE_KWARGS = {"enable_thinking": True}
 
 # Envelopes that must never appear in a target. `run_command` / `wait_for_output`
 # are the verbs v1 emitted at inference (94x / 257x) that appear zero times in

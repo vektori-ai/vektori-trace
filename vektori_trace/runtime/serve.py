@@ -525,34 +525,62 @@ def litellm_generate_captured(
     return extract_captured_completion(resp)
 
 
+#: Rendering options every request must carry, matching how the SFT corpus was
+#: tokenized (`docs/SFT-SCRATCH-PLAN.md` step 2). Qwen3's template default is
+#: already thinking-on, so this pins a decision rather than changing behaviour —
+#: but an unpinned default is exactly how the prompt-seed probe ended up serving
+#: a configuration nobody had chosen. `enable_thinking=False` would additionally
+#: write `<think>\n\n</think>\n\n` into the *prompt*, so the model would be
+#: asked to continue from a position its targets never started at.
+CHAT_TEMPLATE_KWARGS: dict[str, Any] = {"enable_thinking": True}
+
+
 def served_to_harbor_kwargs(
     served: ServedModel,
     *,
     capture_tokens: bool = False,
     capture_logprobs: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """kwargs for `measure_pass_rates` / `collect_rollouts` / `run_trial`.
 
-    With `capture_tokens=True`, harbor agents receive litellm `extra_body` that
-    requests vLLM `return_token_ids` (and optional logprobs). Prefer also
-    wrapping `api_base` in `token_capture.capture_proxy` when the agent harness
-    may drop unknown kwargs — the proxy injects the flag server-side.
+    Always carries `extra_body.chat_template_kwargs` so the served template
+    renders the way the corpus was tokenized. terminus-2 forwards unknown kwargs
+    into litellm and `extra_body` is the documented seam for vLLM-only fields;
+    without this the harness silently used the template default, which is how a
+    rollout and a Phase 7 sweep of "the same" checkpoint measured different
+    prompts.
+
+    With `capture_tokens=True`, harbor agents additionally receive litellm
+    `extra_body` requesting vLLM `return_token_ids` (and optional logprobs).
+    Prefer also wrapping `api_base` in `token_capture.capture_proxy` when the
+    agent harness may drop unknown kwargs — the proxy injects the flag
+    server-side.
     """
     out: dict[str, Any] = {
         "model": served.harbor_model,
         "api_base": served.api_base,
         "model_info": served.model_info,
     }
+    extra_body: dict[str, Any] = {
+        "chat_template_kwargs": dict(
+            CHAT_TEMPLATE_KWARGS if chat_template_kwargs is None else chat_template_kwargs
+        )
+    }
     if capture_tokens:
         from .token_capture import token_capture_agent_kwargs
 
-        out["agent_kwargs"] = token_capture_agent_kwargs(
-            return_token_ids=True, logprobs=capture_logprobs
+        extra_body.update(
+            token_capture_agent_kwargs(
+                return_token_ids=True, logprobs=capture_logprobs
+            ).get("extra_body", {})
         )
+    out["agent_kwargs"] = {"extra_body": extra_body}
     return out
 
 
 __all__ = [
+    "CHAT_TEMPLATE_KWARGS",
     "DEFAULT_HOSTED_VLLM_MODEL_INFO",
     "ServedModel",
     "dump_serve_record",

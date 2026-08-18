@@ -74,7 +74,11 @@ V1_IN_VOLUME = "sft/qwen3-14b-dsv4-lora"       # immutable — never written to
 OUT_IN_VOLUME = "sft/qwen3-14b-dsv4-lora-repaired"
 
 MAX_LENGTH = 40960
-TEMPLATE_KWARGS = {"enable_thinking": False}
+# Thinking stays on: the corpus is tokenized the way the model is served.
+# `False` writes `<think>\n\n</think>\n\n` into the generation prompt, so the
+# model would be asked to continue from a position no target starts at.
+# `docs/SFT-SCRATCH-PLAN.md` step 2.
+TEMPLATE_KWARGS = {"enable_thinking": True}
 IGNORE_INDEX = -100
 
 app = modal.App("vektori-trace-sft-repair")

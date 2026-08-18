@@ -47,11 +47,13 @@ from vektori_trace.evaluate.phase7 import (
     summarize,
 )
 
-# The plan's greedy suite. `enable_thinking` is pinned off because the dataset
-# pins it off; a reasoning block would be off-protocol at generation time and
-# the gates would (correctly) fail it, but the mismatch would be ours.
+# The plan's greedy suite. `enable_thinking` is pinned ON because the dataset is
+# tokenized that way (`docs/SFT-SCRATCH-PLAN.md` step 2). Qwen3's template
+# default is already thinking-on, so this pins a decision rather than changing
+# behaviour — but an unpinned default is how a rollout and a sweep of the same
+# checkpoint end up measuring different prompts.
 GREEDY = {"temperature": 0.0, "max_tokens": 512}
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": True}
 
 
 def load_corpus(root: str, cache: dict[str, list]) -> list[dict]:
@@ -85,6 +87,7 @@ def complete(
     temperature: float | None = None,
     max_tokens: int = 512,
     retries: int = 2,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, str | None, str | None]:
     """(text, finish_reason, error). A transport failure is never a model failure.
 
@@ -98,7 +101,9 @@ def complete(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": GREEDY["temperature"] if temperature is None else temperature,
-        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
+        "chat_template_kwargs": (
+            CHAT_TEMPLATE_KWARGS if chat_template_kwargs is None else chat_template_kwargs
+        ),
     }
     if seed is not None:
         body["seed"] = seed
@@ -168,8 +173,8 @@ def main() -> int:
                          "here abandons a working repair to save ~20 minutes.")
     ap.add_argument("--no-preflight", action="store_true",
                     help="skip the endpoint preflight. Do not: it is the only "
-                         "thing that verifies enable_thinking is actually "
-                         "pinned at eval time.")
+                         "thing that verifies chat_template_kwargs is actually "
+                         "honoured at eval time.")
     ap.add_argument("--suites", nargs="*", default=None,
                     help="restrict to these suites. The control suite only "
                          "interprets a gap between the other two; if there is "
@@ -227,33 +232,44 @@ def main() -> int:
     started = time.time()
 
     if not args.no_preflight:
-        # `chat_template_kwargs` is a vLLM extension, not core OpenAI. If the
-        # server ignores it or rejects it, `enable_thinking=False` is not pinned
-        # and every completion could carry a reasoning block the gates would
-        # then fail — a mismatch that would be ours, not the checkpoint's.
-        # Cheapest possible check: one 16-token request per registered model.
+        # `chat_template_kwargs` is a vLLM extension, not core OpenAI. A server
+        # that rejects or ignores it renders with the template's own default,
+        # and the sweep then measures a prompt nobody chose. The check has to be
+        # differential: send the same message with thinking on and off and
+        # require the outputs to *differ* in whether a reasoning block appears.
+        # Asserting only "thinking on -> <think> present" would pass on a server
+        # that drops the kwarg entirely, since the default is already on.
         print("preflight:")
         bad = False
+        probe = [{"role": "user", "content": "Reply with the single word: ok"}]
         for label in order:
-            text, _finish, err = complete(
-                args.api_base,
-                models[label],
-                [{"role": "user", "content": "Reply with the single word: ok"}],
-                timeout=args.timeout,
-                max_tokens=16,
-                retries=args.retries,
+            _on_text, _f, on_err = complete(
+                args.api_base, models[label], probe, timeout=args.timeout,
+                max_tokens=16, retries=args.retries,
+                chat_template_kwargs={"enable_thinking": True},
             )
-            thinking = "<think>" in text
-            ok = err is None and not thinking
+            off_text, _f, off_err = complete(
+                args.api_base, models[label], probe, timeout=args.timeout,
+                max_tokens=16, retries=args.retries,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+            err = on_err or off_err
+            # With thinking off the template writes the closed wrapper into the
+            # prompt, so the completion cannot open one. With it on, the model
+            # is free to. Identical behaviour means the kwarg went nowhere.
+            honoured = "<think>" not in off_text
+            ok = err is None and honoured
             bad = bad or not ok
-            why = err or ("emitted <think> despite enable_thinking=False"
-                          if thinking else "ok")
+            why = err or ("ok" if honoured else
+                          "emitted <think> with enable_thinking=False — the "
+                          "server is ignoring chat_template_kwargs")
             print(f"  {label:8} {models[label]:44} {'OK' if ok else 'FAIL'}  {why}")
         if bad:
             print(
-                "\npreflight failed — every checkpoint must be reachable and "
-                "must honour enable_thinking=False before the sweep is worth "
-                "running. Check that the endpoint registered each adapter "
+                "\npreflight failed — every checkpoint must be reachable and the "
+                "endpoint must honour chat_template_kwargs before the sweep is "
+                "worth running, or the sweep measures a template nobody chose. "
+                "Check that the endpoint registered each adapter "
                 "(--adapter NAME=PATH) and started with --max-lora-rank 32.",
                 file=sys.stderr,
             )

@@ -327,7 +327,7 @@ def main() -> int:
             msgs = corpora[root][e["line_no"]]["messages"][: e["message_index"]]
             text = tok.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=True,
             )
             e["prefix_tokens"] = len(tok(text, add_special_tokens=False)["input_ids"])
             if e["prefix_tokens"] > budget:

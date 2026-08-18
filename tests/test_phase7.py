@@ -111,19 +111,49 @@ def test_fenced_json_runs_but_is_not_native():
     assert res.parser_warning
 
 
-def test_thinking_block_is_not_native_json():
-    """`enable_thinking=False` is pinned in the dataset; a <think> block is
-    off-protocol even though harbor would dig the object out."""
+def test_thinking_block_is_not_a_format_failure():
+    """Thinking is on, so a reasoning block is the channel, not off-protocol.
+
+    Harbor extracts commands from `<think>…</think>{json}` with only an "Extra
+    text detected before JSON object" warning, so a completion that reasons and
+    then acts would run. The block is stripped before the strict bare-object
+    question is asked, and it is not a legacy envelope.
+    """
     res = g("<think>hmm</think>" + action(["ls\n"]), finish_reason="stop")
     assert res.gates["harbor_accepts"] is True
-    assert res.gates["native_json"] is False
+    assert res.gates["native_json"] is True
+    assert res.gates["no_legacy_envelope"] is True
+    assert res.think_body == "hmm"
+
+
+def test_empty_thinking_block_is_recorded_as_empty():
+    """What a model trained through an unmasked wrapper would emit every time."""
+    res = g("<think>\n\n</think>\n\n" + action(["ls\n"]), finish_reason="stop")
+    assert res.gates["native_json"] is True
+    assert res.think_body == ""
+
+
+def test_tool_call_is_still_a_legacy_envelope():
+    """Splitting think out of the marker tuple must not soften the real failure."""
+    res = g('<tool_call>\n{"name": "bash_command", "arguments": {}}\n</tool_call>',
+            finish_reason="stop")
+    assert res.gates["no_legacy_envelope"] is False
+    assert res.gates["harbor_accepts"] is False
+
+
+def test_thinking_does_not_excuse_a_tool_call():
+    """prompt-seed run 3's shape: wrapper present, schema still v1."""
+    res = g("<think>\n\n</think>\n\nAnalysis: x\nPlan: y\n"
+            '<tool_call>\n{"name": "bash_command", "arguments": {}}\n</tool_call>',
+            finish_reason="stop")
     assert res.gates["no_legacy_envelope"] is False
 
 
-# --------------------------------------------------------------------------
-# Structural gates
-# --------------------------------------------------------------------------
-
+def test_a_later_close_think_is_content_not_a_boundary():
+    """`</think>` inside the action is text the model wrote, not a channel end."""
+    res = g(action(["echo '</think>'\n"]), finish_reason="stop")
+    assert res.gates["native_json"] is True
+    assert res.think_body == ""
 
 def test_invented_top_level_field_fails():
     obj = json.loads(action(["ls\n"]))

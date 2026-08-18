@@ -46,10 +46,22 @@ TEST_RE = re.compile(r"^\s*(pytest|python -m pytest|tox|nox|make test|python -m 
 
 CLONE_RE = re.compile(r"\bgit\s+clone\b")
 
-# The v1 envelope and the thinking block. Both are *substring* checks on the
-# raw completion rather than checks on the parsed object, because the whole
-# point is to catch text the parser threw away.
-LEGACY_MARKERS = ("<tool_call>", "</tool_call>", "<think>", "</think>")
+# The v1 envelope. A *substring* check on the raw completion rather than a check
+# on the parsed object, because the whole point is to catch text the parser threw
+# away.
+#
+# `<think>` used to live in this tuple, from when serving pinned
+# `enable_thinking=False` and a reasoning block meant the template had been
+# bypassed. Thinking is on now (`docs/SFT-SCRATCH-PLAN.md` step 2), so a correct
+# completion *opens with* the wrapper and ORing the two would report "still
+# emitting the tool_call envelope" for output that had dropped the tags — the
+# measurement bug prompt-seed run 3 hit. One flag per failure mode.
+LEGACY_MARKERS = ("<tool_call>", "</tool_call>")
+
+#: Emitted before the action when the model uses its reasoning channel. Not a
+#: format failure — harbor extracts commands from `<think>…</think>{json}` with
+#: only an "Extra text detected before JSON object" warning.
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
 # Top-level keys terminus defines. Anything else is the model inventing
 # protocol, which is how a silently-ignored field becomes a silently-dropped
@@ -81,6 +93,9 @@ class GateResult:
     parser_warning: str | None = None
     n_commands: int = 0
     first_command: str | None = None
+    #: Text between `<think>` and `</think>`, "" when the model emitted none.
+    #: Reported, never gated — see `grade`.
+    think_body: str = ""
     gates: dict[str, bool] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -123,6 +138,33 @@ def _keystrokes(obj: dict[str, Any] | None) -> list[str]:
         for c in (obj.get("commands") or [])
         if isinstance(c, dict)
     ]
+
+
+def _strip_think(completion: str) -> str:
+    """The completion with one leading `<think>…</think>` block removed.
+
+    Only a *leading* block, and only the first: a `</think>` appearing later is
+    the model emitting the literal string inside its action, which is content,
+    not a channel boundary.
+    """
+    text = completion.lstrip()
+    if not text.startswith(THINK_OPEN):
+        return completion
+    end = text.find(THINK_CLOSE)
+    if end == -1:
+        return completion
+    return text[end + len(THINK_CLOSE):].lstrip()
+
+
+def _think_body(completion: str) -> str:
+    """What the model put between `<think>` and `</think>`; "" if nothing."""
+    text = completion.lstrip()
+    if not text.startswith(THINK_OPEN):
+        return ""
+    end = text.find(THINK_CLOSE)
+    if end == -1:
+        return text[len(THINK_OPEN):].strip()
+    return text[len(THINK_OPEN):end].strip()
 
 
 def _first_line(keystrokes: str) -> str:
@@ -183,13 +225,25 @@ def grade(
     # ---- format tier: applies to every prefix ---------------------------
     res.gates["harbor_accepts"] = harbor_ok
 
+    # `native_json` asks "is the completion *only* the JSON object" — no fence,
+    # no prose preamble. A reasoning block is not prose the model invented, it is
+    # the channel the template gave it, so it is removed before the question is
+    # asked. What remains must still be a bare object.
+    body = _strip_think(completion)
     res.gates["native_json"] = (
         harbor_ok
-        and _raw_object(completion) is not None
+        and _raw_object(body) is not None
         and not any(m in completion for m in LEGACY_MARKERS)
     )
 
     res.gates["no_legacy_envelope"] = not any(m in completion for m in LEGACY_MARKERS)
+
+    # Recorded, never gating. Stage A supervises the action, not the reasoning;
+    # think *length* belongs to the instruction-tuned prior. A run where this is
+    # 0 everywhere means the wrapper mask failed and the model was trained to
+    # close its reasoning block immediately — a dataset bug to go fix, not a
+    # reason to reject a checkpoint whose format is correct.
+    res.think_body = _think_body(completion)
 
     obj = _raw_object(completion) or (salvaged if harbor_ok else None)
     res.gates["required_fields"] = bool(obj) and all(
@@ -285,7 +339,16 @@ def summarize(results: Iterable[GateResult]) -> dict[str, Any]:
 # checkpoint on one prefix. The plan originally listed edit/orientation/no-clone
 # among the selection gates — this narrows that deliberately, because the repair
 # being measured is the envelope.
-SELECTION_GATES = ("native_json", "required_fields", "no_legacy_envelope")
+#: `harbor_accepts` and not `native_json`: the parser that will actually run the
+#: rollout is the authority on whether an action is valid, and with thinking on a
+#: correct completion legitimately carries text before the object. `native_json`
+#: stays in the report as the stricter reading. On the 168 graded completions of
+#: the previous sweep the two never disagreed, so this loosening is honest about
+#: what gates rather than a claim that it buys headroom.
+#:
+#: Nothing else gates. `think_body` in particular is reported, not required:
+#: Stage A was never asked to teach reasoning *content*.
+SELECTION_GATES = ("harbor_accepts", "required_fields", "no_legacy_envelope")
 
 # The suite selection is read from. Acquisition prefixes are training inputs: a
 # checkpoint can reproduce a memorised continuation there, so a pass proves

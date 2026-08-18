@@ -76,7 +76,7 @@ def ask(api: str, model: str, messages: list[dict], timeout: float = 180.0):
         "messages": messages,
         "max_tokens": 512,
         "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": True},
     }
     req = urllib.request.Request(
         api.rstrip("/") + "/chat/completions",
