@@ -121,7 +121,7 @@ timeout "$OUTER_TIMEOUT_SEC" uv run vektori-trace passk \
   --agent scripts.prompt_seed_probe:Terminus2PromptSeed \
   --model "hosted_vllm/$SERVED" \
   --api-base "$API_BASE" \
-  --model-info @/data/vektori-trace/model_info.json \
+  --model-info @/data/vektori-trace/model_info_14b.json \
   --stage1-n 1 \
   --no-escalate \
   --max-workers 1 \
@@ -142,6 +142,36 @@ if [ -f "$PROBE_LOG" ]; then
   echo "GATE_EXIT=$GATE_EXIT"
 else
   echo "no probe log at $PROBE_LOG -- the agent never produced a completion"
+fi
+
+# --- 6b. execution evidence --------------------------------------------------
+# The protocol gate proves the model *intended* keystrokes; it sits between
+# parsing and _execute_commands and has no execution evidence. Real execution is
+# only visible in harbor's trajectory, where terminus writes terminal output back
+# as `user` steps -- a user step whose content is terminal output is proof a
+# command ran.
+echo
+echo "== execution evidence (trajectory) =="
+TRAJ=$(find "$OUT" -name "*trajectory*.json" -not -name "*summarization*" 2>/dev/null | head -1)
+if [ -n "$TRAJ" ]; then
+  echo "trajectory: $TRAJ"
+  cp "$TRAJ" "$OUT/trajectory.json"
+  uv run python - "$TRAJ" <<'PYEOF'
+import json, sys
+steps = json.load(open(sys.argv[1])).get("steps", [])
+print(f"{len(steps)} steps")
+user_steps = [s for s in steps if s.get("source") == "user"]
+# Step 1 is the initial prompt; any later user step is terminal output returned
+# after commands actually ran.
+executed = user_steps[1:]
+print(f"user steps after the initial prompt (= command executions): {len(executed)}")
+for s in steps[:8]:
+    msg = (s.get("message") or "")[:400]
+    print(f"\n--- step {s.get('step_id')} source={s.get('source')} ---")
+    print(msg)
+PYEOF
+else
+  echo "no trajectory found under $OUT -- cannot confirm execution"
 fi
 
 echo

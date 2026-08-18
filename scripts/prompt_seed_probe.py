@@ -123,8 +123,22 @@ class Terminus2PromptSeed(Terminus2):
         resolved = probe_log or os.environ.get("PROMPT_SEED_PROBE_LOG")
         self._probe_log = Path(resolved) if resolved else None
         self._probe_turn = 0
+        self._probe_episode = 0
+        self._reseed_turn = -1
         self._seed_events: list[dict[str, Any]] = []
         self._first_completion: str | None = None
+
+    def _reset_per_run_state(self) -> None:
+        """Harbor reuses one agent instance across `run()` calls, and the log is
+        opened in append mode. Without an episode counter a retried rollout writes
+        a second turn-1 record into the same file and the summarizer grades the
+        abandoned attempt, because it reads the first record it finds.
+        """
+        super()._reset_per_run_state()
+        self._probe_episode += 1
+        self._probe_turn = 0
+        self._reseed_turn = -1
+        self._first_completion = None
 
     # ---- seeding -------------------------------------------------------------
 
@@ -170,8 +184,15 @@ class Terminus2PromptSeed(Terminus2):
         """
         chat._messages = list(chat.messages) + self.seed_pair()
         chat.reset_response_chain()
+        if reason == "post_compaction":
+            self._reseed_turn = self._probe_turn
         self._seed_events.append(
-            {"reason": reason, "turn": self._probe_turn, "n_messages": len(chat.messages)}
+            {
+                "reason": reason,
+                "episode": self._probe_episode,
+                "turn": self._probe_turn,
+                "n_messages": len(chat.messages),
+            }
         )
         self.logger.info(
             "PROMPT-SEED: calibration pair installed (%s) at turn %d",
@@ -244,9 +265,34 @@ class Terminus2PromptSeed(Terminus2):
 
         parsed = self._parser.parse_response(raw)
         keystrokes = [c.keystrokes for c in commands]
+        # Turn 1 is the whole experiment; the turn after a compaction is where the
+        # reseed either held or did not.
+        verbatim_context = self._probe_turn == 1 or self._probe_turn == self._reseed_turn + 1
         record = {
+            "episode": self._probe_episode,
             "turn": self._probe_turn,
             "seed_in_context": seed_in_context,
+            # Verbatim context on the turns where the finding lives -- turn 1 and
+            # the first turn after a compaction -- and a digest elsewhere. Prefixes
+            # run to ~40k tokens, so logging every turn in full would produce a file
+            # large enough that nobody opens it, which is its own kind of not
+            # logging. The digest still pins roles, sizes and content hashes, so any
+            # later claim about what the model saw stays checkable.
+            "messages": (
+                [{"role": m.get("role"), "content": m.get("content")} for m in chat.messages]
+                if verbatim_context
+                else None
+            ),
+            "messages_digest": [
+                {
+                    "role": m.get("role"),
+                    "chars": len(m.get("content") or ""),
+                    "sha256": hashlib.sha256((m.get("content") or "").encode()).hexdigest()[:16],
+                }
+                for m in chat.messages
+            ],
+            "prompt": prompt if verbatim_context else None,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()[:16],
             "native_json": is_native_json(raw),
             "legacy_envelope": has_legacy_envelope(raw),
             # A completion that just replays the demonstration is native JSON that
@@ -438,7 +484,23 @@ def summarize(log_path: Path) -> int:
         print(f"no records in {log_path}")
         return 1
 
+    # The log is append-mode and harbor may retry a rollout on the same agent
+    # instance. Grading records[0] blindly would score an abandoned attempt, so
+    # episodes are separated explicitly and the last one -- the attempt that
+    # actually stood -- is the one graded.
+    episodes = sorted({r.get("episode", 1) for r in records})
+    if len(episodes) > 1:
+        print(f"WARNING: {len(episodes)} episodes in this log ({episodes}); grading the last")
+        for ep in episodes:
+            n = sum(1 for r in records if r.get("episode", 1) == ep)
+            print(f"  episode {ep}: {n} turns")
+    graded_episode = episodes[-1]
+    records = [r for r in records if r.get("episode", 1) == graded_episode]
+    print(f"grading episode {graded_episode}")
+
     first = records[0]
+    if first.get("turn") != 1:
+        print(f"WARNING: first graded record is turn {first.get('turn')}, not 1")
     gates = {
         "first_response_is_native_json": first["native_json"],
         "first_response_not_legacy_envelope": not first["legacy_envelope"],

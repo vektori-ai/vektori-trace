@@ -63,6 +63,8 @@ class _Agent(Terminus2PromptSeed):
         self.logger = logging.getLogger("test")
         self._probe_log = None
         self._probe_turn = 0
+        self._probe_episode = 1
+        self._reseed_turn = -1
         self._seed_events = []
         self._first_completion = None
 
