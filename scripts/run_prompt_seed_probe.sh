@@ -68,13 +68,31 @@ echo "staged $(ls "$STAGE")"
 echo
 echo "== serving =="
 ENV_FILE=$OUT/endpoint.env
+# Teardown must never be able to silently no-op. The first run's trap fired,
+# printed `modal: command not found` and left an L40S billing: `modal` is not on
+# PATH under `sudo -iu ubuntu`, and `modal app stop` aborts without --yes when
+# there is no tty. Both are fixed here, and the trap now *verifies* the result
+# rather than assuming it, because a teardown you do not check is not a teardown.
+MODAL=/data/vektori-trace/.venv/bin/modal
 teardown() {
   echo
   echo "== teardown =="
-  modal app stop vektori-trace-serve-student 2>&1 | tail -5 || true
-  modal app list 2>&1 | grep -i "serve-student" || echo "no serve-student app listed"
+  kill "${SERVE_PID:-0}" 2>/dev/null && echo "killed serve pid ${SERVE_PID:-}"
+  for app in $("$MODAL" app list 2>/dev/null | grep -oE 'ap-[A-Za-z0-9]+'); do
+    echo "stopping $app"
+    "$MODAL" app stop "$app" --yes 2>&1 | tail -2 || true
+  done
+  sleep 5
+  echo "-- post-teardown app list --"
+  "$MODAL" app list 2>&1 | head -20
+  if "$MODAL" app list 2>/dev/null | grep -qE 'ephemeral|deployed'; then
+    echo "!!! WARNING: a Modal app is STILL RUNNING -- kill it by hand:" >&2
+    echo "!!!   $MODAL app list; $MODAL app stop <APP_ID> --yes" >&2
+  else
+    echo "all Modal apps stopped"
+  fi
 }
-trap teardown EXIT
+trap teardown EXIT INT TERM
 
 uv run python scripts/serve_student.py \
   --gpu L40S \
