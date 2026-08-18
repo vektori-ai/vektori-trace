@@ -30,10 +30,12 @@ corrected batch and the same seed, and exists only to price the continuation.
 
 ## 0.0 Status — 2026-08-18
 
-Phases 1–6 are **done**. The repaired adapter exists. Phase 7 is **built and
-validated offline**; the only thing left in it is one approved endpoint session.
-Nothing yet demonstrates the repair works at generation time — every metric so
-far is teacher-forced.
+Phases 1–7 are **done**. Phase 7 has run and its answer is negative: no
+checkpoint is deployable. The adapter reproduces Terminus's native JSON only
+when native JSON is already visible in the conversation, and reverts to v1's
+`<tool_call>` envelope at turn 1, where a real rollout starts. Confirmed
+causally by ablation, not inferred. **Phase 6b (dataset rebalance) comes before
+Phases 8–10.**
 
 | | |
 |---|---|
@@ -43,7 +45,7 @@ far is teacher-forced.
 | Phase 4 | trainer written, tests green |
 | Phase 5 | **passed on NF4** — 3 steps, longest rows, 560/560 LoRA tensors moved. The BF16 arm the revised plan called for was never run; see below |
 | Phase 6 | **complete** — 63 steps, 3 epochs, 3.05 h, 7 checkpoints |
-| Phase 7 | **built** — corpora, frozen manifest (`735063bb…`, 24 prefixes), gates, driver, 41 tests. Needs one A100-80GB session |
+| Phase 7 | **RUN** — 168 generations, 0 infra failures, `selected_checkpoint: None`. The protocol is copied from context, not learned; turn 1 still emits v1's envelope |
 
 ### Phase 6 result
 
@@ -626,7 +628,7 @@ follow.
 
 ---
 
-## Phase 7: Checkpoint evaluation — **built; needs one approved endpoint session**
+## Phase 7: Checkpoint evaluation — **RUN, 2026-08-18**
 
 At every saved checkpoint, **no shim**, and through the real serving stack:
 vLLM, BF16 base, LoRA on top. Not a PEFT load in the training precision — the
@@ -818,6 +820,143 @@ untested predicate is not evidence about a checkpoint.
 An endpoint that refused a request is recorded under `infra_failures`, never as
 a checkpoint that failed a gate — the same correction `fallback_exitcode`
 needed in the pass@k reports.
+
+---
+
+### Phase 7 result — 2026-08-18
+
+```text
+168 generations · 24 prefixes × 7 checkpoints · 12 min on A100-80GB
+0 infra failures · every checkpoint × suite graded 8/8
+finish_reason: 160 stop, 8 length
+selected_checkpoint: NONE
+```
+
+`native_json`, generalization suite: ck10 2/8 → ck20-40 4/8 → ck50/60/63 5/8.
+Acquisition flat at 4/8, control 2-4/8. Overall 79/168 pass (47%), against v1's
+**0 of 305**. So the repair moved something real, and did not finish.
+
+**Which prefixes pass is not random.** It is determined by how many prior
+assistant turns the prefix contains:
+
+```text
+native_json PASSES at turn ordinal: 2, 6, 7, 10, 14, 16, 21, 24, 31, 33, 34, 39, 39
+native_json FAILS  at turn ordinal: 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 4
+```
+
+One exception in 24. At turn 1, every checkpoint and every suite reverts to v1's
+exact envelope and harbor returns the same `Missing required fields` that
+produced 305 consecutive failures:
+
+```text
+Analysis: We are in the workspace directory. The task is to fix a Click issue...
+Plan: List the contents of the workspace...
+<tool_call>
+{"name": "bash_command", "arguments": {"keystrokes": "ls -la\n", "duration": 0.1}}
+</tool_call>
+```
+
+The same checkpoint at turn 33 emits a flawless native object. **The instruction
+block is byte-identical in all 24 prefixes** — full schema, worked example,
+required-field list — so instructions cannot explain the difference. The only
+variable that moves with the outcome is the visible history.
+
+Failure causes across all 168: v1 `<tool_call>` envelope **71**, other parser
+error 11, truncated at 512 tokens 7. The truncations are almost all one prefix
+(`acquisition/parse_error_recovery`, turn 3) on every checkpoint — a
+`--max-tokens` artifact, not a model property, which understates acquisition by
+about one of eight.
+
+Validity: 23 of 24 prefixes produce *different* text across the seven
+checkpoints, so seven distinct adapters were measured rather than one adapter
+seven times. `--max-lora-rank 32` and the multi-LoRA registration both work on
+real vLLM; all seven adapters appeared under distinct served names.
+
+### The context probe — cause, not correlation
+
+`scripts/phase7_probe_context.py`, one A100-80GB session, ck63 only, ~7 min.
+
+**A. Dose-response.** One real rollout (`prefecthq__prefect-22700`, 51 actions),
+same checkpoint, prefixes at increasing turn ordinal. Nothing synthesised.
+
+```text
+turn  1  prior_assistant_turns  0  native_json False  legacy True
+turn  2  prior_assistant_turns  1  native_json True   legacy False
+turn  3..20                        native_json True   legacy False
+```
+
+The transition is **0 → 1**, not gradual. A single visible native-JSON turn is
+enough.
+
+**B. Ablation — the decisive arm.** Take the turn-2 prefix the checkpoint answers
+correctly and rewrite its one visible assistant turn into v1's envelope. Nothing
+else changes. The rewrite uses the model's own failure shape, not an invented
+one.
+
+```text
+control (native history)        native_json True   legacy False
+ablated (v1-envelope history)   native_json False  legacy True
+                                → Missing required fields: analysis, plan, commands
+```
+
+**The output follows the visible format.** The model is copying the protocol out
+of context, not producing it from parameters.
+
+### Why, and what it means
+
+Training supervision composition:
+
+```text
+turn-1 actions (nothing to copy)          165   4.6%
+later actions  (native JSON already above) 3396  95.4%
+```
+
+In 95% of rows the correct answer is visible above the target, so "continue the
+format you see" minimises loss without learning the protocol. It is the easier
+solution and the model took it. No learning rate would have changed that; the
+shortcut was available at every step.
+
+**Consequence for Phase 9.** A rollout starts at turn 1 with no assistant
+history. The student emits `<tool_call>`, harbor rejects it, and the *rejection*
+enters context — there is never anything correct to copy, so the rollout
+plausibly never bootstraps and fails as v1 did. No checkpoint here is
+deployable; `selected_checkpoint: None` is the correct answer, not a tooling
+failure.
+
+**OPD does not fix this.** Its advantage is correcting the student's own
+trajectory distribution. At turn 1 there is no history, so the on-policy and
+off-policy distributions are identical and OPD has no extra information to
+offer. It also cannot collect data: with turn 1 unparseable, no command
+executes and the rollout never advances. OPD remains the right tool for the
+step after this one — "valid JSON but strategic failure is exactly what OPD is
+for" — and we do not yet have valid JSON from cold.
+
+### Phase 6b: the mix that removes the shortcut
+
+Oversampling turn-1 rows is not sufficient on its own: there are only 165 of
+them, so duplicating them teaches 165 memorised openers rather than the format.
+The shortcut has to be made *wrong*, not merely rarer.
+
+Both representations of every action are already on disk — `raw_capture` is
+native JSON, the ATIF `tool_calls` form is the v1 envelope, for all 3,528 joined
+turns. So build rows whose **visible history is the v1 envelope** and whose
+**target is native JSON**. Copying then produces the wrong answer and the only
+way to score is to follow the instructions.
+
+```text
+~30%  anti-copy   history in v1 envelope, target native JSON
+~25%  cold start  no assistant history at all
+~45%  as-is       preserves the turn-6+ behaviour that already works
+```
+
+Continue from **ck63**, not from base and not from v1: turn 6+ is already
+correct and there is nothing to gain by re-deriving it, while base would also
+discard v1's real skills, which were never the problem. v1 stays frozen so a
+from-v1 branch remains available if ck63 plateaus.
+
+Re-run Phase 7 against the same frozen manifest afterwards. The turn-1
+categories — `orientation`, `post_compaction`, `first_inspection` — are the
+acceptance test.
 
 ---
 
