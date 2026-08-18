@@ -68,6 +68,11 @@ class ServedModel:
         default_factory=lambda: dict(DEFAULT_HOSTED_VLLM_MODEL_INFO)
     )
     adapter_path: str | None = None
+    # Every LoRA registered on this endpoint, served name -> Volume path. One
+    # base load can host many adapters; Phase 7 grades seven checkpoints and
+    # paying the ~27.6 GiB base load seven times would cost more than the whole
+    # evaluation. `model_name` is one of these keys.
+    adapter_models: dict[str, str] = field(default_factory=dict)
     gpu: str = "L40S"
     base_model: str = ""
     max_model_len: int | None = None
@@ -117,6 +122,9 @@ def serve_model(
     base_model: str,
     *,
     adapter_path: str | None = None,
+    adapter_paths: dict[str, str] | None = None,
+    max_lora_rank: int | None = None,
+    max_loras: int | None = None,
     gpu: str = "L40S",
     model_info: dict[str, Any] | None = None,
     max_model_len: int | None = None,
@@ -191,6 +199,31 @@ def serve_model(
         info["max_output_tokens"] = out_cap
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
+    # The adapter gets its OWN served name, and that is what callers are handed.
+    # vLLM resolves a request's `model` against the served base name *before* it
+    # consults the LoRA table, so registering the adapter under `name` — as this
+    # did — makes every request fall through to the base weights. Nothing errors:
+    # the sweep runs, the adapter is never applied, and the result reads as "OPD
+    # changed nothing". Distinct names make that failure impossible, and make it
+    # visible in /v1/models and in `harbor_model`.
+    lora_name = f"{name}-lora" if vol_adapter else None
+    # `adapter_paths` registers additional LoRAs under caller-chosen suffixes.
+    # vLLM resolves a request's `model` against the base name before it consults
+    # the LoRA table, so every adapter needs a name distinct from `name` or the
+    # request silently falls through to base weights — the failure that made an
+    # OPD sweep read as "changed nothing".
+    lora_table: dict[str, str] = {}
+    if vol_adapter:
+        lora_table[lora_name] = vol_adapter
+    for suffix, path in (adapter_paths or {}).items():
+        served = f"{name}-{suffix}"
+        if served == name:
+            raise ValueError(
+                f"adapter suffix {suffix!r} collides with the base served name "
+                f"{name!r}; requests would resolve to base weights"
+            )
+        lora_table[served] = _resolve_volume_adapter(path)
+    served_name = lora_name or (sorted(lora_table)[0] if lora_table else name)
     vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
@@ -356,8 +389,22 @@ def serve_model(
                 cmd += ["--gpu-memory-utilization", str(gpu_memory_utilization)]
             if extra_vllm_args:
                 cmd += list(extra_vllm_args)
-            if vol_adapter:
-                cmd += ["--enable-lora", "--lora-modules", f"{name}={vol_adapter}"]
+            if lora_table:
+                cmd += ["--enable-lora"]
+                cmd += ["--lora-modules"] + [
+                    f"{n}={p}" for n, p in sorted(lora_table.items())
+                ]
+                # vLLM's default max_lora_rank is 16 and every adapter this repo
+                # trains is rank 32 (`adapter_config.json`, r: 32). Without this
+                # the engine refuses to start — after Modal has allocated the
+                # GPU and pulled the weights.
+                if max_lora_rank is not None:
+                    cmd += ["--max-lora-rank", str(max_lora_rank)]
+                # How many distinct LoRAs may be live in one batch. Requests are
+                # grouped by adapter, so the default of 1 is correct for a
+                # sequential sweep and only costs throughput when it is not.
+                if max_loras is not None:
+                    cmd += ["--max-loras", str(max_loras)]
             # Inherit stdout/stderr so vLLM's own log reaches `modal app logs`.
             proc = subprocess.Popen(cmd)
             deadline = time.time() + 60 * 25
@@ -394,9 +441,10 @@ def serve_model(
             )
         served = ServedModel(
             api_base=url.rstrip("/") + "/v1",
-            model_name=name,
+            model_name=served_name,
             model_info=info,
             adapter_path=vol_adapter,
+            adapter_models=dict(lora_table),
             gpu=gpu,
             base_model=base_model,
             max_model_len=max_model_len,
