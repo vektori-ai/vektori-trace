@@ -12,13 +12,28 @@ contains and which one carries the loss.
 
     turn_1                 117  segment_index 0, the production first turn
     post_compaction_first   48  first action after a compaction boundary
-    parse_error_recovery    18  the action after harbor rejected a completion
                            ---
-                           183
+                           165
 
 The 48 are already inside the 165 firsts (segments 1..N of a rollout), so they
-are not additional; counting them twice was an early error in the plan. The 18
-are genuinely separate — verified: no recovery is also a segment's first action.
+are not additional; counting them twice was an early error in the plan.
+
+**Parse-error recoveries are deferred to Stage B**, against the plan's original
+183. They were included because `parse_error_recovery` fails 2 of 3 prefixes at
+every checkpoint and reads as a cold start — no *valid* prior action to copy a
+protocol from. Measured, they are not cold starts by position:
+
+    turn_1                 952 ..  2,234 tokens
+    post_compaction_first  2,567 .. 6,494
+    parse_error_recovery   5,302 .. 33,179   (median 15,059; 14 of 18 over 8k)
+
+They sit at turns 13-75 with the whole trajectory behind them. Admitting them
+means either a max_length near 33k — where 10% of the rows would carry ~47% of
+the input tokens and Stage A stops being the short, fast format run the plan
+costed — or keeping only the 4 that happen to fit, which selects recoveries by
+trajectory length and so by task and repo. Stage B's one-action-per-row rows
+already run to 40k; that is where these belong. `--recoveries stage-a` builds
+the 183-row version for comparison.
 
 Repo mass is rebalanced because the corpus is not: 110 of 165 firsts are pallets
 (click + jinja), so an unweighted Stage A would be a Click opener model. Weights
@@ -60,7 +75,8 @@ TURN_1 = "turn_1"
 POST_COMPACTION_FIRST = "post_compaction_first"
 PARSE_ERROR_RECOVERY = "parse_error_recovery"
 
-EXPECTED_COUNTS = {TURN_1: 117, POST_COMPACTION_FIRST: 48, PARSE_ERROR_RECOVERY: 18}
+EXPECTED_COUNTS = {TURN_1: 117, POST_COMPACTION_FIRST: 48}
+EXPECTED_COUNTS_WITH_RECOVERIES = {**EXPECTED_COUNTS, PARSE_ERROR_RECOVERY: 18}
 
 # Sampler mass per repo. pallets is capped well under its natural 67%; the other
 # three are lifted, but only to ~1.65x, comfortably inside the 3x cap — a repo
@@ -93,7 +109,9 @@ def _is_native_action(text: str) -> tuple[bool, str]:
     return True, ""
 
 
-def slice_rows(rows: list[dict], manifest: list[dict]) -> list[dict]:
+def slice_rows(
+    rows: list[dict], manifest: list[dict], *, recoveries: bool
+) -> list[dict]:
     """One row per cold start, each ending on its target."""
     out: list[dict] = []
     for row, man in zip(rows, manifest, strict=True):
@@ -114,13 +132,16 @@ def slice_rows(rows: list[dict], manifest: list[dict]) -> list[dict]:
         # on 2 of 3 prefixes at every checkpoint — a cold start in everything but
         # name, since the visible assistant turn above is malformed.
         for i, m in enumerate(meta):
-            if m.get("kind") != "parse_error":
+            if not recoveries or m.get("kind") != "parse_error":
                 continue
             nxt = next(
                 (j for j in range(i + 1, len(meta)) if meta[j].get("kind") == "action"),
                 None,
             )
-            if nxt is not None and row["supervise"][nxt] and nxt != first:
+            # Two rejected completions in a row resolve to the same recovery
+            # action; that is one training row, not two.
+            already = {i for i, _ in targets}
+            if nxt is not None and row["supervise"][nxt] and nxt not in already:
                 targets.append((nxt, PARSE_ERROR_RECOVERY))
 
         for idx, kind in targets:
@@ -208,7 +229,7 @@ def _first_command(row: dict) -> str:
         return "<unparsed>"
 
 
-def check_mix(rep: dict[str, Any]) -> list[str]:
+def check_mix(rep: dict[str, Any], expected: dict[str, int]) -> list[str]:
     """Every condition `docs/SFT-SCRATCH-PLAN.md` says aborts before a GPU."""
     bad = []
     if rep["pallets_mass"] > PALLETS_MASS + 1e-6:
@@ -221,10 +242,12 @@ def check_mix(rep: dict[str, Any]) -> list[str]:
     for repo, e in rep["by_repo"].items():
         if e["upsample"] > MAX_UPSAMPLE + 1e-6:
             bad.append(f"{repo} is upsampled {e['upsample']:.2f}x, cap is {MAX_UPSAMPLE}")
-    for kind, expected in EXPECTED_COUNTS.items():
+    for kind, want in expected.items():
         got = rep["by_kind"].get(kind, 0)
-        if got != expected:
-            bad.append(f"{kind}: {got} rows, expected {expected}")
+        if got != want:
+            bad.append(f"{kind}: {got} rows, expected {want}")
+    for kind in set(rep["by_kind"]) - set(expected):
+        bad.append(f"{kind}: {rep['by_kind'][kind]} unexpected rows")
     return bad
 
 
@@ -243,6 +266,12 @@ def main() -> int:
     ap.add_argument("--model", default="Qwen/Qwen3-14B")
     ap.add_argument("--expect-src-sha", default=EXPECTED_SRC_SHA,
                     help="prefix of the repaired corpus sha256 this may slice")
+    ap.add_argument("--recoveries", choices=("defer", "stage-a"), default="defer",
+                    help="'defer' (default) leaves the 18 parse-error recoveries "
+                         "for Stage B; they run to 33k tokens and would carry ~47%% "
+                         "of Stage A's input for 10%% of its rows. 'stage-a' builds "
+                         "the plan's original 183 — raise --max-length with it.")
+    ap.add_argument("--max-length", type=int, default=MAX_LENGTH)
     args = ap.parse_args()
 
     data = args.src / "sft_repaired.jsonl"
@@ -259,7 +288,8 @@ def main() -> int:
         for ln in (args.src / "repair_manifest.jsonl").read_text().splitlines()
         if ln.strip()
     ]
-    sliced = slice_rows(rows, manifest)
+    want_recoveries = args.recoveries == "stage-a"
+    sliced = slice_rows(rows, manifest, recoveries=want_recoveries)
     print(f"sliced {len(sliced)} rows from {len(rows)} segments: "
           f"{dict(collections.Counter(r['kind'] for r in sliced))}")
 
@@ -277,7 +307,9 @@ def main() -> int:
 
     weights = compute_weights(sliced)
     rep = mix_report(sliced, weights)
-    mix_problems = check_mix(rep)
+    mix_problems = check_mix(
+        rep, EXPECTED_COUNTS_WITH_RECOVERIES if want_recoveries else EXPECTED_COUNTS
+    )
 
     # ---- tokenize, and verify the mask on every row ------------------------
     from transformers import AutoTokenizer
@@ -290,14 +322,14 @@ def main() -> int:
     for r in sliced:
         try:
             ex = tokenize_messages(
-                r["messages"], tok, r["supervise"], max_length=MAX_LENGTH,
+                r["messages"], tok, r["supervise"], max_length=args.max_length,
                 template_kwargs=TEMPLATE_KWARGS, truncate=False,
             )
         except Exception as e:  # a refusal here is a build failure, not a drop
             tok_problems.append(f"{r['source_id']}: {type(e).__name__}: {e}")
             continue
         if ex is None:
-            tok_problems.append(f"{r['source_id']}: over {MAX_LENGTH} tokens or nothing supervised")
+            tok_problems.append(f"{r['source_id']}: over {args.max_length} tokens or nothing supervised")
             continue
         n_sup = sum(1 for lab in ex.labels if lab != IGNORE_INDEX)
         first = next(i for i, lab in enumerate(ex.labels) if lab != IGNORE_INDEX)
@@ -363,7 +395,7 @@ def main() -> int:
     (args.out / "tokenization_fingerprint.json").write_text(json.dumps({
         "model": args.model,
         "template_kwargs": TEMPLATE_KWARGS,
-        "max_length": MAX_LENGTH,
+        "max_length": args.max_length,
         "dataset_sha256": out_sha,
         "per_row": fingerprint,
     }, indent=2))
