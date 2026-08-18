@@ -121,6 +121,15 @@ before reporting it.
 Same session: score **base 14B (no adapter)** and the selected checkpoint on the
 45 + tripwires. That is Stage B's baseline.
 
+**Stage A ran 2026-08-18 and is trained.** 84 steps (21/epoch x 4), BF16,
+`train_loss` 0.5281, peak 36.8 alloc / 37.4 reserved GiB, 560/560 LoRA tensors
+moved, grad norms finite and non-zero. **11.7 s/step, 983 s total** — the
+probe's 26.2 s/step was measured on the 24 longest rows and overestimates a
+full run by ~2x; cost future runs off this number, not the probe's. Nine
+gradeable checkpoints on the volume at `sft/qwen3-14b-stage-a-lora`:
+`checkpoint-10` .. `-80`, `-84`, plus the final adapter at the root. Teardown
+verified, all apps stopped.
+
 ## 6. Selection
 
 Earliest checkpoint clearing all 45 on `harbor_accepts` + `required_fields`
