@@ -121,7 +121,7 @@ def complete(
             # Retrying it just repeats the same mistake more expensively.
             if 400 <= e.code < 500:
                 return "", None, last
-        except Exception as e:  # noqa: BLE001 - transport, not model
+        except Exception as e:
             last = f"{type(e).__name__}: {e}"
         if attempt < retries:
             time.sleep(2 * (attempt + 1))
@@ -264,7 +264,7 @@ def main() -> int:
         entry = job["entry"]
         try:
             return _run(job)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # One malformed prefix must not discard every completion already
             # paid for. It is recorded as ungraded, which blocks its checkpoint
             # from being selected rather than quietly excusing it.

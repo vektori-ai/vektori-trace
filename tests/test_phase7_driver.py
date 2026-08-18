@@ -140,14 +140,14 @@ def test_4xx_is_not_retried(monkeypatch):
 
     calls = []
 
-    def boom(req, timeout):  # noqa: ARG001
+    def boom(req, timeout):
         calls.append(1)
         raise urllib.error.HTTPError(
             "u", 400, "Bad Request", {}, __import__("io").BytesIO(b"nope")
         )
 
     monkeypatch.setattr(driver.urllib.request, "urlopen", boom)
-    text, finish, err = driver.complete(
+    text, _finish, err = driver.complete(
         "http://x/v1", "m", [{"role": "user", "content": "hi"}],
         timeout=1, retries=3,
     )
@@ -159,7 +159,7 @@ def test_4xx_is_not_retried(monkeypatch):
 def test_transport_error_is_retried_then_reported(monkeypatch):
     calls = []
 
-    def boom(req, timeout):  # noqa: ARG001
+    def boom(req, timeout):
         calls.append(1)
         raise TimeoutError("slow")
 
