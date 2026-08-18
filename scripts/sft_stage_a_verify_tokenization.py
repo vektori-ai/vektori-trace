@@ -20,6 +20,11 @@ import json
 import sys
 from pathlib import Path
 
+# Run as a plain script (`python scripts/...`) and the repo root is not on the
+# path, so `scripts.` does not resolve. pytest gets this from rootdir; a bare
+# invocation on the box has to do it itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from scripts.sft_stage_a_train_modal import (
     IGNORE_INDEX,
     MAX_LENGTH,
