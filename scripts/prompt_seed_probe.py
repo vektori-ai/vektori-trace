@@ -106,8 +106,30 @@ def is_native_json(text: str) -> bool:
 
 
 def has_legacy_envelope(text: str) -> bool:
-    """True when the completion carries v1's `<tool_call>` envelope or a think block."""
-    return "<tool_call>" in text or "<think>" in text
+    """True when the completion carries v1's `<tool_call>` envelope.
+
+    Deliberately does NOT count a `<think>` block. Thinking is allowed -- harbor
+    tolerates a leading think block with a warning and still extracts commands --
+    so folding the two together made a gate fail for a reason we had explicitly
+    permitted, and reported "still emitting the tool_call envelope" for a
+    completion that had in fact dropped the tags.
+    """
+    return "<tool_call>" in text
+
+
+def has_think_block(text: str) -> bool:
+    """Recorded separately: allowed, but it breaks the strict native_json tier."""
+    return "<think>" in text
+
+
+def has_v1_tool_schema(text: str) -> bool:
+    """v1's OpenAI tool-call *schema*, with or without the `<tool_call>` tags.
+
+    Run 3 dropped the tags but kept `{"name": ..., "arguments": {...}}`, which
+    harbor still rejects. Tags and schema are separate failures and the split
+    geometry moved one without moving the other, so they need separate flags.
+    """
+    return '"name"' in text and '"arguments"' in text
 
 
 def _normalize(text: str) -> str:
@@ -341,6 +363,8 @@ class Terminus2PromptSeed(Terminus2):
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()[:16],
             "native_json": is_native_json(raw),
             "legacy_envelope": has_legacy_envelope(raw),
+            "think_block": has_think_block(raw),
+            "v1_tool_schema": has_v1_tool_schema(raw),
             # A completion that just replays the demonstration is native JSON that
             # harbor accepts while meaning nothing. Without this the protocol gate
             # can pass vacuously.
@@ -371,6 +395,7 @@ class Terminus2PromptSeed(Terminus2):
             gate = {
                 "harbor_accepts": record["harbor_accepts"],
                 "no_legacy_envelope": not record["legacy_envelope"],
+                "no_v1_tool_schema": not record["v1_tool_schema"],
                 "has_keystrokes": record["has_keystrokes"],
                 "not_a_seed_echo": not record["echoed_seed"],
             }

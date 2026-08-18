@@ -176,6 +176,21 @@ def test_seed_present_tracks_installation_and_removal(agent):
 # ---- format tiers ------------------------------------------------------------
 
 
+def test_think_block_is_not_counted_as_a_legacy_envelope():
+    """Run 3 dropped the <tool_call> tags but kept a <think> block. Conflating the
+    two reported it as 'still emitting the envelope', which was false."""
+    from prompt_seed_probe import has_think_block, has_v1_tool_schema
+
+    run3 = (
+        "<think>\n\n</think>\n\nAnalysis: We are in /workspace.\nPlan: List contents.\n"
+        '{"name": "bash_command", "arguments": {"keystrokes": "ls -la"}}'
+    )
+    assert not has_legacy_envelope(run3)   # tags are gone
+    assert has_think_block(run3)           # allowed, recorded separately
+    assert has_v1_tool_schema(run3)        # the actual remaining defect
+    assert not is_native_json(run3)
+
+
 def test_legacy_envelope_detection_matches_v1_failure_shape():
     v1 = (
         "Analysis: We are in the workspace directory.\n"
