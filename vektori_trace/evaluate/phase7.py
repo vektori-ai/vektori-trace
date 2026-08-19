@@ -402,6 +402,10 @@ TRIPWIRE_CATEGORIES = (
 # tripwires remain diagnostic rather than gating.
 STAGE_B_EDIT_BASELINE = 0
 STAGE_B_TEST_BASELINE = 1
+STAGE_A_BASELINE_ARTIFACT = "/data/phase7-stage-a/results_4096_ck84.json"
+STAGE_A_BASELINE_SHA256 = (
+    "ca6cbd986eb57ee9ba86a42c8b45e316797907f33adebd3b4b802ef5d229855d"
+)
 
 
 def selection_prefix_ids(prefixes: Iterable[dict[str, Any]]) -> list[str]:
@@ -549,7 +553,15 @@ def stage_b_clears(
             if r.checkpoint == checkpoint and r.prefix_id in expected
         }
         missing = sorted(expected - set(group))
-        passed = sum(group[p].gates.get(gate) is True for p in group)
+        # A behavior only counts when harbor could actually execute the action.
+        # `grade` can recognize an edit-like command in a partially recovered
+        # object even when required protocol fields are absent; that is useful
+        # diagnostic information, but it is not a successful agent action.
+        passed = sum(
+            group[p].gates.get(gate) is True
+            and all(group[p].gates.get(fmt) is True for fmt in SELECTION_GATES)
+            for p in group
+        )
         detail = {
             "gate": gate,
             "baseline_passed": baseline,

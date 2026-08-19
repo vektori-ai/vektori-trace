@@ -114,13 +114,15 @@ def _stage_b_results(ck="ck25", *, edits=1, tests=2, omit=None):
         r = GateResult(prefix_id=f"edit{i}", checkpoint=ck,
                        category="first_edit", suite="generalization",
                        completion="")
-        r.gates = {"edit_emission": i < edits}
+        r.gates = {**dict.fromkeys(SELECTION_GATES, True),
+                   "edit_emission": i < edits}
         rows.append(r)
     for i in range(3):
         r = GateResult(prefix_id=f"test{i}", checkpoint=ck,
                        category="test_exec", suite="generalization",
                        completion="")
-        r.gates = {"test_emission": i < tests}
+        r.gates = {**dict.fromkeys(SELECTION_GATES, True),
+                   "test_emission": i < tests}
         rows.append(r)
     return [r for r in rows if r.prefix_id != omit]
 
@@ -145,6 +147,15 @@ def test_stage_b_missing_behavior_result_blocks_selection():
     ok, detail = _stage_b_clear(_stage_b_results(omit="test2"))
     assert ok is False
     assert detail["test_exec"]["ungraded"] == ["test2"]
+
+
+def test_stage_b_does_not_count_behavior_from_an_invalid_action():
+    rows = _stage_b_results(edits=1, tests=2)
+    edit = next(r for r in rows if r.prefix_id == "edit0")
+    edit.gates.update(dict.fromkeys(SELECTION_GATES, False))
+    ok, detail = _stage_b_clear(rows)
+    assert ok is False
+    assert detail["first_edit"]["passed_count"] == 0
 
 
 def test_stage_b_selector_takes_earliest_combined_pass():
