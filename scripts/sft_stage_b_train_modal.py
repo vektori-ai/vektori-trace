@@ -582,11 +582,17 @@ def train(
     # `_get_train_sampler` returning the right object is not proof the loader
     # Accelerate prepares uses it: `prepare` can replace the sampler when it
     # shards. Ask the real dataloader, which is the thing that feeds the steps.
+    #
+    # Accelerate's `DataLoaderShard` always sets `.sampler` to a `SequentialSampler`
+    # placeholder it uses for its own epoch/state bookkeeping — that attribute is
+    # never None, so a `seen is None` fallback never fires and this used to check
+    # the decoy. The sampler that actually draws batches is `.batch_sampler.sampler`
+    # whenever a `batch_sampler` is present (verified off-GPU: draws show repeats
+    # and non-sequential order, which only a WeightedRandomSampler produces).
     loader = trainer.get_train_dataloader()
-    seen = getattr(loader, "sampler", None)
-    if seen is None:
-        batch_sampler = getattr(loader, "batch_sampler", None)
-        seen = getattr(batch_sampler, "sampler", None)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    seen = getattr(batch_sampler, "sampler", None) if batch_sampler is not None \
+        else getattr(loader, "sampler", None)
     if not isinstance(seen, _WRS):
         raise SystemExit(
             f"the prepared dataloader samples with {type(seen).__name__}, not "

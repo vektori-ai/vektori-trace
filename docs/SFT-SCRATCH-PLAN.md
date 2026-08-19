@@ -134,6 +134,11 @@ verified, all apps stopped.
 
 Earliest checkpoint clearing all 45 on `harbor_accepts` + `required_fields`
 + no `<tool_call>`. Exactly those three — nothing else gates.
+
+**Selected: ck84.** ck84 clears 45/45 at 4096 (`docs/STAGE-A-RUN-LOG.md`).
+"Earliest that clears" is unmeasured — ck20/ck40 untested — and stays
+unmeasured by decision: not worth GPU to re-measure. ck84 is Stage B's base,
+not a placeholder.
 Report `native_json` and `think_body_tokens` alongside, **logged, not gating**:
 Stage A was not asked to teach think *content*, the IFT prior owns that. An
 all-empty think body means the step-1 mask failed, which is a CPU bug to fix,
@@ -155,7 +160,9 @@ Continue the Stage A adapter. One supervised action per row, row ends on target.
 - <=4 later actions/segment: first **edit** -> first **test** -> **last** action
   -> one even **mid**. Read-only segments: 4 even ordinals incl. last. Never
   reuse Stage A's first action.
-- ≈660 rows, x1.93 packed, ~1.9 h at v1's measured 1120 tok/s. Timeout 8 h.
+- 577 later+recovery rows (not the ≈660 estimated before the slice existed;
+  corrected here, amendment 4), plus 165 cold_replay = 742 total. x1.93
+  packed, ~1.9 h at v1's measured 1120 tok/s. Timeout 8 h.
 - Cold draws >= **253** (25% supervised-token floor); target **325** (30%).
   `mix_report` must clear the floor before launch.
 - **Plus the 18 parse-error recovery actions** deferred from Stage A
@@ -240,6 +247,23 @@ down. Everything else in this file was agreed before it was written.
    Freeze goes to `/data/phase7-stage-a/manifest.json`.
    `/data/phase7/manifest.json` is the v1 frozen manifest that
    `/data/phase7/results.json` was graded against — never overwrite it.
+
+
+4. **Stage B cold-start rows are Stage A's 165 rows, replayed.** *Signed off
+   2026-08-19.* Step 8's 25%/30% cold-token floor/target was in this plan;
+   the mechanism was not. Stage B's own rows are all later-in-trajectory
+   actions with no prior action to copy a protocol from, so without a replay
+   component the cold share is 0 by construction and the floor is
+   unreachable. `sft_stage_b_dataset.py` replays all 165 Stage A rows
+   (`stage_a_key`, excluded from the later-action pool so no row is used
+   twice) as a weighted component, with the component's sampler mass solved
+   for the token-share target rather than guessed (`solve_cold_mass`).
+   Requires `sft_stage_b_train_modal.py`'s weighted sampler — a uniform
+   sampler over the same jsonl clears only 14.5%, under the floor.
+
+   Built at `/data/sft-stage-b`: 742 rows, `dataset_sha256` `c371033d…`,
+   cold share 30.0% weighted / 14.5% uniform, 165 cold_replay rows, 18
+   parse_error_recovery, `mix_problems: []`.
 
 
 ## Fail closed — before any GPU
