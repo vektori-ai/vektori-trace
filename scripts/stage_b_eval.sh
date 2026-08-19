@@ -94,7 +94,7 @@ echo "=== serving $(date -Is) ==="
   --adapter ckB50="$CK/checkpoint-50" \
   --adapter ckB75="$CK/checkpoint-75" \
   --adapter ckB93="$CK/checkpoint-93" \
-  --max-lora-rank 32 --gpu L40S --max-model-len 40960 --max-hours 2 \
+  --max-lora-rank 32 --gpu L40S --max-model-len 40960 --max-hours 3 \
   --write-env "$ENV_FILE" --write-app-id "$APP_ID_FILE" \
   > "$OUT/serve.log" 2>&1 &
 SERVE_PID=$!
