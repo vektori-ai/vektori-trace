@@ -121,6 +121,15 @@ def _eval_is_untrustworthy(jobs_dir: Path) -> bool:
     return False
 
 
+def _as_text(raw: str | bytes | None) -> str:
+    """Captured output as str, whatever subprocess handed back."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return raw
+
+
 def _ak_args(
     *,
     api_base: str | None,
@@ -217,8 +226,14 @@ def run_trial(
         stdout, stderr = proc.stdout, proc.stderr
         timed_out = False
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        # `text=True` does NOT reach here: subprocess.run decodes on the success
+        # path only, so TimeoutExpired carries raw bytes and `write_text` later
+        # dies with "data must be str, not bytes" -- after the rollout has run,
+        # destroying the report for work already paid for. The timeout path is
+        # exactly the path a guarded rollout takes, so it must not be the
+        # untested one.
+        stdout = _as_text(exc.stdout)
+        stderr = _as_text(exc.stderr)
         timed_out = True
     elapsed_sec = time.perf_counter() - t0
     reward = _find_reward(job_dir)

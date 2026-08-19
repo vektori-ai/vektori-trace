@@ -127,3 +127,25 @@ def test_a_timeout_keeps_its_loss(tmp_path: Path, monkeypatch) -> None:
 
     assert result.passed is False
     assert result.timed_out is True
+
+
+def test_a_timed_out_trial_persists_its_output_instead_of_crashing(tmp_path, monkeypatch):
+    """The 10-minute guarded rollout ends in TimeoutExpired by design. That
+    exception carries bytes even under text=True, and the persist step used to
+    raise TypeError there — losing the report for a rollout already paid for."""
+    import subprocess
+
+    from vektori_trace.evaluate import validity
+
+    def _boom(*a, **kw):
+        raise subprocess.TimeoutExpired(
+            cmd="harbor", timeout=600, output=b"stdout bytes \xff", stderr=b"stderr bytes"
+        )
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    result = validity.run_trial(
+        tmp_path / "task", "terminus-2", tmp_path / "jobs", timeout_sec=600
+    )
+    assert result.timed_out is True
+    written = (tmp_path / "jobs" / "task-terminus-2" / "harbor_stderr.txt").read_text()
+    assert written == "stderr bytes"
