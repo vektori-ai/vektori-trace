@@ -144,17 +144,49 @@ The chat template was pinned on the wire — the job's own `config.json` carries
 ### Still open after step 7
 
 - `native_json` / `required_fields` on **live** turns. A trajectory holds no raw
-  text, so only the capture proxy can grade them. Strongly implied — the plain
-  parser rejects a fenced or enveloped response and we got 16 commands — but
-  not measured.
+  text, and nothing else in the job dir does either (`harbor_stdout.txt` is 0
+  bytes; the pane holds terminal output only). Only `capture-proxy` records raw
+  completions, and this rollout did not run behind it.
+
+  **Do not repeat the claim that "commands existing implies bare JSON".** It is
+  false: harbor *salvages*. `TerminusJSONPlainParser.parse_response` tries the
+  normal path, and on error runs auto-fixes
+  (`terminus_json_plain_parser.py:39-59`). Every turn here carried a warning:
+
+  | turn | warning | what it means |
+  |---|---|---|
+  | 1 | `AUTO-CORRECTED: Extracted JSON from mixed content` | the normal parse **failed**; a regex scrape recovered an object |
+  | 2-6 | `Extra text detected before JSON object` | normal parse succeeded, text preceded the `{` (line 208) |
+
+  So turn 1 is a harder failure than turns 2-6, not the same one. The normal
+  extractor brace-counts from the **first `{` in the whole response**
+  (lines 186-210), so a brace anywhere in the preceding text derails it. And
+  the fallback `_fix_mixed_content` returns the **first regex match that
+  parses** (lines 336-347) — if the pre-JSON text contains a complete
+  JSON-ish object, harbor can execute a draft instead of the final action. On
+  turn 1 the recovered commands were sane, but that is luck, not a guarantee,
+  and a frozen-prefix Phase 7 sweep cannot see this at all.
+
+- **What the pre-JSON text is, is unproven.** Token accounting (real Qwen3-14B
+  tokenizer, against the JSON harbor kept) puts 58-94% of every completion
+  outside the JSON: turn 4 billed 4078 tokens for 232 tokens of action. The
+  `enable_thinking: true` pin is confirmed on the wire in the job's
+  `config.json`, and `reasoning_content` is 0 on all six turns — consistent
+  with no reasoning parser on the endpoint, so a think block would land in
+  `message.content`. Consistent with, **not evidence of**: prose fits equally
+  well. `scripts/serve_student.py --reasoning-parser qwen3` (vLLM 0.21.0)
+  settles it and removes the brace hazard at the same time.
 - The 600 s cap vs ~100 s/turn: Stage B needs a bigger number or it grades
   trajectories that were cut off, not finished.
 
 ## Still open
 
-- ck84 at 4096: does the one miss clear, giving a clean 45/45?
-- ck20 / ck40 at 4096, so "earliest" means something.
-- base 14B on the 45 — read the `orientation` rows hardest.
+- ck20 / ck40 at 4096, so "earliest" means something. **ck84 at 4096 cleared
+  45/45** — that question is closed; this one is not.
+- ~~base 14B on the 45~~ — **done**: 27/41 graded (4 lost to an early
+  kill-switch), `post_compaction` 1/15 vs ck84's 15/15, orientation and
+  first_inspection already at base. Stage A's measured contribution is
+  post-compaction, not turn-1 JSON.
 - **Step 7 ran and is green** (see above). Stage B remains blocked on step 6:
   ck84 clears 45/45 at 4096, but "earliest that clears" is unmeasured — ck20 /
   ck40 at 4096 were never run.

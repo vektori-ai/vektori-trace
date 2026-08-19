@@ -189,6 +189,17 @@ def main() -> int:
                          "not a limit vLLM enforces — do not tune against it. "
                          "40960 matches model_info's max_input_tokens (40,448) "
                          "and what run6 actually served (default: 40960)")
+    ap.add_argument("--reasoning-parser", default=None,
+                    help="vLLM reasoning parser (e.g. `qwen3`). Without it a "
+                         "thinking model's <think> block stays inside "
+                         "message.content, ahead of the JSON — harbor's "
+                         "terminus parser then warns 'Extra text detected "
+                         "before JSON object' on every turn, and its extractor "
+                         "brace-counts from the FIRST '{' in the response, so a "
+                         "brace inside the reasoning derails it into the "
+                         "regex salvage path (observed on the step 7 rollout, "
+                         "turn 1). With it, vLLM splits reasoning into "
+                         "reasoning_content and content is the bare action.")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--max-hours", type=float, default=12.0,
                     help="auto-shutdown after N hours so a forgotten endpoint "
@@ -255,6 +266,12 @@ def main() -> int:
         k, v = spec.split("=", 1)
         adapters[k] = v
 
+    extra_vllm_args: list[str] = []
+    if args.reasoning_parser:
+        extra_vllm_args += ["--reasoning-parser", args.reasoning_parser]
+        print(f"reasoning parser   {args.reasoning_parser} "
+              "(think goes to reasoning_content, not into the action JSON)")
+
     with serve_model(
         args.base_model,
         adapter_path=args.adapter_path,
@@ -264,6 +281,7 @@ def main() -> int:
         gpu=args.gpu,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        extra_vllm_args=extra_vllm_args or None,
     ) as served:
         print(f"UP in {time.time() - t0:.0f}s\n")
 

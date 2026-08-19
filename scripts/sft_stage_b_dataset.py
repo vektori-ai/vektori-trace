@@ -446,7 +446,7 @@ def mix_report(
     }
 
 
-def check_mix(rep: dict[str, Any], *, allow_unweighted: bool = False) -> list[str]:
+def check_mix(rep: dict[str, Any], *, sampler: str = "uniform") -> list[str]:
     """Every condition `docs/SFT-SCRATCH-PLAN.md` says aborts before a GPU."""
     bad = []
     if rep["pallets_mass"] > PALLETS_MASS + 1e-6:
@@ -467,21 +467,21 @@ def check_mix(rep: dict[str, Any], *, allow_unweighted: bool = False) -> list[st
             f"{EXPECTED_RECOVERIES} — amendment 2 moved these here and step 8 "
             "requires them"
         )
+    # Which share is the real one is a property of the trainer, so it is
+    # declared, not guessed. `--sampler weighted` is only honest because
+    # `scripts/sft_stage_b_train_modal.py` overrides `_get_train_sampler` with a
+    # WeightedRandomSampler over this `weight` column and re-checks this same
+    # floor before its first step. Point the jsonl at any other trainer and the
+    # correct declaration is `uniform`.
     share = rep["cold"]["token_share"]
     uniform = rep["cold"].get("token_share_uniform", 0.0)
-    if not allow_unweighted and uniform < COLD_TOKEN_FLOOR - 1e-6 <= share:
+    effective = share if sampler == "weighted" else uniform
+    if effective < COLD_TOKEN_FLOOR - 1e-6:
         bad.append(
-            f"the {share:.1%} cold share holds only under a weighted sampler; "
-            f"uniformly it is {uniform:.1%}, under the {COLD_TOKEN_FLOOR:.0%} "
-            "floor. No trainer in this repo reads `weight` — a Stage B trainer "
-            "must sample by it, or the mix must be materialised. Pass "
-            "--allow-unweighted once that is decided."
-        )
-    if share < COLD_TOKEN_FLOOR - 1e-6:
-        bad.append(
-            f"cold supervised-token share is {share:.1%}, floor is "
-            f"{COLD_TOKEN_FLOOR:.0%} — Stage B would drift off the format Stage A "
-            "just taught"
+            f"cold supervised-token share is {effective:.1%} under a "
+            f"{sampler} sampler ({share:.1%} weighted / {uniform:.1%} uniform), "
+            f"floor is {COLD_TOKEN_FLOOR:.0%} — Stage B would drift off the "
+            "format Stage A just taught"
         )
     for kind in set(rep["by_kind"]) - set(LATER_KINDS) - {
         PARSE_ERROR_RECOVERY, COLD_REPLAY
@@ -514,8 +514,16 @@ def main() -> int:
                     help="supervised-token share to solve the cold component's "
                          "mass for (floor "
                          + f"{COLD_TOKEN_FLOOR * 100:.0f} percent)")
+    ap.add_argument("--sampler", choices=("weighted", "uniform"),
+                    default="uniform",
+                    help="which sampler will train this mix. `weighted` gates on "
+                         "the weighted cold share and is only valid for a trainer "
+                         "that samples by the `weight` column — "
+                         "scripts/sft_stage_b_train_modal.py does. `uniform` "
+                         "gates on the raw token ratio (default)")
     ap.add_argument("--allow-unweighted", action="store_true",
-                    help="accept a mix whose cold floor holds only under a "
+                    help="deprecated alias for --sampler weighted; accepts a mix "
+                         "whose cold floor holds only under a "
                          "weighted sampler. Only once a Stage B trainer samples "
                          "by `weight`, or the decision is recorded in the plan.")
     ap.add_argument("--no-cold-replay", action="store_true",
@@ -640,7 +648,8 @@ def main() -> int:
         )
 
     rep = mix_report(usable, weights, sup_by_id, cold_mass=cold_mass)
-    mix_problems = check_mix(rep, allow_unweighted=args.allow_unweighted)
+    sampler = "weighted" if args.allow_unweighted else args.sampler
+    mix_problems = check_mix(rep, sampler=sampler)
 
     args.out.mkdir(parents=True, exist_ok=True)
     jsonl = args.out / "stage_b.jsonl"
@@ -649,6 +658,11 @@ def main() -> int:
     ))
     out_sha = hashlib.sha256(jsonl.read_bytes()).hexdigest()
 
+    rep["cold"]["sampler_declared"] = sampler
+    rep["cold"]["effective_token_share"] = (
+        rep["cold"]["token_share"] if sampler == "weighted"
+        else rep["cold"]["token_share_uniform"]
+    )
     (args.out / "mix_report.json").write_text(json.dumps(rep, indent=2))
     supervised = [sup_by_id[r["source_id"]] for r in usable]
     preflight = {
@@ -683,7 +697,8 @@ def main() -> int:
     c = rep["cold"]
     print(f"cold: {c['rows']} rows, mass {c['component_mass']:.3f}, "
           f"token share {c['token_share']:.1%} weighted / "
-          f"{c['token_share_uniform']:.1%} uniform (floor {COLD_TOKEN_FLOOR:.0%}), "
+          f"{c['token_share_uniform']:.1%} uniform "
+          f"[{sampler} declared] (floor {COLD_TOKEN_FLOOR:.0%}), "
           f"draws/epoch {c['draws_per_epoch']:.0f} "
           f"(floor {COLD_DRAWS_FLOOR}, target {COLD_DRAWS_TARGET})")
     print(f"ops: {rep['ops']}")

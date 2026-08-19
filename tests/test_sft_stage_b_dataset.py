@@ -199,11 +199,12 @@ def test_the_cold_token_floor_refuses_a_short_mix():
                     "hatch": {"mass": 0.15, "upsample": 1.0},
                     "prefect": {"mass": 0.15, "upsample": 1.0}},
         "by_kind": {sb.LATER_LAST: 600, sb.PARSE_ERROR_RECOVERY: 18},
-        "cold": {"token_share": 0.19},
+        "cold": {"token_share": 0.19, "token_share_uniform": 0.19},
     }
     assert any("cold supervised-token share" in b for b in sb.check_mix(rep))
 
     rep["cold"]["token_share"] = sb.COLD_TOKEN_FLOOR
+    rep["cold"]["token_share_uniform"] = sb.COLD_TOKEN_FLOOR
     assert not [b for b in sb.check_mix(rep) if "cold supervised-token" in b]
 
 
@@ -328,20 +329,32 @@ def _rep(**cold):
     return base
 
 
-def test_a_weighted_only_cold_share_is_refused():
-    """No trainer in this repo reads `weight` — they shuffle uniformly. A mix
-    that clears the floor only under a sampler nobody implements is a mix that
-    trains at 14.5% cold, not 30%."""
-    bad = sb.check_mix(_rep(token_share_uniform=0.145))
-    assert any("holds only under a weighted sampler" in b for b in bad)
-    assert any("14.5%" in b for b in bad)
+def test_a_weighted_only_cold_share_is_refused_for_a_uniform_trainer():
+    """The default declaration is `uniform`, because that is what TRL does with
+    a plain `Dataset`. A mix clearing the floor only under weights would train
+    at 14.5% cold, not 30%."""
+    bad = sb.check_mix(_rep(token_share_uniform=0.145), sampler="uniform")
+    assert any("cold supervised-token share" in b for b in bad)
+    assert any("14.5%" in b for b in bad), "the refusal must name the real share"
 
 
-def test_the_weighted_only_refusal_can_be_waived_deliberately():
-    assert not sb.check_mix(_rep(token_share_uniform=0.145), allow_unweighted=True)
+def test_declaring_a_weighted_sampler_accepts_the_weighted_share():
+    """Only honest because `scripts/sft_stage_b_train_modal.py` overrides
+    `_get_train_sampler` with a WeightedRandomSampler over this column and
+    re-checks the same floor before its first step."""
+    assert not sb.check_mix(_rep(token_share_uniform=0.145), sampler="weighted")
 
 
-def test_a_mix_that_clears_uniformly_needs_no_waiver():
+def test_a_weighted_declaration_does_not_excuse_a_short_weighted_share():
+    """Declaring the sampler picks *which* share is gated, never waives the
+    floor itself."""
+    bad = sb.check_mix(
+        _rep(token_share=0.19, token_share_uniform=0.145), sampler="weighted"
+    )
+    assert any("cold supervised-token share" in b for b in bad)
+
+
+def test_a_mix_that_clears_uniformly_needs_no_declaration():
     assert not sb.check_mix(_rep(token_share_uniform=0.31))
 
 
