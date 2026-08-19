@@ -39,7 +39,10 @@ Tear the app down the moment it returns.
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
+from typing import Any
 
 import modal
 
@@ -57,6 +60,93 @@ GPU = "A100-80GB"
 
 DATA_IN_VOLUME = "sft-stage-b/stage_b.jsonl"
 OUT_IN_VOLUME = "sft/qwen3-14b-stage-b-lora"
+DEFAULT_SAVE_STEPS = 10
+EXPECTED_STAGE_B_DATASET_SHA256 = (
+    "c371033d1aa6bfbee9ac3041a0898e83580e0b6bf447bbff2dc9d5d601c805e4"
+)
+RESUME_REQUIRED_FILES = (
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "optimizer.pt",
+    "rng_state.pth",
+    "scheduler.pt",
+    "trainer_state.json",
+    "training_args.bin",
+)
+
+
+def validate_resume_checkpoint(
+    resume_from: str,
+    *,
+    volume_mount: str | Path,
+    max_steps: int,
+    batch_size: int,
+) -> tuple[Path, dict[str, Any], int]:
+    """Validate a Stage B checkpoint before loading the base model.
+
+    Only checkpoints written beneath this trainer's output directory are legal.
+    The directory suffix, Trainer step, total schedule and batch size must all
+    agree; accepting a merely checkpoint-shaped directory is how an unrelated
+    optimizer state gets applied to the right-shaped LoRA without an error.
+    """
+    rel = Path(resume_from)
+    expected_parent = Path(OUT_IN_VOLUME)
+    match = re.fullmatch(r"checkpoint-([1-9][0-9]*)", rel.name)
+    if rel.is_absolute() or rel.parent != expected_parent or match is None:
+        raise ValueError(
+            "resume checkpoint must be "
+            f"{OUT_IN_VOLUME}/checkpoint-<step>, got {resume_from!r}"
+        )
+
+    path = Path(volume_mount) / rel
+    if not path.is_dir():
+        raise ValueError(f"resume checkpoint not found: {path}")
+    missing = [name for name in RESUME_REQUIRED_FILES if not (path / name).is_file()]
+    if missing:
+        raise ValueError(f"resume checkpoint {path} is incomplete, missing: {missing}")
+
+    try:
+        state = json.loads((path / "trainer_state.json").read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read Trainer state from {path}: {exc}") from exc
+
+    done = int(state.get("global_step", 0))
+    path_step = int(match.group(1))
+    if done != path_step:
+        raise ValueError(
+            f"resume directory says checkpoint-{path_step} but Trainer state "
+            f"reports global_step={done}"
+        )
+    if done >= max_steps:
+        raise ValueError(
+            f"resume checkpoint is at step {done} but max_steps is {max_steps} — "
+            "nothing left to train"
+        )
+    prior_max = state.get("max_steps")
+    if prior_max is None or int(prior_max) != max_steps:
+        raise ValueError(
+            f"resume checkpoint was built for max_steps={prior_max}, current run "
+            f"computes {max_steps}"
+        )
+    prior_batch = state.get("train_batch_size")
+    if prior_batch is None or int(prior_batch) != batch_size:
+        raise ValueError(
+            f"resume checkpoint used train_batch_size={prior_batch}, current run "
+            f"uses {batch_size}"
+        )
+    return path, state, done
+
+
+def resume_training_arg_mismatches(
+    prior: Any, expected: dict[str, Any]
+) -> list[str]:
+    """Return training-dynamics changes that make a resume non-equivalent."""
+    mismatches = []
+    for name, wanted in expected.items():
+        got = getattr(prior, name, None)
+        if got != wanted:
+            mismatches.append(f"{name}: checkpoint={got!r}, current={wanted!r}")
+    return mismatches
 
 #: The adapter Stage B continues. `checkpoint-84` is the Stage A selection —
 #: 45/45 on the frozen manifest at 4096, step 7 rollout green. Pinned as a
@@ -139,8 +229,9 @@ def train(
     lr: float = 5e-5,
     batch_size: int = 1,
     grad_accum: int = 8,
-    save_steps: int = 25,
+    save_steps: int = DEFAULT_SAVE_STEPS,
     seed: int = 0,
+    resume_from: str = "",
 ) -> dict:
     import hashlib
     import json
@@ -267,6 +358,12 @@ def train(
             f"fingerprint is for dataset {expected['dataset_sha256'][:16]}, "
             f"this one is {data_sha[:16]}"
         )
+    if data_sha != EXPECTED_STAGE_B_DATASET_SHA256:
+        raise SystemExit(
+            f"Stage B dataset is {data_sha}, expected the frozen plan dataset "
+            f"{EXPECTED_STAGE_B_DATASET_SHA256} — a matching self-reported "
+            "fingerprint is not enough to resume a different run"
+        )
     actual = [row_digest(e) for e in examples]
     if expected.get("per_row") != actual:
         bad = [
@@ -283,6 +380,66 @@ def train(
         )
     print(f"tokenization matches the builder fingerprint exactly on all "
           f"{len(actual)} rows (dataset {data_sha[:16]})", flush=True)
+
+    steps_per_epoch = -(-len(ds) // (batch_size * grad_accum))
+    max_steps = 3 if probe else int(steps_per_epoch * epochs)
+    out_dir = Path(VOLUME_MOUNT) / OUT_IN_VOLUME
+    resume_path: Path | None = None
+    resume_state: dict[str, Any] | None = None
+    resume_step = 0
+    resume_arg: str | None = None
+    if resume_from:
+        if probe:
+            raise SystemExit("--resume-from is meaningless with --probe: a probe saves nothing")
+        if not nf4:
+            raise SystemExit(
+                "the interrupted Stage B checkpoint was trained with NF4; "
+                "refusing to resume it with --bf16"
+            )
+        try:
+            resume_path, resume_state, resume_step = validate_resume_checkpoint(
+                resume_from,
+                volume_mount=VOLUME_MOUNT,
+                max_steps=max_steps,
+                batch_size=batch_size,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        # `training_args.bin` is our own trusted checkpoint artifact. Trainer
+        # otherwise warns about only a small subset of mismatches and continues;
+        # gradient accumulation, LR or warmup drift would change the resumed run.
+        prior_args = torch.load(
+            resume_path / "training_args.bin", map_location="cpu", weights_only=False
+        )
+        dynamics = {
+            "per_device_train_batch_size": batch_size,
+            "gradient_accumulation_steps": grad_accum,
+            "learning_rate": lr,
+            "seed": seed,
+            "max_steps": max_steps,
+            "warmup_ratio": 0.03,
+            "max_grad_norm": 1.0,
+        }
+        mismatches = resume_training_arg_mismatches(prior_args, dynamics)
+        if mismatches:
+            raise SystemExit(
+                "resume changes training dynamics: " + "; ".join(mismatches)
+            )
+        resume_arg = str(resume_path)
+        print(
+            f"RESUMING from {resume_path}: global_step {resume_step}/{max_steps}, "
+            f"{max_steps - resume_step} steps remain; checkpoint saves every "
+            f"{save_steps} steps",
+            flush=True,
+        )
+        print(
+            f"  prior epoch {resume_state.get('epoch')}, "
+            f"logged history entries {len(resume_state.get('log_history', []))}",
+            flush=True,
+        )
+    else:
+        print(f"fresh run from {BASE_ADAPTER_IN_VOLUME} (no resume)", flush=True)
 
     # ---- model: frozen base, a brand new adapter ---------------------------
     model_kwargs: dict = {"dtype": torch.bfloat16}
@@ -422,11 +579,10 @@ def train(
     net.enable_input_require_grads()
 
     mark("adapter_loaded")
-    before = _snapshot_trainable(net)
-
-    steps_per_epoch = -(-len(ds) // (batch_size * grad_accum))
-    max_steps = 3 if probe else int(steps_per_epoch * epochs)
-    out_dir = Path(VOLUME_MOUNT) / OUT_IN_VOLUME
+    # On resume, Trainer has not loaded checkpoint-50's adapter yet. Snapshot
+    # in `on_train_begin`, after `_load_from_checkpoint` but before step 51, so
+    # the moved check measures only work performed by this invocation.
+    before = None if resume_arg else _snapshot_trainable(net)
 
     if probe:
         # Trainer's sampler is shuffled, so three steps may never touch the
@@ -512,6 +668,16 @@ def train(
     losses: list[float] = []
 
     class _Collect(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kw):
+            nonlocal before
+            if before is None:
+                before = _snapshot_trainable(net)
+                print(
+                    f"resume baseline captured after loading global step "
+                    f"{state.global_step}",
+                    flush=True,
+                )
+
         def on_log(self, args, state, control, logs=None, **kw):
             if not logs:
                 return
@@ -617,7 +783,7 @@ def train(
     mark("pre_train")
     t0 = time.time()
     try:
-        result = trainer.train()
+        result = trainer.train(resume_from_checkpoint=resume_arg)
     except torch.cuda.OutOfMemoryError as exc:
         # An OOM used to leave nothing but a traceback, because every summary was
         # built after train() returned. The failure is the measurement here.
@@ -655,6 +821,18 @@ def train(
         torch.cuda.memory._dump_snapshot(str(snap))
         print(f"memory snapshot written to {snap}", flush=True)
     elapsed = time.time() - t0
+    final_step = int(trainer.state.global_step)
+    if final_step != max_steps:
+        raise SystemExit(
+            f"training returned at global_step={final_step}, expected {max_steps}; "
+            "refusing to write a final adapter for an incomplete run"
+        )
+    executed_steps = final_step - resume_step
+    if executed_steps <= 0:
+        raise SystemExit(
+            f"training executed {executed_steps} new steps "
+            f"({resume_step} -> {final_step})"
+        )
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
     peak_reserved = torch.cuda.max_memory_reserved() / 2**30
     # Printed here, not only inside `summary`. The first bf16 probe measured the
@@ -665,6 +843,8 @@ def train(
           f"(ceiling {BF16_PEAK_CEILING_GIB:.0f} GiB, arm "
           f"{'nf4' if nf4 else 'bf16'})", flush=True)
 
+    if before is None:
+        raise SystemExit("resume baseline was never captured before training")
     moved = _count_moved(net, before)
     train_loss = result.metrics.get("train_loss")
 
@@ -675,6 +855,10 @@ def train(
         "probe": probe,
         "stage": "B",
         "continued_adapter": str(adapter_path),
+        "resumed_from": str(resume_path) if resume_path else None,
+        "initial_global_step": resume_step,
+        "final_global_step": final_step,
+        "steps_executed": executed_steps,
         "sampler": {
             "kind": "WeightedRandomSampler",
             "draws_per_epoch": len(row_weights),
@@ -702,7 +886,7 @@ def train(
         "peak_vram_allocated_gib": round(peak_alloc, 1),
         "peak_vram_reserved_gib": round(peak_reserved, 1),
         "longest_row_tokens": max(len(e["input_ids"]) for e in examples),
-        "sec_per_optimizer_step": round(elapsed / max(max_steps, 1), 1),
+        "sec_per_optimizer_step": round(elapsed / executed_steps, 1),
         "train_loss": train_loss,
         "losses": losses,
         "grad_norms": grad_norms,
@@ -1015,8 +1199,16 @@ def main(
     bf16: bool = False,
     memory_history: bool = False,
     epochs: float = 1.0,
+    resume_from: str = "",
 ):
-    """`--bf16` selects the other arm; NF4 is the default at 40960."""
+    """`--bf16` selects the other arm; NF4 is the default at 40960.
+
+    `--resume-from sft/qwen3-14b-stage-b-lora/checkpoint-50` continues an
+    interrupted run: Trainer state (optimizer, LR schedule, step counter, RNG)
+    is restored from that checkpoint, and the remaining steps run. Leave it
+    empty for a fresh run from Stage A's checkpoint-84.
+    """
     print(train.remote(
-        probe=probe, nf4=not bf16, memory_history=memory_history, epochs=epochs
+        probe=probe, nf4=not bf16, memory_history=memory_history, epochs=epochs,
+        resume_from=resume_from,
     ))

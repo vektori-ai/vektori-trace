@@ -9,7 +9,9 @@ here so a GPU session is never the place a typo surfaces.
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,3 +111,95 @@ def test_the_sampler_seam_is_asserted_not_assumed():
     assert '_get_train_sampler' in SRC
     assert 'hasattr(SFTTrainer, "_get_train_sampler")' in SRC
     assert "WeightedRandomSampler" in SRC
+
+
+# ---- interrupted-run resume --------------------------------------------
+
+def _checkpoint(tmp_path: Path, step: int = 50) -> tuple[Path, str]:
+    rel = f"{sb.OUT_IN_VOLUME}/checkpoint-{step}"
+    path = tmp_path / rel
+    path.mkdir(parents=True)
+    for name in sb.RESUME_REQUIRED_FILES:
+        (path / name).touch()
+    (path / "trainer_state.json").write_text(json.dumps({
+        "global_step": step,
+        "max_steps": 93,
+        "train_batch_size": 1,
+        "epoch": step / 93,
+    }))
+    return path, rel
+
+
+def test_resume_accepts_the_complete_stage_b_checkpoint(tmp_path):
+    path, rel = _checkpoint(tmp_path)
+    got, state, step = sb.validate_resume_checkpoint(
+        rel, volume_mount=tmp_path, max_steps=93, batch_size=1
+    )
+    assert got == path
+    assert state["global_step"] == step == 50
+
+
+def test_resume_requires_rng_state_instead_of_silently_reseeding(tmp_path):
+    path, rel = _checkpoint(tmp_path)
+    (path / "rng_state.pth").unlink()
+    with pytest.raises(ValueError, match="rng_state.pth"):
+        sb.validate_resume_checkpoint(
+            rel, volume_mount=tmp_path, max_steps=93, batch_size=1
+        )
+
+
+@pytest.mark.parametrize("rel", [
+    "/adapters/sft/qwen3-14b-stage-b-lora/checkpoint-50",
+    "sft/qwen3-14b-stage-a-lora/checkpoint-50",
+    "sft/qwen3-14b-stage-b-lora/not-a-checkpoint",
+])
+def test_resume_refuses_paths_outside_the_stage_b_checkpoint_series(tmp_path, rel):
+    with pytest.raises(ValueError, match="must be"):
+        sb.validate_resume_checkpoint(
+            rel, volume_mount=tmp_path, max_steps=93, batch_size=1
+        )
+
+
+def test_resume_directory_step_must_match_trainer_state(tmp_path):
+    path, rel = _checkpoint(tmp_path)
+    state = json.loads((path / "trainer_state.json").read_text())
+    state["global_step"] = 49
+    (path / "trainer_state.json").write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="global_step=49"):
+        sb.validate_resume_checkpoint(
+            rel, volume_mount=tmp_path, max_steps=93, batch_size=1
+        )
+
+
+def test_resume_refuses_schedule_or_batch_drift(tmp_path):
+    _, rel = _checkpoint(tmp_path)
+    with pytest.raises(ValueError, match="max_steps"):
+        sb.validate_resume_checkpoint(
+            rel, volume_mount=tmp_path, max_steps=94, batch_size=1
+        )
+    with pytest.raises(ValueError, match="train_batch_size"):
+        sb.validate_resume_checkpoint(
+            rel, volume_mount=tmp_path, max_steps=93, batch_size=2
+        )
+
+
+def test_resume_training_arguments_fail_closed_on_dynamics_changes():
+    prior = SimpleNamespace(
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=5e-5,
+    )
+    expected = {
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 4,
+        "learning_rate": 5e-5,
+    }
+    assert sb.resume_training_arg_mismatches(prior, expected) == [
+        "gradient_accumulation_steps: checkpoint=8, current=4"
+    ]
+
+
+def test_stage_b_saves_every_ten_steps_and_checks_resume_completion():
+    assert sb.DEFAULT_SAVE_STEPS == 10
+    assert 'save_steps: int = DEFAULT_SAVE_STEPS' in SRC
+    assert "final_step != max_steps" in SRC
