@@ -387,3 +387,71 @@ def test_infra_failures_stay_out_of_the_denominator_but_reach_the_log(
     lines = [json.loads(x) for x in log_path.read_text().splitlines()]
     assert len(lines) == 2
     assert all(x["passed"] is None and x["infra_failure"] is True for x in lines)
+
+
+def _passk_argv_sweep(monkeypatch, tmp_path, argv):
+    """Run `vektori-trace passk` with two_stage_sweep stubbed; return its kwargs."""
+    import vektori_trace.evaluate.passk as passk_mod
+    from vektori_trace.cli.main import main
+
+    seen: dict = {}
+
+    def _fake_sweep(task_dirs, **kwargs):
+        seen.update(kwargs)
+        return {
+            "escalated": [],
+            "luck_quarantine": [],
+            "support": {},
+            "no_gradeable_rollouts": [],
+        }
+
+    monkeypatch.setattr(passk_mod, "two_stage_sweep", _fake_sweep)
+    assert main(argv) == 0
+    return seen
+
+
+def test_passk_pins_the_chat_template_for_a_self_hosted_endpoint(tmp_path, monkeypatch):
+    """An --api-base run that does not pin renders on the template default,
+    which is a different prompt than the one Phase 7 graded — silently."""
+    from vektori_trace.runtime.serve import CHAT_TEMPLATE_KWARGS, LLM_CALL_KWARGS_KEY
+
+    tasks = _task_dirs(tmp_path, ["t1"])[0].parent
+    seen = _passk_argv_sweep(
+        monkeypatch,
+        tmp_path,
+        [
+            "passk", "--tasks-dir", str(tasks), "--agent", "terminus-2",
+            "--model", "hosted_vllm/Qwen3-14B-ck84",
+            "--api-base", "http://x/v1", "--out", str(tmp_path / "out"),
+        ],
+    )
+    extra_body = seen["agent_kwargs"][LLM_CALL_KWARGS_KEY]["extra_body"]
+    assert extra_body["chat_template_kwargs"] == CHAT_TEMPLATE_KWARGS
+
+
+def test_passk_leaves_a_provider_model_unpinned(tmp_path, monkeypatch):
+    """No --api-base means a public provider, which has no template of ours."""
+    tasks = _task_dirs(tmp_path, ["t1"])[0].parent
+    seen = _passk_argv_sweep(
+        monkeypatch,
+        tmp_path,
+        [
+            "passk", "--tasks-dir", str(tasks), "--agent", "terminus-2",
+            "--model", "claude-sonnet-5", "--out", str(tmp_path / "out"),
+        ],
+    )
+    assert seen["agent_kwargs"] is None
+
+
+def test_passk_can_be_told_not_to_pin(tmp_path, monkeypatch):
+    tasks = _task_dirs(tmp_path, ["t1"])[0].parent
+    seen = _passk_argv_sweep(
+        monkeypatch,
+        tmp_path,
+        [
+            "passk", "--tasks-dir", str(tasks), "--agent", "terminus-2",
+            "--model", "hosted_vllm/x", "--api-base", "http://x/v1",
+            "--no-pin-chat-template", "--out", str(tmp_path / "out"),
+        ],
+    )
+    assert seen["agent_kwargs"] is None

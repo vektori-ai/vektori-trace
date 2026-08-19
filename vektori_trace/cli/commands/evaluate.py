@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from .._args import _add_endpoint_args, _positive_int_arg
 from .._shared import _load_traces
@@ -46,6 +47,23 @@ def cmd_passk(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # A self-hosted endpoint has to render the way the corpus was tokenized.
+    # Terminus2 only forwards `llm_call_kwargs`, so an unpinned run silently
+    # takes the template default — the prompt-seed probe's failure, and the
+    # reason `--api-base` alone is not enough to reproduce a Phase 7 number.
+    # Public-provider models have no chat template of ours to pin, so the pin
+    # rides on `--api-base` being present.
+    agent_kwargs: dict[str, Any] | None = None
+    if args.api_base is not None and not args.no_pin_chat_template:
+        from ...runtime.serve import CHAT_TEMPLATE_KWARGS, LLM_CALL_KWARGS_KEY
+
+        agent_kwargs = {
+            LLM_CALL_KWARGS_KEY: {
+                "extra_body": {"chat_template_kwargs": dict(CHAT_TEMPLATE_KWARGS)}
+            }
+        }
+        print(f"pinned chat_template_kwargs: {json.dumps(CHAT_TEMPLATE_KWARGS)}")
+
     report = two_stage_sweep(
         task_dirs,
         agent=args.agent,
@@ -55,6 +73,7 @@ def cmd_passk(args: argparse.Namespace) -> int:
         stage2_n=args.stage2_n,
         api_base=args.api_base,
         model_info=args.model_info,
+        agent_kwargs=agent_kwargs,
         task_to_capability=task_to_capability,
         max_workers=args.max_workers,
         escalate=not args.no_escalate,
@@ -127,6 +146,15 @@ def register_passk(sub: argparse._SubParsersAction) -> None:
     # ~1,300 containerised rollouts of minutes each; serially that is days,
     # which does not fit "nothing expensive precedes the gate".
     p_passk.add_argument("--max-workers", type=_positive_int_arg, default=1)
+    p_passk.add_argument(
+        "--no-pin-chat-template",
+        action="store_true",
+        help=(
+            "do not send chat_template_kwargs with an --api-base run. The pin "
+            "matches how the SFT corpus was tokenized; unpinning it measures a "
+            "different prompt than Phase 7 graded"
+        ),
+    )
     p_passk.add_argument(
         "--no-escalate",
         action="store_true",
