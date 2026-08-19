@@ -130,6 +130,7 @@ def serve_model(
     max_model_len: int | None = None,
     gpu_memory_utilization: float | None = None,
     extra_vllm_args: list[str] | None = None,
+    on_app_started: Callable[[str], None] | None = None,
 ) -> Iterator[ServedModel]:
     """Spin up Modal vLLM with optional LoRA; tear down on exit.
 
@@ -431,6 +432,13 @@ def serve_model(
             raise RuntimeError("vLLM failed to become healthy within 25 minutes")
 
     with app.run():
+        # Expose the exact app created by this context before the first remote
+        # call can allocate a GPU. Lifecycle wrappers use this to stop only the
+        # app they own if startup or evaluation fails.
+        if not app.app_id:
+            raise RuntimeError("Modal app started without an app_id")
+        if on_app_started is not None:
+            on_app_started(app.app_id)
         server = VllmServer()
         _ = server.health.remote()
         web = server.openai_compat

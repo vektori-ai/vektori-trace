@@ -206,6 +206,8 @@ def main() -> int:
                          "cannot bill indefinitely; 0 disables (default: 12)")
     ap.add_argument("--write-env", default=None,
                     help="also append STUDENT_API_BASE=<url> to this file")
+    ap.add_argument("--write-app-id", default=None,
+                    help="write the exact Modal app ID as soon as app.run starts")
     ap.add_argument("--gpu-log", default="gpu_log.jsonl",
                     help="NVML samples (util%%, memory, temp, power, SM clock) "
                          "appended here on this box; empty string disables")
@@ -272,6 +274,13 @@ def main() -> int:
         print(f"reasoning parser   {args.reasoning_parser} "
               "(think goes to reasoning_content, not into the action JSON)")
 
+    def _record_app_id(app_id: str) -> None:
+        print(f"  MODAL_APP_ID={app_id}", flush=True)
+        if args.write_app_id:
+            path = Path(args.write_app_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(app_id + "\n")
+
     with serve_model(
         args.base_model,
         adapter_path=args.adapter_path,
@@ -282,6 +291,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         extra_vllm_args=extra_vllm_args or None,
+        on_app_started=_record_app_id,
     ) as served:
         print(f"UP in {time.time() - t0:.0f}s\n")
 
