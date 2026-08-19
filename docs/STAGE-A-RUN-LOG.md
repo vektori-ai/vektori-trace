@@ -107,11 +107,54 @@ think body 9,719 chars. Not malformed JSON — the model talked past the budget.
   prefixes are turn-1 with no JSON to copy, the other categories carry prior
   assistant JSON in context.
 
+
+## Step 7 — guarded rollout (2026-08-19)
+
+Endpoint `ap-UKoxjslnft8WKJ8X2Ty1EL`, L40S, base + ck84 on one load,
+00:47:42 -> ~01:08 UTC (~21 min, ~$0.70). Torn down and verified `stopped`,
+0 tasks.
+
+Task **`pallets__click-3653`** — a training task: 6 of the 165 Stage A rows
+come from it, and it is the acquisition suite's orientation task.
+`--stage1-n 1 --no-escalate --timeout-sec 600`.
+
+**Result: 6/6 turns accepted, 16 commands executed, no parser loop.** The model
+oriented at `/workspace` without cloning, walked `src/click/termui.py` to
+`tests/test_termui.py`, edited with `sed -i` on turn 5 and ran pytest on 5 and
+6. It hit the 600 s cap mid-`pytest tests/ -q`; step 7 does not require a pass.
+Per-turn latency ~100 s. Report: `/data/vektori-out/stage-a-rollout/`.
+
+The chat template was pinned on the wire — the job's own `config.json` carries
+`llm_call_kwargs.extra_body.chat_template_kwargs.enable_thinking: true`.
+
+### Two bugs this found
+
+1. **A trajectory is a parse, not a completion.** Harbor stores its
+   decomposition: `message` is the analysis/plan prose, `tool_calls` are
+   synthetic `bash_command` entries holding the extracted keystrokes. The first
+   grader read `message` as raw output and scored all six correct turns as
+   total format failures, with the synthetic `tool_calls` firing the
+   legacy-envelope gate on top. Commands existing **is** the evidence the
+   parser accepted the turn. Corrected in `scripts/rollout_gate.py`.
+2. **`TimeoutExpired` carries bytes under `text=True`.** `subprocess.run`
+   decodes on the success path only, so persisting harbor's output raised
+   `TypeError` *after* the rollout ran and destroyed `passk.json`. A guarded
+   rollout ends in a timeout by design. Fixed in `validity.py` with a test.
+
+### Still open after step 7
+
+- `native_json` / `required_fields` on **live** turns. A trajectory holds no raw
+  text, so only the capture proxy can grade them. Strongly implied — the plain
+  parser rejects a fenced or enveloped response and we got 16 commands — but
+  not measured.
+- The 600 s cap vs ~100 s/turn: Stage B needs a bigger number or it grades
+  trajectories that were cut off, not finished.
+
 ## Still open
 
 - ck84 at 4096: does the one miss clear, giving a clean 45/45?
 - ck20 / ck40 at 4096, so "earliest" means something.
 - base 14B on the 45 — read the `orientation` rows hardest.
-- Step 7 guarded rollout — **new** endpoint, `--max-hours 0.5`, never on a clock
-  with under 20 minutes left.
-- Stage B stays blocked until step 6 and step 7 are green.
+- **Step 7 ran and is green** (see above). Stage B remains blocked on step 6:
+  ck84 clears 45/45 at 4096, but "earliest that clears" is unmeasured — ck20 /
+  ck40 at 4096 were never run.
