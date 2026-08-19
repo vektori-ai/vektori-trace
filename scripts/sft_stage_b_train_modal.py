@@ -242,8 +242,9 @@ def train(
     fp_path = data_path.parent / "tokenization_fingerprint.json"
     if not fp_path.exists():
         raise SystemExit(
-            f"{fp_path} is missing — run scripts/sft_stage_a_dataset.py and stage "
-            "its fingerprint before training"
+            f"{fp_path} is missing — build with scripts/sft_stage_b_dataset.py "
+            "(--sampler weighted), verify with scripts/sft_stage_b_verify.py, and "
+            "stage the directory onto the volume before training"
         )
     expected = json.loads(fp_path.read_text())
     if expected.get("model") != model:
@@ -578,6 +579,22 @@ def train(
             f"the trainer's sampler is {type(got_sampler).__name__}, not "
             "WeightedRandomSampler — the mix on disk is not the mix that trains"
         )
+    # `_get_train_sampler` returning the right object is not proof the loader
+    # Accelerate prepares uses it: `prepare` can replace the sampler when it
+    # shards. Ask the real dataloader, which is the thing that feeds the steps.
+    loader = trainer.get_train_dataloader()
+    seen = getattr(loader, "sampler", None)
+    if seen is None:
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        seen = getattr(batch_sampler, "sampler", None)
+    if not isinstance(seen, _WRS):
+        raise SystemExit(
+            f"the prepared dataloader samples with {type(seen).__name__}, not "
+            "WeightedRandomSampler — Accelerate replaced it, so the cold share "
+            "measured above is not what will train"
+        )
+    print(f"dataloader sampler: {type(seen).__name__} (checked on the prepared "
+          "loader, not just the factory)", flush=True)
     # What the sampler actually drew, not what it was asked for. A realised cold
     # count far from the expectation means the weight vector is not doing what
     # the mix report claims.

@@ -1,7 +1,8 @@
 """Each trainer's inlined tokenizer must match `dataset.tokenize_messages` exactly.
 
-`scripts/sft_repair_train_modal.py` and `scripts/sft_stage_a_train_modal.py`
-both carry a copy of the masking logic because
+`scripts/sft_repair_train_modal.py`, `scripts/sft_stage_a_train_modal.py` and
+`scripts/sft_stage_b_train_modal.py` each carry a copy of the masking logic
+because
 Modal re-imports the module inside a container where the local package is not
 installed. A copy can drift, and this one did: the plan's step 1 rewrote
 `tokenize_messages` while `tokenize_row` kept the per-message length loop. The
@@ -17,7 +18,11 @@ import pytest
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("modal")
 
-from scripts import sft_repair_train_modal, sft_stage_a_train_modal  # noqa: E402
+from scripts import (  # noqa: E402
+    sft_repair_train_modal,
+    sft_stage_a_train_modal,
+    sft_stage_b_train_modal,
+)
 from scripts.sft_repair_train_modal import tokenize_row  # noqa: E402
 from vektori_trace.dataset import tokenize_messages  # noqa: E402
 
@@ -26,6 +31,11 @@ from vektori_trace.dataset import tokenize_messages  # noqa: E402
 TRAINERS = [
     pytest.param(sft_repair_train_modal, id="repair"),
     pytest.param(sft_stage_a_train_modal, id="stage-a"),
+    # Stage B inlines the same copy at a different MAX_LENGTH. Its own docstring
+    # claims the fingerprint covers drift, but that check runs inside the Modal
+    # container, after the image build and the 14B download are paid for — and a
+    # drifted copy is what burned a repair run.
+    pytest.param(sft_stage_b_train_modal, id="stage-b"),
 ]
 
 MODEL = "Qwen/Qwen3-14B"
