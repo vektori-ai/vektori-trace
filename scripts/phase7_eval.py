@@ -45,8 +45,11 @@ from vektori_trace.evaluate.phase7 import (
     clears,
     grade,
     select_checkpoint,
+    select_stage_b_checkpoint,
     selection_prefix_ids,
+    stage_b_clears,
     summarize,
+    tripwire_prefix_ids,
 )
 
 # The plan's greedy suite. `enable_thinking` is pinned ON because the dataset is
@@ -206,11 +209,15 @@ def main() -> int:
                          "checkpoint passes greedily.")
     ap.add_argument("--sampled-temperature", type=float, default=0.7)
     ap.add_argument("--strategy", choices=("staged", "all"), default="staged",
-                    help="staged: smoke the last checkpoint, then walk the "
-                         "checkpoints in training order and stop at the first "
-                         "that passes. Identical answer to `all` — selection is "
-                         "`earliest passing`, so every checkpoint after the "
-                         "winner is a generation whose result is discarded.")
+                    help="staged: with stage-a, smoke the last checkpoint then "
+                         "walk earlier checkpoints; with stage-b, walk in true "
+                         "training order and stop at the first combined pass. "
+                         "`all` evaluates every checkpoint.")
+    ap.add_argument(
+        "--selection-policy", choices=("stage-a", "stage-b"), default="stage-a",
+        help="stage-b additionally requires first_edit > 0/3 and test_exec "
+             "> 1/3. It evaluates checkpoints in true earliest-first order.",
+    )
     ap.add_argument("--retries", type=int, default=2,
                     help="transport retries per request (default 2)")
     ap.add_argument("--abort-on-smoke", action="store_true",
@@ -425,6 +432,8 @@ def main() -> int:
     # suite fails, and — worse — would stop early on a partial set when the
     # endpoint dropped a request.
     sel_ids = selection_prefix_ids(prefixes)
+    edit_ids = tripwire_prefix_ids(prefixes, "first_edit")
+    test_ids = tripwire_prefix_ids(prefixes, "test_exec")
     missing_suites = sorted(set(SELECTION_SUITES) - available_suites)
     if missing_suites:
         print(
@@ -439,16 +448,42 @@ def main() -> int:
         print("no prefix in a selection category — nothing to select on",
               file=sys.stderr)
         return 1
+    if args.selection_policy == "stage-b":
+        if len(edit_ids) != 3 or len(test_ids) != 3:
+            print(
+                "Stage B selection requires exactly three first_edit and three "
+                f"test_exec prefixes; found {len(edit_ids)} and {len(test_ids)}",
+                file=sys.stderr,
+            )
+            return 1
+        prefix_by_id = {p["prefix_id"]: p for p in prefixes}
+        for category, ids in (("first_edit", edit_ids), ("test_exec", test_ids)):
+            suites = {prefix_by_id[p]["suite"] for p in ids}
+            if suites != set(SELECTION_SUITES):
+                print(
+                    f"Stage B {category} tripwires must contain one prefix per "
+                    f"suite; found {sorted(suites)}",
+                    file=sys.stderr,
+                )
+                return 1
     by_suite = {
         s: sum(1 for p in prefixes
                if p["prefix_id"] in set(sel_ids) and p["suite"] == s)
         for s in sorted(available_suites)
     }
-    print(f"selecting on {len(sel_ids)} prefixes in categories "
+    print(f"selecting with {args.selection_policy} policy on {len(sel_ids)} prefixes in categories "
           f"{SELECTION_CATEGORIES} across suites {by_suite}, "
           f"gates {SELECTION_GATES}\n")
 
     def checkpoint_clears(label: str) -> tuple[bool, dict]:
+        if args.selection_policy == "stage-b":
+            return stage_b_clears(
+                results,
+                checkpoint=label,
+                format_prefix_ids=sel_ids,
+                edit_prefix_ids=edit_ids,
+                test_prefix_ids=test_ids,
+            )
         return clears(
             results,
             checkpoint=label,
@@ -462,6 +497,28 @@ def main() -> int:
             for label in order:
                 run_checkpoint(label, pool)
                 evaluated.append(label)
+        elif args.selection_policy == "stage-b":
+            # Stage B selection is genuinely earliest-first.  Do not pay for a
+            # full ck93 smoke before testing ck25: ck93 cannot affect the answer
+            # once an earlier checkpoint clears the combined rule.
+            for label in order:
+                run_checkpoint(label, pool)
+                evaluated.append(label)
+                ok, detail = checkpoint_clears(label)
+                if ok:
+                    print(
+                        f"\n{label} clears Stage B format + behavior gates — "
+                        "stopping, it is the earliest."
+                    )
+                    break
+                ungraded = (
+                    detail["format"].get("ungraded", [])
+                    + detail["first_edit"].get("ungraded", [])
+                    + detail["test_exec"].get("ungraded", [])
+                )
+                if ungraded:
+                    print(f"  {label}: {len(ungraded)} required result(s) "
+                          "ungraded, cannot clear", file=sys.stderr)
         else:
             # Smoke the last checkpoint. It has seen the most training, so if it
             # cannot emit the protocol nothing earlier is going to. This is a
@@ -516,9 +573,18 @@ def main() -> int:
         {**asdict(r), "failed_gates": r.failed_gates, "passed": r.passed}
         for r in results
     ]
-    chosen, trace = select_checkpoint(
-        results, order=order, expected_prefix_ids=sel_ids
-    )
+    if args.selection_policy == "stage-b":
+        chosen, trace = select_stage_b_checkpoint(
+            results,
+            order=order,
+            format_prefix_ids=sel_ids,
+            edit_prefix_ids=edit_ids,
+            test_prefix_ids=test_ids,
+        )
+    else:
+        chosen, trace = select_checkpoint(
+            results, order=order, expected_prefix_ids=sel_ids
+        )
     report = {
         "manifest": str(args.manifest),
         "manifest_sha256": (args.manifest.parent / "manifest_sha256.txt").read_text().strip()
@@ -527,6 +593,7 @@ def main() -> int:
         "api_base": args.api_base,
         "checkpoint_order": order,
         "strategy": args.strategy,
+        "selection_policy": args.selection_policy,
         # Which checkpoints were actually generated for. A checkpoint absent
         # from this list was never tested, which is not the same as tested and
         # failed — `selection_trace` marks it "no results" for that reason.
@@ -543,6 +610,15 @@ def main() -> int:
         "selection_suites": sorted(by_suite),
         "selection_gates": list(SELECTION_GATES),
         "selection_prefix_ids": sel_ids,
+        "stage_b_behavior_prefix_ids": {
+            "first_edit": edit_ids,
+            "test_exec": test_ids,
+        } if args.selection_policy == "stage-b" else None,
+        "stage_b_baseline": {
+            "first_edit": "0/3",
+            "test_exec": "1/3",
+            "comparison": "strictly_greater",
+        } if args.selection_policy == "stage-b" else None,
         "selected_checkpoint": chosen,
         "selection_trace": trace,
         "summary": summarize(results),

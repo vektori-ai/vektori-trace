@@ -22,7 +22,9 @@ from vektori_trace.evaluate.phase7 import (
     GateResult,
     clears,
     select_checkpoint,
+    select_stage_b_checkpoint,
     selection_prefix_ids,
+    stage_b_clears,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,6 +106,63 @@ def test_a_tripwire_category_failing_does_not_block_the_stop():
     ]
     ok, _ = clears(got, checkpoint="ck10", expected_prefix_ids=expected)
     assert ok is True
+
+
+def _stage_b_results(ck="ck25", *, edits=1, tests=2, omit=None):
+    rows = [res(ck, "generalization", True, prefix_id="format")]
+    for i in range(3):
+        r = GateResult(prefix_id=f"edit{i}", checkpoint=ck,
+                       category="first_edit", suite="generalization",
+                       completion="")
+        r.gates = {"edit_emission": i < edits}
+        rows.append(r)
+    for i in range(3):
+        r = GateResult(prefix_id=f"test{i}", checkpoint=ck,
+                       category="test_exec", suite="generalization",
+                       completion="")
+        r.gates = {"test_emission": i < tests}
+        rows.append(r)
+    return [r for r in rows if r.prefix_id != omit]
+
+
+def _stage_b_clear(rows, ck="ck25"):
+    return stage_b_clears(
+        rows,
+        checkpoint=ck,
+        format_prefix_ids=["format"],
+        edit_prefix_ids=["edit0", "edit1", "edit2"],
+        test_prefix_ids=["test0", "test1", "test2"],
+    )
+
+
+def test_stage_b_requires_strict_improvement_over_both_stage_a_baselines():
+    assert _stage_b_clear(_stage_b_results(edits=1, tests=2))[0] is True
+    assert _stage_b_clear(_stage_b_results(edits=0, tests=2))[0] is False
+    assert _stage_b_clear(_stage_b_results(edits=1, tests=1))[0] is False
+
+
+def test_stage_b_missing_behavior_result_blocks_selection():
+    ok, detail = _stage_b_clear(_stage_b_results(omit="test2"))
+    assert ok is False
+    assert detail["test_exec"]["ungraded"] == ["test2"]
+
+
+def test_stage_b_selector_takes_earliest_combined_pass():
+    rows = (
+        _stage_b_results("ck25", edits=0, tests=2)
+        + _stage_b_results("ck50", edits=1, tests=2)
+        + _stage_b_results("ck75", edits=2, tests=3)
+    )
+    chosen, trace = select_stage_b_checkpoint(
+        rows,
+        order=["ck25", "ck50", "ck75", "ck93"],
+        format_prefix_ids=["format"],
+        edit_prefix_ids=["edit0", "edit1", "edit2"],
+        test_prefix_ids=["test0", "test1", "test2"],
+    )
+    assert chosen == "ck50"
+    assert trace["ck25"]["passed"] is False
+    assert trace["ck50"]["passed"] is True
 
 
 def test_a_failing_acquisition_prefix_now_blocks_selection():

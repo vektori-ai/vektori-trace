@@ -394,6 +394,15 @@ TRIPWIRE_CATEGORIES = (
     "parse_error_recovery", "long_context",
 )
 
+# Stage B exists specifically to move these two behavior tripwires.  These are
+# the observed Stage A scores on the frozen three-prefix groups, not estimates:
+# first_edit=0/3 and test_exec=1/3.  Stage B selection requires a strict
+# improvement (at least 1/3 and 2/3 respectively) in addition to Stage A's
+# format gate.  Keep this policy separate from `select_checkpoint`: Stage A's
+# tripwires remain diagnostic rather than gating.
+STAGE_B_EDIT_BASELINE = 0
+STAGE_B_TEST_BASELINE = 1
+
 
 def selection_prefix_ids(prefixes: Iterable[dict[str, Any]]) -> list[str]:
     """The 45. Read off the frozen manifest, never recomputed from results —
@@ -403,6 +412,17 @@ def selection_prefix_ids(prefixes: Iterable[dict[str, Any]]) -> list[str]:
         for p in prefixes
         if p.get("category") in SELECTION_CATEGORIES
         and p.get("suite") in SELECTION_SUITES
+    ]
+
+
+def tripwire_prefix_ids(
+    prefixes: Iterable[dict[str, Any]], category: str
+) -> list[str]:
+    """Frozen greedy tripwires for `category` across the three core suites."""
+    return [
+        p["prefix_id"]
+        for p in prefixes
+        if p.get("category") == category and p.get("suite") in SELECTION_SUITES
     ]
 
 
@@ -470,7 +490,10 @@ def select_checkpoint(
     overfit to 34 tasks — and the checkpoints exist precisely so that choice can
     be made on behavior instead.
     """
-    rows = list(results)
+    # Sampled probes reuse the same prefix ids but are labelled `*-sampled`.
+    # They are diagnostics and must not overwrite or contaminate greedy
+    # checkpoint selection.
+    rows = [r for r in results if r.suite in SELECTION_SUITES]
     expected = list(expected_prefix_ids) if expected_prefix_ids is not None else None
     trace: dict[str, Any] = {}
     chosen: str | None = None
@@ -488,4 +511,89 @@ def select_checkpoint(
         trace[ck] = detail
         if ok and chosen is None:
             chosen = ck
+    return chosen, trace
+
+
+def stage_b_clears(
+    results: Iterable[GateResult],
+    *,
+    checkpoint: str,
+    format_prefix_ids: Iterable[str],
+    edit_prefix_ids: Iterable[str],
+    test_prefix_ids: Iterable[str],
+    edit_baseline: int = STAGE_B_EDIT_BASELINE,
+    test_baseline: int = STAGE_B_TEST_BASELINE,
+) -> tuple[bool, dict[str, Any]]:
+    """Apply Stage B's combined format + behavior checkpoint rule.
+
+    Missing results block selection.  A present result whose category gate is
+    absent also fails: absence must never become an accidental pass.
+    """
+    # Sampled probes reuse the same ids with a `*-sampled` suite label. They
+    # are reported separately and never participate in greedy selection.
+    rows = [r for r in results if r.suite in SELECTION_SUITES]
+    format_ok, format_detail = clears(
+        rows,
+        checkpoint=checkpoint,
+        require=SELECTION_GATES,
+        expected_prefix_ids=format_prefix_ids,
+    )
+
+    def behavior(
+        expected_ids: Iterable[str], gate: str, baseline: int
+    ) -> tuple[bool, dict[str, Any]]:
+        expected = set(expected_ids)
+        group = {
+            r.prefix_id: r
+            for r in rows
+            if r.checkpoint == checkpoint and r.prefix_id in expected
+        }
+        missing = sorted(expected - set(group))
+        passed = sum(group[p].gates.get(gate) is True for p in group)
+        detail = {
+            "gate": gate,
+            "baseline_passed": baseline,
+            "n_expected": len(expected),
+            "n_graded": len(group),
+            "passed_count": passed,
+            "ungraded": missing,
+        }
+        ok = bool(expected) and not missing and passed > baseline
+        detail["passed"] = ok
+        return ok, detail
+
+    edit_ok, edit_detail = behavior(edit_prefix_ids, "edit_emission", edit_baseline)
+    test_ok, test_detail = behavior(test_prefix_ids, "test_emission", test_baseline)
+    ok = format_ok and edit_ok and test_ok
+    return ok, {
+        "passed": ok,
+        "format": format_detail,
+        "first_edit": edit_detail,
+        "test_exec": test_detail,
+    }
+
+
+def select_stage_b_checkpoint(
+    results: Iterable[GateResult],
+    *,
+    order: list[str],
+    format_prefix_ids: Iterable[str],
+    edit_prefix_ids: Iterable[str],
+    test_prefix_ids: Iterable[str],
+) -> tuple[str | None, dict[str, Any]]:
+    """Earliest checkpoint clearing the complete Stage B selection rule."""
+    rows = list(results)
+    trace: dict[str, Any] = {}
+    chosen: str | None = None
+    for checkpoint in order:
+        ok, detail = stage_b_clears(
+            rows,
+            checkpoint=checkpoint,
+            format_prefix_ids=format_prefix_ids,
+            edit_prefix_ids=edit_prefix_ids,
+            test_prefix_ids=test_prefix_ids,
+        )
+        trace[checkpoint] = detail
+        if ok and chosen is None:
+            chosen = checkpoint
     return chosen, trace
