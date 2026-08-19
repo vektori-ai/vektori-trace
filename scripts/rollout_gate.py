@@ -24,19 +24,42 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vektori_trace.evaluate.phase7 import grade
-from vektori_trace.mining.atif import find_trajectory, parse_job_trajectory
+
+
+def _agent_steps(job_dir: Path) -> tuple[Path, list[dict]]:
+    """The agent steps of one harbor trial, straight out of trajectory.json.
+
+    Deliberately not `atif.parse_job_trajectory`: that normalises into Turns for
+    mining, and the three fields this has to keep apart — `message` (the raw
+    completion), `reasoning_content` (the think channel, which vLLM returns
+    *outside* the message) and `tool_calls` (the v1 envelope) — are exactly what
+    normalisation merges. Grading the merged text would score a tool-call
+    envelope as if the model had emitted nothing.
+    """
+    candidates = [
+        p for p in job_dir.rglob("trajectory.json") if p.parent.name == "agent"
+    ] or list(job_dir.rglob("trajectory.json"))
+    if not candidates:
+        raise FileNotFoundError(f"no trajectory.json under {job_dir}")
+    path = sorted(candidates)[0]
+    data = json.loads(path.read_text())
+    steps = data.get("steps", data) if isinstance(data, dict) else data
+    return path, [s for s in steps if s.get("source") in ("agent", "assistant")]
 
 
 def grade_job(job_dir: Path, *, checkpoint: str) -> list[dict]:
-    turns = parse_job_trajectory(job_dir)
+    _, steps = _agent_steps(job_dir)
     rows: list[dict] = []
     n = 0
-    for turn in turns:
-        if turn.role != "assistant" or not (turn.content or "").strip():
+    for step in steps:
+        message = step.get("message") or ""
+        tool_calls = step.get("tool_calls") or []
+        reasoning = step.get("reasoning_content") or ""
+        if not message.strip() and not tool_calls:
             continue
         n += 1
         res = grade(
-            turn.content,
+            message,
             prefix_id=f"{job_dir.name}#turn{n}",
             checkpoint=checkpoint,
             # Turn 1 of a live rollout *is* the cold start. Later turns carry
@@ -47,6 +70,13 @@ def grade_job(job_dir: Path, *, checkpoint: str) -> list[dict]:
             # even before the terminal has shown it.
             git_present=True,
         )
+        # The v1 regression put the action in an OpenAI tool_call instead of the
+        # message body. harbor's terminus parser never sees it, so `message`
+        # alone would grade as "emitted nothing" rather than "emitted the wrong
+        # protocol". Fail the envelope gate on the field it actually lands in.
+        if tool_calls:
+            res.gates["no_legacy_envelope"] = False
+            res.notes.append(f"{len(tool_calls)} tool_call(s) on the wire")
         rows.append(
             {
                 "turn": n,
@@ -58,8 +88,12 @@ def grade_job(job_dir: Path, *, checkpoint: str) -> list[dict]:
                 "first_command": res.first_command,
                 "parser_error": res.parser_error,
                 "parser_warning": res.parser_warning,
-                "think_chars": len(res.think_body),
-                "completion_chars": len(res.completion),
+                "n_tool_calls": len(tool_calls),
+                # vLLM returns the think channel outside the message when the
+                # template opens it, so this is not len(res.think_body).
+                "think_chars": len(reasoning) or len(res.think_body),
+                "completion_chars": len(message),
+                "notes": res.notes,
             }
         )
     return rows
@@ -76,7 +110,7 @@ def main() -> int:
 
     job_dirs = sorted(
         {p.parent.parent for p in args.jobs_dir.rglob("trajectory.json")}
-    ) or ([args.jobs_dir] if find_trajectory(args.jobs_dir) else [])
+    )
     if not job_dirs:
         print(f"no trajectory.json under {args.jobs_dir}", file=sys.stderr)
         return 2
@@ -91,7 +125,7 @@ def main() -> int:
         for r in rows:
             status = "PASS" if r["passed"] else "FAIL " + ",".join(r["failed_gates"])
             print(f"  turn {r['turn']:>3}  {status:<50} "
-                  f"cmds={r['n_commands']} think={r['think_chars']}c "
+                  f"cmds={r['n_commands']} tc={r['n_tool_calls']} think={r['think_chars']}c "
                   f"{(r['first_command'] or '')[:40]!r}")
 
     n = len(all_rows)
