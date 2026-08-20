@@ -522,3 +522,169 @@ __all__ = [
     "opd_loss_fn",
     "run_fireworks_opd",
 ]
+
+
+# ── Cross-tokenizer path (docs/OPD-MULTITURN-PLAN.md §6.5) ────────────────────
+#
+# `build_opd_datum` / `opd_loss_fn` above require one teacher logprob per student
+# token. That holds only when teacher and student share a tokenizer, which
+# `check_tokenizers` enforces on that path. DeepSeek-V4 does not share Qwen3's
+# tokenizer, so the datum below carries what survives alignment instead:
+#
+#   - `advantages`  — detached per-*student*-token A_i from
+#                     `chunk_opd.assign_chunk_advantages`, already computed
+#                     against the teacher's own tokenization. The teacher's token
+#                     count never appears here; it was consumed during alignment.
+#   - `behavior_logprobs` — log pi_old(s_i), for the importance ratio. The
+#                     same-tokenizer path has no equivalent because
+#                     `reverse_kl_surrogate` is not an importance-sampled
+#                     objective.
+#
+# Both are per-student-token, so the three-array index correspondence that
+# `build_opd_datum` protects is preserved — only the *source* of the numbers
+# changes.
+
+
+def build_cross_opd_datum(
+    tinker: Any,
+    full_tokens: list[int],
+    prompt_len: int,
+    advantages: list[float],
+    behavior_logprobs: list[float],
+    supervised_mask: list[bool] | None = None,
+) -> Any:
+    """One `tinker.Datum` for the cross-tokenizer chunk objective.
+
+    `advantages` and `behavior_logprobs` cover only the sampled action and are
+    zero-padded across the prefix, exactly as `build_opd_datum` pads the teacher
+    scores — one index means one thing across every array.
+
+    `supervised_mask` lets sentinel positions (unalignable tails, over-long
+    chunks) be dropped from both the numerator and the denominator. Without it
+    every action token is supervised. A sentinel's advantage is already 0.0, so
+    it contributes no gradient either way; the mask is what keeps it out of the
+    *denominator*, so a partly-unaligned action is not silently rescaled.
+    """
+    import torch
+
+    n = len(full_tokens)
+    action_len = n - prompt_len
+    if action_len <= 0:
+        raise ValueError(f"no sampled tokens: prompt_len={prompt_len}, total={n}")
+    if len(advantages) != action_len:
+        raise ValueError(
+            f"{len(advantages)} advantages for {action_len} sampled tokens — "
+            "advantages are per-student-token after chunk alignment; a mismatch "
+            "means the alignment covered a different span than was sampled"
+        )
+    if len(behavior_logprobs) != action_len:
+        raise ValueError(
+            f"{len(behavior_logprobs)} behavior logprobs for {action_len} sampled "
+            "tokens — refusing to build a misaligned datum"
+        )
+    if supervised_mask is not None and len(supervised_mask) != action_len:
+        raise ValueError(
+            f"{len(supervised_mask)} mask entries for {action_len} sampled tokens"
+        )
+
+    weights = torch.zeros(n, dtype=torch.float32)
+    if supervised_mask is None:
+        weights[prompt_len:] = 1.0
+    else:
+        weights[prompt_len:] = torch.tensor(
+            [1.0 if s else 0.0 for s in supervised_mask], dtype=torch.float32
+        )
+    adv = torch.zeros(n, dtype=torch.float32)
+    adv[prompt_len:] = torch.tensor(advantages, dtype=torch.float32)
+    behavior = torch.zeros(n, dtype=torch.float32)
+    behavior[prompt_len:] = torch.tensor(behavior_logprobs, dtype=torch.float32)
+
+    return tinker.Datum(
+        model_input=tinker.ModelInput.from_ints(full_tokens),
+        loss_fn_inputs={
+            "weights": tinker.TensorData(
+                data=weights.tolist(), dtype="float32", shape=[n]
+            ),
+            "advantages": tinker.TensorData(
+                data=adv.tolist(), dtype="float32", shape=[n]
+            ),
+            "behavior_logprobs": tinker.TensorData(
+                data=behavior.tolist(), dtype="float32", shape=[n]
+            ),
+        },
+    )
+
+
+def cross_opd_loss_fn(
+    data: list[Any], logprobs_list: list[Any]
+) -> tuple[Any, dict[str, float]]:
+    """`chunk_opd.clipped_is_policy_loss` in `forward_backward_custom`'s shape.
+
+    Differs from `opd_loss_fn` in two ways that matter:
+
+    - **No `min_len` truncation.** The plan (§6.5) makes a length mismatch a hard
+      error: a forward pass returning fewer logprobs than the datum has tokens
+      means the remote tokenisation disagrees with the one alignment was computed
+      against, and silently dropping the suffix would train on advantages
+      belonging to other positions.
+    - **One global denominator.** Each example contributes its raw sum
+      (`denominator=1.0`); the total is divided once by the batch-wide supervised
+      token count. `opd_loss_fn` divides by `len(data)`, which weights a short
+      action the same as a long one — acceptable for a mean-of-means objective,
+      wrong for the plan's "summed and divided once by the global count of
+      supervised ck75 tokens".
+    """
+    import torch
+
+    from ...chunk_opd import clip_fraction, clipped_is_policy_loss
+
+    total = torch.tensor(0.0)
+    n_tokens = 0.0
+    clip_fracs: list[float] = []
+    adv_sum = 0.0
+
+    for datum, student_lp in zip(data, logprobs_list, strict=True):
+        weights = torch.tensor(
+            datum.loss_fn_inputs["weights"].data, dtype=torch.float32
+        )
+        adv = torch.tensor(
+            datum.loss_fn_inputs["advantages"].data, dtype=torch.float32
+        )
+        behavior = torch.tensor(
+            datum.loss_fn_inputs["behavior_logprobs"].data, dtype=torch.float32
+        )
+
+        if len(student_lp) != len(weights):
+            raise RuntimeError(
+                f"forward returned {len(student_lp)} logprobs for a datum with "
+                f"{len(weights)} tokens. Not truncating: the advantages were "
+                "aligned against the full sequence and would land on the wrong "
+                "positions (docs/OPD-MULTITURN-PLAN.md §6.5)"
+            )
+
+        s = student_lp.float()
+        # Raw sum here; the global denominator is applied once below.
+        total = total + clipped_is_policy_loss(
+            s, behavior, adv, weights, denominator=1.0
+        )
+        n_tokens += float(weights.sum())
+
+        supervised = weights > 0
+        if bool(supervised.any()):
+            clip_fracs.append(clip_fraction(s, behavior, weights))
+            adv_sum += float(adv[supervised].sum())
+
+    loss = total / max(n_tokens, 1.0)
+    metrics = {
+        "opd_loss": float(loss.detach().item()),
+        "action_tokens": n_tokens,
+        "clip_fraction": sum(clip_fracs) / len(clip_fracs) if clip_fracs else 0.0,
+        # Monitoring only: mean advantage should sit near 0 when the student
+        # already matches the teacher, and its sign says which way the update
+        # pushes.
+        "mean_advantage": adv_sum / n_tokens if n_tokens else 0.0,
+    }
+    return loss, metrics
+
+
+__all__ += ["build_cross_opd_datum", "cross_opd_loss_fn"]
