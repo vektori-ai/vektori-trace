@@ -1,4 +1,4 @@
-"""Phase-0 §6.1 pins — the manifest and the vendored paper-code hashes.
+"""Phase-0 §6.1 pins — the manifest and the reference paper-code hashes.
 
 The point of these tests is that a pin nobody filled in must be loud. A manifest
 that silently defaults its way to "complete" is worse than no manifest, because
@@ -11,12 +11,12 @@ import pytest
 
 from vektori_trace.opd_manifest import (
     PAPER_CODE_REVISION,
-    VENDOR_SHA256,
+    REFERENCE_SHA256,
     OPDRunManifest,
     PinError,
     current_commit,
     sha256_file,
-    verify_vendor_pins,
+    verify_reference_pins,
 )
 from vektori_trace.tokenizer_check import CROSS_STUDENT, CROSS_TEACHER
 
@@ -26,6 +26,8 @@ def _complete() -> OPDRunManifest:
         student_base_model="Qwen/Qwen3-14B",
         student_adapter_path="/data/stage-b/checkpoint-75",
         student_adapter_sha256="0" * 64,
+        student_adapter_config_sha256="1" * 64,
+        student_tokenizer_sha256="2" * 64,
         fireworks_model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
         harbor_revision="abc1234",
         task_corpus="cs/corpus50_v3",
@@ -34,27 +36,27 @@ def _complete() -> OPDRunManifest:
 
 
 # ---------------------------------------------------------------------------
-# Vendored paper code
+# Reference paper code
 # ---------------------------------------------------------------------------
 
 
-def test_vendored_paper_code_matches_its_pin():
+def test_reference_paper_code_matches_its_pin():
     """The port in chunk_opd.py is only meaningful against these exact bytes."""
-    observed = verify_vendor_pins()
-    assert observed == VENDOR_SHA256
+    observed = verify_reference_pins()
+    assert observed == REFERENCE_SHA256
 
 
-def test_altered_vendor_file_is_detected(tmp_path):
-    for name in VENDOR_SHA256:
+def test_altered_reference_file_is_detected(tmp_path):
+    for name in REFERENCE_SHA256:
         (tmp_path / name).write_text("# not the upstream file\n")
 
     with pytest.raises(PinError, match="does not match its pin"):
-        verify_vendor_pins(tmp_path)
+        verify_reference_pins(tmp_path)
 
 
-def test_missing_vendor_file_is_detected(tmp_path):
+def test_missing_reference_file_is_detected(tmp_path):
     with pytest.raises(PinError, match="missing"):
-        verify_vendor_pins(tmp_path)
+        verify_reference_pins(tmp_path)
 
 
 def test_paper_revision_is_a_full_sha():
@@ -109,6 +111,27 @@ def test_cross_tokenizer_pair_is_the_plans_pair_by_default():
     assert m.student_tokenizer == CROSS_STUDENT
 
 
+def test_clip_eps_is_pinned_at_the_reference_default():
+    """Recorded as a value, not left to a code default (user call #3)."""
+    from vektori_trace.chunk_opd import DEFAULT_CLIP_EPS
+
+    m = OPDRunManifest()
+    assert m.clip_eps == DEFAULT_CLIP_EPS == 0.2
+    assert m.to_dict()["clip_eps"] == 0.2
+    assert m.large_chunk_threshold == 6
+
+
+def test_adapter_hashes_are_required_and_distinct_fields():
+    """Weights, config, and tokenizer are separate pins — one SHA cannot cover all."""
+    m = _complete()
+    m.student_adapter_config_sha256 = None
+    assert "student_adapter_config_sha256" in m.missing_pins()
+
+    m2 = _complete()
+    m2.student_tokenizer_sha256 = None
+    assert "student_tokenizer_sha256" in m2.missing_pins()
+
+
 def test_advantage_clamp_none_is_a_real_value_not_a_missing_pin():
     """Upstream's default is no clamp; None must not read as 'unpinned'."""
     m = _complete()
@@ -117,10 +140,10 @@ def test_advantage_clamp_none_is_a_real_value_not_a_missing_pin():
     m.require_complete()
 
 
-def test_to_dict_carries_vendor_hashes_and_paper_identity():
+def test_to_dict_carries_reference_hashes_and_paper_identity():
     d = _complete().to_dict()
 
-    assert d["vendor_sha256"] == VENDOR_SHA256
+    assert d["reference_sha256"] == REFERENCE_SHA256
     assert d["paper_arxiv_id"] == "2606.09456"
     assert d["paper_code_revision"] == PAPER_CODE_REVISION
     assert d["teacher_model"] == CROSS_TEACHER

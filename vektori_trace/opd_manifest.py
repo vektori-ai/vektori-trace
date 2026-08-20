@@ -11,9 +11,9 @@ Two deliberate design points:
   reads as `None` and `missing_pins()` names it. Defaulting to "whatever
   `tokenizer_check` says" would let a run report a pin it never checked.
 - **The paper-code pin is verified against bytes on disk**, not trusted. The
-  vendored files under `vendor/opd_paper/` are what the port in `chunk_opd.py`
-  claims to implement; `verify_vendor_pins()` re-hashes them so an edit to
-  "just fix a typo" in vendored code shows up as a failed pin.
+  files under `opd_reference/` are what the port in `chunk_opd.py` claims to
+  implement; `verify_reference_pins()` re-hashes them so an edit to "just fix a
+  typo" in reference code shows up as a failed pin.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .chunk_opd import DEFAULT_CLIP_EPS, DEFAULT_LARGE_CHUNK_THRESHOLD
 from .tokenizer_check import CROSS_STUDENT, CROSS_TEACHER
 
 #: Repo of record for the loss, and the revision `chunk_opd.py` was ported from.
@@ -31,8 +32,8 @@ PAPER_ARXIV_ID = "2606.09456"
 PAPER_REPO = "https://github.com/ivanniu/On-Policy-Distill"
 PAPER_CODE_REVISION = "927a8264f2e303b7f82c2d331a58fd4240c8805a"
 
-#: sha256 of each vendored upstream file, recorded when it was vendored.
-VENDOR_SHA256 = {
+#: sha256 of each upstream reference file, recorded when it was copied in.
+REFERENCE_SHA256 = {
     "reward_manager_opd.py": (
         "a24be172575818e3b44ac6287d68e9984a956c467f2e3baaa90d6c2ad365fe3e"
     ),
@@ -41,7 +42,7 @@ VENDOR_SHA256 = {
     ),
 }
 
-VENDOR_DIR = Path(__file__).parent / "vendor" / "opd_paper"
+REFERENCE_DIR = Path(__file__).parent / "opd_reference"
 
 
 class PinError(RuntimeError):
@@ -58,11 +59,26 @@ class OPDRunManifest:
     """
 
     # -- student (ck75) ------------------------------------------------------
+    #: Base model *revision*, not just the family — a re-tagged base silently
+    #: changes what the adapter is applied to.
     student_base_model: str | None = None
-    #: Stage-B checkpoint-75; the adapter actually loaded, not the family.
+    student_base_revision: str | None = None
+    #: Stage-B checkpoint-75; the adapter directory actually loaded.
+    #: Known location: vektori-trace-adapters / sft/qwen3-14b-stage-b-lora/
+    #: checkpoint-75 (docs/SOL-HANDOFF.md). Its hashes are not in the repo and
+    #: must be read off the box/volume before the first paid call.
     student_adapter_path: str | None = None
+    #: sha256 of `adapter_model.safetensors` specifically — the weights, not the
+    #: directory. Two checkpoints can share a config and differ only here.
     student_adapter_sha256: str | None = None
+    #: sha256 of `adapter_config.json` — rank, alpha, target modules. A config
+    #: change with identical weights still changes what gets loaded.
+    student_adapter_config_sha256: str | None = None
     student_tokenizer: str = CROSS_STUDENT
+    #: sha256 of the tokenizer + chat template as served. CLAUDE.md records that
+    #: Qwen3's template decides where the think-wrapper lands, so this is a
+    #: correctness pin, not bookkeeping.
+    student_tokenizer_sha256: str | None = None
     #: The serving-side chat template. Qwen3's think-wrapper behaviour is
     #: template-dependent (see CLAUDE.md), so the renderer is a pin, not a detail.
     student_renderer_sha256: str | None = None
@@ -93,8 +109,13 @@ class OPDRunManifest:
     max_new_tokens: int | None = None
     max_context_tokens: int | None = None
     compaction_policy: str | None = None
-    clip_eps: float | None = None
-    large_chunk_threshold: int | None = None
+    #: Pinned at the reference implementation's default (verl `clip_ratio`).
+    #: Recorded rather than left to the code default so a run report states it.
+    #: Near-inert on a one-step smoke — behaviour and current policy start
+    #: identical, so every ratio is 1 — and only bites once updates go stale or
+    #: repeat over epochs. Do not tune before the probe/smoke produces evidence.
+    clip_eps: float = DEFAULT_CLIP_EPS
+    large_chunk_threshold: int = DEFAULT_LARGE_CHUNK_THRESHOLD
     advantage_clamp: float | None = None
 
     # -- our own code --------------------------------------------------------
@@ -109,6 +130,8 @@ class OPDRunManifest:
         "student_base_model",
         "student_adapter_path",
         "student_adapter_sha256",
+        "student_adapter_config_sha256",
+        "student_tokenizer_sha256",
         "fireworks_model_id",
         "harbor_revision",
         "task_corpus",
@@ -136,7 +159,7 @@ class OPDRunManifest:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d["vendor_sha256"] = dict(VENDOR_SHA256)
+        d["reference_sha256"] = dict(REFERENCE_SHA256)
         d["paper_repo"] = PAPER_REPO
         return d
 
@@ -150,18 +173,18 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def verify_vendor_pins(vendor_dir: Path | None = None) -> dict[str, str]:
-    """Re-hash the vendored upstream sources against `VENDOR_SHA256`.
+def verify_reference_pins(reference_dir: Path | None = None) -> dict[str, str]:
+    """Re-hash the upstream reference sources against `REFERENCE_SHA256`.
 
     Returns the observed hashes on success. Raises `PinError` naming every file
     that is missing or altered — the port in `chunk_opd.py` is only meaningful
     relative to these exact bytes.
     """
-    root = vendor_dir or VENDOR_DIR
+    root = reference_dir or REFERENCE_DIR
     observed: dict[str, str] = {}
     problems: list[str] = []
 
-    for name, expected in VENDOR_SHA256.items():
+    for name, expected in REFERENCE_SHA256.items():
         path = root / name
         if not path.is_file():
             problems.append(f"{name}: missing at {path}")
@@ -173,7 +196,7 @@ def verify_vendor_pins(vendor_dir: Path | None = None) -> dict[str, str]:
 
     if problems:
         raise PinError(
-            "vendored paper code does not match its pin: "
+            "reference paper code does not match its pin: "
             + "; ".join(problems)
             + f" (revision {PAPER_CODE_REVISION}; see {PAPER_REPO})"
         )
@@ -211,11 +234,11 @@ __all__ = [
     "PAPER_ARXIV_ID",
     "PAPER_CODE_REVISION",
     "PAPER_REPO",
-    "VENDOR_DIR",
-    "VENDOR_SHA256",
+    "REFERENCE_DIR",
+    "REFERENCE_SHA256",
     "OPDRunManifest",
     "PinError",
     "current_commit",
     "sha256_file",
-    "verify_vendor_pins",
+    "verify_reference_pins",
 ]

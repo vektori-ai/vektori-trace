@@ -17,8 +17,11 @@ import pytest
 
 from vektori_trace.align import align_by_bytes
 from vektori_trace.chunk_opd import (
+    CHUNK_LOSS_ID,
     DEFAULT_LARGE_CHUNK_THRESHOLD,
+    LEGACY_LOSS_IDS,
     ChunkOPDError,
+    assert_chunk_loss_selected,
     assign_chunk_advantages,
 )
 
@@ -453,3 +456,31 @@ def test_every_action_byte_belongs_to_exactly_one_chunk():
         assert span.byte_start == cursor
         cursor = span.byte_end
     assert cursor == total
+
+
+# ---------------------------------------------------------------------------
+# Loss-selection fence: cross_kl stays diagnostic, never a training path
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_loss_is_accepted_for_a_cross_tokenizer_run():
+    assert_chunk_loss_selected(CHUNK_LOSS_ID)
+
+
+@pytest.mark.parametrize("legacy", sorted(LEGACY_LOSS_IDS))
+def test_legacy_estimator_b_is_refused_on_a_cross_tokenizer_run(legacy):
+    """cross_kl produces a finite plausible number from the same inputs, so a
+    misconfiguration is invisible in the logs. It must fail loudly instead."""
+    with pytest.raises(ChunkOPDError, match="legacy/diagnostic only"):
+        assert_chunk_loss_selected(legacy)
+
+
+def test_unknown_loss_is_refused():
+    with pytest.raises(ChunkOPDError, match="unknown loss"):
+        assert_chunk_loss_selected("forward_kl")
+
+
+def test_same_tokenizer_runs_are_unaffected_by_the_fence():
+    """reverse_kl_surrogate stays correct when the tokenizers actually match."""
+    for loss in [*LEGACY_LOSS_IDS, "anything"]:
+        assert_chunk_loss_selected(loss, cross_tokenizer=False)

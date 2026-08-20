@@ -72,10 +72,10 @@ target-version = "py312"
 # Vendored DeepSeek encoder — pinned by SHA256 in FINAL-PLAN.md; do not reformat.
 extend-exclude = [
     "vektori_trace/encoding_dsv4.py",
-    # Pinned upstream sources for arXiv:2606.09456, vendored verbatim for
-    # provenance (see vektori_trace/vendor/opd_paper/README.md). Never imported;
-    # reformatting them would break the diff against the pinned revision.
-    "vektori_trace/vendor/opd_paper/*.py",
+    # Upstream reference sources for arXiv:2606.09456, kept verbatim (see
+    # vektori_trace/opd_reference/README.md). Never imported; reformatting them
+    # would break the diff against the pinned revision.
+    "vektori_trace/opd_reference/*.py",
 ]
 
 [tool.ruff.lint]
@@ -91,5 +91,5 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["vektori_trace*"]
-# Pinned upstream sources kept for provenance/diffing only — never imported.
-exclude = ["vektori_trace.vendor*"]
+# Upstream reference sources kept for diffing only — never imported.
+exclude = ["vektori_trace.opd_reference*"]

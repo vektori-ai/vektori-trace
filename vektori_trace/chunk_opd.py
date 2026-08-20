@@ -2,8 +2,8 @@
 
 This is the loss of record for `docs/OPD-MULTITURN-PLAN.md` — a port of Niu et
 al., *Breaking the Tokenizer Barrier: On-Policy Distillation across Model
-Families* (arXiv:2606.09456), pinned at revision `927a8264` and vendored under
-`vektori_trace/vendor/opd_paper/` so the port can be diffed against its source.
+Families* (arXiv:2606.09456), pinned at revision `927a8264`. The upstream
+source sits in `vektori_trace/opd_reference/` so the port can be diffed against it.
 
 Why this module exists rather than a tweak to `cross_kl.py`
 -----------------------------------------------------------
@@ -23,8 +23,19 @@ internal semantic structure within the chunk:
     log q_i = (L_T / L_S) · log p_i
     A_i     = log q_i − log p_i = (L_T / L_S − 1) · log p_i
 
-`cross_kl.py` is left intact: it is still the diagnostic/estimator-A path and
-`distill.py` still calls it. Nothing here reaches back into it.
+Boundary with `cross_kl.py`
+---------------------------
+`cross_kl.py` stays as a legacy regression oracle and diagnostic — `distill.py`
+still calls it, and deleting it would lose the estimator-A comparison. But it is
+**not permitted on a cross-tokenizer training path**:
+
+- `chunk_opd` is the only allowed loss for DeepSeek→Qwen runs;
+- `cross_kl.cross_step_loss` / `span_surrogate` are diagnostic-only;
+- `assert_chunk_loss_selected()` below makes a config that asks for estimator B
+  on a `--cross-tokenizer` production run fail loudly rather than silently
+  optimising the unpublished objective.
+
+Nothing here reaches back into `cross_kl`.
 
 The 1:1 reduction that makes this checkable
 -------------------------------------------
@@ -147,7 +158,7 @@ def assign_chunk_advantages(
     """Semantic-prior credit assignment — the paper's Eq. for `log q_i` and `A_i`.
 
     Consumes byte-aligned spans from `align.align_by_bytes` (our aligner; see the
-    vendor README for why we align on bytes instead of upstream's decode-and-
+    opd_reference README for why we align on bytes instead of upstream's decode-and-
     compare) and applies upstream's per-chunk redistribution unchanged.
 
     Args:
@@ -386,13 +397,50 @@ def clip_fraction(
         return float((out.float() * mask).sum().item()) / denom if denom else 0.0
 
 
+#: Loss identifiers a cross-tokenizer production run may select. `cross_kl`'s
+#: estimator B stays reachable for diagnostics and legacy regression, but it is
+#: not the published objective and must never be what a paid run optimises.
+CHUNK_LOSS_ID = "chunk_opd"
+LEGACY_LOSS_IDS = frozenset({"cross_step_loss", "span_surrogate", "estimator_b"})
+
+
+def assert_chunk_loss_selected(loss_id: str, *, cross_tokenizer: bool = True) -> None:
+    """Fail unless a cross-tokenizer run is configured for the published loss.
+
+    Call this from any `--cross-tokenizer` production entry point before
+    spending. `cross_kl`'s span surrogate produces a finite, plausible number
+    from the same inputs, so a misconfiguration is invisible in the logs — which
+    is exactly the class of failure the plan's §11 stop conditions target.
+
+    Same-tokenizer runs (`cross_tokenizer=False`) are unaffected:
+    `opd.reverse_kl_surrogate` remains correct there.
+    """
+    if not cross_tokenizer:
+        return
+    if loss_id in LEGACY_LOSS_IDS:
+        raise ChunkOPDError(
+            f"loss {loss_id!r} is legacy/diagnostic only and cannot be used for a "
+            "cross-tokenizer training run: it treats a whole aligned span as one "
+            f"sampled unit, which is not the published objective. Use {CHUNK_LOSS_ID!r} "
+            "(docs/OPD-MULTITURN-PLAN.md §6.5)."
+        )
+    if loss_id != CHUNK_LOSS_ID:
+        raise ChunkOPDError(
+            f"unknown loss {loss_id!r} for a cross-tokenizer run; expected "
+            f"{CHUNK_LOSS_ID!r}"
+        )
+
+
 __all__ = [
+    "CHUNK_LOSS_ID",
     "DEFAULT_CLIP_EPS",
     "DEFAULT_LARGE_CHUNK_THRESHOLD",
     "DEGENERATE_LS_EPS",
+    "LEGACY_LOSS_IDS",
     "AlignmentError",
     "ChunkOPDError",
     "ChunkStats",
+    "assert_chunk_loss_selected",
     "assign_chunk_advantages",
     "clip_fraction",
     "clipped_is_policy_loss",
