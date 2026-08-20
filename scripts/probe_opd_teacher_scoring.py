@@ -13,6 +13,12 @@ Proves, against the real deployment, every condition
 
 Run on **one short** and **one multi-turn** transcript, as §6.3 specifies.
 
+Token ids come from the **pinned local encoder** (`encoding_dsv4` +
+`providers/teacher/cross.py`), not from a server endpoint: Fireworks exposes no
+`/tokenize`, and `providers/teacher/fireworks.py` documents that the OPD loop
+never needs one because it holds the prefix as ids already. Probing any other
+tokenisation path would prove nothing about the run.
+
 Read-only and cheap: every call is `max_tokens=1` over a bounded prefix. The
 multi-turn transcript is the only one with real size, and it is scored once.
 `top_logprobs` is never sent — §6.3 omits it, and top-5 is irrelevant to this
@@ -101,17 +107,48 @@ class Gate:
         return [r["gate"] for r in self.rows if not r["pass"]]
 
 
-def tokenize(text: str, model: str, key: str) -> list[int] | None:
-    """Ask the deployment for the ids it would use. None when unsupported."""
-    status, body = post(
-        BASE + "/tokenize", {"model": model, "text": text}, key
+def load_teacher_tokenizer(repo: str):
+    """The pinned local DeepSeek tokenizer — the production path.
+
+    Fireworks exposes **no** `/tokenize` endpoint; `providers/teacher/fireworks.py`
+    documents this and the OPD loop never needs one, because it holds the prefix
+    as ids already. Ids therefore come from the SHA-pinned local encoder, exactly
+    as `providers/teacher/cross.py` does it at training time. Probing a different
+    tokenisation path than the run will use would prove nothing about the run.
+    """
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    return load_tokenizer(repo)
+
+
+def render_and_encode(messages, tok, thinking_mode: str = "chat"):
+    """messages -> DeepSeek-rendered string -> teacher ids, the production way."""
+    from vektori_trace.providers.teacher.cross import (
+        encode_teacher_ids,
+        render_teacher_prefix,
     )
-    if status != 200:
-        return None
-    toks = body.get("tokens") or body.get("token_ids")
-    if isinstance(toks, list) and toks and isinstance(toks[0], int):
-        return [int(t) for t in toks]
-    return None
+
+    text = render_teacher_prefix(messages, thinking_mode=thinking_mode)
+    return text, encode_teacher_ids(text, tok)
+
+
+def _decode(tok: Any, ids: list[int]) -> str:
+    """Decode ids **with special tokens visible**.
+
+    Critical: the default `decode` silently drops EOS, so a span still carrying
+    the renderer's `<|end_of_sentence|>` decodes to exactly the action bytes and
+    looks byte-exact while containing a token ck75 never sampled. Scoring that
+    token would supervise the teacher's opinion of a turn boundary as if it were
+    the model's own output.
+    """
+    for kwargs in ({"skip_special_tokens": False}, {}):
+        try:
+            return tok.decode(ids, **kwargs)
+        except TypeError:
+            continue
+        except Exception:  # pragma: no cover - flavour differences
+            return ""
+    return ""
 
 
 def score(
@@ -141,8 +178,9 @@ def score(
 
 def run_case(
     name: str,
-    prefix_text: str,
+    prior_messages: list[dict[str, Any]],
     action_text: str,
+    tok: Any,
     model: str,
     key: str,
     echo_mode: str,
@@ -151,30 +189,64 @@ def run_case(
     print(f"\n=== {name} (echo_mode={echo_mode}) ===")
     ev: dict[str, Any] = {"case": name, "echo_mode": echo_mode}
 
-    # --- C (part 1): the boundary must come from real tokenisation, never from
-    # assuming tokenize(prefix+action) == tokenize(prefix) + tokenize(action).
-    prefix_ids = tokenize(prefix_text, model, key)
-    joint_ids = tokenize(prefix_text + action_text, model, key)
-    if prefix_ids is None or joint_ids is None:
+    # --- C (part 1): locate the action span the way §4 demands — tokenise
+    # `teacher_prefix + exact_action` jointly, never by assuming
+    #   tokenize(prefix + action) == tokenize(prefix) + tokenize(action).
+    # Both renders go through the pinned encoder, so this is the same
+    # tokenisation the training run will use.
+    _prefix_text, prefix_ids = render_and_encode(prior_messages, tok)
+    joint_text, joint_ids = render_and_encode(
+        [*prior_messages, {"role": "assistant", "content": action_text}], tok
+    )
+
+    # The rendered assistant turn adds a role header before the action bytes;
+    # what we supervise is only the action itself, so find where the action's
+    # own bytes begin inside the joint render.
+    if action_text not in joint_text:
         g.check(
             f"{name}/C-boundary",
             False,
-            "/tokenize unavailable — cannot locate the action span by id. "
-            "§6.3 requires ids/offsets sufficient to locate it.",
+            "rendered joint prompt does not contain the verbatim action bytes — "
+            "the renderer altered them, so no byte-exact span exists",
         )
         return ev
 
+    prefix_ok = joint_ids[: len(prefix_ids)] == prefix_ids
     action_ids = joint_ids[len(prefix_ids):]
-    concat_ids = tokenize(action_text, model, key) or []
+
+    # The renderer closes a completed assistant turn with EOS. That token was
+    # never sampled by ck75, so §4 ("only bytes actually sampled as ck75's
+    # completion are supervised") excludes it. Drop it by checking the decoded
+    # bytes rather than hardcoding an id.
+    n_eos_dropped = 0
+    while len(action_ids) > 1 and _decode(tok, action_ids) != action_text:
+        if not _decode(tok, action_ids).startswith(action_text):
+            break  # mismatch is not a trailing-token problem; report it as-is
+        action_ids = action_ids[:-1]
+        n_eos_dropped += 1
+    ev["n_trailing_tokens_dropped"] = n_eos_dropped
+    _, concat_ids = render_and_encode(
+        [{"role": "assistant", "content": action_text}], tok
+    )
     ev["n_prefix_tokens"] = len(prefix_ids)
     ev["n_action_tokens"] = len(action_ids)
+    ev["prefix_is_exact_id_prefix_of_joint"] = prefix_ok
 
+    decoded = _decode(tok, action_ids)
+    g.check(
+        f"{name}/C-bytes",
+        decoded == action_text,
+        f"scored span decodes to the exact action bytes ({len(action_text)} chars)"
+        if decoded == action_text
+        else f"scored span decodes to {decoded!r}, expected {action_text!r}",
+    )
     g.check(
         f"{name}/C-boundary",
-        joint_ids[: len(prefix_ids)] == prefix_ids and len(action_ids) > 0,
-        f"action span located by joint tokenisation: {len(action_ids)} teacher "
-        f"tokens (naive concat would give {len(concat_ids)})",
-        {"straddles": concat_ids != action_ids},
+        len(action_ids) > 0,
+        f"joint tokenisation gives {len(prefix_ids)} prefix + {len(action_ids)} "
+        f"continuation teacher tokens; prefix is an exact id-prefix of the joint "
+        f"encoding: {prefix_ok}",
+        {"boundary_shifts_under_concat": concat_ids != action_ids},
     )
 
     status, body = score(prefix_ids, action_ids, model, key, echo_mode)
@@ -307,6 +379,12 @@ def main() -> int:
     ap.add_argument(
         "--model", default="accounts/fireworks/models/deepseek-v4-flash-0731"
     )
+    ap.add_argument(
+        "--tokenizer",
+        default="deepseek-ai/DeepSeek-V4-Flash-0731",
+        help="HF repo for the teacher tokenizer (the production path; Fireworks "
+        "has no /tokenize endpoint)",
+    )
     ap.add_argument("--echo-mode", default="full", choices=["full", "last", "both"])
     ap.add_argument("--out", default=None, help="write the JSON report here")
     args = ap.parse_args()
@@ -316,23 +394,50 @@ def main() -> int:
         print("FIREWORKS_API_KEY is not set", file=sys.stderr)
         return 2
 
+    # The renderer and tokenizer are the production ones. A failure to load
+    # them is a real Phase-0 failure (the run needs both), not a probe excuse.
+    try:
+        from vektori_trace.encoding_dsv4 import verify_encoding_dsv4_pin
+
+        verify_encoding_dsv4_pin()
+        print(f"pinned DeepSeek encoder verified; loading tokenizer {args.tokenizer}")
+        tok = load_teacher_tokenizer(args.tokenizer)
+    except Exception as e:  # report it, do not mask it
+        print(f"\nFAILED to load the pinned teacher renderer/tokenizer: {e}")
+        print(
+            "This is the same path the training run uses, so it must work before "
+            "any scoring is meaningful."
+        )
+        return 2
+
     # §6.3: "at least one short and one multi-turn frozen transcript".
-    short_prefix = "<|user|>List the source directory.<|assistant|>"
-    multi_prefix = "".join(
-        f"<|{role}|>{text}" for role, text in MULTI_TURN[:-1]
-    ) + "<|assistant|>"
+    short_messages = [
+        {"role": "system", "content": "You are a terminal agent."},
+        {"role": "user", "content": "List the source directory."},
+    ]
+    multi_messages = [
+        {"role": role, "content": text} for role, text in MULTI_TURN[:-1]
+    ]
     multi_action = MULTI_TURN[-1][1]
 
     modes = ["full", "last"] if args.echo_mode == "both" else [args.echo_mode]
 
     g = Gate()
-    report: dict[str, Any] = {"model": args.model, "cases": []}
+    report: dict[str, Any] = {
+        "model": args.model,
+        "tokenizer": args.tokenizer,
+        "cases": [],
+    }
     for mode in modes:
         report["cases"].append(
-            run_case("short", short_prefix, SHORT_ACTION, args.model, key, mode, g)
+            run_case(
+                "short", short_messages, SHORT_ACTION, tok, args.model, key, mode, g
+            )
         )
         report["cases"].append(
-            run_case("multiturn", multi_prefix, multi_action, args.model, key, mode, g)
+            run_case(
+                "multiturn", multi_messages, multi_action, tok, args.model, key, mode, g
+            )
         )
 
     report["gates"] = g.rows
