@@ -688,3 +688,40 @@ def cross_opd_loss_fn(
 
 
 __all__ += ["build_cross_opd_datum", "cross_opd_loss_fn"]
+
+
+def validate_cross_opd_config(
+    cfg: FireworksOPDConfig,
+    *,
+    loss_id: str = "chunk_opd",
+) -> None:
+    """Gate a cross-tokenizer run's config before anything is spent.
+
+    Three plan requirements that are each invisible at runtime if violated:
+
+    - **§7.1 token cap.** `FireworksOPDConfig.max_new_tokens` still defaults to
+      256, the cap the previous run used. A truncated action still aligns and
+      still produces a finite loss, so nothing downstream reveals it.
+    - **§6.5 loss selection.** `cross_kl`'s span surrogate yields a plausible
+      number from the same inputs; only an explicit check separates it from the
+      published objective.
+    - **`top_k`.** Unused on this path — the chunk objective needs the realized
+      path's log probabilities, not a top-K set. A config carrying it was
+      written for a different objective.
+
+    Call this from the driver, not from the loss: by the time a loss function
+    runs, the rollout that used the wrong cap has already happened.
+    """
+    from ...chunk_opd import assert_chunk_loss_selected, assert_token_cap_is_task_derived
+
+    assert_chunk_loss_selected(loss_id, cross_tokenizer=True)
+    assert_token_cap_is_task_derived(cfg.max_new_tokens)
+    if cfg.top_k:
+        raise ValueError(
+            f"top_k={cfg.top_k} has no meaning for the chunk objective, which "
+            "scores the realized path rather than a top-K set. A config setting "
+            "it was written for a different loss (docs/OPD-MULTITURN-PLAN.md §2)."
+        )
+
+
+__all__ += ["validate_cross_opd_config"]

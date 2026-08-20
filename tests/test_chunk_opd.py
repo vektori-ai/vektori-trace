@@ -20,8 +20,11 @@ from vektori_trace.chunk_opd import (
     CHUNK_LOSS_ID,
     DEFAULT_LARGE_CHUNK_THRESHOLD,
     LEGACY_LOSS_IDS,
+    MIN_TASK_DERIVED_TOKEN_CAP,
+    PREVIOUS_TOKEN_CAP,
     ChunkOPDError,
     assert_chunk_loss_selected,
+    assert_token_cap_is_task_derived,
     assign_chunk_advantages,
 )
 
@@ -484,3 +487,136 @@ def test_same_tokenizer_runs_are_unaffected_by_the_fence():
     """reverse_kl_surrogate stays correct when the tokenizers actually match."""
     for loss in [*LEGACY_LOSS_IDS, "anything"]:
         assert_chunk_loss_selected(loss, cross_tokenizer=False)
+
+
+# ---------------------------------------------------------------------------
+# §7.1 token cap — the previous 256 default must not come back
+# ---------------------------------------------------------------------------
+
+
+def test_task_derived_cap_is_accepted():
+    assert_token_cap_is_task_derived(2048)
+    assert_token_cap_is_task_derived(MIN_TASK_DERIVED_TOKEN_CAP)
+
+
+@pytest.mark.parametrize("cap", [PREVIOUS_TOKEN_CAP, 128, 64])
+def test_previous_256_cap_and_below_are_refused(cap):
+    """A truncated action is a different action, and the loss stays finite —
+    invisible in every downstream metric, so it has to be a hard gate."""
+    with pytest.raises(ChunkOPDError, match="previous"):
+        assert_token_cap_is_task_derived(cap)
+
+
+def test_cap_between_256_and_the_floor_is_refused():
+    with pytest.raises(ChunkOPDError, match="floor"):
+        assert_token_cap_is_task_derived(MIN_TASK_DERIVED_TOKEN_CAP - 1)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_nonpositive_cap_is_refused(bad):
+    with pytest.raises(ChunkOPDError, match="must be > 0"):
+        assert_token_cap_is_task_derived(bad)
+
+
+# ---------------------------------------------------------------------------
+# §10 reporting fields
+# ---------------------------------------------------------------------------
+
+
+def test_advantage_sign_counts_distinguish_agreement_from_cancellation():
+    """A mean near zero comes both from agreement and from opposing pressures."""
+    token_bytes = [b"a", b"b", b"c", b"d"]
+    alignment = align_by_bytes(token_bytes, token_bytes)
+
+    # +1, -1, +1, -1 -> mean 0, but nothing agrees.
+    behavior = [-1.0, -1.0, -1.0, -1.0]
+    teacher = [0.0, -2.0, 0.0, -2.0]
+
+    _, _, stats = assign_chunk_advantages(alignment, behavior, teacher)
+
+    assert stats.mean_advantage == pytest.approx(0.0, abs=1e-12)
+    assert stats.n_advantage_positive == 2
+    assert stats.n_advantage_negative == 2
+    assert stats.n_advantage_zero == 0
+    # Magnitude tells the two cases apart.
+    assert stats.mean_abs_advantage == pytest.approx(1.0, abs=1e-12)
+
+
+def test_agreement_reports_zero_sign_counts_and_zero_magnitude():
+    token_bytes = [b"a", b"b"]
+    alignment = align_by_bytes(token_bytes, token_bytes)
+    lps = [-0.5, -1.5]
+
+    _, _, stats = assign_chunk_advantages(alignment, lps, list(lps))
+
+    assert stats.n_advantage_zero == 2
+    assert stats.n_advantage_positive == 0
+    assert stats.n_advantage_negative == 0
+    assert stats.mean_abs_advantage == pytest.approx(0.0, abs=1e-12)
+
+
+def test_contribution_is_attributed_by_chunk_type():
+    """§10: advantage contribution by chunk type."""
+    # chunk 0: 1:1 (byte "a"); chunk 1: 2 student <-> 1 teacher ("bc")
+    student = [b"a", b"b", b"c"]
+    teacher_bytes = [b"a", b"bc"]
+    alignment = align_by_bytes(student, teacher_bytes)
+
+    behavior = [-1.0, -1.0, -1.0]
+    teacher = [-3.0, -4.0]
+
+    _, _, stats = assign_chunk_advantages(alignment, behavior, teacher)
+
+    assert set(stats.tokens_by_kind) == {"1:1", "N:1"}
+    assert stats.tokens_by_kind["1:1"] == 1
+    assert stats.tokens_by_kind["N:1"] == 2
+    assert sum(stats.tokens_by_kind.values()) == stats.n_supervised_tokens
+    assert sum(stats.advantage_abs_by_kind.values()) == pytest.approx(
+        stats.advantage_abs_sum, abs=1e-9
+    )
+
+
+def test_length_histograms_cover_every_chunk():
+    student = [b"a", b"bc", b"d", b"ef"]
+    teacher_bytes = [b"a", b"b", b"c", b"de", b"f"]
+    alignment = align_by_bytes(student, teacher_bytes)
+
+    _, _, stats = assign_chunk_advantages(alignment, [-0.5] * 4, [-0.5] * 5)
+
+    assert sum(stats.student_len_hist.values()) == stats.n_chunks
+    assert sum(stats.teacher_len_hist.values()) == stats.n_chunks
+    assert sum(stats.byte_len_hist.values()) == stats.n_chunks
+    assert max(stats.student_len_hist) == stats.max_chunk_student_tokens
+    assert max(stats.teacher_len_hist) == stats.max_chunk_teacher_tokens
+    assert max(stats.byte_len_hist) == stats.max_chunk_bytes
+
+
+def test_per_kind_contribution_reflects_post_clamp_advantages():
+    """Clamping changes magnitudes; the report must match what was used."""
+    token_bytes = [b"a", b"b"]
+    alignment = align_by_bytes(token_bytes, token_bytes)
+
+    _, _, stats = assign_chunk_advantages(
+        alignment, [-0.5, -0.5], [-20.0, -0.6], clamp=5.0
+    )
+
+    assert stats.n_clamped_tokens == 1
+    assert sum(stats.advantage_abs_by_kind.values()) == pytest.approx(
+        stats.advantage_abs_sum, abs=1e-9
+    )
+    assert stats.advantage_abs_by_kind["1:1"] == pytest.approx(5.1, abs=1e-9)
+
+
+def test_stats_to_dict_is_json_serialisable_with_string_hist_keys():
+    import json
+
+    student = [b"ab", b"c"]
+    teacher_bytes = [b"a", b"bc"]
+    alignment = align_by_bytes(student, teacher_bytes)
+    _, _, stats = assign_chunk_advantages(alignment, [-0.5, -0.5], [-1.0, -1.0])
+
+    d = stats.to_dict()
+    blob = json.dumps(d)
+    assert "chunk_kinds" not in d
+    assert all(isinstance(k, str) for k in d["student_len_hist"])
+    assert json.loads(blob)["mean_abs_advantage"] == d["mean_abs_advantage"]

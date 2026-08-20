@@ -285,3 +285,57 @@ def test_zero_advantage_everywhere_yields_zero_loss_and_zero_gradient(tinker):
 
     assert float(loss.detach()) == pytest.approx(0.0, abs=1e-9)
     assert float(lp.grad.abs().sum()) == pytest.approx(0.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Config gate (plan §7.1 cap, §6.5 loss selection)
+# ---------------------------------------------------------------------------
+
+
+def test_the_shipped_default_config_is_refused():
+    """FireworksOPDConfig still defaults max_new_tokens=256 — the previous cap.
+
+    This is the whole reason the gate exists: a driver that just constructs the
+    config and runs would silently reproduce the old truncation.
+    """
+    from vektori_trace.chunk_opd import ChunkOPDError
+    from vektori_trace.providers.student.fireworks import (
+        FireworksOPDConfig,
+        validate_cross_opd_config,
+    )
+
+    assert FireworksOPDConfig().max_new_tokens == 256
+    with pytest.raises(ChunkOPDError, match="previous"):
+        validate_cross_opd_config(FireworksOPDConfig())
+
+
+def test_task_derived_cap_passes_the_gate():
+    from vektori_trace.providers.student.fireworks import (
+        FireworksOPDConfig,
+        validate_cross_opd_config,
+    )
+
+    validate_cross_opd_config(FireworksOPDConfig(max_new_tokens=2048))
+
+
+def test_gate_refuses_the_legacy_span_surrogate():
+    from vektori_trace.chunk_opd import ChunkOPDError
+    from vektori_trace.providers.student.fireworks import (
+        FireworksOPDConfig,
+        validate_cross_opd_config,
+    )
+
+    with pytest.raises(ChunkOPDError, match="legacy/diagnostic only"):
+        validate_cross_opd_config(
+            FireworksOPDConfig(max_new_tokens=2048), loss_id="cross_step_loss"
+        )
+
+
+def test_gate_refuses_top_k_on_the_chunk_objective():
+    from vektori_trace.providers.student.fireworks import (
+        FireworksOPDConfig,
+        validate_cross_opd_config,
+    )
+
+    with pytest.raises(ValueError, match="no meaning for the chunk objective"):
+        validate_cross_opd_config(FireworksOPDConfig(max_new_tokens=2048, top_k=5))

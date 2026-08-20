@@ -117,6 +117,22 @@ class ChunkStats:
     advantage_abs_sum: float = 0.0
     advantage_min: float = 0.0
     advantage_max: float = 0.0
+    #: §10 "advantage sign": counts, not just the mean, because a mean near zero
+    #: is produced both by a teacher that agrees and by large opposing pressures
+    #: that cancel. Those are different situations and must be distinguishable.
+    n_advantage_positive: int = 0
+    n_advantage_negative: int = 0
+    n_advantage_zero: int = 0
+    #: §10 "contribution by chunk type" — summed |A_i| and token count keyed by
+    #: "1:1"/"1:N"/"N:1"/"M:N", so a report can say whether the signal is coming
+    #: from cleanly aligned positions or from the ragged ones.
+    advantage_abs_by_kind: dict[str, float] = field(default_factory=dict)
+    tokens_by_kind: dict[str, int] = field(default_factory=dict)
+    #: §10 "chunk byte/token length distributions" — full histograms rather than
+    #: just the maxima, keyed by length.
+    student_len_hist: dict[int, int] = field(default_factory=dict)
+    teacher_len_hist: dict[int, int] = field(default_factory=dict)
+    byte_len_hist: dict[int, int] = field(default_factory=dict)
     chunk_kinds: list[str] = field(default_factory=list)
 
     @property
@@ -128,12 +144,25 @@ class ChunkStats:
     def mean_advantage(self) -> float:
         return self.advantage_sum / self.n_supervised_tokens if self.n_supervised_tokens else 0.0
 
+    @property
+    def mean_abs_advantage(self) -> float:
+        """Magnitude irrespective of sign — §10 "advantage magnitude"."""
+        return (
+            self.advantage_abs_sum / self.n_supervised_tokens
+            if self.n_supervised_tokens
+            else 0.0
+        )
+
     def to_dict(self) -> dict[str, Any]:
         d = {
             k: v for k, v in self.__dict__.items() if k != "chunk_kinds"
         }
+        # Histogram keys are ints; JSON object keys must be strings.
+        for k in ("student_len_hist", "teacher_len_hist", "byte_len_hist"):
+            d[k] = {str(n): c for n, c in sorted(d[k].items())}
         d["aligned_fraction"] = self.aligned_fraction
         d["mean_advantage"] = self.mean_advantage
+        d["mean_abs_advantage"] = self.mean_abs_advantage
         return d
 
 
@@ -230,6 +259,9 @@ def assign_chunk_advantages(
         stats.max_chunk_student_tokens = max(stats.max_chunk_student_tokens, n_span_s)
         stats.max_chunk_teacher_tokens = max(stats.max_chunk_teacher_tokens, n_span_t)
         stats.max_chunk_bytes = max(stats.max_chunk_bytes, span.byte_len)
+        stats.student_len_hist[n_span_s] = stats.student_len_hist.get(n_span_s, 0) + 1
+        stats.teacher_len_hist[n_span_t] = stats.teacher_len_hist.get(n_span_t, 0) + 1
+        stats.byte_len_hist[span.byte_len] = stats.byte_len_hist.get(span.byte_len, 0) + 1
 
         # Sentinel: upstream marks over-long chunks inf and lets core_algos turn
         # that into advantage 0. We carry the mask explicitly instead of encoding
@@ -259,14 +291,30 @@ def assign_chunk_advantages(
                 supervised[i] = True
 
         stats.n_supervised_tokens += n_span_s
+        stats.tokens_by_kind[kind] = stats.tokens_by_kind.get(kind, 0) + n_span_s
+        stats.advantage_abs_by_kind[kind] = stats.advantage_abs_by_kind.get(
+            kind, 0.0
+        ) + sum(abs(advantages[i]) for i in span.student_idx)
 
     if clamp is not None:
         if clamp <= 0:
             raise ChunkOPDError(f"clamp must be > 0, got {clamp!r}")
+        any_clamped = False
         for i, a in enumerate(advantages):
             if supervised[i] and abs(a) > clamp:
                 advantages[i] = math.copysign(clamp, a)
                 stats.n_clamped_tokens += 1
+                any_clamped = True
+        if any_clamped:
+            # The per-kind magnitudes were accumulated pre-clamp; recompute them
+            # so the reported contribution matches the advantages actually used.
+            stats.advantage_abs_by_kind = {}
+            for span, kind in zip(alignment.spans, stats.chunk_kinds, strict=True):
+                if not all(supervised[i] for i in span.student_idx):
+                    continue
+                stats.advantage_abs_by_kind[kind] = stats.advantage_abs_by_kind.get(
+                    kind, 0.0
+                ) + sum(abs(advantages[i]) for i in span.student_idx)
 
     live = [advantages[i] for i in range(n_s) if supervised[i]]
     if live:
@@ -274,6 +322,9 @@ def assign_chunk_advantages(
         stats.advantage_abs_sum = sum(abs(a) for a in live)
         stats.advantage_min = min(live)
         stats.advantage_max = max(live)
+        stats.n_advantage_positive = sum(1 for a in live if a > 0.0)
+        stats.n_advantage_negative = sum(1 for a in live if a < 0.0)
+        stats.n_advantage_zero = sum(1 for a in live if a == 0.0)
     one_to_one_tokens = sum(
         sp.n_student
         for sp in alignment.spans
@@ -397,6 +448,43 @@ def clip_fraction(
         return float((out.float() * mask).sum().item()) / denom if denom else 0.0
 
 
+#: The per-turn generation cap the previous OPD run used. Plan §7.1: "Use the
+#: task-derived per-turn token cap already validated for ck75; do not return to
+#: the previous 256-token cap." It is still `distill.FireworksOPDConfig`'s
+#: default, so a driver that forgets to override it silently reproduces the old
+#: truncation — hence an explicit guard rather than a comment.
+PREVIOUS_TOKEN_CAP = 256
+
+#: Floor for a task-derived cap. Not a tuned value: it is simply above
+#: `PREVIOUS_TOKEN_CAP`, so "did you override the old default" is answerable.
+MIN_TASK_DERIVED_TOKEN_CAP = 512
+
+
+def assert_token_cap_is_task_derived(max_new_tokens: int) -> None:
+    """Refuse the previous 256-token per-turn cap (plan §7.1).
+
+    A truncated action is not a wrong action the teacher can grade — it is a
+    *different* action whose tail never existed. Alignment still succeeds on the
+    truncated bytes, so the loss stays finite and the failure is invisible in
+    every downstream metric, which is why this is a hard gate rather than a
+    warning.
+    """
+    if max_new_tokens <= 0:
+        raise ChunkOPDError(f"max_new_tokens must be > 0, got {max_new_tokens!r}")
+    if max_new_tokens <= PREVIOUS_TOKEN_CAP:
+        raise ChunkOPDError(
+            f"max_new_tokens={max_new_tokens} is at or below the previous "
+            f"{PREVIOUS_TOKEN_CAP}-token cap, which plan §7.1 forbids returning to. "
+            "Pass the task-derived cap validated for ck75 "
+            f"(>= {MIN_TASK_DERIVED_TOKEN_CAP})."
+        )
+    if max_new_tokens < MIN_TASK_DERIVED_TOKEN_CAP:
+        raise ChunkOPDError(
+            f"max_new_tokens={max_new_tokens} is below the "
+            f"{MIN_TASK_DERIVED_TOKEN_CAP} floor for a task-derived cap (§7.1)."
+        )
+
+
 #: Loss identifiers a cross-tokenizer production run may select. `cross_kl`'s
 #: estimator B stays reachable for diagnostics and legacy regression, but it is
 #: not the published objective and must never be what a paid run optimises.
@@ -437,10 +525,13 @@ __all__ = [
     "DEFAULT_LARGE_CHUNK_THRESHOLD",
     "DEGENERATE_LS_EPS",
     "LEGACY_LOSS_IDS",
+    "MIN_TASK_DERIVED_TOKEN_CAP",
+    "PREVIOUS_TOKEN_CAP",
     "AlignmentError",
     "ChunkOPDError",
     "ChunkStats",
     "assert_chunk_loss_selected",
+    "assert_token_cap_is_task_derived",
     "assign_chunk_advantages",
     "clip_fraction",
     "clipped_is_policy_loss",
