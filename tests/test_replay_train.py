@@ -453,3 +453,54 @@ def test_action_logprobs_refuse_an_empty_prefix(lora_model):
 
     with pytest.raises(ReplayTrainError, match="no prompt_token_ids"):
         action_logprobs_under_prefix(lora_model, [], [9, 10])
+
+
+class TestLoadV0Placement:
+    """`load_v0_for_training` refuses to load 14B weights without a real GPU.
+
+    The bug this guards is silent, not loud: `from_pretrained` with no
+    `device_map` puts the model on CPU and `torch.tensor(..., device=None)`
+    agrees, so the run trains — correctly, and far too slowly to finish. These
+    tests assert the refusal happens *before* any weight load, which is why
+    they can run on a CPU-only machine with a nonexistent model id.
+    """
+
+    def _cfg(self, **kw):
+        from vektori_trace.replay_train import ReplayTrainConfig
+
+        return ReplayTrainConfig(
+            base_model="does-not-exist/never-loaded",
+            adapter_path="/nonexistent/adapter",
+            **kw,
+        )
+
+    def test_unset_device_is_refused(self):
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, load_v0_for_training
+
+        with pytest.raises(ReplayTrainError, match="device is unset"):
+            load_v0_for_training(self._cfg())
+
+    def test_cpu_device_is_refused(self):
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, load_v0_for_training
+
+        with pytest.raises(ReplayTrainError, match="not a CUDA device"):
+            load_v0_for_training(self._cfg(device="cpu"))
+
+    def test_missing_adapter_still_refused_first(self):
+        """adapter_path is checked before placement; order must not regress."""
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainConfig, ReplayTrainError, load_v0_for_training
+
+        cfg = ReplayTrainConfig(base_model="x", adapter_path=None, device="cuda")
+        with pytest.raises(ReplayTrainError, match="adapter_path is required"):
+            load_v0_for_training(cfg)
+
+    def test_config_stays_constructible_for_cpu_tests(self):
+        """The tiny CPU tests build a config and call make_optimizer_step."""
+        cfg = self._cfg()
+        assert cfg.device is None

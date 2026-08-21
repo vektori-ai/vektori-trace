@@ -314,8 +314,44 @@ def load_v0_for_training(cfg: ReplayTrainConfig):
     if not cfg.adapter_path:
         raise ReplayTrainError("adapter_path is required to load v0")
 
+    # Placement is checked *before* the 14B download/load, because the failure
+    # this guards against is silent rather than loud: `from_pretrained` with no
+    # `device_map` lands on CPU, `torch.tensor(..., device=None)` also means
+    # CPU, and the run then trains correctly but at a speed that reads as a
+    # hang. A serving endpoint on some other host does not make this process
+    # GPU-resident. Require the device explicitly; never infer it.
+    if not cfg.device:
+        raise ReplayTrainError(
+            "ReplayTrainConfig.device is unset — refusing to load a 14B model "
+            "with no explicit placement. Training the replay update on CPU is "
+            "not a slower version of the right run, it is an unfinishable one. "
+            'Set device="cuda" (or "cuda:N") in a real GPU training job; the '
+            "tiny CPU tests call make_optimizer_step directly and do not "
+            "reach this loader."
+        )
+    if not str(cfg.device).startswith("cuda"):
+        raise ReplayTrainError(
+            f"device={cfg.device!r} is not a CUDA device; the replay update "
+            "requires a real GPU training runtime"
+        )
+    if not torch.cuda.is_available():
+        raise ReplayTrainError(
+            f"device={cfg.device!r} requested but torch.cuda.is_available() is "
+            "False — this process has no GPU. The ck75 serving endpoint is a "
+            "separate host and does not provide one here."
+        )
+    index = torch.device(cfg.device).index or 0
+    if index >= torch.cuda.device_count():
+        raise ReplayTrainError(
+            f"device={cfg.device!r} but only {torch.cuda.device_count()} CUDA "
+            "device(s) are visible"
+        )
+
     base = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model, torch_dtype=torch.bfloat16, trust_remote_code=True
+        cfg.base_model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map={"": cfg.device},
     )
     model = PeftModel.from_pretrained(base, cfg.adapter_path, is_trainable=True)
     if not _lora_params(model):
