@@ -11,7 +11,10 @@ verified end to end:
   E. those survive `replay_sample.sampled_action_from_capture` into a
      `SampledAction` whose bytes reconstruct exactly;
   F. four independent draws at one prefix differ (temperature is live, so the
-     four samples §8.3 asks for are not four copies).
+     four samples §8.3 asks for are not four copies);
+  G. no sample hit the token cap — 8192 is above the corpus p99.9 but below its
+     observed max, and those are the *teacher's* lengths, so the student's own
+     cap-hit rate is the only evidence the cap is right.
 
 D is the load-bearing one. `log pi_old` is the denominator of §5's importance
 ratio and cannot be recovered after sampling — if it is missing the whole
@@ -141,9 +144,17 @@ def main() -> int:
                     help="replay step to probe; default is mid-trace")
     ap.add_argument("--n-samples", type=int, default=4,
                     help="§8.3 draws four independent actions per prefix")
-    ap.add_argument("--max-tokens", type=int, default=512,
-                    help="task-derived cap; must exceed the old 256 (§7.1)")
+    ap.add_argument("--max-tokens", type=int, default=8192,
+                    help="measured cap (docs/action-length-measurement.md); "
+                         "must exceed the old 256 (§7.1)")
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument(
+        "--allow-truncated",
+        action="store_true",
+        help="record a cap-hit instead of failing. Off by default: the replay "
+             "run must fail closed on any truncation, so a probe that tolerates "
+             "it would not be probing the real path.",
+    )
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -241,11 +252,12 @@ def main() -> int:
                     prefix_id=prefix.prefix_id,
                     sample_index=i,
                     policy_version="ck75-v0",
-                    allow_truncated=True,
+                    allow_truncated=args.allow_truncated,
                 )
             )
         except CaptureAdaptError as e:
-            g.check("D-logprobs", False, f"sample {i}: {e}")
+            gate = "G-cap" if "mid-sequence" in str(e) else "D-logprobs"
+            g.check(gate, False, f"sample {i}: {e}")
             return _finish(g, report, args)
 
     g.check(
@@ -280,7 +292,22 @@ def main() -> int:
         f"temperature {args.temperature}",
     )
 
-    report["cap"] = summarize_cap_hits(actions)
+    # --- G: no sample hit the cap. 8192 sits above p99.9 (8,126) but *below*
+    # the observed max (8,842), so truncation is possible by construction — and
+    # these are DeepSeek's lengths, not ck75's. A non-zero rate here means the
+    # cap is wrong for the student and must be re-derived before the real run.
+    cap_report = summarize_cap_hits(actions)
+    g.check(
+        "G-cap",
+        cap_report["n_cap_hits"] == 0,
+        f"no sample hit the {args.max_tokens}-token cap "
+        f"(max sampled {cap_report['max_action_tokens']}, "
+        f"mean {cap_report['mean_action_tokens']:.0f})"
+        if cap_report["n_cap_hits"] == 0
+        else f"{cap_report['n_cap_hits']}/{cap_report['n_actions']} samples hit "
+        f"the cap — re-derive it from ck75's own lengths before the run",
+    )
+    report["cap"] = cap_report
     report["samples"] = [
         {
             "key": a.key,

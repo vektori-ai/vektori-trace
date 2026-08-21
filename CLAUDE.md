@@ -89,7 +89,10 @@ over 2,978 stored actions: median 605 tokens, p99.9 8,126, max 8,842
 (`docs/action-length-measurement.md`). The previous OPD run — the 0/13 one —
 ran under that cap, so the teacher was scoring fragments as completed actions.
 A truncated action still aligns and still yields a finite loss, so nothing in
-that run's logs showed it. Use **8192**.
+that run's logs showed it. One severe cause among several, not the identified
+largest — data scale, batch size and the legacy loss were each independently
+serious. Use **8192** provisionally (above p99.9, below the 8,842 max) and fail
+closed on any cap hit.
 `FireworksOPDConfig.max_new_tokens` still defaults to 256;
 `chunk_opd.assert_token_cap_is_task_derived` and `validate_cross_opd_config`
 are what refuse it.

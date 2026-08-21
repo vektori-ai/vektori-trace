@@ -415,7 +415,9 @@ different experiments that both report 32 actions.
   The previous run's 256-token cap cut **69.2%** of actions mid-sequence, and
   the teacher scored those fragments as completed actions; a truncated action
   still aligns and still yields a finite loss, so nothing downstream showed it.
-  8192 is a loop guard rather than a length budget.
+  8192 is provisional and a loop guard rather than a length budget: it sits
+  above p99.9 (8,126) but **below the observed max of 8,842**, so it can still
+  truncate. The run fails closed on any cap hit.
 
   Two caveats carried into the run: those are *DeepSeek's* lengths, so ck75's
   own `cap_hit_rate` (§10) must be checked and the cap re-derived if it is
