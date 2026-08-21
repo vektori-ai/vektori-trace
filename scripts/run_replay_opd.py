@@ -296,7 +296,24 @@ def train(batch_inputs, args):
         max_new_tokens=args.max_tokens,
         n_samples_per_prefix=args.n_samples,
         stored_teacher_actions=stored,
-        selection_policy="stratified-diagnostic",
+        selection_policy=_selection_policy(),
+    )
+
+
+def _selection_policy() -> str:
+    """What the batch actually sampled from, not what §8.3 asked for.
+
+    Until reconstruction lands, every candidate at or after a trace's first
+    compaction boundary is excluded, so this run stresses pre-compaction states
+    only. §8.3's "two authentic post-compaction prefixes" is not met and the
+    report must not imply otherwise.
+    """
+    from vektori_trace.compaction import reconstruction_is_implemented
+
+    return (
+        "stratified-diagnostic"
+        if reconstruction_is_implemented()
+        else "stratified-pre-compaction-only"
     )
 
 
@@ -416,8 +433,11 @@ def main() -> int:
     prefixes, sel = select_prefixes(args, student_tok)
     report["corpus"] = sel["corpus"]
     report["context_filter"] = sel["context_filter"]
+    report["selection_policy"] = _selection_policy()
     report["post_compaction_coverage"] = {
         "claimed": False,
+        "eligible_pool": "pre-compaction only — candidates at or after a trace's "
+                         "first boundary are excluded, not merely un-required",
         "reason": "boundaries ARE detected (compaction.boundaries_from_raw), but "
                   "post-compaction prefixes are not reconstructed: "
                   "prefix_turns_through_step still slices from step 0, so a "

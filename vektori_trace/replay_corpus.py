@@ -237,7 +237,7 @@ def candidates_from_traces(
         # `compaction` module docstring and plan §15: `select_replay_prefixes`
         # refuses a non-zero `require_post_compaction` precisely because this
         # flag is positional, not reconstructed.
-        comp_steps, diag = _compaction_steps_for(rec, turns)
+        comp_steps, first_boundary, diag = _compaction_steps_for(rec, turns)
         for k, v in diag.items():
             compaction_diag[k] = compaction_diag.get(k, 0) + v
 
@@ -249,13 +249,16 @@ def candidates_from_traces(
                 min_step=min_step,
                 max_step=upper,
                 compaction_steps=comp_steps,
+                first_boundary_step=first_boundary,
             )
         )
     candidates_from_traces.last_compaction_report = dict(compaction_diag)
     return out
 
 
-def _compaction_steps_for(rec: TraceRecord, turns: list[Any]) -> tuple[set[int], dict[str, int]]:
+def _compaction_steps_for(
+    rec: TraceRecord, turns: list[Any]
+) -> tuple[set[int], int | None, dict[str, int]]:
     """Post-compaction step indices for one trace, plus what went wrong.
 
     Failures are *counted and returned*, not swallowed. A trace whose
@@ -279,18 +282,18 @@ def _compaction_steps_for(rec: TraceRecord, turns: list[Any]) -> tuple[set[int],
         traj_path = find_trajectory(rec.trial_dir)
     except Exception:
         diag["find_trajectory_failed"] = 1
-        return set(), diag
+        return set(), None, diag
     if traj_path is None:
         diag["no_trajectory"] = 1
-        return set(), diag
+        return set(), None, diag
 
     try:
         raw = boundaries_from_raw(traj_path)
     except CompactionError:
         diag["unreadable_trajectory"] = 1
-        return set(), diag
+        return set(), None, diag
     if not raw:
-        return set(), diag
+        return set(), None, diag
 
     diag["traces_with_markers"] = 1
     diag["raw_boundaries"] = len(raw)
@@ -298,7 +301,9 @@ def _compaction_steps_for(rec: TraceRecord, turns: list[Any]) -> tuple[set[int],
         located = locate_in_turns(raw, turns, assistant_tool_steps(turns))
     except Exception:
         diag["mapping_failed"] = 1
-        return set(), diag
+        # Fail closed: an unmappable compacted trace must not look ordinary.
+        # Step 0 marks the whole trace ineligible until reconstruction lands.
+        return set(), 0, diag
 
     diag["unmatched_markers"] = sum(1 for b in located if b.marker_turn_index is None)
     diag["missing_handoff"] = sum(1 for b in located if b.handoff_turn_index is None)
@@ -306,7 +311,9 @@ def _compaction_steps_for(rec: TraceRecord, turns: list[Any]) -> tuple[set[int],
     diag["mapped_boundaries"] = len(steps)
     if steps:
         diag["traces_mapped"] = 1
-    return steps, diag
+    from .compaction import first_boundary_step
+
+    return steps, first_boundary_step(located), diag
 
 
 def corpus_report(traces: list[TraceRecord]) -> dict[str, Any]:

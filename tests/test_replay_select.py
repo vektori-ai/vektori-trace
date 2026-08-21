@@ -290,3 +290,58 @@ def test_stage_spread_is_reproducible_across_processes():
 
     assert _task_offset("pallets__click-3152") == _task_offset("pallets__click-3152")
     assert 0 <= _task_offset("anything") < 3
+
+
+def _pc_pool(n=24, seg_on=lambda i: i % 3 == 0):
+    """Candidates where some sit inside a compacted segment."""
+    return [
+        ReplayPrefix(
+            task=f"t{i}",
+            trace_id=f"tr{i}",
+            step_index=(i * 3) % 40 + 1,
+            prefix_turns=[object()],
+            post_compaction=seg_on(i),
+            in_compacted_segment=seg_on(i),
+            trace_n_steps=45,
+        )
+        for i in range(n)
+    ]
+
+
+def test_zero_quota_does_not_permit_compacted_selection():
+    """`require_post_compaction=0` means "do not select", not "do not require".
+
+    The sort key orders marked candidates first, so a zero-quota run used to
+    take them opportunistically — 7 of 8 on a mixed pool — while reporting no
+    post-compaction coverage.
+    """
+    chosen = select_replay_prefixes(_pc_pool(), n_prefixes=8, require_post_compaction=0)
+    assert len(chosen) == 8
+    assert not any(c.in_compacted_segment for c in chosen)
+    assert not any(c.post_compaction for c in chosen)
+
+
+def test_exclusion_covers_whole_segment_not_just_first_step():
+    """Only the first step after a boundary is *marked* post_compaction.
+
+    Later steps in the same compacted segment are equally misreconstructed, so
+    excluding on `post_compaction` alone would leave most of them eligible.
+    """
+    pool = [
+        ReplayPrefix(
+            task=f"t{i}", trace_id=f"tr{i}", step_index=s, prefix_turns=[object()],
+            # only step 10 is "marked"; 11-13 are in the same segment
+            post_compaction=(s == 10),
+            in_compacted_segment=(s >= 10),
+            trace_n_steps=45,
+        )
+        for i, s in enumerate([1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13])
+    ]
+    chosen = select_replay_prefixes(pool, n_prefixes=8, require_post_compaction=0)
+    assert all(c.step_index < 10 for c in chosen)
+
+
+def test_all_candidates_compacted_is_refused():
+    pool = _pc_pool(n=12, seg_on=lambda i: True)
+    with pytest.raises(ReplaySelectionError, match="sit at or after a compaction"):
+        select_replay_prefixes(pool, n_prefixes=8, require_post_compaction=0)

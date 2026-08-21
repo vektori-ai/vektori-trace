@@ -90,6 +90,14 @@ class ReplayPrefix:
     #: trajectory. `None` means unknown, and `_stage` falls back to the
     #: observed span.
     trace_n_steps: int | None = None
+    #: True when this step sits at or after the trace's first compaction
+    #: boundary, i.e. its prefix is built from context Harbor replaced.
+    #:
+    #: Distinct from `post_compaction`, which marks only the *first* step after
+    #: each boundary and exists for reporting. Every later step in a compacted
+    #: segment is equally misreconstructed, so exclusion must key off this flag
+    #: — filtering on `post_compaction` would leave most affected states in.
+    in_compacted_segment: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -109,6 +117,7 @@ def enumerate_prefixes(
     min_step: int = 1,
     max_step: int | None = None,
     compaction_steps: set[int] | None = None,
+    first_boundary_step: int | None = None,
 ) -> list[ReplayPrefix]:
     """Every usable replay state inside one stored trajectory.
 
@@ -141,6 +150,9 @@ def enumerate_prefixes(
                 step_index=t,
                 prefix_turns=prefix,
                 post_compaction=t in comp,
+                in_compacted_segment=(
+                    first_boundary_step is not None and t >= first_boundary_step
+                ),
                 trace_n_steps=len(steps),
             )
         )
@@ -193,9 +205,26 @@ def select_replay_prefixes(
     # empty pool: once `replay_corpus` began deriving boundaries the pool
     # stopped being empty, and the availability check below silently started
     # accepting exactly what it was written to prevent.
-    if require_post_compaction > 0:
-        from .compaction import reconstruction_is_implemented
+    from .compaction import reconstruction_is_implemented
 
+    # Exclude, do not merely un-require. `require_post_compaction=0` sets a
+    # quota, and the sort key below orders marked candidates first, so a
+    # zero-quota run still selected them opportunistically — 7 of 8 on a mixed
+    # pool. Quota and eligibility are different things.
+    if not reconstruction_is_implemented():
+        eligible = [c for c in candidates if not c.in_compacted_segment]
+        n_dropped = len(candidates) - len(eligible)
+        if n_dropped:
+            candidates = eligible
+            if not candidates:
+                raise ReplaySelectionError(
+                    f"all {n_dropped} candidates sit at or after a compaction "
+                    "boundary and reconstruction is not implemented, so every "
+                    "prefix would carry context Harbor replaced "
+                    "(docs/OPD-MULTITURN-PLAN.md §15)"
+                )
+
+    if require_post_compaction > 0:
         if not reconstruction_is_implemented():
             raise ReplaySelectionError(
                 f"require_post_compaction={require_post_compaction} but "

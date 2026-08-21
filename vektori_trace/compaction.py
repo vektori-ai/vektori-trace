@@ -210,6 +210,20 @@ def post_compaction_steps(boundaries: list[CompactionBoundary]) -> set[int]:
     return {b.first_step_after for b in boundaries if b.first_step_after is not None}
 
 
+def first_boundary_step(boundaries: list[CompactionBoundary]) -> int | None:
+    """The earliest replay step affected by any boundary, or None.
+
+    Every step at or after this one sits inside a compacted segment, so its
+    prefix is built from context Harbor replaced. `post_compaction_steps`
+    deliberately marks only `first_step_after` per boundary — a *position*, for
+    reporting — which means later steps in the same segment are equally
+    misreconstructed and carry no mark. Anything that needs to *exclude*
+    affected states must use this, not the marks.
+    """
+    steps = [b.first_step_after for b in boundaries if b.first_step_after is not None]
+    return min(steps) if steps else None
+
+
 def reconstruction_is_implemented() -> bool:
     """Whether post-compaction prefixes are rebuilt from the retained state.
 
@@ -224,6 +238,7 @@ __all__ = [
     "CompactionError",
     "HANDOFF_MARKERS",
     "boundaries_from_raw",
+    "first_boundary_step",
     "locate_in_turns",
     "post_compaction_steps",
     "reconstruction_is_implemented",
