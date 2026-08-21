@@ -211,6 +211,12 @@ def run_case(
         n_trailing_tokens_dropped=n_dropped,
         prefix_is_exact_id_prefix_of_joint=prefix_ok,
         action_ids=action_ids,
+        # The full submitted sequence, so the exact request can be re-derived
+        # offline from the report alone (§10 archival). The echoed ids are not
+        # recorded separately because `score_ids` returns logprobs, not entries —
+        # but it raises unless every entry's token_id matched these, so a
+        # returned value is the equality proof.
+        prefix_ids=prefix_ids,
     )
 
     g.check(
