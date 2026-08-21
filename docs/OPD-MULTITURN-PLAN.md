@@ -1,21 +1,54 @@
-# Final phased plan: DeepSeek-to-Qwen multi-turn and replay OPD
+# Final phased plan: DeepSeek-to-Qwen replay-prefix OPD
 
 **Student:** Stage-B `checkpoint-75` (`ck75`, Qwen3-14B)  
 **Teacher:** `deepseek-ai/DeepSeek-V4-Flash-0731`, hosted by Fireworks  
 **Loss:** sampled reverse-KL with the published minimal synchronized-chunk
 method from *Breaking the Tokenizer Barrier*  
-**Environment:** Harbor / Terminus, with ck75's actions actually executed  
-**Starting scale:** two live multi-turn trajectories and one optimizer update
+**Environment:** stored DeepSeek trace prefixes; ck75 samples the next action
+**Starting scale:** eight replay prefixes x four ck75 actions, one optimizer update
 
-Approval of this document does not authorize paid inference, Harbor runs, or
-GPU training. Each paid phase requires a separate approval.
+Approval of this document does not authorize paid inference or GPU training.
+Each paid phase requires a separate approval.
+
+## 0. Revision — replay only
+
+**Decided 2026-08-21: this experiment runs replay-prefix OPD only. Live
+multi-turn Harbor OPD is out of scope.**
+
+The original plan ran a live two-trajectory Harbor smoke first (Phase 1), then
+replay (Phase 2) starting from the live-updated adapter. Two reasons that
+ordering is dropped:
+
+1. **It made the replay question unanswerable.** `v2` was defined as "`v1` plus
+   one replay update", so every replay measurement was conditioned on a `v1`
+   produced by two trajectories. §9's branches 2 and 3 ask whether replay is
+   useful, neutral, or harmful — none of which a v1-parented `v2` can establish.
+   Replay must branch from the untouched baseline.
+2. **Live rollout is the expensive, most-blocked half.** It needs Harbor
+   sandboxes, a rollout loop that does not yet exist, and a serving path that
+   returns per-token behaviour log probabilities. Replay needs none of the
+   first two: the prefixes are already on disk.
+
+What this changes, concretely:
+
+- there is no `v1`; the single trained artifact is **`v_replay`, trained from
+  frozen `v0`**;
+- Phase 1 (live smoke) is removed; the former Phase 2 becomes **the** training
+  phase;
+- Phase 3 compares `v0` against `v_replay` only;
+- everything in Phase 0 stands unchanged — the loss, alignment, pins, and
+  training proof are shared by both designs and are already complete.
+
+Live OPD is deferred, not rejected. If replay shows value, a later plan may
+revisit it; its exclusions in §2 remain in force until then.
 
 ## 1. The decision
 
 The next experiment will test one thing:
 
 > Can DeepSeek provide useful dense likelihood supervision on ck75's own
-> multi-turn Harbor actions when the two models use different tokenizers?
+> actions, sampled at authentic stored trace states, when the two models use
+> different tokenizers?
 
 We will not use GOLD. Fireworks does not expose the full DeepSeek vocabulary
 distribution required for faithful GOLD, and its top-5 output is not a valid
@@ -53,10 +86,12 @@ The following are outside this experiment:
 - updating ck75 after each assistant turn;
 - training on the stored DeepSeek action as the target;
 - mixing live OPD and replay-prefix OPD before each passes separately;
-- a large pilot before the two-trajectory smoke and one replay update pass.
+- a large pilot before the one replay update pass;
+- **live multi-turn Harbor OPD, and any adapter parented on a live update
+  (see §0)**.
 
-Harbor outcome, parser validity, and task success are still logged and used for
-evaluation and stopping. They simply do not enter the OPD loss in these phases.
+Parser validity and task success are still logged and used for evaluation and
+stopping. They simply do not enter the OPD loss in this phase.
 
 ## 3. What the teacher computes
 
@@ -183,7 +218,7 @@ be recorded in the run manifest.
 ## 6. Phase 0: no-training proof
 
 Phase 0 is local or uses only the minimum explicitly approved Fireworks probe.
-It must pass before Harbor/GPU training.
+It must pass before GPU training.
 
 ### 6.1 Pin every artifact
 
@@ -236,7 +271,7 @@ On a mocked two-turn batch, prove:
 - a nonzero finite gradient reaches ck75 trainable parameters;
 - exactly one optimizer step changes and reloads the adapter.
 
-### 6.5 Required repository changes before the smoke
+### 6.5 Required repository changes before training
 
 The current repository is not yet an implementation of this published method.
 In particular:
@@ -262,86 +297,28 @@ has been implemented.
 Failure of any Phase-0 assertion stops the experiment. Do not fall back to GOLD,
 SimpleOPD, isolated-action scoring, or an unreferenced byte-group loss.
 
-## 7. Phase 1: smallest live multi-turn OPD smoke
+**Status as of 2026-08-21:** 6.2, 6.3, 6.4 and 6.5 are complete. 6.3 passed
+against the live deployment (13 gates, short and multi-turn transcripts,
+`/data/opd_probe_report.json`). 6.1's schema exists but ck75's adapter, config
+and tokenizer hashes are **not yet recorded** — that is the remaining Phase-0
+item, and it gates the first paid call.
 
-This phase proves the real Harbor loop before traces are introduced as training
-states.
+## 7. Live multi-turn smoke — REMOVED
 
-### 7.1 Rollout shape
+Superseded by §0. This experiment does not run live Harbor rollouts, and no
+adapter in it is parented on a live update.
 
-- Freeze ck75 version `v0` for the entire rollout batch.
-- Start two independent fresh Harbor sandboxes.
-- Require at least two assistant turns per trajectory.
-- Stop at natural completion or a four-turn smoke cap.
-- Use the task-derived per-turn token cap already validated for ck75; do not
-  return to the previous 256-token cap.
-- Generation is no-grad. Save messages, exact action bytes, Qwen token IDs,
-  behavior log probabilities, observations, masks, policy version, and
-  termination reason.
+The rollout-shape requirements that still apply to replay sampling are carried
+into §8.3 rather than left here: the frozen policy version, the task-derived
+per-turn token cap (**not** the previous 256-token cap), no-grad generation, and
+the full record of sampled bytes, token ids, behaviour log probabilities, masks
+and termination reason.
 
-At every turn:
+## 8. Phase 1: one replay-prefix OPD update (the only training phase)
 
-```text
-ck75 samples action
-    -> execute that exact action in Harbor
-    -> append Harbor's exact bounded observation
-    -> ck75 samples the next action from the resulting state
-```
-
-This makes the complete trajectory state distribution student-owned.
-
-### 7.2 Teacher scoring
-
-After both trajectories are collected, score them; do not update within an
-episode.
-
-Preferred path: render each complete trajectory once for DeepSeek, request
-echoed log probabilities for the complete serialized transcript, and retain
-only the ck75-generated assistant spans. This is one logical teacher request
-per trajectory.
-
-Fallback: if the endpoint cannot reliably return full-trajectory offsets, issue
-one request per assistant action with that action's complete DeepSeek-rendered
-prefix. Never score an action without its prefix. Record the additional repeated
-prefix-token cost.
-
-### 7.3 One student update
-
-1. Align each action into minimal synchronized chunks.
-2. Compute detached chunk likelihoods and per-Qwen-token advantages.
-3. Recompute ck75 current log probabilities in training microbatches.
-4. Accumulate globally token-normalized gradients over both trajectories.
-5. Apply exactly one optimizer step.
-6. Publish and reload `v1` only after the whole batch succeeds.
-7. Re-score a frozen canary prefix under `v0` and `v1` to prove weight motion.
-
-### 7.4 Hard pass conditions
-
-- both trajectories were generated entirely by frozen `v0`;
-- executed actions exactly match the recorded sampled bytes;
-- each Harbor response appears in the next ck75 and DeepSeek semantic history;
-- every supervised action byte aligns exactly once;
-- all student, teacher, chunk, advantage, ratio, loss, and gradient values are
-  finite;
-- no system, user, environment, template, or injected think token contributes
-  to loss;
-- no context was silently truncated;
-- the teacher was scored only after rollout collection;
-- exactly one optimizer step occurred;
-- `v1` differs from `v0` and can be reloaded;
-- the existing 45-prefix protocol/format canary does not regress.
-
-Also produce a cost ledger: Qwen generated tokens, Qwen rollout context tokens,
-DeepSeek input and scored-action tokens, repeated-prefix tokens, number of
-teacher requests, Harbor time, student training tokens, GPU time, and cache
-hits. This smoke proves mechanics only; two trajectories cannot prove improved
-capability.
-
-## 8. Phase 2: one replay-prefix OPD update
-
-Only after Phase 1 passes do we use the existing DeepSeek corpus as optimizer
-data. This phase tests replay OPD separately; it is not mixed into the live
-smoke.
+**This is the only training phase.** It starts from frozen `v0` (§0), not from
+any live-updated adapter, so its result is a measurement of replay OPD against
+the untouched baseline rather than a marginal effect on top of something else.
 
 The audited corpus contains 238 DeepSeek rollouts over 60 tasks: 117 passes and
 121 failures. Thirty-four tasks have at least one pass; 26 have none. Begin with
@@ -368,7 +345,7 @@ For one selected trace prefix:
 
 ```text
 stored task + prior actions + prior Harbor observations
-        -> render for current ck75 version v1
+        -> render for frozen ck75 v0
         -> ck75 samples a new next action
         -> render the same semantic prefix for DeepSeek
         -> append and score the exact new ck75 action once
@@ -385,65 +362,82 @@ OPD and not replay SFT.
 - Select eight valid prefixes across distinct tasks and trace stages, including
   at least two authentic post-compaction prefixes if available.
 - Sample four independent ck75 actions per prefix: 32 replay actions total.
-- Freeze one ck75 version for all 32 samples.
+- **Freeze `v0` for all 32 samples**, and record its pinned identity (§6.1).
+- Use the task-derived per-turn token cap. Not the previous 256-token cap: a
+  truncated action still aligns and still yields a finite loss, so the error is
+  invisible downstream.
+- Generation is no-grad. Save prefix identity, exact sampled action bytes, Qwen
+  token ids, behaviour log probabilities, masks, policy version and termination
+  reason — the behaviour log probabilities are `log pi_old` in §5's ratio and
+  cannot be recomputed later.
 - Score every complete new action with DeepSeek using its full semantic prefix.
 - Apply the same published chunk loss and exactly one optimizer step.
-- Archive `v2` separately; do not overwrite `v1`.
+- Archive the result as **`v_replay`**, parented on `v0`. Nothing overwrites
+  `v0`.
 
 The old DeepSeek continuation must not appear in the loss labels. It may be kept
 only for qualitative comparison.
 
 ### 8.4 Replay pass conditions
 
-All Phase-1 numerical/alignment conditions still apply, plus:
-
+- every one of the 32 actions was generated by frozen `v0`;
+- every supervised action byte aligns exactly once;
+- all student, teacher, chunk, advantage, ratio, loss and gradient values are
+  finite;
+- no system, user, environment, template or injected think token contributes to
+  loss;
+- no context was silently truncated;
+- the teacher was scored only after sampling, never inside it;
+- exactly one optimizer step occurred;
+- `v_replay` differs from `v0` and can be reloaded;
+- the existing 45-prefix protocol/format canary does not regress;
 - every replay prefix corresponds to an actually observed trace state;
 - compaction reconstruction matches the historical boundary rather than a
   guessed concatenation of the whole trace;
 - ck75, not DeepSeek, generated every supervised action;
 - trace/task/prefix IDs make every example reproducible;
 - no task or single trace dominates the global supervised-token count;
-- `v2` reloads and does not regress the protocol/format canary.
+- `v_replay` reloads and does not regress the protocol/format canary.
 
-## 9. Phase 3: choose one pilot from evidence
+Also produce a cost ledger: Qwen generated tokens, Qwen sampling context tokens,
+DeepSeek input and scored-action tokens, repeated-prefix tokens, number of
+teacher requests, student training tokens, GPU time and cache hits. Thirty-two
+actions prove mechanics; they cannot prove improved capability.
 
-Do not automatically mix live and replay batches. First compare `v0`, `v1`, and
-`v2` on the same frozen protocol canaries and a small held-out Harbor evaluation.
+## 9. Phase 2: decide from evidence
+
+Compare `v0` against `v_replay` on the same frozen protocol canaries and a small
+held-out evaluation. Both share a parent, so the difference is attributable to
+the replay update and nothing else.
 
 - `v0`: untouched ck75 baseline;
-- `v1`: one two-trajectory live OPD update;
-- `v2`: `v1` plus one 32-action replay-prefix update.
+- `v_replay`: `v0` plus one 32-action replay-prefix update.
 
-The comparison is diagnostic, not statistically conclusive. Its purpose is to
-choose the next single axis:
+The comparison is diagnostic, not statistically conclusive — 32 actions and one
+optimizer step cannot separate a real effect from noise. Its purpose is to
+decide one thing:
 
-1. If Phase 1 is mechanically sound and live behavior moves sensibly, run a
-   small fresh multi-turn pilot.
-2. If replay adds useful movement without protocol regression, run a replay
-   pilot before introducing a live/replay mixture.
-3. If replay is neutral or harmful, keep the traces for state selection and
-   evaluation but do not use them in the optimizer.
-4. If teacher likelihood pressure causes protocol, length, or termination
-   regression, stop and inspect the rendered histories and chunk advantages;
-   do not scale the run.
+1. If the update is mechanically sound and behaviour moves without protocol
+   regression, run a larger replay pilot.
+2. If replay is neutral, keep the traces for state selection and evaluation and
+   reconsider whether the optimizer should see them at all.
+3. If teacher likelihood pressure causes protocol, length or termination
+   regression, stop and inspect the rendered histories and chunk advantages; do
+   not scale the run.
 
-The first fresh pilot shape is 8 frozen task groups x 4 ck75 rollouts = 32
-student-owned trajectories per optimizer batch. The turn cap must be derived
-from the actual task distribution: stored successful trajectories include
-14-25-turn cases, so copying a ten-turn cap is not justified. Freeze the cap,
-task split, learning rate, renderer, loss, and compaction policy before the
-pilot.
+A larger replay pilot must freeze its prefix selection, learning rate, renderer,
+loss and compaction policy before it starts.
 
-Only after separate live and replay pilots show value may a later plan evaluate
-a mixture such as fresh student-owned trajectories plus replay prefixes. That
-mixture requires explicit sampling weights and per-source metrics; it is not
-part of this smallest experiment.
+Live OPD and any live/replay mixture are out of scope (§0, §2). Should replay
+prove useful, a later plan may add live rollouts — and it must give them their
+own `v0`-parented arm rather than stacking them on `v_replay`, for exactly the
+reason §0 gives.
 
 ## 10. Required artifacts and metrics
 
-Every live trajectory or replay example must archive:
+Every replay example must archive:
 
-- task/environment revision and sandbox ID where applicable;
+- task/environment revision and the source trace/prefix ID;
 - policy and adapter version;
 - canonical messages and separately rendered Qwen/DeepSeek prefixes;
 - exact sampled action bytes;
@@ -451,7 +445,8 @@ Every live trajectory or replay example must archive:
 - minimal chunk membership and `L_S`, `L_T`, assigned targets, and advantages;
 - loss masks and global normalization counts;
 - request IDs, model revision, latency, token usage, and truncation status;
-- Harbor observation, termination reason, parser validity, and outcome;
+- the stored observations reconstructed into the prefix, termination reason,
+  parser validity, and outcome;
 - compaction event and retained/replacement messages.
 
 Report at minimum:
@@ -460,8 +455,8 @@ Report at minimum:
 - aligned chunk counts and 1:1, 1:N, N:1, and M:N proportions;
 - chunk byte/token length distributions and maximums;
 - advantage sign, magnitude, clipping, and contribution by chunk type;
-- supervised-token counts by task, trace, turn, and source (live/replay);
-- response length, cap rate, parser validity, termination rate, and Harbor pass;
+- supervised-token counts by task, trace and trace stage;
+- response length, cap rate, parser validity and termination rate;
 - input/scored tokens and actual dollar/GPU cost.
 
 ## 11. Stop conditions
@@ -476,7 +471,7 @@ Stop without scaling for any of the following:
 - non-finite or explosively clipped advantages/loss/gradients;
 - environment or template tokens receive gradient;
 - silent history truncation or mismatched compaction;
-- executed Harbor action differs from the recorded action;
+- the action scored by the teacher differs from the action ck75 sampled;
 - stale adapter or teacher model revision;
 - protocol/format canary regression;
 - sharp growth in length, cap hits, repetition, or missing termination;
@@ -500,8 +495,10 @@ Stop without scaling for any of the following:
 
 Ask separately before:
 
-1. the minimal Fireworks scoring probe;
-2. the two-trajectory live Harbor/GPU smoke;
-3. the 32-action replay-prefix update;
-4. the 32-trajectory fresh pilot;
-5. any replay pilot, mixed-source experiment, or larger run.
+1. the minimal Fireworks scoring probe — **done, passed 2026-08-21**;
+2. the 32-action replay-prefix update (sampling + teacher scoring + one GPU
+   optimizer step);
+3. the `v0` vs `v_replay` evaluation, if it needs GPU serving;
+4. any larger replay pilot.
+
+Live Harbor/GPU rollouts are not on this list; they are out of scope (§0).
