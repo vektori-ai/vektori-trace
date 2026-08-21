@@ -230,7 +230,128 @@ def current_commit(repo_root: Path | None = None) -> str | None:
     return f"{rev}-dirty" if dirty else rev
 
 
+
+
+def hash_adapter_dir(adapter_path: Path) -> dict[str, str | None]:
+    """The two adapter pins §6.1 wants, read off disk.
+
+    Weights and config are hashed separately and deliberately: two Stage-B
+    checkpoints can share `adapter_config.json` byte-for-byte and differ only in
+    `adapter_model.safetensors`, so a single directory-level hash would let a
+    wrong checkpoint pass as the right one. Returns `None` for a file that is
+    absent rather than raising — `missing_pins()` is what refuses, and it names
+    the field.
+    """
+    root = Path(adapter_path)
+    out: dict[str, str | None] = {
+        "student_adapter_sha256": None,
+        "student_adapter_config_sha256": None,
+    }
+    weights = root / "adapter_model.safetensors"
+    if weights.is_file():
+        out["student_adapter_sha256"] = sha256_file(weights)
+    config = root / "adapter_config.json"
+    if config.is_file():
+        out["student_adapter_config_sha256"] = sha256_file(config)
+    return out
+
+
+def hash_tokenizer_dir(tokenizer_path: Path) -> str | None:
+    """One hash over the tokenizer files that decide rendering.
+
+    `tokenizer.json` alone is not enough: CLAUDE.md records that Qwen3's chat
+    template governs where the empty-think wrapper lands, and the template
+    ships in `tokenizer_config.json`. A tokenizer pin that ignored the template
+    would call two materially different renderers identical. Files are hashed in
+    a fixed order, each with its name, so the digest is stable and a missing
+    file cannot collide with an empty one.
+    """
+    root = Path(tokenizer_path)
+    if not root.is_dir():
+        return None
+    names = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "chat_template.jinja",
+    )
+    h = hashlib.sha256()
+    found = False
+    for name in names:
+        path = root / name
+        if not path.is_file():
+            continue
+        found = True
+        h.update(name.encode())
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest() if found else None
+
+
+def build_run_manifest(
+    *,
+    base_model: str,
+    adapter_path: str | None,
+    task_corpus: str,
+    fireworks_model_id: str,
+    student_tokenizer: str | None = None,
+    tokenizer_dir: str | Path | None = None,
+    harbor_revision: str | None = None,
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
+    teacher_serving_precision: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> OPDRunManifest:
+    """Assemble a §6.1 manifest, deriving only what can be read from disk.
+
+    The split matters. Hashes of files this process actually loads are *derived*
+    — deriving them is strictly better than trusting a human to retype them, and
+    they cannot drift from what ran. Everything else (Harbor revision, serving
+    precision) is *recorded*: this process cannot observe it, so an inferred
+    value would be a guess wearing a pin's clothing.
+
+    `vektori_trace_commit` comes from `current_commit()`, which suffixes
+    `-dirty` on an unclean tree, so a manifest cannot claim a clean commit for
+    code that was edited after it.
+
+    This does not call `require_complete()`. The caller decides when to refuse,
+    because a dry run legitimately builds an incomplete manifest to *report*
+    what is unpinned; only a paid run must refuse.
+    """
+    adapter_hashes: dict[str, str | None] = {
+        "student_adapter_sha256": None,
+        "student_adapter_config_sha256": None,
+    }
+    if adapter_path:
+        adapter_hashes = hash_adapter_dir(Path(adapter_path))
+
+    tok_dir = tokenizer_dir if tokenizer_dir is not None else adapter_path
+    tok_sha = hash_tokenizer_dir(Path(tok_dir)) if tok_dir else None
+
+    return OPDRunManifest(
+        student_base_model=base_model,
+        student_adapter_path=str(adapter_path) if adapter_path else None,
+        student_adapter_sha256=adapter_hashes["student_adapter_sha256"],
+        student_adapter_config_sha256=adapter_hashes["student_adapter_config_sha256"],
+        student_tokenizer=student_tokenizer or CROSS_STUDENT,
+        student_tokenizer_sha256=tok_sha,
+        fireworks_model_id=fireworks_model_id,
+        teacher_serving_precision=teacher_serving_precision,
+        harbor_revision=harbor_revision,
+        task_corpus=task_corpus,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        vektori_trace_commit=current_commit(),
+        extra=dict(extra or {}),
+    )
+
 __all__ = [
+    "build_run_manifest",
+    "hash_adapter_dir",
+    "hash_tokenizer_dir",
     "PAPER_ARXIV_ID",
     "PAPER_CODE_REVISION",
     "PAPER_REPO",

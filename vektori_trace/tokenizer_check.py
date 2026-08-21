@@ -41,7 +41,15 @@ DEFAULT_STUDENT = PILOT_STUDENT
 # byte-identical tokenizer.json, so the §4 alignment measurements hold for
 # either, but the encoders differ and only 0731's is vendored.
 CROSS_TEACHER = "deepseek-ai/DeepSeek-V4-Flash-0731"
-CROSS_STUDENT = PILOT_STUDENT
+
+# The cross-tokenizer *student* is Stage-B ck75, which is Qwen3-14B — not
+# `PILOT_STUDENT`. It aliased to the 8B pilot student until 2026-08-21, which
+# was inert while nothing read it, but `OPDRunManifest.student_tokenizer`
+# defaults to this constant: a run would have recorded "Qwen/Qwen3-8B" as the
+# pinned tokenizer while `run_replay_opd.py` served 14B. A pin that disagrees
+# with what ran is worse than an absent pin, because §11 treats the manifest as
+# the thing a result is attributed to.
+CROSS_STUDENT = "Qwen/Qwen3-14B"
 
 
 class TokenizerMismatchError(RuntimeError):

@@ -171,3 +171,100 @@ def test_current_commit_is_a_sha_or_none():
 
 def test_current_commit_outside_a_repo_is_none(tmp_path):
     assert current_commit(tmp_path) is None
+
+
+class TestDerivedPins:
+    """Hashes are read off disk, so a pin cannot disagree with what loaded."""
+
+    def _adapter(self, tmp_path, weights=b"W", config=b'{"r": 32}'):
+        d = tmp_path / "checkpoint-75"
+        d.mkdir(parents=True)
+        (d / "adapter_model.safetensors").write_bytes(weights)
+        (d / "adapter_config.json").write_bytes(config)
+        return d
+
+    def test_weights_and_config_hashed_separately(self, tmp_path):
+        """Two checkpoints sharing a config must not hash alike.
+
+        This is the collision a single directory-level hash would permit, and
+        it is the realistic one: Stage-B checkpoints differ in weights while
+        their adapter_config.json is byte-identical.
+        """
+        from vektori_trace.opd_manifest import hash_adapter_dir
+
+        a = hash_adapter_dir(self._adapter(tmp_path / "a", weights=b"ck75"))
+        b = hash_adapter_dir(self._adapter(tmp_path / "b", weights=b"ck90"))
+
+        assert a["student_adapter_config_sha256"] == b["student_adapter_config_sha256"]
+        assert a["student_adapter_sha256"] != b["student_adapter_sha256"]
+
+    def test_missing_files_are_none_not_raise(self, tmp_path):
+        from vektori_trace.opd_manifest import hash_adapter_dir
+
+        got = hash_adapter_dir(tmp_path / "nope")
+        assert got == {
+            "student_adapter_sha256": None,
+            "student_adapter_config_sha256": None,
+        }
+
+    def test_tokenizer_hash_covers_chat_template(self, tmp_path):
+        """A template change must move the tokenizer pin.
+
+        CLAUDE.md: Qwen3's chat template decides where the empty-think wrapper
+        lands. Hashing tokenizer.json alone would call two materially different
+        renderers identical.
+        """
+        from vektori_trace.opd_manifest import hash_tokenizer_dir
+
+        d = tmp_path / "tok"
+        d.mkdir()
+        (d / "tokenizer.json").write_bytes(b"vocab")
+        (d / "tokenizer_config.json").write_bytes(b'{"chat_template": "A"}')
+        first = hash_tokenizer_dir(d)
+
+        (d / "tokenizer_config.json").write_bytes(b'{"chat_template": "B"}')
+        assert hash_tokenizer_dir(d) != first
+
+    def test_tokenizer_dir_absent_is_none(self, tmp_path):
+        from vektori_trace.opd_manifest import hash_tokenizer_dir
+
+        assert hash_tokenizer_dir(tmp_path / "missing") is None
+
+    def test_build_manifest_derives_and_refuses(self, tmp_path):
+        from vektori_trace.opd_manifest import PinError, build_run_manifest
+
+        adapter = self._adapter(tmp_path)
+        (adapter / "tokenizer.json").write_bytes(b"v")
+        (adapter / "tokenizer_config.json").write_bytes(b"{}")
+
+        m = build_run_manifest(
+            base_model="Qwen/Qwen3-14B",
+            adapter_path=str(adapter),
+            task_corpus="/data/vektori-out/dsv4-corpus60",
+            fireworks_model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+            harbor_revision="abc123",
+        )
+        assert m.student_adapter_sha256
+        assert m.student_tokenizer_sha256
+        assert m.vektori_trace_commit
+        m.require_complete()  # all required pins derived or supplied
+
+        # Without harbor_revision the gate refuses and names the field.
+        m2 = build_run_manifest(
+            base_model="Qwen/Qwen3-14B",
+            adapter_path=str(adapter),
+            task_corpus="/data/x",
+            fireworks_model_id="fw",
+        )
+        with pytest.raises(PinError, match="harbor_revision"):
+            m2.require_complete()
+
+    def test_student_tokenizer_pin_is_the_14b_student(self):
+        """CROSS_STUDENT aliased to the 8B pilot student until 2026-08-21.
+
+        The manifest defaults `student_tokenizer` to it, so a run would have
+        pinned Qwen3-8B while serving 14B.
+        """
+        from vektori_trace.opd_manifest import OPDRunManifest
+
+        assert OPDRunManifest().student_tokenizer == "Qwen/Qwen3-14B"

@@ -220,6 +220,30 @@ def train(batch_inputs, args):
     )
 
 
+def _build_manifest(args):
+    """The §6.1 manifest for this invocation.
+
+    Hashes are derived from `--adapter-path` rather than typed, so they cannot
+    disagree with what is loaded; unobservable facts (Harbor revision, teacher
+    precision) come from flags because guessing them would be a fake pin.
+    """
+    from vektori_trace.opd_manifest import build_run_manifest
+
+    return build_run_manifest(
+        base_model=args.base_model,
+        adapter_path=args.adapter_path,
+        task_corpus=",".join(str(c) for c in args.corpus),
+        fireworks_model_id=args.teacher_model,
+        student_tokenizer=args.student_tokenizer,
+        tokenizer_dir=args.tokenizer_dir or args.adapter_path,
+        harbor_revision=args.harbor_revision,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        teacher_serving_precision=args.teacher_precision,
+        extra={"selection_policy": "stratified-diagnostic"},
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", action="append", default=None)
@@ -239,6 +263,16 @@ def main() -> int:
     # teacher
     ap.add_argument("--teacher-model", default=DEFAULT_TEACHER)
     ap.add_argument("--teacher-tokenizer", default="deepseek-ai/DeepSeek-V4-Flash-0731")
+    ap.add_argument("--teacher-precision", default="fp8 (Fireworks serving default)",
+                    help="recorded, not observed: Fireworks serves fp8 and a run "
+                         "against a bf16 teacher is not comparable")
+    # pins
+    ap.add_argument("--tokenizer-dir", default=None,
+                    help="directory whose tokenizer/chat-template files are hashed "
+                         "for the pin; defaults to --adapter-path")
+    ap.add_argument("--harbor-revision", default=os.environ.get("HARBOR_REVISION"),
+                    help="§6.1 pin; this process cannot observe it, so it must be "
+                         "supplied for a paid run")
     # training
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--device", default=os.environ.get("REPLAY_TRAIN_DEVICE"),
@@ -285,6 +319,13 @@ def main() -> int:
             total += sum(len(m.get("content") or "") for m in turns_to_messages(p.prefix_turns))
         report["dry_run"] = True
         report["approx_prefix_chars"] = total
+        # A dry run *reports* what is unpinned rather than refusing: knowing
+        # which pins are missing is exactly what it is for.
+        manifest = _build_manifest(args)
+        report["manifest"] = manifest.to_dict()
+        report["missing_pins"] = manifest.missing_pins()
+        if manifest.missing_pins():
+            log(f"UNPINNED (would block a paid run): {', '.join(manifest.missing_pins())}")
         report["projected_teacher_requests"] = args.n_prefixes * args.n_samples
         log(
             f"DRY RUN — would sample {args.n_prefixes * args.n_samples} actions "
@@ -328,6 +369,33 @@ def main() -> int:
         log(f"training device: {args.device} ({torch.cuda.get_device_name(idx)})")
     except ImportError:
         raise SystemExit("torch is not importable; this host cannot train")
+
+    # §6.1 pin gate. Before sampling, before Fireworks, before weights: an
+    # unpinned run produces numbers that cannot be attributed to a
+    # configuration, which §11 makes a stop condition rather than a reporting
+    # gap. `verify_reference_pins` re-hashes the vendored paper code, so an edit
+    # to the reference implementation the loss claims to port fails here.
+    from vektori_trace.opd_manifest import PinError, verify_reference_pins
+
+    try:
+        report["reference_sha256_observed"] = verify_reference_pins()
+    except PinError as e:
+        print(f"reference pin check failed: {e}", file=sys.stderr)
+        return 2
+
+    manifest = _build_manifest(args)
+    report["manifest"] = manifest.to_dict()
+    try:
+        manifest.require_complete()
+    except PinError as e:
+        print(f"{e}", file=sys.stderr)
+        print(
+            "Fill the missing pins (adapter/tokenizer hashes are derived from "
+            "--adapter-path; harbor revision via --harbor-revision) and re-run.",
+            file=sys.stderr,
+        )
+        return 2
+    log(f"pins complete; commit {manifest.vektori_trace_commit}")
 
     import transformers
 
