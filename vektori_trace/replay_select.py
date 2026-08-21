@@ -172,12 +172,14 @@ def select_replay_prefixes(
     available_pc = [c for c in candidates if c.post_compaction]
     want_pc = min(require_post_compaction, len(available_pc))
 
-    # Spread across trace *stages*, not just tasks. Sorting by step_index alone
-    # makes the one-per-task rule pick every task's earliest state, which is a
-    # kappa-decay batch by accident rather than the stratified sample §8.3 asks
-    # for — and it skips exactly the long-horizon states this run exists to
-    # stress. Each candidate is bucketed by where it sits in its own trace, and
-    # buckets are visited round-robin so early/middle/late all appear.
+    # Spread across trace *stages*, not just tasks. §8.3 asks for both, and
+    # with 34 eligible tasks for 8 slots a task-first ordering fills every slot
+    # from whichever stage sorts first — the real corpus produced eight step-1
+    # prefixes, a kappa-decay batch by accident.
+    #
+    # So stage is assigned to the *slot*, not derived from the sort: slot k
+    # wants stage k % 3, and each pass takes the best available candidate in
+    # that stage. Deterministic, and it cannot collapse to one end.
     by_trace_len: dict[str, int] = {}
     for c in candidates:
         by_trace_len[c.trace_id] = max(by_trace_len.get(c.trace_id, 0), c.step_index)
@@ -192,20 +194,11 @@ def select_replay_prefixes(
 
     ordered = sorted(
         candidates,
-        key=lambda c: (
-            not c.post_compaction,
-            # Round-robin the stages so consecutive picks alternate early /
-            # middle / late rather than exhausting one end first. Offset by a
-            # stable digest of the task, never `hash()` — that is randomised
-            # per process and would make selection unreproducible, which §8.4
-            # requires it not to be.
-            (_stage(c) + _task_offset(c.task)) % 3,
-            _stage(c),
-            c.task,
-            c.trace_id,
-            c.step_index,
-        ),
+        key=lambda c: (not c.post_compaction, c.task, c.trace_id, c.step_index),
     )
+    by_stage: dict[int, list[ReplayPrefix]] = {0: [], 1: [], 2: []}
+    for c in ordered:
+        by_stage[_stage(c)].append(c)
 
     chosen: list[ReplayPrefix] = []
     per_task: Counter[str] = Counter()
@@ -219,15 +212,14 @@ def select_replay_prefixes(
             return False
         return allow_task_repeat or per_task[c.task] < 1
 
-    # Pass 1: post-compaction quota, then one per distinct task.
-    for allow_repeat in (False, True):
-        for c in ordered:
-            if len(chosen) >= n_prefixes:
-                break
+    # Pass 1: post-compaction quota first, then round-robin the stages so each
+    # slot draws from early / middle / late in turn.
+    def _take(pool, *, allow_repeat: bool, want_pc: bool) -> bool:
+        nonlocal pc_taken
+        for c in pool:
             if c in chosen:
                 continue
-            if pc_taken < want_pc and not c.post_compaction:
-                # Still owe post-compaction slots; take those first.
+            if want_pc and not c.post_compaction:
                 continue
             if not _fits(c, allow_task_repeat=allow_repeat):
                 continue
@@ -236,6 +228,26 @@ def select_replay_prefixes(
             per_trace[c.trace_id] += 1
             if c.post_compaction:
                 pc_taken += 1
+            return True
+        return False
+
+    while pc_taken < want_pc and len(chosen) < n_prefixes:
+        if not _take(ordered, allow_repeat=False, want_pc=True):
+            break
+
+    for allow_repeat in (False, True):
+        slot = len(chosen)
+        while len(chosen) < n_prefixes:
+            target = slot % 3
+            # Try the target stage, then the others, so a corpus without late
+            # states still fills the batch rather than failing.
+            if not any(
+                _take(by_stage[(target + off) % 3], allow_repeat=allow_repeat,
+                      want_pc=False)
+                for off in (0, 1, 2)
+            ):
+                break
+            slot += 1
         if len(chosen) >= n_prefixes:
             break
 

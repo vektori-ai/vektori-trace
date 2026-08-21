@@ -243,16 +243,26 @@ def test_selection_spreads_across_trace_stages():
     earliest state — a kappa-decay batch by accident, skipping the long-horizon
     states a diagnostic run exists to stress.
     """
+    # The real corpus's shape, which a uniform fixture does not reproduce: many
+    # more eligible tasks than slots, several traces per task, and trace lengths
+    # spanning 9..238 states. Under a task-first ordering this produced eight
+    # step-1 prefixes.
+    import random
+
+    rng = random.Random(0)
     cands = []
-    for t in range(8):
-        for step in range(1, 61):
-            cands.append(_prefix(f"task{t}", f"tr{t}", step))
+    for t in range(34):
+        for r in range(3):
+            n = rng.choice([9, 20, 37, 60, 120, 238])
+            for step in range(1, n + 1):
+                cands.append(_prefix(f"task{t}", f"tr{t}_{r}", step))
 
     chosen = select_replay_prefixes(cands, require_post_compaction=0, max_per_trace=1)
 
     steps = sorted(c.step_index for c in chosen)
     assert len(chosen) == 8
     assert len({c.task for c in chosen}) == 8
+    assert len({c.trace_id for c in chosen}) == 8
     assert max(steps) > 20, f"no late-trace state selected: {steps}"
     assert min(steps) < 20, f"no early-trace state selected: {steps}"
 
