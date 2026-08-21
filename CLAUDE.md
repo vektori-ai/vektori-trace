@@ -84,10 +84,15 @@ Three things settled 2026-08-21, each of which cost a wrong turn to find:
   encoder (`encoding_dsv4` + `providers/teacher/cross.py`) and go to
   `/completions` as an integer array. §6.3 probe passed 2026-08-21.
 
-Do not reintroduce the 256-token per-turn cap: a truncated action still aligns
-and still yields a finite loss, so the error is invisible downstream.
-`FireworksOPDConfig.max_new_tokens` still defaults to it, and
-`validate_cross_opd_config` is what refuses it.
+**The 256-token per-turn cap truncated 69% of actions.** Measured 2026-08-21
+over 2,978 stored actions: median 605 tokens, p99.9 8,126, max 8,842
+(`docs/action-length-measurement.md`). The previous OPD run — the 0/13 one —
+ran under that cap, so the teacher was scoring fragments as completed actions.
+A truncated action still aligns and still yields a finite loss, so nothing in
+that run's logs showed it. Use **8192**.
+`FireworksOPDConfig.max_new_tokens` still defaults to 256;
+`chunk_opd.assert_token_cap_is_task_derived` and `validate_cross_opd_config`
+are what refuse it.
 
 ## The SFT plan of record
 

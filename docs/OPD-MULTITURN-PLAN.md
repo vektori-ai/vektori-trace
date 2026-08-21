@@ -409,9 +409,18 @@ different experiments that both report 32 actions.
   at least two authentic post-compaction prefixes if available.
 - Sample four independent ck75 actions per prefix: 32 replay actions total.
 - **Freeze `v0` for all 32 samples**, and record its pinned identity (§6.1).
-- Use the task-derived per-turn token cap. Not the previous 256-token cap: a
-  truncated action still aligns and still yields a finite loss, so the error is
-  invisible downstream.
+- **Per-turn token cap: 8192.** Measured, not chosen — see
+  `docs/action-length-measurement.md`. Across 2,978 assistant actions in the
+  stored corpus the median is 605 tokens, p99.9 is 8,126 and the max is 8,842.
+  The previous run's 256-token cap cut **69.2%** of actions mid-sequence, and
+  the teacher scored those fragments as completed actions; a truncated action
+  still aligns and still yields a finite loss, so nothing downstream showed it.
+  8192 is a loop guard rather than a length budget.
+
+  Two caveats carried into the run: those are *DeepSeek's* lengths, so ck75's
+  own `cap_hit_rate` (§10) must be checked and the cap re-derived if it is
+  non-zero; and the measurement covered 40 of 117 passing traces, so the tail
+  should be confirmed on the full set before a learning-oriented run.
 - Generation is no-grad. Save prefix identity, exact sampled action bytes, Qwen
   token ids, behaviour log probabilities, masks, policy version and termination
   reason — the behaviour log probabilities are `log pi_old` in §5's ratio and
