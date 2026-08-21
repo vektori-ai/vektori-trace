@@ -310,6 +310,19 @@ def run_replay_chunk_opd(
         for kind, n in adv.stats.tokens_by_kind.items():
             chunk_kinds[kind] = chunk_kinds.get(kind, 0) + n
 
+    # §10 wants counts by trace stage. The realized step histogram is the honest
+    # form: it states which prefixes the sampling policy actually drew, rather
+    # than which ones it was supposed to. A stratified batch and a kappa^t batch
+    # are distinguishable here even when both report 32 actions.
+    step_hist: dict[str, int] = {}
+    tokens_by_step: dict[str, int] = {}
+    by_prefix = {p.prefix_id: p for p in batch.prefixes}
+    for key, adv in zip(batch.keys, batch.advantages, strict=True):
+        pid = key.rsplit("#", 1)[0]
+        step = str(by_prefix[pid].step_index)
+        step_hist[step] = step_hist.get(step, 0) + 1
+        tokens_by_step[step] = tokens_by_step.get(step, 0) + adv.n_supervised
+
     return {
         "policy_version": batch.policy_version,
         "selection_policy": selection_policy,
@@ -320,6 +333,8 @@ def run_replay_chunk_opd(
         "global_supervised_tokens": batch.global_supervised_tokens,
         "supervised_tokens_by_prefix": batch.supervised_tokens_by_prefix,
         "supervised_tokens_by_chunk_kind": chunk_kinds,
+        "realized_step_histogram": dict(sorted(step_hist.items(), key=lambda kv: int(kv[0]))),
+        "supervised_tokens_by_step": dict(sorted(tokens_by_step.items(), key=lambda kv: int(kv[0]))),
         "spread": batch.spread_report,
         "prefix_ids": [p.prefix_id for p in batch.prefixes],
         "action_keys": batch.keys,

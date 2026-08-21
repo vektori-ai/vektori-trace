@@ -38,6 +38,10 @@ def _prefix(task: str, trace: str, step: int = 2) -> ReplayPrefix:
     return ReplayPrefix(task=task, trace_id=trace, step_index=step, prefix_turns=[])
 
 
+def _mk(task: str, trace: str, step: int) -> ReplayPrefix:
+    return ReplayPrefix(task, trace, step, [])
+
+
 def _split(text: str, chunk: int) -> list[bytes]:
     raw = text.encode()
     return [raw[i : i + chunk] for i in range(0, len(raw), chunk)]
@@ -303,3 +307,59 @@ def test_invalid_kappa_is_refused(bad):
 def test_empty_candidates_refused():
     with pytest.raises(ReplaySelectionError, match="no candidates"):
         reopd_step_weights([])
+
+
+def test_kappa_mass_beyond_step_10_matches_the_documented_figures():
+    """Locks the numbers the kappa choice is argued from.
+
+    These were wrong once in review (28% claimed for kappa=0.95 over 0..24; the
+    real figure is 44.5%), and the whole early-vs-late-prefix argument rests on
+    them, so they are asserted rather than left in prose.
+    """
+    cands = [_prefix("t", f"tr{i}", step=i) for i in range(25)]
+
+    steep = reopd_step_weights(cands, kappa=0.6)
+    late_steep = sum(steep[c.prefix_id] for c in cands if c.step_index >= 10)
+    assert late_steep == pytest.approx(0.0060, abs=5e-4)
+
+    shallow = reopd_step_weights(cands, kappa=0.95)
+    late_shallow = sum(shallow[c.prefix_id] for c in cands if c.step_index >= 10)
+    assert late_shallow == pytest.approx(0.4447, abs=1e-3)
+
+
+def test_pooled_weighting_gives_a_long_trace_more_total_mass():
+    """The pooled form is a choice: long traces carry more mass before decay.
+
+    Documented on `reopd_step_weights` because it is one origin of the
+    single-trace domination §8.4 forbids.
+    """
+    long_trace = [_mk("t", "long", i) for i in range(12)]
+    short_trace = [_mk("t", "short", i) for i in range(3)]
+    w = reopd_step_weights(long_trace + short_trace, kappa=0.95)
+
+    long_mass = sum(w[c.prefix_id] for c in long_trace)
+    short_mass = sum(w[c.prefix_id] for c in short_trace)
+    assert long_mass > short_mass
+
+
+def test_report_carries_the_realized_step_histogram():
+    """§10 by-trace-stage counts, and the only way to tell the two policies apart."""
+    prefixes = [_mk(f"task{i}", f"tr{i}", step=i) for i in range(8)]
+    actions, scores = [], {}
+    for p in prefixes:
+        for i in range(4):
+            a = _action(p, i)
+            actions.append(a)
+            scores[a.key] = _teacher(a)
+
+    rep = run_replay_chunk_opd(
+        prefixes, actions, scores, _noop_step, max_new_tokens=CAP
+    )
+
+    hist = rep["realized_step_histogram"]
+    assert sum(hist.values()) == 32
+    assert set(hist) == {str(i) for i in range(8)}
+    assert all(v == 4 for v in hist.values()), "4 samples at each prefix"
+    assert sum(rep["supervised_tokens_by_step"].values()) == (
+        rep["global_supervised_tokens"]
+    )

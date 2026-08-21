@@ -305,6 +305,30 @@ def reopd_step_weights(
     module does not own the RNG, because a run has to be reproducible from its
     recorded seed and prefix ids.
 
+    **This is the pooled form**, and that is a choice, not a detail. Two
+    distributions are easy to conflate:
+
+    - *uniform over trajectories, then decay within a trace* — every trace
+      contributes equally regardless of length;
+    - *pooled globally over all eligible prefixes, then decay* — what this
+      function does: weights are normalised across the whole candidate list, so
+      a long trace contributes more prefixes and carries more total mass before
+      decay is even applied.
+
+    Pooled sampling is therefore one of the ways a single long trace comes to
+    dominate a batch, which §8.4 forbids — `assert_no_source_dominates` is the
+    backstop, but the sampling policy is where it originates. A caller wanting
+    the uniform-over-traces form must group candidates by `trace_id` and call
+    this once per trace. Whichever is used belongs in the run manifest: two runs
+    differing only here are not comparable.
+
+    Calibrating kappa: 0.6 is the paper's default, and on our corpus it is very
+    steep. Over a 25-step trace (indices 0..24) it puts 99.4% of the mass in the
+    first ten steps, so states at step >= 10 are drawn about once per five
+    32-action batches. kappa=0.95 over the same range leaves 44.5% at steps
+    >= 10. Pick it from the corpus's measured length distribution rather than
+    inheriting 0.6, and report the realized step histogram alongside the choice.
+
     Not used by `select_replay_prefixes`; see the module docstring for why this
     first run samples stratified instead, and record which policy was used.
     """
