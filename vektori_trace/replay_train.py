@@ -18,9 +18,14 @@ Four properties it exists to guarantee
    no gradient — every position a sentinel, a masking bug — would otherwise
    report success and save a byte-identical adapter. The step compares LoRA
    tensors before and after and fails if nothing changed.
-4. **Nothing but ck75's sampled tokens is supervised.** The advantages arrive
-   per-student-token from `chunk_opd`, and the mask comes from the sentinel
-   flags. No prefix token is ever in the tensor.
+4. **Nothing but ck75's sampled tokens is supervised.** The prefix is in the
+   forward pass — it has to be, or the conditioning is wrong — but only the
+   action positions are scored, so no prefix token can reach the loss.
+5. **`log pi_current` is computed in the conditioning `log pi_old` was captured
+   in.** The action is scored after its full rendered replay prefix, and every
+   action token is scored including the first. Scoring the action alone would
+   compare two different distributions while producing a perfectly finite loss
+   and a moving adapter — see `action_logprobs_under_prefix`.
 
 Everything torch/peft is imported lazily so the module (and the semantics tests
 around it) import without the train extra.
@@ -76,11 +81,11 @@ def _lora_params(model: Any) -> list[tuple[str, Any]]:
 
 
 def current_logprobs(model: Any, token_ids: list[int], *, device: Any = None):
-    """`log pi_current` for each supplied id, autograd live.
+    """`log pi_current` for each supplied id after the first, autograd live.
 
     Next-token convention: logits at position t score token t+1, so the first
-    supplied id is context and receives no score. The caller aligns advantages
-    to the returned length rather than assuming a 1:1 with `token_ids`.
+    supplied id is context and receives no score. Returns a tensor of length
+    `len(token_ids) - 1`.
     """
     import torch
 
@@ -90,6 +95,65 @@ def current_logprobs(model: Any, token_ids: list[int], *, device: Any = None):
     targets = x[:, 1:]
     lp = torch.log_softmax(logits, dim=-1)
     return lp.gather(-1, targets.unsqueeze(-1)).squeeze(-1).squeeze(0)
+
+
+def action_logprobs_under_prefix(
+    model: Any,
+    prompt_token_ids: list[int],
+    action_token_ids: list[int],
+    *,
+    device: Any = None,
+):
+    """`log pi_current` for **every** action token, conditioned on the real prefix.
+
+    This is the correctness-critical function in the module. `log pi_old` was
+    captured while ck75 sampled the action after its full rendered replay prefix,
+    so `log pi_current` has to be recomputed in that same conditioning or the
+    importance ratio `exp(log pi_current - log pi_old)` compares two different
+    distributions — and does so while staying finite, so nothing downstream
+    reveals it.
+
+    Two consequences that a naive implementation gets wrong:
+
+    - **The prefix must be in the forward pass**, not just the action. Scoring
+      `action_token_ids` alone conditions each token on the previous *action*
+      tokens and nothing else, which is not the state ck75 acted in.
+    - **The first action token must be scored**, from the final prefix logit.
+      Dropping it (by treating it as context under the next-token convention)
+      discards the position that most directly reflects the student's choice at
+      that state.
+
+    Returns a tensor of length `len(action_token_ids)`, aligned 1:1 with the
+    captured behaviour log probabilities.
+    """
+    import torch
+
+    if not prompt_token_ids:
+        raise ReplayTrainError(
+            "no prompt_token_ids — the action would be scored without the replay "
+            "prefix it was sampled under, making log pi_current incomparable to "
+            "log pi_old"
+        )
+    if not action_token_ids:
+        raise ReplayTrainError("no action tokens to score")
+
+    full = list(prompt_token_ids) + list(action_token_ids)
+    n_prompt = len(prompt_token_ids)
+
+    x = torch.tensor([full], device=device)
+    out = model(input_ids=x)
+    # Position t predicts token t+1, so the logit that scores action token j is
+    # at index (n_prompt + j - 1). For j = 0 that is the final prefix position.
+    logits = out.logits[0, n_prompt - 1 : -1, :].float()
+    targets = x[0, n_prompt:]
+    lp = torch.log_softmax(logits, dim=-1)
+    scored = lp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    if scored.shape[0] != len(action_token_ids):
+        raise ReplayTrainError(
+            f"scored {scored.shape[0]} positions for {len(action_token_ids)} "
+            "action tokens"
+        )
+    return scored
 
 
 def make_optimizer_step(
@@ -134,22 +198,30 @@ def make_optimizer_step(
 
         for adv in batch.advantages:
             ids = adv.action_token_ids
-            if len(ids) < 2:
-                # Nothing to score: the first id is context under the
-                # next-token convention.
+            if not ids:
                 continue
-            cur = current_logprobs(model, ids, device=cfg.device)
+            if not adv.prompt_token_ids:
+                raise ReplayTrainError(
+                    f"example {adv.turn_index}: no prompt_token_ids. The action "
+                    "would be scored without its replay prefix, so log pi_current "
+                    "would not be comparable to the captured log pi_old and the "
+                    "importance ratio would be meaningless while staying finite."
+                )
+            # Every action token, conditioned on the real prefix, 1:1 with the
+            # captured behaviour log probabilities. No slicing.
+            cur = action_logprobs_under_prefix(
+                model, adv.prompt_token_ids, ids, device=cfg.device
+            )
             n = cur.shape[0]
 
             beh = torch.tensor(
-                adv.behavior_logprobs[1 : n + 1], dtype=torch.float32,
-                device=cur.device,
+                adv.behavior_logprobs[:n], dtype=torch.float32, device=cur.device
             )
             a = torch.tensor(
-                adv.advantages[1 : n + 1], dtype=torch.float32, device=cur.device
+                adv.advantages[:n], dtype=torch.float32, device=cur.device
             )
             mask = torch.tensor(
-                [1.0 if s else 0.0 for s in adv.supervised_mask[1 : n + 1]],
+                [1.0 if s else 0.0 for s in adv.supervised_mask[:n]],
                 dtype=torch.float32,
                 device=cur.device,
             )
@@ -269,6 +341,7 @@ def build_optimizer(model: Any, cfg: ReplayTrainConfig):
 __all__ = [
     "ReplayTrainConfig",
     "ReplayTrainError",
+    "action_logprobs_under_prefix",
     "build_optimizer",
     "current_logprobs",
     "load_v0_for_training",

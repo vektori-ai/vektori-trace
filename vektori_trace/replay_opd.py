@@ -60,6 +60,13 @@ class SampledAction:
     action_token_bytes: list[bytes]
     behavior_logprobs: list[float]
     policy_version: str
+    #: The exact Qwen prompt ids the action was sampled under. Required to
+    #: recompute `log pi_current` in the same conditioning `log pi_old` was
+    #: captured in — without it the importance ratio compares two different
+    #: distributions and the gradient is wrong while every metric stays finite.
+    #: Optional only so a unit test can construct an action in isolation; the
+    #: optimizer step refuses an action that lacks it.
+    prompt_token_ids: list[int] | None = None
     termination_reason: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -194,6 +201,7 @@ def build_replay_batch(
             teacher_lps,
             large_chunk_threshold=large_chunk_threshold,
             clamp=advantage_clamp,
+            prompt_token_ids=action.prompt_token_ids,
         )
         advantages.append(adv)
         keys.append(action.key)

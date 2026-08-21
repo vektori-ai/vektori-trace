@@ -74,6 +74,7 @@ def _action(prefix, i, text=None) -> SampledAction:
         action_token_bytes=toks,
         behavior_logprobs=[-0.5 - 0.01 * k for k in range(len(toks))],
         policy_version=V0,
+        prompt_token_ids=[11, 12, 13, 14, 15],
     )
 
 
@@ -238,6 +239,7 @@ def _batch(model, n_prefixes=8, n_per=4):
         for i in range(n_per):
             a = _action(p, i)
             a.action_token_ids = [(t * 7 + 3) % vocab for t in a.action_token_ids]
+            a.prompt_token_ids = [(t * 5 + 1) % vocab for t in range(6)]
             actions.append(a)
     # Teacher side: a different granularity, so the chunk path is exercised.
     scored = {}
@@ -367,3 +369,87 @@ def test_gradient_is_globally_normalised_not_per_example(lora_model, tmp_path):
     assert a == pytest.approx(b, rel=0.35), (
         "the update scale must follow total supervised tokens, not example count"
     )
+
+
+# ---------------------------------------------------------------------------
+# Prefix conditioning — log pi_current must match log pi_old's conditioning
+# ---------------------------------------------------------------------------
+
+
+def test_every_action_token_is_scored_including_the_first(lora_model):
+    """1:1 with the captured behaviour logprobs — no token dropped as context."""
+    from vektori_trace.replay_train import action_logprobs_under_prefix
+
+    prompt = [5, 6, 7, 8]
+    action = [9, 10, 11]
+    lp = action_logprobs_under_prefix(lora_model, prompt, action)
+
+    assert lp.shape[0] == len(action), "all action tokens, first included"
+    assert lp.requires_grad
+
+
+def test_changing_the_prefix_changes_the_first_action_logprob(lora_model):
+    """The regression test for the conditioning bug.
+
+    log pi_old was captured after the full replay prefix. If log pi_current is
+    computed without it, the importance ratio compares two different
+    distributions — finitely, so nothing downstream reveals it. A different
+    prefix must therefore produce a different first-token score.
+    """
+    from vektori_trace.replay_train import action_logprobs_under_prefix
+
+    action = [9, 10, 11]
+    a = action_logprobs_under_prefix(lora_model, [5, 6, 7, 8], action)
+    b = action_logprobs_under_prefix(lora_model, [21, 22, 23, 24], action)
+
+    assert float(a[0]) != pytest.approx(float(b[0]), abs=1e-9), (
+        "the first action token is scored from the final prefix logit, so it "
+        "must move when the prefix changes"
+    )
+
+
+def test_scoring_the_action_alone_differs_from_scoring_it_under_its_prefix(
+    lora_model,
+):
+    """The old, wrong path and the correct one must not agree.
+
+    If these matched, the bug would have been unobservable and this test
+    worthless — so the assertion is that they differ.
+    """
+    from vektori_trace.replay_train import (
+        action_logprobs_under_prefix,
+        current_logprobs,
+    )
+
+    prompt = [5, 6, 7, 8]
+    action = [9, 10, 11]
+
+    correct = action_logprobs_under_prefix(lora_model, prompt, action)
+    # What the buggy version did: score the action with no prefix at all, which
+    # also silently drops the first token.
+    naive = current_logprobs(lora_model, action)
+
+    assert correct.shape[0] == len(action)
+    assert naive.shape[0] == len(action) - 1
+    assert float(correct[1]) != pytest.approx(float(naive[0]), abs=1e-9)
+
+
+def test_missing_prompt_ids_are_refused(lora_model, tmp_path):
+    """A batch whose actions lack prefixes cannot be trained on."""
+    cfg = ReplayTrainConfig(output_dir=tmp_path / "v")
+    opt = build_optimizer(lora_model, cfg)
+    step = make_optimizer_step(lora_model, opt, cfg, save=False)
+
+    batch = _batch(lora_model, n_prefixes=8, n_per=1)
+    for adv in batch.advantages:
+        adv.prompt_token_ids = None
+
+    with pytest.raises(ReplayTrainError, match="no prompt_token_ids"):
+        step(batch)
+
+
+def test_action_logprobs_refuse_an_empty_prefix(lora_model):
+    from vektori_trace.replay_train import action_logprobs_under_prefix
+
+    with pytest.raises(ReplayTrainError, match="no prompt_token_ids"):
+        action_logprobs_under_prefix(lora_model, [], [9, 10])

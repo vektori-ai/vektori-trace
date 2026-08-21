@@ -164,6 +164,10 @@ class TurnAdvantages:
     advantages: list[float]
     supervised_mask: list[bool]
     stats: ChunkStats
+    #: Prompt ids the action was sampled under. `log pi_current` must be
+    #: recomputed in this conditioning or it is not comparable to
+    #: `behavior_logprobs`.
+    prompt_token_ids: list[int] | None = None
 
     @property
     def n_supervised(self) -> int:
@@ -177,6 +181,7 @@ def advantages_for_turn(
     *,
     large_chunk_threshold: int | None = None,
     clamp: float | None = None,
+    prompt_token_ids: list[int] | None = None,
 ) -> TurnAdvantages:
     """align -> semantic-prior credit assignment, for one turn.
 
@@ -209,6 +214,7 @@ def advantages_for_turn(
         advantages=advantages,
         supervised_mask=supervised,
         stats=stats,
+        prompt_token_ids=list(prompt_token_ids) if prompt_token_ids else None,
     )
 
 
