@@ -504,3 +504,82 @@ class TestLoadV0Placement:
         """The tiny CPU tests build a config and call make_optimizer_step."""
         cfg = self._cfg()
         assert cfg.device is None
+
+
+class TestAdapterReloadable:
+    """§8.4: v_replay must differ from v0 *and be reloadable*.
+
+    "Differs" is proven from live tensors in the step; reloadability is a
+    property of the bytes on disk. The two diverge exactly in the quiet cases —
+    a config with no weights beside it, a truncated write — where the in-memory
+    model is fine and nothing else in the run would notice.
+    """
+
+    def _good(self, tmp_path):
+        import torch
+        from safetensors.torch import save_file
+
+        d = tmp_path / "v_replay"
+        d.mkdir()
+        (d / "adapter_config.json").write_text(
+            '{"peft_type": "LORA", "r": 32, "lora_alpha": 64, '
+            '"target_modules": ["q_proj"]}'
+        )
+        save_file({"base.lora_A.weight": torch.zeros(2, 2)},
+                  str(d / "adapter_model.safetensors"))
+        return d
+
+    def test_good_adapter_reports_shape(self, tmp_path):
+        from vektori_trace.replay_train import verify_adapter_reloadable
+
+        got = verify_adapter_reloadable(self._good(tmp_path))
+        assert got["peft_type"] == "LORA"
+        assert got["r"] == 32
+        assert got["n_tensors"] == 1
+        assert got["weights_bytes"] > 0
+
+    def test_config_without_weights_refused(self, tmp_path):
+        """The failure a `moved > 0` check cannot see."""
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, verify_adapter_reloadable
+
+        d = tmp_path / "v_replay"
+        d.mkdir()
+        (d / "adapter_config.json").write_text("{}")
+        with pytest.raises(ReplayTrainError, match="no adapter weights file"):
+            verify_adapter_reloadable(d)
+
+    def test_zero_byte_weights_refused(self, tmp_path):
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, verify_adapter_reloadable
+
+        d = tmp_path / "v_replay"
+        d.mkdir()
+        (d / "adapter_config.json").write_text("{}")
+        (d / "adapter_model.safetensors").write_bytes(b"")
+        with pytest.raises(ReplayTrainError, match="zero bytes"):
+            verify_adapter_reloadable(d)
+
+    def test_corrupt_weights_refused(self, tmp_path):
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, verify_adapter_reloadable
+
+        d = tmp_path / "v_replay"
+        d.mkdir()
+        (d / "adapter_config.json").write_text("{}")
+        (d / "adapter_model.safetensors").write_bytes(b"not a safetensors file")
+        with pytest.raises(ReplayTrainError, match="unreadable"):
+            verify_adapter_reloadable(d)
+
+    def test_missing_config_refused(self, tmp_path):
+        import pytest
+
+        from vektori_trace.replay_train import ReplayTrainError, verify_adapter_reloadable
+
+        d = tmp_path / "v_replay"
+        d.mkdir()
+        with pytest.raises(ReplayTrainError, match="adapter_config.json is missing"):
+            verify_adapter_reloadable(d)

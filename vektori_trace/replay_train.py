@@ -33,6 +33,7 @@ around it) import without the train extra.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -277,10 +278,19 @@ def make_optimizer_step(
         )
 
         saved: str | None = None
+        reload_check: dict[str, Any] | None = None
         if save:
             cfg.output_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(cfg.output_dir))
             saved = str(cfg.output_dir)
+            # §8.4: "v_replay differs from v0 **and can be reloaded**". The
+            # difference is proven above from live tensors; reloadability is a
+            # property of what actually landed on disk, and the two can diverge
+            # — a save that writes a config without weights, or a truncated
+            # write, still leaves `moved > 0` true. Verified here rather than in
+            # the caller because this is the only place that knows the step
+            # succeeded.
+            reload_check = verify_adapter_reloadable(cfg.output_dir)
 
         return {
             "loss": loss_total / denom,
@@ -295,10 +305,85 @@ def make_optimizer_step(
             "lora_tensors_total": len(params),
             "max_param_delta": max_delta,
             "adapter_saved_to": saved,
+            "adapter_reload_check": reload_check,
             "optimizer_steps": 1,
         }
 
     return step
+
+
+def verify_adapter_reloadable(adapter_dir: Path) -> dict[str, Any]:
+    """Prove the saved adapter is loadable, from the bytes on disk (§8.4).
+
+    Reads and validates the artifact rather than trusting that
+    `save_pretrained` returned without raising. The failures this catches are
+    the quiet ones: a config written with no weights file beside it, a
+    zero-length safetensors, a rank that disagrees with what was trained. All
+    of them leave the in-memory model perfectly fine, so nothing else in the
+    run would notice.
+
+    Deliberately does not instantiate a 14B base to do it — that would double
+    peak memory at the worst moment. Structural validation of the adapter
+    artifact is what distinguishes "saved" from "saved something usable"; a
+    full load belongs in the evaluation arm, which has to load it anyway.
+    """
+    d = Path(adapter_dir)
+    problems: list[str] = []
+
+    config = d / "adapter_config.json"
+    if not config.is_file():
+        problems.append("adapter_config.json is missing")
+        cfg_data: dict[str, Any] = {}
+    else:
+        try:
+            cfg_data = json.loads(config.read_text())
+        except json.JSONDecodeError as e:
+            problems.append(f"adapter_config.json is not valid JSON: {e}")
+            cfg_data = {}
+
+    weights = d / "adapter_model.safetensors"
+    legacy = d / "adapter_model.bin"
+    if weights.is_file():
+        size = weights.stat().st_size
+        if size == 0:
+            problems.append("adapter_model.safetensors is zero bytes")
+    elif legacy.is_file():
+        size = legacy.stat().st_size
+        if size == 0:
+            problems.append("adapter_model.bin is zero bytes")
+    else:
+        size = 0
+        problems.append("no adapter weights file (.safetensors or .bin)")
+
+    n_tensors: int | None = None
+    if weights.is_file() and weights.stat().st_size > 0:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(weights), framework="pt") as fh:
+                keys = list(fh.keys())
+            n_tensors = len(keys)
+            if n_tensors == 0:
+                problems.append("adapter weights contain no tensors")
+        except ImportError:
+            pass
+        except Exception as e:  # a corrupt file raises several types
+            problems.append(f"adapter weights unreadable: {type(e).__name__}: {e}")
+
+    if problems:
+        raise ReplayTrainError(
+            "v_replay was saved but is not reloadable (§8.4): " + "; ".join(problems)
+        )
+
+    return {
+        "adapter_dir": str(d),
+        "weights_bytes": size,
+        "n_tensors": n_tensors,
+        "peft_type": cfg_data.get("peft_type"),
+        "r": cfg_data.get("r"),
+        "lora_alpha": cfg_data.get("lora_alpha"),
+        "target_modules": cfg_data.get("target_modules"),
+    }
 
 
 def load_v0_for_training(cfg: ReplayTrainConfig):
@@ -375,6 +460,7 @@ def build_optimizer(model: Any, cfg: ReplayTrainConfig):
 
 
 __all__ = [
+    "verify_adapter_reloadable",
     "ReplayTrainConfig",
     "ReplayTrainError",
     "action_logprobs_under_prefix",
