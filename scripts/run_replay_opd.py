@@ -202,6 +202,7 @@ def train(batch_inputs, args):
         adapter_path=args.adapter_path,
         output_dir=Path(args.out) / "v_replay",
         learning_rate=args.learning_rate,
+        device=args.device,
     )
     log(f"loading v0 from {cfg.adapter_path}")
     model = load_v0_for_training(cfg)
@@ -240,6 +241,12 @@ def main() -> int:
     ap.add_argument("--teacher-tokenizer", default="deepseek-ai/DeepSeek-V4-Flash-0731")
     # training
     ap.add_argument("--learning-rate", type=float, default=1e-5)
+    ap.add_argument("--device", default=os.environ.get("REPLAY_TRAIN_DEVICE"),
+                    help='CUDA device for the optimizer step, e.g. "cuda" or '
+                         '"cuda:0". Required for a real run and deliberately '
+                         "not defaulted: the ck75 serving endpoint is a "
+                         "different host, and an inferred device is how the "
+                         "step silently ran on CPU.")
     ap.add_argument("--out", default="./vektori-out/opd-replay")
     ap.add_argument("--dry-run", action="store_true",
                     help="select and render only; spend nothing")
@@ -288,13 +295,39 @@ def main() -> int:
         return 0
 
     for need, flag in ((args.api_base, "--api-base"), (args.model, "--model"),
-                       (args.adapter_path, "--adapter-path")):
+                       (args.adapter_path, "--adapter-path"),
+                       (args.device, "--device")):
         if not need:
             print(f"{flag} is required for a real run", file=sys.stderr)
             return 2
     if not os.environ.get("FIREWORKS_API_KEY"):
         print("FIREWORKS_API_KEY is not set", file=sys.stderr)
         return 2
+
+    # Validate the training device *now*, not at stage 4. `load_v0_for_training`
+    # would catch a bad device anyway, but only after 32 samples and every
+    # teacher call have been paid for. The check is free; the ordering is the
+    # whole point.
+    try:
+        import torch
+
+        if not str(args.device).startswith("cuda"):
+            raise SystemExit(f"--device {args.device!r} is not a CUDA device")
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                f"--device {args.device!r} but torch.cuda.is_available() is False — "
+                "this host has no GPU. The ck75 serving endpoint is a separate "
+                "machine and does not provide one to this process."
+            )
+        idx = torch.device(args.device).index or 0
+        if idx >= torch.cuda.device_count():
+            raise SystemExit(
+                f"--device {args.device!r} but only {torch.cuda.device_count()} "
+                "CUDA device(s) visible"
+            )
+        log(f"training device: {args.device} ({torch.cuda.get_device_name(idx)})")
+    except ImportError:
+        raise SystemExit("torch is not importable; this host cannot train")
 
     import transformers
 
