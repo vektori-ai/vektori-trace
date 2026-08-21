@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +209,7 @@ def candidates_from_traces(
     *,
     min_step: int = 1,
     max_step: int | None = None,
+    reconstruct_compaction: bool = True,
 ) -> list[ReplayPrefix]:
     """Flatten traces into the candidate pool `replay_select` chooses from.
 
@@ -230,16 +231,55 @@ def candidates_from_traces(
         if upper <= min_step:
             continue
 
-        # Compaction boundaries, derived rather than left empty. This marks a
-        # step as *following* a boundary; it does not rebuild the retained
-        # state — `prefix_turns_through_step` still slices from index 0, so the
-        # prefix carries pre-boundary history that Harbor replaced. See
-        # `compaction` module docstring and plan §15: `select_replay_prefixes`
-        # refuses a non-zero `require_post_compaction` precisely because this
-        # flag is positional, not reconstructed.
         comp_steps, first_boundary, diag = _compaction_steps_for(rec, turns)
         for k, v in diag.items():
             compaction_diag[k] = compaction_diag.get(k, 0) + v
+
+        if reconstruct_compaction and first_boundary is not None:
+            # Enumerate from the *reconstructed* segment: the retained handoff
+            # head plus what followed it, with the replaced history dropped.
+            # This is `sft_export_traces`' definition, which is the geometry
+            # ck75 was actually trained on — a flat prefix here would be both
+            # historically false and off-distribution for the student we
+            # sample from.
+            #
+            # Steps are re-enumerated inside the segment, so `step_index` is
+            # positional within the live conversation rather than within the
+            # whole trace. That is the coordinate the prefix has to be built
+            # in; the original trace length is still carried for staging.
+            from .compaction import current_segment
+
+            try:
+                seg_turns = current_segment(turns, rec.trial_dir)
+            except Exception:
+                compaction_diag["reconstruction_failed"] = (
+                    compaction_diag.get("reconstruction_failed", 0) + 1
+                )
+                continue
+            if not seg_turns:
+                compaction_diag["empty_segment"] = (
+                    compaction_diag.get("empty_segment", 0) + 1
+                )
+                continue
+            compaction_diag["traces_reconstructed"] = (
+                compaction_diag.get("traces_reconstructed", 0) + 1
+            )
+            seg = enumerate_prefixes(
+                rec.task,
+                rec.trace_id,
+                seg_turns,
+                min_step=min_step,
+                max_step=max_step,
+                compaction_steps=set(),
+                first_boundary_step=None,
+            )
+            # Every candidate here *is* post-compaction, and now legitimately
+            # so: its prefix is the retained state, not the replaced history.
+            out.extend(
+                replace(c, post_compaction=True, trace_n_steps=rec.n_steps)
+                for c in seg
+            )
+            continue
 
         out.extend(
             enumerate_prefixes(

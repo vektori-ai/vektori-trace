@@ -224,17 +224,143 @@ def first_boundary_step(boundaries: list[CompactionBoundary]) -> int | None:
     return min(steps) if steps else None
 
 
+#: The system turn terminus-2 writes at every context reset. `atif` keeps it as
+#: a depth-0 system turn, so it survives parsing as a split point. Kept
+#: byte-identical to `sft_export_traces.BOUNDARY_MESSAGE`: the two paths must
+#: split at the same places or the SFT corpus and the replay corpus describe
+#: different conversations.
+BOUNDARY_MESSAGE = "Performed context summarization and handoff to continue task."
+
+
+def handoff_head(jobs_dir: Path, boundary_ordinal: int) -> list[Any]:
+    """The opening of the conversation that follows compaction number N.
+
+    Ported verbatim from `sft_export_traces.handoff_head`, which established
+    the contract v1/ck75 was actually trained on. Its reasoning, unchanged:
+
+        The main trajectory only holds the *tail* of a handoff — the step
+        carrying the previous agent's answers. The head (the "you are picking
+        up work…" message with the summary in it, and the new agent's
+        questions) lives in `trajectory.summarization-N-questions.json`, which
+        is why reading only `agent/trajectory.json` produces a conversation
+        with no beginning.
+
+    `SFT-REPAIR-PLAN.md` records that collapsing this head into the single
+    main-trajectory user message was considered and rejected: it leaves "Here
+    are the answers…" dangling against questions absent from the context.
+    """
+    from .mining.atif import find_trajectory, parse_trajectory_file
+
+    main = find_trajectory(Path(jobs_dir))
+    if main is None:
+        return []
+    path = main.parent / f"trajectory.summarization-{boundary_ordinal}-questions.json"
+    if not path.exists():
+        return []
+    # Depth 0: this is the parent conversation resuming, not subagent chatter.
+    return [t for t in parse_trajectory_file(path) if t.subagent_depth == 0]
+
+
+def split_on_compaction(turns: list[Any], jobs_dir: Path) -> list[list[Any]]:
+    """One list of turns per linear conversation the model actually saw.
+
+    Ported from `sft_export_traces.split_on_compaction`. Each boundary ends the
+    current segment and starts the next one from the questions-sidecar head, so
+    a segment contains the retained state and what followed it — never the
+    history `boundary: "replace"` discarded.
+
+    Splits on `BOUNDARY_MESSAGE` rather than on `extra.context_management`
+    because it operates on parsed `Turn`s, which do not carry `extra`. The
+    structured predicate remains the detector of record
+    (`boundaries_from_raw`); `assert_split_agrees_with_raw` checks the two
+    agree on a given trace, since a disagreement would mean the corpus this
+    run trains on differs from the one it reports.
+    """
+    segments: list[list[Any]] = []
+    current: list[Any] = []
+    boundary_ordinal = 0
+    for turn in turns:
+        if turn.subagent_depth > 0:
+            continue  # summarization subagent transcript; reached via handoff_head
+        content = turn.content or ""
+        if turn.role == "system" and content.startswith("[subagent"):
+            continue
+        if turn.role == "system" and content.strip() == BOUNDARY_MESSAGE:
+            segments.append(current)
+            boundary_ordinal += 1
+            current = list(handoff_head(jobs_dir, boundary_ordinal))
+            continue
+        current.append(turn)
+    segments.append(current)
+    return [s for s in segments if s]
+
+
+def current_segment(turns: list[Any], jobs_dir: Path) -> list[Any]:
+    """The latest reconstructed segment — the conversation now in context.
+
+    After several boundaries only the most recent segment is live; earlier ones
+    were replaced. The audited corpus has traces with up to four boundaries, so
+    "latest" is the common case rather than an edge one.
+    """
+    segments = split_on_compaction(turns, jobs_dir)
+    return segments[-1] if segments else []
+
+
+def assert_split_agrees_with_raw(turns: list[Any], jobs_dir: Path) -> dict[str, Any]:
+    """The prose split and the structured detector must find the same boundaries.
+
+    `split_on_compaction` keys on `BOUNDARY_MESSAGE`; `boundaries_from_raw`
+    keys on `extra.context_management`. They should agree exactly. A
+    disagreement is a finding, not a nuisance: it means one of the two views of
+    the corpus is wrong, and both are load-bearing — the split builds what the
+    model sees, the detector builds what the report claims.
+    """
+    from .mining.atif import find_trajectory
+
+    main = find_trajectory(Path(jobs_dir))
+    if main is None:
+        raise CompactionError(f"{jobs_dir}: no trajectory to reconcile against")
+    raw = boundaries_from_raw(main)
+    n_prose = sum(
+        1
+        for t in turns
+        if getattr(t, "subagent_depth", 0) == 0
+        and getattr(t, "role", None) == "system"
+        and (getattr(t, "content", "") or "").strip() == BOUNDARY_MESSAGE
+    )
+    if n_prose != len(raw):
+        raise CompactionError(
+            f"{jobs_dir}: the message-based split finds {n_prose} boundaries but "
+            f"extra.context_management finds {len(raw)}. The reconstructed "
+            "conversation and the reported boundary inventory disagree."
+        )
+    return {"n_boundaries": len(raw), "agrees": True}
+
+
 def reconstruction_is_implemented() -> bool:
     """Whether post-compaction prefixes are rebuilt from the retained state.
 
-    Exists so a caller can assert on it rather than assume. Returns False:
-    `prefix_turns_through_step` still slices from index 0 (plan §15).
+    Exists so a caller can assert on it rather than assume.
+
+    True since the port of `sft_export_traces`' definition:
+    `candidates_from_traces` enumerates compacted traces from
+    `current_segment`, so a post-compaction candidate's prefix is the retained
+    handoff state plus what followed it — not the history Harbor replaced.
+
+    Consequences for callers, both deliberate: `select_replay_prefixes` stops
+    excluding compacted candidates, and `require_post_compaction > 0` becomes
+    satisfiable. Anything that reverts the enumeration must revert this too.
     """
-    return False
+    return True
 
 
 __all__ = [
+    "BOUNDARY_MESSAGE",
     "CompactionBoundary",
+    "assert_split_agrees_with_raw",
+    "current_segment",
+    "handoff_head",
+    "split_on_compaction",
     "CompactionError",
     "HANDOFF_MARKERS",
     "boundaries_from_raw",

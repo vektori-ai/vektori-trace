@@ -642,11 +642,38 @@ Established:
   post-compaction prefix carries the pre-compaction history *and* the sidecar
   text.
 
-**Not established, and gating any parser:** what the retained state DeepSeek
-actually conditioned on after a boundary. The sidecars hold a
-summary/questions/answers handoff conversation, not a drop-in message list.
-Until that is read, mark-only / replace-from-sidecar / both is undecided.
+**Resolved 2026-08-22 — the answer was already in the repository.**
+`scripts/sft_export_traces.py` reconstructed exactly this for the SFT corpus:
+`handoff_head()` loads the head from
+`trajectory.summarization-N-questions.json` and `split_on_compaction()` starts
+each segment from it, discarding the replaced history. Its docstring is
+explicit that the main trajectory holds only the *tail* — the previous agent's
+answers — so the 185/185 inlined-handoff finding shows the tail is reachable,
+not that the main trajectory is sufficient. `SFT-REPAIR-PLAN.md` records that
+collapsing the head into that single user message was considered and rejected:
+it leaves "Here are the answers…" dangling against absent questions.
 
-**Consequence for this run:** no prefix may be selected or reported as
-post-compaction. `require_post_compaction` must refuse rather than silently
-degrade to zero, so the run cannot claim coverage it does not have.
+This matters beyond provenance. **ck75's own SFT used that geometry**, so a
+flat pre-boundary prefix is off-distribution for the very student replay OPD
+samples from — a validity problem for an on-policy method, not just a
+historical inaccuracy.
+
+The reconstruction now lives in `vektori_trace/compaction.py`
+(`split_on_compaction`, `handoff_head`, `current_segment`) and
+`sft_export_traces.py` imports it, so the two paths cannot drift; a test pins
+byte-identical output against the original implementation.
+`candidates_from_traces` enumerates compacted traces from `current_segment`,
+and `reconstruction_is_implemented()` returns True.
+
+**Consequence for this run:** post-compaction prefixes are legitimate again and
+`require_post_compaction=2` is satisfiable. Two guards remain from the interim
+period and stay: while the contract is False, candidates at or after a trace's
+first boundary are *excluded* rather than merely un-required (a zero quota
+still selected them — 7 of 8 on a mixed pool), and exclusion keys off
+`in_compacted_segment`, which covers the whole segment, rather than
+`post_compaction`, which marks only the first step after each boundary.
+
+**The census must be re-run.** The 38% overflow figure measured flat prefixes
+carrying replaced history; reconstruction makes compacted prefixes far shorter,
+and SFT's own `COMPACTION_TRIGGER` (40448 − 8000 = 32,448) bounds a correctly
+rebuilt segment just above this run's 31,744 budget.

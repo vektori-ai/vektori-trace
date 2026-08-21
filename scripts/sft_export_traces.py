@@ -39,10 +39,14 @@ from vektori_trace.mining.atif import (
 )
 from vektori_trace.schema import Turn
 
-# terminus-2 writes this system step at every context reset, tagged
-# `extra.context_management = {"type": "compaction", "boundary": "replace"}`.
-# atif keeps it as a depth-0 system turn, so it survives as our split point.
-BOUNDARY_MESSAGE = "Performed context summarization and handoff to continue task."
+# The reconstruction lives in `vektori_trace.compaction` now, so replay OPD and
+# this exporter split at exactly the same places. Re-exported here because this
+# script's behaviour must not change: v1/ck75 were trained on its output.
+from vektori_trace.compaction import (  # noqa: E402
+    BOUNDARY_MESSAGE,
+    handoff_head,
+    split_on_compaction,
+)
 
 # The compaction trigger: max_input_tokens 40448 minus the 8000-free-token
 # threshold. No rebuilt segment can legitimately exceed it.
@@ -91,44 +95,6 @@ def passing_rollouts(run_dir: Path) -> list[dict]:
     return select_rollouts(run_dir, "passing")
 
 
-def handoff_head(jobs_dir: Path, boundary_ordinal: int) -> list[Turn]:
-    """The opening of the conversation that follows compaction number N.
-
-    The main trajectory only holds the *tail* of a handoff — the step carrying
-    the previous agent's answers. The head (the "you are picking up work…"
-    message with the summary in it, and the new agent's questions) lives in
-    `trajectory.summarization-N-questions.json`, which is why reading only
-    `agent/trajectory.json` produces a conversation with no beginning.
-    """
-    main = find_trajectory(jobs_dir)
-    if main is None:
-        return []
-    path = main.parent / f"trajectory.summarization-{boundary_ordinal}-questions.json"
-    if not path.exists():
-        return []
-    # Depth 0: this is the parent conversation resuming, not subagent chatter.
-    return [t for t in parse_trajectory_file(path) if t.subagent_depth == 0]
-
-
-def split_on_compaction(turns: list[Turn], jobs_dir: Path) -> list[list[Turn]]:
-    """One list of turns per linear conversation the model actually saw."""
-    segments: list[list[Turn]] = []
-    current: list[Turn] = []
-    boundary_ordinal = 0
-    for turn in turns:
-        if turn.subagent_depth > 0:
-            continue  # summarization subagent transcript; reached via handoff_head
-        content = turn.content or ""
-        if turn.role == "system" and content.startswith("[subagent"):
-            continue
-        if turn.role == "system" and content.strip() == BOUNDARY_MESSAGE:
-            segments.append(current)
-            boundary_ordinal += 1
-            current = list(handoff_head(jobs_dir, boundary_ordinal))
-            continue
-        current.append(turn)
-    segments.append(current)
-    return [s for s in segments if s]
 
 
 def build_segments(rollouts: list[dict]) -> tuple[list[Segment], list[str]]:

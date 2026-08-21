@@ -126,17 +126,16 @@ def test_one_prefix_per_trace_by_default():
     assert len(traces) == len(set(traces))
 
 
-def test_post_compaction_is_refused_while_reconstruction_is_missing():
-    """§8.3 wants two, but the prefixes are not reconstructed yet.
+def test_post_compaction_is_selectable_once_reconstructed():
+    """§8.3's two post-compaction prefixes, now legitimately satisfiable.
 
-    A marked candidate only means "this step follows a boundary"; its prefix is
-    still a flat slice from step 0 carrying the history compaction replaced. So
-    availability is not the gate — `reconstruction_is_implemented()` is. This
-    previously passed by *selecting* such prefixes, which is the bug.
+    While reconstruction was missing this had to refuse: a marked candidate's
+    prefix was a flat slice carrying the replaced history. Candidates are now
+    enumerated from the retained segment, so the quota can be met.
     """
     pool = _pool(10, pc_on={"tr0-0", "tr1-0", "tr2-0"})
-    with pytest.raises(ReplaySelectionError, match="reconstruction is not implemented"):
-        select_replay_prefixes(pool, require_post_compaction=2)
+    chosen = select_replay_prefixes(pool, require_post_compaction=2)
+    assert sum(1 for c in chosen if c.post_compaction) >= 2
 
 
 def test_missing_post_compaction_refuses_rather_than_degrades():
@@ -308,25 +307,32 @@ def _pc_pool(n=24, seg_on=lambda i: i % 3 == 0):
     ]
 
 
-def test_zero_quota_does_not_permit_compacted_selection():
-    """`require_post_compaction=0` means "do not select", not "do not require".
+def test_compacted_candidates_excluded_when_reconstruction_absent(monkeypatch):
+    """The guard that made a zero quota mean "do not select", not just "do not require".
 
-    The sort key orders marked candidates first, so a zero-quota run used to
-    take them opportunistically — 7 of 8 on a mixed pool — while reporting no
-    post-compaction coverage.
+    The sort key orders marked candidates first, so a zero-quota run took them
+    opportunistically — 7 of 8 on a mixed pool — while reporting no coverage.
+    Reconstruction now makes them legitimate, so this pins the fallback: if the
+    contract ever goes False again, exclusion must resume.
     """
+    import vektori_trace.compaction as comp
+
+    monkeypatch.setattr(comp, "reconstruction_is_implemented", lambda: False)
     chosen = select_replay_prefixes(_pc_pool(), n_prefixes=8, require_post_compaction=0)
     assert len(chosen) == 8
     assert not any(c.in_compacted_segment for c in chosen)
-    assert not any(c.post_compaction for c in chosen)
 
 
-def test_exclusion_covers_whole_segment_not_just_first_step():
+def test_exclusion_covers_whole_segment_not_just_first_step(monkeypatch):
     """Only the first step after a boundary is *marked* post_compaction.
 
-    Later steps in the same compacted segment are equally misreconstructed, so
-    excluding on `post_compaction` alone would leave most of them eligible.
+    Later steps in the same compacted segment came from the same replaced
+    context, so excluding on `post_compaction` alone would leave most of them
+    eligible. Exercised under the no-reconstruction contract.
     """
+    import vektori_trace.compaction as comp
+
+    monkeypatch.setattr(comp, "reconstruction_is_implemented", lambda: False)
     pool = [
         ReplayPrefix(
             task=f"t{i}", trace_id=f"tr{i}", step_index=s, prefix_turns=[object()],
@@ -341,7 +347,10 @@ def test_exclusion_covers_whole_segment_not_just_first_step():
     assert all(c.step_index < 10 for c in chosen)
 
 
-def test_all_candidates_compacted_is_refused():
+def test_all_candidates_compacted_is_refused(monkeypatch):
+    import vektori_trace.compaction as comp
+
+    monkeypatch.setattr(comp, "reconstruction_is_implemented", lambda: False)
     pool = _pc_pool(n=12, seg_on=lambda i: True)
     with pytest.raises(ReplaySelectionError, match="sit at or after a compaction"):
         select_replay_prefixes(pool, n_prefixes=8, require_post_compaction=0)
