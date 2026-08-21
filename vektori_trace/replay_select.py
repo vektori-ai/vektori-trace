@@ -19,6 +19,25 @@ two of its properties hard pass conditions:
 What it deliberately does **not** do: read `trajectory.json` files itself. The
 repo already parses Harbor/ATIF trajectories into `schema.Turn`, and a second
 parser would drift from the first.
+
+Two selection policies, and which one a run used is not a detail
+---------------------------------------------------------------
+ReOPD (arXiv:2607.04763) samples replay prefixes under a decaying weight
+`w(t, kappa) = kappa ** t`, kappa=0.6 by default, deliberately favouring *early*
+trace steps because those carry the least distribution shift from the student's
+own states. That is the paper's recipe, and `reopd_step_weights` implements it.
+
+This first 32-action run does **not** use it. It uses `select_replay_prefixes`,
+a stratified diagnostic sample spread across distinct tasks and trace stages,
+including post-compaction states, because the run's purpose is to exercise the
+mechanics — long prefixes, compaction boundaries, ragged alignment — rather than
+to maximise learning signal. Under a kappa=0.6 schedule the late and
+post-compaction states this run most wants to test are precisely the ones that
+would almost never be drawn.
+
+That is a deliberate deviation, not the ReOPD recipe, and a run report must say
+which policy it used. Once mechanics are proven, a learning-oriented run should
+switch to `reopd_step_weights`.
 """
 
 from __future__ import annotations
@@ -267,10 +286,51 @@ def assert_no_source_dominates(
     }
 
 
+#: ReOPD's default steepness (arXiv:2607.04763). kappa=1.0 is uniform.
+REOPD_DEFAULT_KAPPA = 0.6
+
+
+def reopd_step_weights(
+    candidates: list[ReplayPrefix], *, kappa: float = REOPD_DEFAULT_KAPPA
+) -> dict[str, float]:
+    """ReOPD's `w(t, kappa) = kappa ** t` prefix weights, normalised to sum to 1.
+
+    The paper's argument is that a stored teacher prefix is off-policy for the
+    student, and the further into the trace it sits the further the state has
+    drifted from anything the student would have reached itself. Early steps are
+    therefore the reliable ones, and the schedule is a single steepness knob
+    rather than a hard cutoff.
+
+    Returned as `{prefix_id: weight}` for the caller to sample with — this
+    module does not own the RNG, because a run has to be reproducible from its
+    recorded seed and prefix ids.
+
+    Not used by `select_replay_prefixes`; see the module docstring for why this
+    first run samples stratified instead, and record which policy was used.
+    """
+    if not 0.0 < kappa <= 1.0:
+        raise ReplaySelectionError(
+            f"kappa must be in (0, 1], got {kappa!r} (1.0 = uniform)"
+        )
+    if not candidates:
+        raise ReplaySelectionError("no candidates to weight")
+
+    raw = {c.prefix_id: kappa ** c.step_index for c in candidates}
+    total = sum(raw.values())
+    if total <= 0:
+        raise ReplaySelectionError(
+            f"all weights underflowed at kappa={kappa} — steps are too deep "
+            "for this schedule; raise kappa or restrict max_step"
+        )
+    return {k: v / total for k, v in raw.items()}
+
+
 __all__ = [
+    "REOPD_DEFAULT_KAPPA",
     "ReplayPrefix",
     "ReplaySelectionError",
     "assert_no_source_dominates",
     "enumerate_prefixes",
+    "reopd_step_weights",
     "select_replay_prefixes",
 ]
