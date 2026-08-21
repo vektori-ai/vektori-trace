@@ -170,7 +170,27 @@ def select_replay_prefixes(
 
     want_tasks = n_prefixes if min_distinct_tasks is None else min_distinct_tasks
     available_pc = [c for c in candidates if c.post_compaction]
-    want_pc = min(require_post_compaction, len(available_pc))
+    if require_post_compaction > len(available_pc):
+        # Refuse rather than degrade. `min(require, available)` quietly asked
+        # for zero when the pool had none, and the run then reported a
+        # stratified batch with post-compaction coverage it never had. Nothing
+        # downstream could tell the difference — the batch is well-formed
+        # either way.
+        #
+        # As of 2026-08-21 the pool is *always* empty: `replay_corpus` never
+        # derives boundary steps, and §15 records why a parser is not yet
+        # justified. So this fires on the real corpus by design, and callers
+        # that genuinely want no post-compaction coverage must say
+        # `require_post_compaction=0` explicitly.
+        raise ReplaySelectionError(
+            f"asked for {require_post_compaction} post-compaction prefixes but "
+            f"only {len(available_pc)} candidates are marked. Compaction "
+            "boundaries are not currently derived from the corpus "
+            "(docs/OPD-MULTITURN-PLAN.md §15), so this pool is empty by "
+            "construction. Pass require_post_compaction=0 to run without that "
+            "coverage — and do not report the batch as having it."
+        )
+    want_pc = require_post_compaction
 
     # Spread across trace *stages*, not just tasks. §8.3 asks for both, and
     # with 34 eligible tasks for 8 slots a task-first ordering fills every slot

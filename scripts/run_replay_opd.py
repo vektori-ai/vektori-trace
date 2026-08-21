@@ -274,7 +274,11 @@ def main() -> int:
     ap.add_argument("--n-samples", type=int, default=4)
     ap.add_argument("--max-step", type=int, default=None,
                     help="cap the replay step; long prefixes eat the context window")
-    ap.add_argument("--require-post-compaction", type=int, default=2)
+    ap.add_argument("--require-post-compaction", type=int, default=0,
+                    help="§8.3 wants 2, but compaction boundaries are not "
+                         "derived from the corpus yet (plan §15), so the pool "
+                         "is empty and any value > 0 refuses. Default 0 means "
+                         "this run makes no post-compaction claim.")
     # student
     ap.add_argument("--api-base", default=os.environ.get("STUDENT_API_BASE"))
     ap.add_argument("--model", default=os.environ.get("STUDENT_MODEL"))
@@ -332,9 +336,18 @@ def main() -> int:
     log("stage 1/4: selecting prefixes")
     prefixes, sel = select_prefixes(args)
     report["corpus"] = sel["corpus"]
+    report["post_compaction_coverage"] = {
+        "claimed": False,
+        "reason": "compaction boundaries are not derived from the corpus "
+                  "(docs/OPD-MULTITURN-PLAN.md §15); every candidate is "
+                  "post_compaction=False by construction",
+        "required": args.require_post_compaction,
+    }
     report["prefixes"] = [
         {"prefix_id": p.prefix_id, "task": p.task, "step": p.step_index,
          "post_compaction": p.post_compaction}
+        # NB: post_compaction is False for every candidate until boundaries are
+        # derived from the corpus (plan §15). Reported, not claimed.
         for p in prefixes
     ]
 

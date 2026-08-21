@@ -553,9 +553,100 @@ Stop without scaling for any of the following:
 Ask separately before:
 
 1. the minimal Fireworks scoring probe — **done, passed 2026-08-21**;
-2. the 32-action replay-prefix update (sampling + teacher scoring + one GPU
+2. **the one-example GPU training memory preflight** (§14) — one selected
+   prefix, one action, one forward/backward. Inserted ahead of the 32-action
+   run on 2026-08-21: it is the cheaper question and it determines the other's
+   design;
+3. the 32-action replay-prefix update (sampling + teacher scoring + one GPU
    optimizer step);
-3. the `v0` vs `v_replay` evaluation, if it needs GPU serving;
-4. any larger replay pilot.
+4. the `v0` vs `v_replay` evaluation, if it needs GPU serving;
+5. any larger replay pilot.
 
 Live Harbor/GPU rollouts are not on this list; they are out of scope (§0).
+
+## 14. Execution topology and the memory preflight
+
+**Decided 2026-08-21.** Serving, scoring, and training are three stages with
+saved artifacts between them, not one process:
+
+```text
+L40S serving session
+  -> 4-sample preflight (ids, cap, logprobs, prompt_token_ids)
+  -> 32 sampled captures saved immutably
+  -> teardown
+
+Fireworks
+  -> score the saved captures
+  -> save the scored/aligned batch
+
+separate GPU training job
+  -> load the saved batch
+  -> forward/backward memory preflight
+  -> exactly one optimizer step
+  -> save v_replay
+```
+
+Three reasons, each learned from a specific failure:
+
+- **A serving endpoint is not a training GPU.** `load_v0_for_training` ran with
+  no `device_map`, so the optimizer step would have executed on the host CPU
+  while an L40S served vLLM next to it. It failed silently — slow, not wrong —
+  because `torch.tensor(..., device=None)` also means CPU. The loader now
+  refuses an unset or non-CUDA device before loading any weights.
+- **Teardown between stages.** Sampling holds a GPU that scoring does not need.
+- **The captures are irreplaceable.** `log pi_old` is captured under a frozen
+  policy and cannot be recomputed once the policy moves, so the training step
+  must be resumable against saved captures rather than re-sampling.
+
+The runner is **not** built around this topology yet, deliberately: it should
+not be designed against an L40S assumption that a backward pass at real context
+may not survive.
+
+**The memory preflight is the next paid gate.** A bf16 14B is ~28 GB of weights
+before activations, gradients or optimizer state; LoRA keeps the optimizer
+state small but activation memory at a long prefix does not shrink with it. The
+prefix measured for §14's own preflight was ~95k tokens rendered — well past
+the 30k earlier drafts assumed — so the prefix used must be chosen from the
+measured distribution, not assumed. Fail the preflight and the 32-action run's
+hardware and configuration are wrong as specified.
+
+### 14.1 Prefix context budget
+
+Prefix overflow is checked locally before every sampling request
+(`replay_context.assert_prefix_fits`) against the pinned tokenizer and the
+serving `--max-model-len` (40960). This is not symmetric with the action cap: a
+too-long *action* returns `finish_reason="length"` and is refused, whereas a
+too-long *prefix* is silently truncated from the front by the server. Sampling
+then succeeds, `log pi_old` is finite, alignment passes, and the loss is a real
+number computed at a state the run cannot describe.
+
+The bias matters more than the error: long-horizon and post-compaction prefixes
+overflow first, and those are exactly the states §8.3 exists to stress.
+
+## 15. Compaction: what is established
+
+**Measured 2026-08-21, one real trace — `docs/compaction-evidence.md`.**
+Recorded here because §8.3 asks for post-compaction prefixes and §8.4 requires
+compaction reconstruction to match the historical boundary.
+
+Established:
+
+- compaction is machine-readable: a `source: "system"` step carrying
+  `extra.context_management = {"type": "compaction", "boundary": "replace"}`;
+- **a trace can have several boundaries** (the probed trace has two), each with
+  its own `summarization_index` and sidecar set. Post-compaction is therefore
+  not one boolean per trace — it is "after boundary N, with the replacement
+  state boundary N recorded";
+- the ATIF parser splices the referenced sidecars in **additively**
+  (`_subagent_turns`), so `boundary: "replace"` is not honored and a
+  post-compaction prefix carries the pre-compaction history *and* the sidecar
+  text.
+
+**Not established, and gating any parser:** what the retained state DeepSeek
+actually conditioned on after a boundary. The sidecars hold a
+summary/questions/answers handoff conversation, not a drop-in message list.
+Until that is read, mark-only / replace-from-sidecar / both is undecided.
+
+**Consequence for this run:** no prefix may be selected or reported as
+post-compaction. `require_post_compaction` must refuse rather than silently
+degrade to zero, so the run cannot claim coverage it does not have.

@@ -134,9 +134,21 @@ def test_post_compaction_prefixes_are_taken_when_available():
     assert sum(1 for c in chosen if c.post_compaction) >= 2
 
 
-def test_no_post_compaction_available_is_not_a_failure():
-    """"if available" — a corpus without them still selects."""
-    chosen = select_replay_prefixes(_pool(10), require_post_compaction=2)
+def test_missing_post_compaction_refuses_rather_than_degrades():
+    """§8.3's "if available" must not become a silent zero.
+
+    `min(require, available)` asked for two and accepted none, and the batch it
+    returned was indistinguishable from one that genuinely had the coverage.
+    Since `replay_corpus` never derives boundaries (plan §15), the pool is
+    empty on the real corpus and this is the default path, not an edge case.
+    """
+    with pytest.raises(ReplaySelectionError, match="post-compaction prefixes but"):
+        select_replay_prefixes(_pool(10), require_post_compaction=2)
+
+
+def test_running_without_post_compaction_must_be_explicit():
+    """Opting out is allowed; it just has to be said out loud."""
+    chosen = select_replay_prefixes(_pool(10), require_post_compaction=0)
     assert len(chosen) == 8
     assert not any(c.post_compaction for c in chosen)
 
