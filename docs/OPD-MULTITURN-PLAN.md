@@ -320,11 +320,41 @@ and termination reason.
 any live-updated adapter, so its result is a measurement of replay OPD against
 the untouched baseline rather than a marginal effect on top of something else.
 
-The audited corpus contains 238 DeepSeek rollouts over 60 tasks: 117 passes and
-121 failures. Thirty-four tasks have at least one pass; 26 have none. Begin with
-valid prefixes from passing trajectories because their environment histories
-and compaction boundaries are already reconstructable. Do not claim that
-DeepSeek passed all 60 tasks merely because it was run on all 60.
+The audited corpus is `/data/vektori-out/dsv4-corpus60` plus `-b`. Measured
+2026-08-21 with `replay_corpus.corpus_report`, which is the source of truth for
+these numbers:
+
+| | |
+| --- | --- |
+| trajectories | **240** over **60** tasks |
+| passes (`reward == 1.0`) | **117**, across **34** tasks |
+| failures | 116 |
+| unknown (verifier never ran) | 7 |
+
+Earlier drafts said 238; 240 is what the loader finds. A pass is `reward == 1.0`
+and nothing else — the corpus also carries fractional rewards (0.5, 0.125,
+0.777…) which are partial credit, not a fixed bug.
+
+**Trajectory lengths, and they are not what earlier drafts assumed:**
+
+| | all 240 | passing 117 |
+| --- | --- | --- |
+| min steps | 11 | 11 |
+| median | **59** | **39** |
+| mean | 102 | 66 |
+| max | **460** | 240 |
+
+An earlier version of this plan said "14-25-turn cases". That is wrong by a wide
+margin: the median passing trace is 39 steps and the longest is 240. This
+matters directly for any prefix schedule — ReOPD's default `kappa=0.6` puts
+99.4% of its mass in the first ten steps, so on a 39-step median it would render
+roughly three quarters of every trace unreachable. See §8.3 on why this run
+samples stratified instead.
+
+Begin with valid prefixes from passing trajectories because their environment
+histories and compaction boundaries are already reconstructable. Do not claim
+that DeepSeek passed all 60 tasks merely because it was run on all 60 — only 34
+have a pass.
 
 ### 8.1 What a trace contributes
 
@@ -358,6 +388,22 @@ ck75 version. This is therefore replay-prefix OPD, not fully live trajectory
 OPD and not replay SFT.
 
 ### 8.3 Small replay batch
+
+**Sampling policy: stratified diagnostic, not the ReOPD schedule.** ReOPD
+(arXiv:2607.04763) draws replay prefixes under a decaying weight
+`w(t, kappa) = kappa ** t`, kappa=0.6, deliberately favouring early trace steps
+because those carry the least distribution shift. This run does **not** use it,
+for a reason the measured lengths above make concrete: at kappa=0.6, states past
+step ~10 are drawn about once per five 32-action batches, and the median passing
+trace here is 39 steps. The long-horizon and post-compaction states this run
+exists to stress would essentially never appear.
+
+That is a deliberate deviation. `replay_select.reopd_step_weights` implements
+the paper's schedule and is available for a later learning-oriented pilot, whose
+kappa should be calibrated against the measured length distribution rather than
+inherited. The run report records which policy was used
+(`selection_policy`), because a stratified batch and a `kappa^t` batch are
+different experiments that both report 32 actions.
 
 - Select eight valid prefixes across distinct tasks and trace stages, including
   at least two authentic post-compaction prefixes if available.
