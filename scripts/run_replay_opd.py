@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""One replay-prefix OPD update, end to end (plan §8).
+
+    corpus -> 8 prefixes -> 4 ck75 actions each -> DeepSeek scores each
+           -> chunk alignment + semantic-prior advantages
+           -> one optimizer step -> v_replay
+
+Every stage is an existing, tested module; this is the assembly. It is written
+as one script rather than a library entry point because the run is a *single
+event* with an approval attached to it, and the things worth getting right are
+ordering and refusal, not reuse.
+
+Three orderings that are not arbitrary
+--------------------------------------
+1. **Select and sample before scoring.** Teacher scoring is the paid step; a
+   batch that would fail spread checks or arrive short should fail before it
+   costs anything.
+2. **Score everything before training.** §8.3 takes exactly one optimizer step,
+   so a partially-scored batch cannot be trained on — the denominator would be
+   silently wrong.
+3. **Load `v0` last.** It is the largest allocation, and there is no reason to
+   hold 14B of weights while waiting on HTTP.
+
+Sampling needs a served ck75 (`scripts/serve_student.py`), and scoring needs
+`FIREWORKS_API_KEY`. `--dry-run` does everything except spend: it selects,
+renders, and reports what the run *would* cost, which is the number an approval
+should be granted against.
+
+    .venv/bin/python scripts/run_replay_opd.py --dry-run
+    .venv/bin/python scripts/run_replay_opd.py --api-base "$STUDENT_API_BASE" \\
+        --model "$STUDENT_MODEL" --adapter-path /adapters/... --out /data/replay-v1
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+DEFAULT_CORPUS = ["/data/vektori-out/dsv4-corpus60", "/data/vektori-out/dsv4-corpus60-b"]
+DEFAULT_TEACHER = "accounts/fireworks/models/deepseek-v4-flash-0731"
+POLICY_VERSION = "ck75-v0"
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def post(url: str, payload: dict, timeout: float = 900.0):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, {"raw": raw[:800]}
+    except urllib.error.URLError as e:
+        return 0, {"unreachable": str(e)}
+
+
+class _Capture:
+    """Duck-typed `CapturedCompletion` over a raw vLLM completion choice."""
+
+    def __init__(self, body: dict, choice: dict):
+        lp = choice.get("logprobs") or {}
+        self.token_ids = choice.get("token_ids") or body.get("token_ids") or []
+        self.prompt_token_ids = body.get("prompt_token_ids") or []
+        self.logprobs = lp.get("token_logprobs")
+        self.finish_reason = choice.get("finish_reason")
+        self.text = choice.get("text")
+        self.request_id = body.get("id")
+        self.model = body.get("model")
+
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+
+
+def select_prefixes(args) -> tuple[list, dict[str, Any]]:
+    from vektori_trace.replay_corpus import (
+        candidates_from_traces,
+        corpus_report,
+        load_corpus,
+    )
+    from vektori_trace.replay_select import select_replay_prefixes
+
+    traces = []
+    for root in args.corpus:
+        traces.extend(load_corpus(Path(root), passing_only=True))
+    if not traces:
+        raise SystemExit(f"no passing traces under {args.corpus}")
+    log(f"corpus: {len(traces)} passing traces")
+
+    candidates = candidates_from_traces(traces, max_step=args.max_step)
+    log(f"candidate replay states: {len(candidates)}")
+
+    chosen = select_replay_prefixes(
+        candidates,
+        n_prefixes=args.n_prefixes,
+        require_post_compaction=args.require_post_compaction,
+    )
+    by_trace = {t.trace_id: t for t in traces}
+    for p in chosen:
+        log(f"  {p.task} {p.prefix_id} (step {p.step_index})")
+    return chosen, {"traces": by_trace, "corpus": corpus_report(traces)}
+
+
+def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
+    """Four ck75 actions per prefix, with ids and behaviour logprobs."""
+    from vektori_trace.dataset import turns_to_messages
+    from vektori_trace.replay_sample import (
+        sampled_action_from_capture,
+        summarize_cap_hits,
+    )
+
+    actions, rendered = [], {}
+    for prefix in prefixes:
+        messages = turns_to_messages(prefix.prefix_turns)
+        if not messages:
+            raise SystemExit(f"{prefix.prefix_id}: prefix rendered to zero messages")
+        rendered[prefix.prefix_id] = messages
+        prompt = student_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        for i in range(args.n_samples):
+            status, body = post(
+                args.api_base.rstrip("/") + "/completions",
+                {
+                    "model": args.model,
+                    "prompt": prompt,
+                    "max_tokens": args.max_tokens,
+                    "temperature": args.temperature,
+                    "logprobs": 0,
+                    "return_token_ids": True,
+                },
+            )
+            if status != 200:
+                raise SystemExit(
+                    f"{prefix.prefix_id}#{i}: sampling failed HTTP {status}: "
+                    f"{str(body)[:300]}"
+                )
+            cap = _Capture(body, (body.get("choices") or [{}])[0])
+            # Refuses a missing logprob, a missing prompt id, or a cap hit —
+            # all three are unrecoverable after sampling.
+            actions.append(
+                sampled_action_from_capture(
+                    cap,
+                    student_tok,
+                    prefix_id=prefix.prefix_id,
+                    sample_index=i,
+                    policy_version=POLICY_VERSION,
+                )
+            )
+        log(f"  sampled 4 at {prefix.prefix_id}")
+    return actions, {"rendered": rendered, "cap": summarize_cap_hits(actions)}
+
+
+def score_actions(actions, rendered, args):
+    from vektori_trace.providers.teacher.fireworks import FireworksTeacherPool
+    from vektori_trace.replay_score import score_replay_batch
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    teacher_tok = load_tokenizer(args.teacher_tokenizer)
+    pool = FireworksTeacherPool(model=args.teacher_model)
+    scored, ledger = score_replay_batch(actions, rendered, teacher_tok, pool)
+    log(
+        f"scored {ledger['n_actions']} actions; "
+        f"{ledger['teacher_input_tokens']:,} teacher input tokens "
+        f"({ledger['repeated_prefix_tokens']:,} repeated prefix)"
+    )
+    return scored, ledger, pool.provenance()
+
+
+def train(batch_inputs, args):
+    from vektori_trace.replay_opd import run_replay_chunk_opd
+    from vektori_trace.replay_train import (
+        ReplayTrainConfig,
+        build_optimizer,
+        load_v0_for_training,
+        make_optimizer_step,
+    )
+
+    prefixes, actions, scored, stored = batch_inputs
+    cfg = ReplayTrainConfig(
+        base_model=args.base_model,
+        adapter_path=args.adapter_path,
+        output_dir=Path(args.out) / "v_replay",
+        learning_rate=args.learning_rate,
+    )
+    log(f"loading v0 from {cfg.adapter_path}")
+    model = load_v0_for_training(cfg)
+    opt = build_optimizer(model, cfg)
+
+    return run_replay_chunk_opd(
+        prefixes,
+        actions,
+        scored,
+        make_optimizer_step(model, opt, cfg),
+        max_new_tokens=args.max_tokens,
+        n_samples_per_prefix=args.n_samples,
+        stored_teacher_actions=stored,
+        selection_policy="stratified-diagnostic",
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", action="append", default=None)
+    ap.add_argument("--n-prefixes", type=int, default=8)
+    ap.add_argument("--n-samples", type=int, default=4)
+    ap.add_argument("--max-step", type=int, default=None,
+                    help="cap the replay step; long prefixes eat the context window")
+    ap.add_argument("--require-post-compaction", type=int, default=2)
+    # student
+    ap.add_argument("--api-base", default=os.environ.get("STUDENT_API_BASE"))
+    ap.add_argument("--model", default=os.environ.get("STUDENT_MODEL"))
+    ap.add_argument("--base-model", default="Qwen/Qwen3-14B")
+    ap.add_argument("--student-tokenizer", default="Qwen/Qwen3-14B")
+    ap.add_argument("--adapter-path", default=None, help="the frozen v0 adapter")
+    ap.add_argument("--max-tokens", type=int, default=9216)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    # teacher
+    ap.add_argument("--teacher-model", default=DEFAULT_TEACHER)
+    ap.add_argument("--teacher-tokenizer", default="deepseek-ai/DeepSeek-V4-Flash-0731")
+    # training
+    ap.add_argument("--learning-rate", type=float, default=1e-5)
+    ap.add_argument("--out", default="./vektori-out/opd-replay")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="select and render only; spend nothing")
+    args = ap.parse_args()
+    args.corpus = args.corpus or DEFAULT_CORPUS
+
+    from vektori_trace.chunk_opd import assert_token_cap_is_task_derived
+
+    assert_token_cap_is_task_derived(args.max_tokens)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "policy_version": POLICY_VERSION,
+        "n_prefixes": args.n_prefixes,
+        "n_samples_per_prefix": args.n_samples,
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "learning_rate": args.learning_rate,
+    }
+
+    log("stage 1/4: selecting prefixes")
+    prefixes, sel = select_prefixes(args)
+    report["corpus"] = sel["corpus"]
+    report["prefixes"] = [
+        {"prefix_id": p.prefix_id, "task": p.task, "step": p.step_index,
+         "post_compaction": p.post_compaction}
+        for p in prefixes
+    ]
+
+    if args.dry_run:
+        from vektori_trace.dataset import turns_to_messages
+
+        total = 0
+        for p in prefixes:
+            total += sum(len(m.get("content") or "") for m in turns_to_messages(p.prefix_turns))
+        report["dry_run"] = True
+        report["approx_prefix_chars"] = total
+        report["projected_teacher_requests"] = args.n_prefixes * args.n_samples
+        log(
+            f"DRY RUN — would sample {args.n_prefixes * args.n_samples} actions "
+            f"and issue as many teacher requests. Nothing spent."
+        )
+        (out / "dry_run.json").write_text(json.dumps(report, indent=2))
+        log(f"report: {out / 'dry_run.json'}")
+        return 0
+
+    for need, flag in ((args.api_base, "--api-base"), (args.model, "--model"),
+                       (args.adapter_path, "--adapter-path")):
+        if not need:
+            print(f"{flag} is required for a real run", file=sys.stderr)
+            return 2
+    if not os.environ.get("FIREWORKS_API_KEY"):
+        print("FIREWORKS_API_KEY is not set", file=sys.stderr)
+        return 2
+
+    import transformers
+
+    student_tok = transformers.AutoTokenizer.from_pretrained(
+        args.student_tokenizer, trust_remote_code=True
+    )
+
+    log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
+    actions, samp = sample_actions(prefixes, student_tok, args)
+    report["cap"] = samp["cap"]
+
+    log("stage 3/4: scoring with DeepSeek")
+    scored, ledger, teacher_prov = score_actions(actions, samp["rendered"], args)
+    report["teacher_ledger"] = ledger
+    report["teacher"] = teacher_prov
+
+    # The stored DeepSeek action at each replay step, so the driver can assert
+    # ck75 did not simply reproduce it. Never a training target.
+    stored = {}
+    for p in prefixes:
+        rec = sel["traces"].get(p.trace_id)
+        if rec is not None:
+            got = rec.stored_actions.get(p.step_index)
+            if got:
+                stored[p.prefix_id] = got
+
+    log("stage 4/4: one optimizer step")
+    result = train((prefixes, actions, scored, stored), args)
+    report["run"] = result
+
+    (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
+    log(f"v_replay: {result['optimizer'].get('adapter_saved_to')}")
+    log(f"report: {out / 'replay_run.json'}")
+    log("TEAR DOWN the ck75 endpoint now — it is the only thing still billing.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
