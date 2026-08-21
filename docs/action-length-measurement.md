@@ -89,3 +89,30 @@ Two caveats, both real:
 
 CPU only, no endpoint, no spend — reads trajectories off disk and tokenizes
 locally. See `scripts/measure_action_lengths.py`.
+
+
+## ck75's own lengths — first evidence (2026-08-21)
+
+The serving probe (`scripts/probe_ck75_replay_sampling.py`) sampled four actions
+at one replay prefix (`agronholm__anyio-1121__b3TsPDw@70`, a 30,408-token
+prompt). Token counts:
+
+    242, 295, 272, 231     mean 260, max 295
+
+**ck75 is roughly 4x terser than DeepSeek** (median 534, mean 956). Against the
+9,216 cap that is ~35x of headroom, so the cap is doing nothing for the student
+but its job as a loop guard — which is the job it was chosen for.
+
+Two things this does *not* license:
+
+- **Four samples at one prefix is not a distribution.** It is the first real
+  ck75 evidence and it points opposite to the corpus measurement, which is
+  reason to watch rather than to re-derive the cap downward.
+- **Terser is not obviously better.** The run6 forensics recorded ck75 giving
+  "fast, confident, wrong" answers — four rollouts that patched CI workflows
+  without ever opening `src/`. A student emitting 260 tokens where the teacher
+  emits 956 may be efficient or may be skipping the work. The chunk advantages
+  are where that would show up, not here.
+
+The corpus figures above stay the basis for the cap: they bound what a *long*
+action looks like, and the cap exists for the tail, not the median.
