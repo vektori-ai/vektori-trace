@@ -216,6 +216,7 @@ def candidates_from_traces(
     action" for ck75 to take at a state the trace itself never continued from.
     """
     out: list[ReplayPrefix] = []
+    compaction_diag: dict[str, int] = {}
     for rec in traces:
         from .mining.atif import parse_job_trajectory
 
@@ -236,28 +237,9 @@ def candidates_from_traces(
         # `compaction` module docstring and plan §15: `select_replay_prefixes`
         # refuses a non-zero `require_post_compaction` precisely because this
         # flag is positional, not reconstructed.
-        comp_steps: set[int] = set()
-        try:
-            from .compaction import (
-                boundaries_from_raw,
-                locate_in_turns,
-                post_compaction_steps,
-            )
-            from .evaluate.resume import assistant_tool_steps
-            from .mining.atif import find_trajectory
-
-            traj_path = find_trajectory(rec.trial_dir)
-            if traj_path is not None:
-                raw = boundaries_from_raw(traj_path)
-                if raw:
-                    located = locate_in_turns(
-                        raw, turns, assistant_tool_steps(turns)
-                    )
-                    comp_steps = post_compaction_steps(located)
-        except Exception:
-            # A trace whose boundaries cannot be read is not a fatal corpus
-            # error: it simply contributes no post-compaction candidates.
-            comp_steps = set()
+        comp_steps, diag = _compaction_steps_for(rec, turns)
+        for k, v in diag.items():
+            compaction_diag[k] = compaction_diag.get(k, 0) + v
 
         out.extend(
             enumerate_prefixes(
@@ -269,7 +251,62 @@ def candidates_from_traces(
                 compaction_steps=comp_steps,
             )
         )
+    candidates_from_traces.last_compaction_report = dict(compaction_diag)
     return out
+
+
+def _compaction_steps_for(rec: TraceRecord, turns: list[Any]) -> tuple[set[int], dict[str, int]]:
+    """Post-compaction step indices for one trace, plus what went wrong.
+
+    Failures are *counted and returned*, not swallowed. A trace whose
+    boundaries cannot be mapped silently becomes an ordinary trace: its
+    post-compaction states vanish from the pool and nothing says so. That is
+    tolerable while `require_post_compaction=0`, and unacceptable the moment a
+    post-compaction experiment relies on the pool being complete — so the
+    caller gets the counts and can decide.
+    """
+    from .compaction import (
+        CompactionError,
+        boundaries_from_raw,
+        locate_in_turns,
+        post_compaction_steps,
+    )
+    from .evaluate.resume import assistant_tool_steps
+    from .mining.atif import find_trajectory
+
+    diag: dict[str, int] = {"traces_seen": 1}
+    try:
+        traj_path = find_trajectory(rec.trial_dir)
+    except Exception:
+        diag["find_trajectory_failed"] = 1
+        return set(), diag
+    if traj_path is None:
+        diag["no_trajectory"] = 1
+        return set(), diag
+
+    try:
+        raw = boundaries_from_raw(traj_path)
+    except CompactionError:
+        diag["unreadable_trajectory"] = 1
+        return set(), diag
+    if not raw:
+        return set(), diag
+
+    diag["traces_with_markers"] = 1
+    diag["raw_boundaries"] = len(raw)
+    try:
+        located = locate_in_turns(raw, turns, assistant_tool_steps(turns))
+    except Exception:
+        diag["mapping_failed"] = 1
+        return set(), diag
+
+    diag["unmatched_markers"] = sum(1 for b in located if b.marker_turn_index is None)
+    diag["missing_handoff"] = sum(1 for b in located if b.handoff_turn_index is None)
+    steps = post_compaction_steps(located)
+    diag["mapped_boundaries"] = len(steps)
+    if steps:
+        diag["traces_mapped"] = 1
+    return steps, diag
 
 
 def corpus_report(traces: list[TraceRecord]) -> dict[str, Any]:

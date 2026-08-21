@@ -174,11 +174,12 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
 
     from vektori_trace.replay_context import (
         assert_prefix_fits,
+        assert_prompt_ids_match,
         measure_prefix,
         summarize_budgets,
     )
 
-    actions, rendered, budgets = [], {}, []
+    actions, rendered, budgets, parity = [], {}, [], []
     for prefix in prefixes:
         messages = turns_to_messages(prefix.prefix_turns)
         if not messages:
@@ -218,6 +219,15 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
                     f"{str(body)[:300]}"
                 )
             cap = _Capture(body, (body.get("choices") or [{}])[0])
+            # The local budget proved our rendering fits; this proves the
+            # server consumed that exact rendering. Checked on every sample,
+            # because drift is not per-prefix and truncation is silent.
+            local_ids = student_tok(prompt, add_special_tokens=False)["input_ids"]
+            parity.append(
+                assert_prompt_ids_match(
+                    prefix.prefix_id, list(local_ids), cap.prompt_token_ids
+                )
+            )
             # Refuses a missing logprob, a missing prompt id, or a cap hit —
             # all three are unrecoverable after sampling.
             actions.append(
@@ -234,6 +244,10 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
         "rendered": rendered,
         "cap": summarize_cap_hits(actions),
         "context": summarize_budgets(budgets),
+        "prompt_id_parity": {
+            "n_checked": len(parity),
+            "all_exact": all(p.get("exact_match") for p in parity),
+        },
     }
 
 
@@ -404,9 +418,16 @@ def main() -> int:
     report["context_filter"] = sel["context_filter"]
     report["post_compaction_coverage"] = {
         "claimed": False,
-        "reason": "compaction boundaries are not derived from the corpus "
-                  "(docs/OPD-MULTITURN-PLAN.md §15); every candidate is "
-                  "post_compaction=False by construction",
+        "reason": "boundaries ARE detected (compaction.boundaries_from_raw), but "
+                  "post-compaction prefixes are not reconstructed: "
+                  "prefix_turns_through_step still slices from step 0, so a "
+                  "marked prefix carries the pre-boundary history that "
+                  "boundary:replace discarded. SFT solved this in "
+                  "sft_export_traces.split_on_compaction/handoff_head, which "
+                  "also pulls the retained head from the questions sidecar; "
+                  "porting that is the open work (docs/OPD-MULTITURN-PLAN.md §15)",
+        "boundaries_detected": True,
+        "reconstruction_implemented": False,
         "required": args.require_post_compaction,
     }
     report["prefixes"] = [

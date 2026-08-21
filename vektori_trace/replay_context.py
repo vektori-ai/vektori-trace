@@ -143,6 +143,7 @@ def filter_candidates_by_budget(
     max_new_tokens: int,
     max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     progress: Any = None,
+    allow_render_errors: bool = False,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Drop candidates that cannot be sampled, *before* selection runs.
 
@@ -208,11 +209,27 @@ def filter_candidates_by_budget(
             )
 
     fitting = [b for b in budgets if b.fits]
+    n_render_errors = len(dropped) - (len(budgets) - len(fitting))
+    if n_render_errors and not allow_render_errors:
+        # Overflow is a legitimate exclusion; a render failure is not. It means
+        # a candidate could not be built at all — a code or data fault — and
+        # continuing would select from a subset biased by whatever broke, while
+        # every downstream count still looks consistent.
+        first = next(
+            (d for d in dropped if d.get("reason", "").startswith("render/measure")),
+            {},
+        )
+        raise ContextBudgetError(
+            f"{n_render_errors} candidate(s) failed to render or tokenize; "
+            "refusing to select from a pool shaped by an unexplained failure. "
+            f"First: {first.get('prefix_id')}: {first.get('reason')}. "
+            "Pass allow_render_errors=True only for exploratory reporting."
+        )
     report = {
         "n_candidates": len(candidates),
         "n_fitting": len(kept),
         "n_overflow": len(budgets) - len(fitting),
-        "n_render_errors": len(dropped) - (len(budgets) - len(fitting)),
+        "n_render_errors": n_render_errors,
         "overflow_rate": (
             round(1 - len(fitting) / len(budgets), 4) if budgets else None
         ),
@@ -239,8 +256,58 @@ def filter_candidates_by_budget(
     return kept, report
 
 
+def assert_prompt_ids_match(
+    prefix_id: str,
+    local_ids: list[int],
+    server_ids: list[int] | None,
+    *,
+    max_report: int = 6,
+) -> dict[str, Any]:
+    """The server must have consumed exactly the prompt we measured.
+
+    The local budget check proves our *rendering* fits. It cannot prove the
+    server saw that rendering: a chat-template difference, a tokenizer revision
+    skew, or front-truncation all leave the local count intact while changing
+    what was actually conditioned on. `log pi_old` would then be captured under
+    a prompt we cannot reproduce, and every downstream assertion still passes.
+
+    The returned `prompt_token_ids` make this checkable for free at sampling
+    time, so it is checked rather than assumed — and it matters most exactly
+    where headroom is thin.
+    """
+    if not server_ids:
+        raise ContextBudgetError(
+            f"{prefix_id}: the server returned no prompt_token_ids, so the "
+            "prompt it consumed cannot be reconciled with the one measured "
+            "locally. Request them (`return_token_ids`) rather than assuming "
+            "the renderings agree."
+        )
+    if len(local_ids) != len(server_ids):
+        raise ContextBudgetError(
+            f"{prefix_id}: local rendering is {len(local_ids)} tokens but the "
+            f"server consumed {len(server_ids)}. A shorter server prompt means "
+            "silent front-truncation; a different length at all means the two "
+            "renderings disagree (§4). Difference: "
+            f"{len(server_ids) - len(local_ids):+d}."
+        )
+    mismatches = [i for i, (a, b) in enumerate(zip(local_ids, server_ids)) if a != b]
+    if mismatches:
+        head = mismatches[:max_report]
+        detail = ", ".join(
+            f"pos {i}: local {local_ids[i]} != server {server_ids[i]}" for i in head
+        )
+        raise ContextBudgetError(
+            f"{prefix_id}: {len(mismatches)} prompt token id(s) differ between "
+            f"the local rendering and the server's. First: {detail}. The "
+            "template or tokenizer has drifted; log pi_old would be captured "
+            "under a prompt this run cannot reproduce."
+        )
+    return {"prefix_id": prefix_id, "n_prompt_tokens": len(local_ids), "exact_match": True}
+
+
 __all__ = [
     "ContextBudget",
+    "assert_prompt_ids_match",
     "filter_candidates_by_budget",
     "ContextBudgetError",
     "DEFAULT_MAX_MODEL_LEN",

@@ -79,6 +79,17 @@ class ReplayPrefix:
     #: at least two such prefixes "if available" — they are the long-horizon
     #: cases most likely to break the rendering contract.
     post_compaction: bool = False
+    #: Total replay steps in the *original* trace, set at enumeration time.
+    #:
+    #: Stage (early/middle/late) must be computed against this, not against
+    #: whatever survives a filter. The context-budget filter removes ~38% of
+    #: candidates and the removals are concentrated in late steps, so deriving
+    #: the span from the filtered pool promotes the latest surviving *middle*
+    #: state into "late" — and the batch then reports early/middle/late
+    #: stratification relative to a truncated pool rather than to the
+    #: trajectory. `None` means unknown, and `_stage` falls back to the
+    #: observed span.
+    trace_n_steps: int | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -130,6 +141,7 @@ def enumerate_prefixes(
                 step_index=t,
                 prefix_turns=prefix,
                 post_compaction=t in comp,
+                trace_n_steps=len(steps),
             )
         )
     return out
@@ -170,6 +182,33 @@ def select_replay_prefixes(
 
     want_tasks = n_prefixes if min_distinct_tasks is None else min_distinct_tasks
     available_pc = [c for c in candidates if c.post_compaction]
+
+    # A post-compaction candidate is *positional*: `compaction` detects the
+    # boundary, but `prefix_turns_through_step` still slices from index 0, so
+    # the prefix carries the pre-boundary history that `boundary: "replace"`
+    # discarded. Selecting one would put a prefix in the batch whose content is
+    # the opposite of the state it is labelled as.
+    #
+    # This check must key off the reconstruction contract rather than off an
+    # empty pool: once `replay_corpus` began deriving boundaries the pool
+    # stopped being empty, and the availability check below silently started
+    # accepting exactly what it was written to prevent.
+    if require_post_compaction > 0:
+        from .compaction import reconstruction_is_implemented
+
+        if not reconstruction_is_implemented():
+            raise ReplaySelectionError(
+                f"require_post_compaction={require_post_compaction} but "
+                "post-compaction reconstruction is not implemented "
+                "(compaction.reconstruction_is_implemented() is False). "
+                f"{len(available_pc)} candidates are *marked* as following a "
+                "boundary, but their prefixes are flat slices from step 0 and "
+                "still contain the history compaction replaced — so selecting "
+                "them would claim coverage the batch does not have "
+                "(docs/OPD-MULTITURN-PLAN.md §15). Pass "
+                "require_post_compaction=0 until reconstruction lands."
+            )
+
     if require_post_compaction > len(available_pc):
         # Refuse rather than degrade. `min(require, available)` quietly asked
         # for zero when the pool had none, and the run then reported a
@@ -200,13 +239,19 @@ def select_replay_prefixes(
     # So stage is assigned to the *slot*, not derived from the sort: slot k
     # wants stage k % 3, and each pass takes the best available candidate in
     # that stage. Deterministic, and it cannot collapse to one end.
+    # Prefer the immutable original trace length; fall back to the observed
+    # span only for candidates that predate `trace_n_steps`.
     by_trace_len: dict[str, int] = {}
     for c in candidates:
         by_trace_len[c.trace_id] = max(by_trace_len.get(c.trace_id, 0), c.step_index)
 
     def _stage(c: ReplayPrefix) -> int:
-        """0=early, 1=middle, 2=late within this candidate's own trace."""
-        span = by_trace_len.get(c.trace_id, 0)
+        """0=early, 1=middle, 2=late within this candidate's own trace.
+
+        Measured against the original trace length when it is known, so a
+        filtered pool cannot silently redefine what "late" means.
+        """
+        span = c.trace_n_steps - 1 if c.trace_n_steps else by_trace_len.get(c.trace_id, 0)
         if span <= 0:
             return 0
         frac = c.step_index / span

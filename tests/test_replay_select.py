@@ -126,12 +126,17 @@ def test_one_prefix_per_trace_by_default():
     assert len(traces) == len(set(traces))
 
 
-def test_post_compaction_prefixes_are_taken_when_available():
-    """§8.3: at least two authentic post-compaction prefixes if available."""
-    pool = _pool(10, pc_on={"tr0-0", "tr1-0", "tr2-0"})
-    chosen = select_replay_prefixes(pool, require_post_compaction=2)
+def test_post_compaction_is_refused_while_reconstruction_is_missing():
+    """§8.3 wants two, but the prefixes are not reconstructed yet.
 
-    assert sum(1 for c in chosen if c.post_compaction) >= 2
+    A marked candidate only means "this step follows a boundary"; its prefix is
+    still a flat slice from step 0 carrying the history compaction replaced. So
+    availability is not the gate — `reconstruction_is_implemented()` is. This
+    previously passed by *selecting* such prefixes, which is the bug.
+    """
+    pool = _pool(10, pc_on={"tr0-0", "tr1-0", "tr2-0"})
+    with pytest.raises(ReplaySelectionError, match="reconstruction is not implemented"):
+        select_replay_prefixes(pool, require_post_compaction=2)
 
 
 def test_missing_post_compaction_refuses_rather_than_degrades():
@@ -139,10 +144,10 @@ def test_missing_post_compaction_refuses_rather_than_degrades():
 
     `min(require, available)` asked for two and accepted none, and the batch it
     returned was indistinguishable from one that genuinely had the coverage.
-    Since `replay_corpus` never derives boundaries (plan §15), the pool is
-    empty on the real corpus and this is the default path, not an edge case.
+    The reconstruction gate now fires first, but both refusals must hold: once
+    reconstruction lands, an empty pool must still refuse rather than degrade.
     """
-    with pytest.raises(ReplaySelectionError, match="post-compaction prefixes but"):
+    with pytest.raises(ReplaySelectionError):
         select_replay_prefixes(_pool(10), require_post_compaction=2)
 
 

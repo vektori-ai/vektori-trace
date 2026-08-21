@@ -230,6 +230,28 @@ def current_commit(repo_root: Path | None = None) -> str | None:
     return f"{rev}-dirty" if dirty else rev
 
 
+def require_commit(repo_root: Path | None = None) -> str:
+    """`current_commit()`, but a failure is an error rather than a `None`.
+
+    `current_commit` returns `None` on any git failure, which is right for a
+    manifest field that a caller may legitimately leave unpinned. It is wrong
+    for an artifact that claims to record which code produced it: a census
+    whose `vektori_trace_commit` is `null` cannot be attributed, and the null
+    looks identical whether git was missing, the directory was unsafe-owned, or
+    `$HOME` was unset — all of which have happened on the box.
+    """
+    got = current_commit(repo_root)
+    if not got:
+        raise PinError(
+            "cannot determine the vektori-trace commit. On the EC2 box this is "
+            "usually git's `dubious ownership` guard or an unset $HOME under "
+            "SSM: run `export HOME=/root; git config --global --add "
+            "safe.directory /data/vektori-trace`. An artifact that cannot name "
+            "its own code is not reproducible evidence."
+        )
+    return got
+
+
 
 
 def hash_adapter_dir(adapter_path: Path) -> dict[str, str | None]:
@@ -360,6 +382,7 @@ __all__ = [
     "OPDRunManifest",
     "PinError",
     "current_commit",
+    "require_commit",
     "sha256_file",
     "verify_reference_pins",
 ]

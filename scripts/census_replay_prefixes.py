@@ -70,7 +70,9 @@ def _tokenizer_sha(tok) -> str | None:
 
 
 def census_compaction(corpus_roots: list[str]) -> dict[str, Any]:
-    """Boundary inventory straight from the raw trajectories."""
+    """Boundary inventory, using the same detector the runtime uses."""
+    from vektori_trace.compaction import CompactionError, boundaries_from_raw
+
     n_traces = 0
     boundaries = 0
     shapes: Counter = Counter()
@@ -85,40 +87,28 @@ def census_compaction(corpus_roots: list[str]) -> dict[str, Any]:
                 steps = json.load(traj.open())["steps"]
             except Exception:
                 continue
-            marks = [
-                i
-                for i, s in enumerate(steps)
-                if (s.get("extra") or {}).get("context_management")
-            ]
-            if not marks:
+            # Exactly the production predicate. Duplicating the condition here
+            # let the census count records the runtime detector would ignore,
+            # so the two could disagree about how many boundaries exist.
+            try:
+                found = boundaries_from_raw(traj)
+            except CompactionError:
+                shapes["unreadable_trajectory"] += 1
+                continue
+            if not found:
                 continue
             n_traces += 1
-            per_trace[len(marks)] += 1
-            for pos in marks:
+            per_trace[len(found)] += 1
+            for b in found:
                 boundaries += 1
-                cm = (steps[pos].get("extra") or {}).get("context_management") or {}
-                nxt = steps[pos + 1] if pos + 1 < len(steps) else None
-                src = nxt.get("source") if nxt else None
-                msg = (nxt.get("message") or "") if nxt else ""
-                marker = next((m for m in HANDOFF_MARKERS if m in msg), None)
-                if src == "user" and marker:
+                if b.meta.get("next_is_handoff"):
                     shapes["user_handoff_inlined"] += 1
-                elif nxt is None:
+                elif b.meta.get("next_source") is None:
                     shapes["boundary_is_last_step"] += 1
                 else:
-                    shapes[f"next_is_{src}_unrecognised"] += 1
-                rows.append(
-                    {
-                        "trial": str(traj.parent.parent),
-                        "raw_pos": pos,
-                        "raw_step_id": steps[pos].get("step_id"),
-                        "boundary": cm.get("boundary"),
-                        "type": cm.get("type"),
-                        "next_source": src,
-                        "next_marker": marker,
-                        "next_len": len(msg),
-                    }
-                )
+                    shapes[f"next_is_{b.meta.get('next_source')}_unrecognised"] += 1
+                rows.append({"trial": str(traj.parent.parent), **b.to_dict(),
+                             **b.meta})
 
     return {
         "traces_with_compaction": n_traces,
@@ -143,7 +133,7 @@ def main() -> int:
     import transformers
 
     from vektori_trace.dataset import turns_to_messages
-    from vektori_trace.opd_manifest import current_commit
+    from vektori_trace.opd_manifest import require_commit
     from vektori_trace.replay_context import measure_prefix, summarize_budgets
     from vektori_trace.replay_corpus import candidates_from_traces, load_corpus
 
@@ -201,7 +191,7 @@ def main() -> int:
             "tokenizer": args.tokenizer,
             "tokenizer_sha256": _tokenizer_sha(tok),
             "renderer_sha256": _renderer_sha(turns_to_messages),
-            "vektori_trace_commit": current_commit(),
+            "vektori_trace_commit": require_commit(),
             "max_model_len": args.max_model_len,
             "max_new_tokens": args.max_new_tokens,
             "budget_for_prefix": args.max_model_len - args.max_new_tokens,

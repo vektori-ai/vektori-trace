@@ -160,7 +160,31 @@ class TestBudgetFilter:
         assert rep["post_compaction_before"] == 1
         assert rep["post_compaction_after"] == 0
 
-    def test_render_failure_is_dropped_not_raised(self):
+    def test_render_failure_is_fatal_by_default(self):
+        """Overflow is a legitimate exclusion; a render failure is not.
+
+        A candidate that cannot be built at all signals a code or data fault,
+        and continuing would select from a pool shaped by whatever broke while
+        every downstream count still looked consistent.
+        """
+        from vektori_trace.replay_context import (
+            ContextBudgetError,
+            filter_candidates_by_budget,
+        )
+
+        def bad_render(c):
+            if c.prefix_id == "b@2":
+                raise ValueError("boom")
+            return _render(c)
+
+        cands = [_Cand("a@1", 1, tokens=10), _Cand("b@2", 2, tokens=10)]
+        with pytest.raises(ContextBudgetError, match="failed to render"):
+            filter_candidates_by_budget(
+                cands, bad_render, _Tok(), max_new_tokens=100, max_model_len=40960
+            )
+
+    def test_render_failure_can_be_tolerated_for_reporting(self):
+        """Exploratory reporting may want the survivors; a paid run may not."""
         from vektori_trace.replay_context import filter_candidates_by_budget
 
         def bad_render(c):
@@ -170,7 +194,48 @@ class TestBudgetFilter:
 
         cands = [_Cand("a@1", 1, tokens=10), _Cand("b@2", 2, tokens=10)]
         kept, rep = filter_candidates_by_budget(
-            cands, bad_render, _Tok(), max_new_tokens=100, max_model_len=40960
+            cands, bad_render, _Tok(), max_new_tokens=100, max_model_len=40960,
+            allow_render_errors=True,
         )
         assert [c.prefix_id for c in kept] == ["a@1"]
         assert rep["n_render_errors"] == 1
+
+
+class TestPromptIdParity:
+    """The server must have consumed exactly the prompt we measured."""
+
+    def test_exact_match_passes(self):
+        from vektori_trace.replay_context import assert_prompt_ids_match
+
+        got = assert_prompt_ids_match("p@1", [1, 2, 3], [1, 2, 3])
+        assert got["exact_match"] is True
+        assert got["n_prompt_tokens"] == 3
+
+    def test_missing_server_ids_refused(self):
+        from vektori_trace.replay_context import (
+            ContextBudgetError,
+            assert_prompt_ids_match,
+        )
+
+        with pytest.raises(ContextBudgetError, match="no prompt_token_ids"):
+            assert_prompt_ids_match("p@1", [1, 2], None)
+
+    def test_shorter_server_prompt_is_truncation(self):
+        """The failure the local budget check cannot see."""
+        from vektori_trace.replay_context import (
+            ContextBudgetError,
+            assert_prompt_ids_match,
+        )
+
+        with pytest.raises(ContextBudgetError, match=r"-1"):
+            assert_prompt_ids_match("p@1", [1, 2, 3], [2, 3])
+
+    def test_same_length_different_ids_is_drift(self):
+        """Template or tokenizer skew: length agrees, content does not."""
+        from vektori_trace.replay_context import (
+            ContextBudgetError,
+            assert_prompt_ids_match,
+        )
+
+        with pytest.raises(ContextBudgetError, match="pos 1: local 2 != server 9"):
+            assert_prompt_ids_match("p@1", [1, 2, 3], [1, 9, 3])

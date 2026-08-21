@@ -23,10 +23,24 @@ honours the replacement, a run must not claim post-compaction coverage
 (§8.3/§8.4). `replay_select.select_replay_prefixes` refuses a non-zero
 `require_post_compaction` for exactly that reason.
 
-The retained state is *reachable*: it is the inlined user handoff message the
-detector records as `handoff_turn_index`. Reconstruction would slice from
-there rather than from 0. That change belongs to the prefix builder and is
-deliberately not made here.
+The retained state is *reachable*, but it is **not** just the inlined user
+handoff message this detector records as `handoff_turn_index`. That message is
+only the *tail* — the previous agent's answers. The head (the "you are picking
+up work…" summary and the new agent's questions) lives in
+`trajectory.summarization-N-questions.json`.
+
+`scripts/sft_export_traces.py` already solved this for the SFT corpus:
+`handoff_head()` loads the questions sidecar and `split_on_compaction()` starts
+each new segment from it, discarding pre-boundary turns. The SFT repair plan
+records that collapsing the head into the single main-trajectory user message
+was considered and rejected — it leaves "Here are the answers…" dangling
+against questions absent from the context.
+
+That matters beyond provenance: ck75's own SFT was done on that reconstructed
+geometry, so feeding it a flat pre-boundary prefix is off-distribution with
+respect to its training. Reconstruction should therefore reuse the SFT
+definition rather than invent a second one. That change belongs to the prefix
+builder and is deliberately not made here.
 """
 
 from __future__ import annotations
