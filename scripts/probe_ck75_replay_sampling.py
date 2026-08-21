@@ -12,9 +12,9 @@ verified end to end:
      `SampledAction` whose bytes reconstruct exactly;
   F. four independent draws at one prefix differ (temperature is live, so the
      four samples §8.3 asks for are not four copies);
-  G. no sample hit the token cap — 8192 is above the corpus p99.9 but below its
-     observed max, and those are the *teacher's* lengths, so the student's own
-     cap-hit rate is the only evidence the cap is right.
+  G. no sample hit the token cap — 9216 clears the corpus max (8,842) outright,
+     but those are the *teacher's* lengths, so the student's own cap-hit rate is
+     the only evidence the cap is right for ck75.
 
 D is the load-bearing one. `log pi_old` is the denominator of §5's importance
 ratio and cannot be recovered after sampling — if it is missing the whole
@@ -144,7 +144,7 @@ def main() -> int:
                     help="replay step to probe; default is mid-trace")
     ap.add_argument("--n-samples", type=int, default=4,
                     help="§8.3 draws four independent actions per prefix")
-    ap.add_argument("--max-tokens", type=int, default=8192,
+    ap.add_argument("--max-tokens", type=int, default=9216,
                     help="measured cap (docs/action-length-measurement.md); "
                          "must exceed the old 256 (§7.1)")
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -292,10 +292,10 @@ def main() -> int:
         f"temperature {args.temperature}",
     )
 
-    # --- G: no sample hit the cap. 8192 sits above p99.9 (8,126) but *below*
-    # the observed max (8,842), so truncation is possible by construction — and
-    # these are DeepSeek's lengths, not ck75's. A non-zero rate here means the
-    # cap is wrong for the student and must be re-derived before the real run.
+    # --- G: no sample hit the cap. 9216 clears the corpus's observed max
+    # (8,842) with room, so no stored action would have been truncated by it.
+    # But these are DeepSeek's lengths, not ck75's: a non-zero rate here means
+    # the cap is wrong for the student and must be re-derived before the run.
     cap_report = summarize_cap_hits(actions)
     g.check(
         "G-cap",

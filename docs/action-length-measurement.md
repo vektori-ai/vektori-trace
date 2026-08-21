@@ -1,32 +1,40 @@
 # Action-length distribution, and the cap that follows from it
 
-Measured 2026-08-21 on the box. 2,978 assistant actions from 40 of the 117
-passing DeepSeek trajectories in `/data/vektori-out/dsv4-corpus60{,-b}`, token
+Measured 2026-08-21 on the box. **All 7,677 assistant actions from all 117
+passing** DeepSeek trajectories in `/data/vektori-out/dsv4-corpus60{,-b}`, token
 counts under `Qwen/Qwen3-14B`'s tokenizer (the student's, since the cap binds
 the student). `thinking + content`, because both are sampled tokens.
 
 ## Distribution
 
-| statistic | tokens |
-| --- | --- |
-| median | 605 |
-| mean | 1,040 |
-| p90 | 2,481 |
-| p95 | 3,209 |
-| p99 | 5,374 |
-| p99.9 | 8,126 |
-| max | 8,842 |
+| statistic | full (117 traces) | first pass (40 traces) |
+| --- | --- | --- |
+| actions | **7,677** | 2,978 |
+| median | **534** | 605 |
+| mean | **956** | 1,040 |
+| p90 | 2,384 | 2,481 |
+| p95 | 3,172 | 3,209 |
+| p99 | 5,185 | 5,374 |
+| p99.9 | **7,557** | 8,126 |
+| max | **8,842** | 8,842 |
+
+The full pass is slightly kinder than the 40-trace sample — p99.9 fell from
+8,126 to 7,557 while the max held at 8,842, so the tail is a handful of
+outliers rather than a heavy shoulder.
 
 ## Truncation by cap
 
+Over all 7,677 actions:
+
 | cap | actions cut mid-sequence |
 | --- | --- |
-| **256** (the previous run's default) | **2,062 / 2,978 = 69.2%** |
-| 512 | 1,619 = 54.4% |
-| 1,024 | 1,100 = 36.9% |
-| 2,048 | 481 = 16.2% |
-| 4,096 | 62 = 2.1% |
-| 8,192 | ~0 (above p99.9) |
+| **256** (the previous run's default) | **5,238 = 68.2%** |
+| 512 | 3,922 = 51.1% |
+| 1,024 | 2,526 = 32.9% |
+| 2,048 | 1,046 = 13.6% |
+| 4,096 | 159 = 2.1% |
+| 8,192 | 2 = 0.03% |
+| **9,216** (chosen) | **0** |
 
 ## Why this is a finding and not a parameter note
 
@@ -53,11 +61,14 @@ rather than leaving the default to be noticed by a reader.
 
 ## The cap to use
 
-**8,192, provisionally.** Above p99.9 (8,126) but **below the observed max of
-8,842** — so it can still truncate a real action, and calling it "effectively
-above the max" would be wrong. It is a loop guard rather than a length budget:
-run6 recorded models repeating identical output up to 21 times, and an uncapped
-degenerate sample generates until context exhaustion.
+**9,216.** Clears the observed max (8,842) outright: **no** action in the
+corpus would have been truncated by it. 8,192 was the earlier candidate and
+still cut 2 of 7,677 — small, but the run fails closed on a cap hit, so those 2
+would abort a batch if drawn. The extra ~1k tokens buys that away for nothing.
+
+It remains a loop guard rather than a length budget: run6 recorded models
+repeating identical output up to 21 times, and an uncapped degenerate sample
+generates until context exhaustion.
 
 The replay run must **fail closed** on any cap hit rather than recording one:
 a truncated action is a fragment the teacher would grade as complete, which is
@@ -71,10 +82,8 @@ Two caveats, both real:
   (`replay_sample.summarize_cap_hits`); a non-zero rate at 8,192 means this
   number is still wrong for the student and must be re-derived from its own
   samples.
-- **40 traces, not 117.** The sample was bounded for speed. The tail is where
-  the cap decision lives, so the full 117-trace pass must confirm p99.9 (and the
-  max) **before** the cap is fixed for a paid run. Until then 8,192 is
-  provisional.
+- **The full 117-trace pass is done** and is what the numbers above report. The
+  earlier 40-trace figures are kept only to show the two agree.
 
 ## Reproducing
 
