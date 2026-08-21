@@ -55,10 +55,17 @@ class TraceRecord:
 def _read_outcome(trial_dir: Path) -> bool | None:
     """Whether this trial passed, from its `result.json`.
 
-    Returns None when the file is missing or the verdict cannot be located,
-    which is treated as "unknown" rather than "failed": a trial whose result was
-    never written is not evidence of a failing agent, and silently binning it
-    with real failures would distort any pass-rate quoted from this corpus.
+    Harbor writes the verdict at `verifier_result.rewards.reward`. A *pass* is
+    `reward == 1.0` and nothing else: this corpus also contains fractional
+    rewards (0.5, 0.125, 0.777...) which are partial credit — some F2P tests
+    passing — and treating those as passes would put prefixes from a trace that
+    never fixed the bug into a pool §8 says should start from passing runs.
+
+    Returns None when the file is missing, unreadable, or carries no reward.
+    That is "unknown", not "failed": 246 of this corpus's 479 result files have
+    no reward at all (mostly `AgentTimeoutError`, where the verifier never ran),
+    and binning them with real failures would distort any pass rate quoted from
+    it.
     """
     path = trial_dir / "result.json"
     if not path.is_file():
@@ -68,23 +75,36 @@ def _read_outcome(trial_dir: Path) -> bool | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    # Harbor nests the verdict differently across versions; check the shapes
-    # this corpus actually uses before giving up.
+    reward = _extract_reward(data)
+    if reward is None:
+        return None
+    return float(reward) >= 1.0
+
+
+def _extract_reward(data: dict[str, Any]) -> float | None:
+    """The trial's scalar reward, across the shapes this corpus uses.
+
+    `verifier_result.rewards.reward` is the current Harbor layout. The flatter
+    fallbacks are older shapes; they are checked after it so a file carrying
+    both cannot have the stale one win.
+    """
+    vr = data.get("verifier_result")
+    if isinstance(vr, dict):
+        rewards = vr.get("rewards")
+        if isinstance(rewards, dict):
+            val = rewards.get("reward")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                return float(val)
+        val = vr.get("reward")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return float(val)
+
     for key in ("reward", "passed", "success"):
-        if key in data and data[key] is not None:
-            val = data[key]
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, (int, float)):
-                return float(val) >= 1.0
-    stats = data.get("stats")
-    if isinstance(stats, dict):
-        for key in ("reward", "passed", "n_passed"):
-            val = stats.get(key)
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, (int, float)):
-                return float(val) >= 1.0
+        val = data.get(key)
+        if isinstance(val, bool):
+            return 1.0 if val else 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
     return None
 
 

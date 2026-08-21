@@ -63,7 +63,10 @@ def _write_trial(root, task: str, trial: str, *, reward=1.0):
     (d / "agent").mkdir(parents=True)
     shutil.copy(REAL_TRAJECTORY, d / "agent" / "trajectory.json")
     if reward is not None:
-        (d / "result.json").write_text(json.dumps({"reward": reward}))
+        # The shape this corpus actually uses: verifier_result.rewards.reward
+        (d / "result.json").write_text(
+            json.dumps({"verifier_result": {"rewards": {"reward": reward}}})
+        )
     return d
 
 
@@ -299,3 +302,73 @@ def test_cap_hit_summary_on_empty_batch():
 def test_trace_record_defaults():
     rec = TraceRecord(task="t", trace_id="tr", trial_dir=Path("."), n_steps=3, passed=True)
     assert rec.stored_actions == {}
+
+
+# ---------------------------------------------------------------------------
+# Verdict parsing — the shape the real corpus uses
+# ---------------------------------------------------------------------------
+
+
+def test_reward_is_read_from_verifier_result_rewards(tmp_path):
+    """The real layout: verifier_result.rewards.reward, not a top-level key."""
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "pass", reward=1.0)
+    assert load_trace(d).passed is True
+
+
+@pytest.mark.parametrize("reward", [0.5, 0.125, 0.777778, 0.993174])
+def test_partial_credit_is_not_a_pass(tmp_path, reward):
+    """Fractional rewards are some-F2P-passing, not a fixed bug.
+
+    Counting them would put prefixes from traces that never solved the task
+    into a pool §8 says starts from passing runs.
+    """
+    root = tmp_path / f"c{reward}"
+    d = _write_trial(root, "t__x", "partial", reward=reward)
+    assert load_trace(d).passed is False
+
+
+def test_zero_reward_is_a_fail_not_unknown(tmp_path):
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "zero", reward=0.0)
+    rec = load_trace(d)
+    assert rec.passed is False
+
+
+def test_result_without_a_reward_is_unknown(tmp_path):
+    """AgentTimeoutError trials: the verifier never ran, so there is no verdict."""
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "timeout", reward=None)
+    (d / "result.json").write_text(
+        json.dumps(
+            {
+                "verifier_result": None,
+                "exception_info": {"exception_type": "AgentTimeoutError"},
+            }
+        )
+    )
+    assert load_trace(d).passed is None
+
+
+def test_legacy_flat_reward_still_read(tmp_path):
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "legacy", reward=None)
+    (d / "result.json").write_text(json.dumps({"reward": 1.0}))
+    assert load_trace(d).passed is True
+
+
+def test_nested_shape_wins_over_a_stale_flat_one(tmp_path):
+    """A file carrying both must not let the older key decide."""
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "both", reward=None)
+    (d / "result.json").write_text(
+        json.dumps({"reward": 0.0, "verifier_result": {"rewards": {"reward": 1.0}}})
+    )
+    assert load_trace(d).passed is True
+
+
+def test_unreadable_result_is_unknown(tmp_path):
+    root = tmp_path / "c"
+    d = _write_trial(root, "t__x", "bad", reward=None)
+    (d / "result.json").write_text("{not json")
+    assert load_trace(d).passed is None
