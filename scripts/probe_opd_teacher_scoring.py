@@ -29,10 +29,14 @@ isolated-action scoring, or a top-5 reconstruction: fix the transport or stop.
 
 Usage
 -----
-    export FIREWORKS_API_KEY=...            # or: source /data/.env.fw
-    python3 scripts/probe_opd_teacher_scoring.py \
+    export FIREWORKS_API_KEY=...            # or: set -a; . /data/.env.fw; set +a
+    .venv/bin/python scripts/probe_opd_teacher_scoring.py \
         --model accounts/fireworks/models/deepseek-v4-flash-0731 \
         --out /tmp/opd_probe_report.json
+
+Use the project interpreter (`.venv/bin/python` / `uv run python`), not a bare
+`python3`: the probe imports the repo's renderer, tokenizer and scorer on
+purpose, so the package has to be importable.
 
 Add `--echo-mode last` to also check the cheaper `echo_last` shape. Exit code is
 0 only when every gate passes.
@@ -317,6 +321,21 @@ def main() -> int:
                 vocab_size = len(tok.get_vocab())
             except Exception:
                 vocab_size = None
+    except ModuleNotFoundError as e:
+        if e.name and e.name.split(".")[0] == "vektori_trace":
+            print(
+                f"\ncannot import vektori_trace: {e}\n\n"
+                "Run this with the project's interpreter, not the system one:\n"
+                "    .venv/bin/python scripts/probe_opd_teacher_scoring.py ...\n"
+                "(or `uv run python scripts/...`). The probe deliberately uses the "
+                "repo's own renderer/tokenizer/scorer, so it needs the package "
+                "importable — a bare `python3` is usually the system interpreter "
+                "without it.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"\nFAILED to load the pinned teacher renderer/tokenizer: {e}")
+        return 2
     except Exception as e:  # report it, do not mask it
         print(f"\nFAILED to load the pinned teacher renderer/tokenizer: {e}")
         print(
