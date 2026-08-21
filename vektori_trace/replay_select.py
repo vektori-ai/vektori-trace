@@ -51,6 +51,13 @@ from .reopd import prefix_turns_through_step
 from .schema import Turn
 
 
+def _task_offset(task: str) -> int:
+    """Stable per-task offset in [0, 3). `hash()` is randomised per process."""
+    import hashlib
+
+    return int(hashlib.sha256(task.encode()).hexdigest()[:8], 16) % 3
+
+
 class ReplaySelectionError(ValueError):
     """The chosen prefixes cannot support a defensible replay update."""
 
@@ -165,9 +172,39 @@ def select_replay_prefixes(
     available_pc = [c for c in candidates if c.post_compaction]
     want_pc = min(require_post_compaction, len(available_pc))
 
+    # Spread across trace *stages*, not just tasks. Sorting by step_index alone
+    # makes the one-per-task rule pick every task's earliest state, which is a
+    # kappa-decay batch by accident rather than the stratified sample §8.3 asks
+    # for — and it skips exactly the long-horizon states this run exists to
+    # stress. Each candidate is bucketed by where it sits in its own trace, and
+    # buckets are visited round-robin so early/middle/late all appear.
+    by_trace_len: dict[str, int] = {}
+    for c in candidates:
+        by_trace_len[c.trace_id] = max(by_trace_len.get(c.trace_id, 0), c.step_index)
+
+    def _stage(c: ReplayPrefix) -> int:
+        """0=early, 1=middle, 2=late within this candidate's own trace."""
+        span = by_trace_len.get(c.trace_id, 0)
+        if span <= 0:
+            return 0
+        frac = c.step_index / span
+        return 0 if frac < 1 / 3 else (1 if frac < 2 / 3 else 2)
+
     ordered = sorted(
         candidates,
-        key=lambda c: (not c.post_compaction, c.task, c.trace_id, c.step_index),
+        key=lambda c: (
+            not c.post_compaction,
+            # Round-robin the stages so consecutive picks alternate early /
+            # middle / late rather than exhausting one end first. Offset by a
+            # stable digest of the task, never `hash()` — that is randomised
+            # per process and would make selection unreproducible, which §8.4
+            # requires it not to be.
+            (_stage(c) + _task_offset(c.task)) % 3,
+            _stage(c),
+            c.task,
+            c.trace_id,
+            c.step_index,
+        ),
     )
 
     chosen: list[ReplayPrefix] = []

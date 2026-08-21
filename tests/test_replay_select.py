@@ -234,3 +234,32 @@ def test_zero_tokens_is_refused():
     prefixes = [_prefix("a", "tr0", 2)]
     with pytest.raises(ReplaySelectionError, match="no supervised tokens"):
         assert_no_source_dominates({"tr0@2": 0}, prefixes)
+
+
+def test_selection_spreads_across_trace_stages():
+    """§8.3 asks for distinct tasks AND trace stages.
+
+    Sorting by step_index alone made the one-per-task rule pick every task's
+    earliest state — a kappa-decay batch by accident, skipping the long-horizon
+    states a diagnostic run exists to stress.
+    """
+    cands = []
+    for t in range(8):
+        for step in range(1, 61):
+            cands.append(_prefix(f"task{t}", f"tr{t}", step))
+
+    chosen = select_replay_prefixes(cands, require_post_compaction=0, max_per_trace=1)
+
+    steps = sorted(c.step_index for c in chosen)
+    assert len(chosen) == 8
+    assert len({c.task for c in chosen}) == 8
+    assert max(steps) > 20, f"no late-trace state selected: {steps}"
+    assert min(steps) < 20, f"no early-trace state selected: {steps}"
+
+
+def test_stage_spread_is_reproducible_across_processes():
+    """Uses a stable digest, not hash(), which is randomised per process."""
+    from vektori_trace.replay_select import _task_offset
+
+    assert _task_offset("pallets__click-3152") == _task_offset("pallets__click-3152")
+    assert 0 <= _task_offset("anything") < 3
