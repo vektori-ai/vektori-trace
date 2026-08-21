@@ -422,6 +422,45 @@ def main() -> int:
             if got:
                 stored[p.prefix_id] = got
 
+    # §10 per-example archival, *before* the optimizer step. Behaviour log
+    # probabilities are `log pi_old` and cannot be recomputed once the policy
+    # moves, and the paid half of the run is already complete here — a crash in
+    # the training step must not cost the captures that were spent on.
+    log("archiving examples (§10)")
+    from vektori_trace.replay_archive import build_example_record, write_examples
+
+    # Build the batch here and archive *from it*, so the advantages on disk are
+    # the same objects the optimizer consumes. Recomputing them for the archive
+    # would allow the record and the update to disagree, which is precisely the
+    # kind of drift the archive exists to detect.
+    from vektori_trace.replay_opd import build_replay_batch
+
+    batch = build_replay_batch(prefixes, actions, scored, stored_teacher_actions=stored)
+    by_prefix = {p.prefix_id: p for p in prefixes}
+    by_action = {a.key: a for a in actions}
+    records = []
+    for key, adv in zip(batch.keys, batch.advantages, strict=True):
+        act = by_action[key]
+        pref = by_prefix[act.prefix_id]
+        tb, tlp = scored.get(key, (None, None))
+        records.append(
+            build_example_record(
+                prefix=pref,
+                action=act,
+                advantages=adv,
+                canonical_messages=samp["rendered"].get(act.prefix_id),
+                teacher_token_bytes=tb,
+                teacher_logprobs=tlp,
+                teacher_request=teacher_prov,
+            )
+        )
+    report["archive"] = write_examples(out / "examples.jsonl", records)
+    log(
+        f"archived {report['archive']['n_examples']} examples "
+        f"({report['archive']['bytes_written']:,} bytes); "
+        f"max task share {report['archive']['max_task_share']}"
+    )
+
     log("stage 4/4: one optimizer step")
     result = train((prefixes, actions, scored, stored), args)
     report["run"] = result
