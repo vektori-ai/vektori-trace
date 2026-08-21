@@ -92,7 +92,7 @@ class _Capture:
 # ---------------------------------------------------------------------------
 
 
-def select_prefixes(args) -> tuple[list, dict[str, Any]]:
+def select_prefixes(args, student_tok=None) -> tuple[list, dict[str, Any]]:
     from vektori_trace.replay_corpus import (
         candidates_from_traces,
         corpus_report,
@@ -110,6 +110,45 @@ def select_prefixes(args) -> tuple[list, dict[str, Any]]:
     candidates = candidates_from_traces(traces, max_step=args.max_step)
     log(f"candidate replay states: {len(candidates)}")
 
+    # Context-budget filter, *before* selection. 38% of the measured pool
+    # cannot be sampled at all, and overflow is concentrated in late-stage
+    # prefixes — so filtering after selection would re-draw from an unknown
+    # subset, and filtering inside the sampling loop would kill the batch after
+    # some actions were already paid for. Only a pre-filter lets the spread
+    # constraints operate on states that are actually reachable.
+    budget_report: dict[str, Any] = {"skipped": "no tokenizer supplied"}
+    if student_tok is not None:
+        from vektori_trace.dataset import turns_to_messages
+        from vektori_trace.replay_context import filter_candidates_by_budget
+
+        def _render(c):
+            return student_tok.apply_chat_template(
+                turns_to_messages(c.prefix_turns),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        candidates, budget_report = filter_candidates_by_budget(
+            candidates,
+            _render,
+            student_tok,
+            max_new_tokens=args.max_tokens,
+            max_model_len=args.max_model_len,
+            progress=lambda i, n: log(f"  budget {i}/{n}") if i and i % 2000 == 0 else None,
+        )
+        log(
+            f"context filter: {budget_report['n_fitting']}/{budget_report['n_candidates']} "
+            f"fit (overflow {budget_report['overflow_rate']}); "
+            f"tasks {budget_report['eligible_tasks_before']}->"
+            f"{budget_report['eligible_tasks_after']}, "
+            f"post-compaction {budget_report['post_compaction_before']}->"
+            f"{budget_report['post_compaction_after']}"
+        )
+        if not candidates:
+            raise SystemExit(
+                "every candidate overflows the context window; nothing to sample"
+            )
+
     chosen = select_replay_prefixes(
         candidates,
         n_prefixes=args.n_prefixes,
@@ -118,7 +157,11 @@ def select_prefixes(args) -> tuple[list, dict[str, Any]]:
     by_trace = {t.trace_id: t for t in traces}
     for p in chosen:
         log(f"  {p.task} {p.prefix_id} (step {p.step_index})")
-    return chosen, {"traces": by_trace, "corpus": corpus_report(traces)}
+    return chosen, {
+        "traces": by_trace,
+        "corpus": corpus_report(traces),
+        "context_filter": budget_report,
+    }
 
 
 def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
@@ -333,9 +376,32 @@ def main() -> int:
         "learning_rate": args.learning_rate,
     }
 
+    # The tokenizer is needed *before* selection now: the context-budget filter
+    # measures rendered prompts, and it must run on the candidate pool rather
+    # than on the eight already chosen.
+    student_tok = None
+    try:
+        import transformers
+
+        student_tok = transformers.AutoTokenizer.from_pretrained(
+            args.student_tokenizer, trust_remote_code=True
+        )
+    except Exception as e:
+        if not args.dry_run:
+            print(
+                f"cannot load student tokenizer {args.student_tokenizer!r}: {e}\n"
+                "The context-budget filter cannot be skipped on a paid run: 38% of "
+                "candidates overflow and would be sampled at silently truncated "
+                "states.",
+                file=sys.stderr,
+            )
+            return 2
+        log(f"tokenizer unavailable ({type(e).__name__}); budget filter skipped")
+
     log("stage 1/4: selecting prefixes")
-    prefixes, sel = select_prefixes(args)
+    prefixes, sel = select_prefixes(args, student_tok)
     report["corpus"] = sel["corpus"]
+    report["context_filter"] = sel["context_filter"]
     report["post_compaction_coverage"] = {
         "claimed": False,
         "reason": "compaction boundaries are not derived from the corpus "
@@ -366,13 +432,11 @@ def main() -> int:
         # dry run can catch for free that would otherwise corrupt a paid run
         # silently.
         try:
-            import transformers
-
             from vektori_trace.replay_context import measure_prefix, summarize_budgets
 
-            tok = transformers.AutoTokenizer.from_pretrained(
-                args.student_tokenizer, trust_remote_code=True
-            )
+            tok = student_tok
+            if tok is None:
+                raise RuntimeError("tokenizer unavailable")
             budgets = []
             for p in prefixes:
                 prompt = tok.apply_chat_template(
@@ -478,11 +542,9 @@ def main() -> int:
         return 2
     log(f"pins complete; commit {manifest.vektori_trace_commit}")
 
-    import transformers
-
-    student_tok = transformers.AutoTokenizer.from_pretrained(
-        args.student_tokenizer, trust_remote_code=True
-    )
+    if student_tok is None:  # unreachable on a real run; guarded, not assumed
+        print("student tokenizer was not loaded", file=sys.stderr)
+        return 2
 
     log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
     actions, samp = sample_actions(prefixes, student_tok, args)

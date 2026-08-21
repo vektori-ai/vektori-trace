@@ -228,9 +228,45 @@ def candidates_from_traces(
             upper = min(upper, max_step)
         if upper <= min_step:
             continue
+
+        # Compaction boundaries, derived rather than left empty. This marks a
+        # step as *following* a boundary; it does not rebuild the retained
+        # state — `prefix_turns_through_step` still slices from index 0, so the
+        # prefix carries pre-boundary history that Harbor replaced. See
+        # `compaction` module docstring and plan §15: `select_replay_prefixes`
+        # refuses a non-zero `require_post_compaction` precisely because this
+        # flag is positional, not reconstructed.
+        comp_steps: set[int] = set()
+        try:
+            from .compaction import (
+                boundaries_from_raw,
+                locate_in_turns,
+                post_compaction_steps,
+            )
+            from .evaluate.resume import assistant_tool_steps
+            from .mining.atif import find_trajectory
+
+            traj_path = find_trajectory(rec.trial_dir)
+            if traj_path is not None:
+                raw = boundaries_from_raw(traj_path)
+                if raw:
+                    located = locate_in_turns(
+                        raw, turns, assistant_tool_steps(turns)
+                    )
+                    comp_steps = post_compaction_steps(located)
+        except Exception:
+            # A trace whose boundaries cannot be read is not a fatal corpus
+            # error: it simply contributes no post-compaction candidates.
+            comp_steps = set()
+
         out.extend(
             enumerate_prefixes(
-                rec.task, rec.trace_id, turns, min_step=min_step, max_step=upper
+                rec.task,
+                rec.trace_id,
+                turns,
+                min_step=min_step,
+                max_step=upper,
+                compaction_steps=comp_steps,
             )
         )
     return out

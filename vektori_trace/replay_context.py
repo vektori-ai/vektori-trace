@@ -135,8 +135,113 @@ def summarize_budgets(budgets: list[ContextBudget]) -> dict[str, Any]:
     }
 
 
+def filter_candidates_by_budget(
+    candidates: list[Any],
+    render: Any,
+    tokenizer: Any,
+    *,
+    max_new_tokens: int,
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN,
+    progress: Any = None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Drop candidates that cannot be sampled, *before* selection runs.
+
+    Filtering has to happen here rather than after selection or inside the
+    sampling loop, and the reason is about what "stratified" means. Selection
+    picks eight prefixes spread across tasks and trace stages; if 38% of the
+    pool cannot actually be sampled, a post-hoc rejection re-runs selection on
+    an unknown subset, and an in-loop rejection kills the batch after some
+    actions are already paid for. Only a pre-filter lets selection spread
+    across the states that are genuinely reachable.
+
+    The report deliberately records the stage and post-compaction distribution
+    **before and after** filtering. Overflow is not uniform — long-horizon
+    prefixes are exactly the ones that overflow — so the filter can quietly
+    convert a late-stage stratum into an early-stage one while every count
+    still looks right.
+
+    `render` maps one candidate to its prompt string.
+    """
+    kept: list[Any] = []
+    dropped: list[dict[str, Any]] = []
+    budgets: list[ContextBudget] = []
+
+    def _stage(c: Any) -> str:
+        return str(getattr(c, "step_index", "?"))
+
+    before_steps: dict[str, int] = {}
+    after_steps: dict[str, int] = {}
+    before_pc = after_pc = 0
+
+    for i, c in enumerate(candidates):
+        if progress is not None and i % 500 == 0:
+            progress(i, len(candidates))
+        before_steps[_stage(c)] = before_steps.get(_stage(c), 0) + 1
+        if getattr(c, "post_compaction", False):
+            before_pc += 1
+        try:
+            budget = measure_prefix(
+                getattr(c, "prefix_id", str(i)),
+                render(c),
+                tokenizer,
+                max_new_tokens=max_new_tokens,
+                max_model_len=max_model_len,
+            )
+        except Exception as e:
+            dropped.append(
+                {"prefix_id": getattr(c, "prefix_id", str(i)),
+                 "reason": f"render/measure failed: {type(e).__name__}: {e}"}
+            )
+            continue
+        budgets.append(budget)
+        if budget.fits:
+            kept.append(c)
+            after_steps[_stage(c)] = after_steps.get(_stage(c), 0) + 1
+            if getattr(c, "post_compaction", False):
+                after_pc += 1
+        else:
+            dropped.append(
+                {"prefix_id": budget.prefix_id,
+                 "prefix_tokens": budget.prefix_tokens,
+                 "over_by": -budget.headroom,
+                 "reason": "context overflow"}
+            )
+
+    fitting = [b for b in budgets if b.fits]
+    report = {
+        "n_candidates": len(candidates),
+        "n_fitting": len(kept),
+        "n_overflow": len(budgets) - len(fitting),
+        "n_render_errors": len(dropped) - (len(budgets) - len(fitting)),
+        "overflow_rate": (
+            round(1 - len(fitting) / len(budgets), 4) if budgets else None
+        ),
+        "max_model_len": max_model_len,
+        "max_new_tokens": max_new_tokens,
+        "budget_for_prefix": max_model_len - max_new_tokens,
+        "eligible_tasks_before": len({getattr(c, "task", None) for c in candidates}),
+        "eligible_tasks_after": len({getattr(c, "task", None) for c in kept}),
+        "eligible_traces_before": len({getattr(c, "trace_id", None) for c in candidates}),
+        "eligible_traces_after": len({getattr(c, "trace_id", None) for c in kept}),
+        "post_compaction_before": before_pc,
+        "post_compaction_after": after_pc,
+        "stage_distribution_before": dict(
+            sorted(before_steps.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
+        ),
+        "stage_distribution_after": dict(
+            sorted(after_steps.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
+        ),
+        "prefix_tokens_fitting": summarize_budgets(fitting) if fitting else {},
+        "dropped": dropped[:200],
+        "n_dropped_recorded": min(len(dropped), 200),
+        "n_dropped_total": len(dropped),
+    }
+    return kept, report
+
+
 __all__ = [
     "ContextBudget",
+    "filter_candidates_by_budget",
     "ContextBudgetError",
     "DEFAULT_MAX_MODEL_LEN",
     "assert_prefix_fits",
