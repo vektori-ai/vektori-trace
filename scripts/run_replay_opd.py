@@ -129,7 +129,13 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
         summarize_cap_hits,
     )
 
-    actions, rendered = [], {}
+    from vektori_trace.replay_context import (
+        assert_prefix_fits,
+        measure_prefix,
+        summarize_budgets,
+    )
+
+    actions, rendered, budgets = [], {}, []
     for prefix in prefixes:
         messages = turns_to_messages(prefix.prefix_turns)
         if not messages:
@@ -138,6 +144,19 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
         prompt = student_tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        # §4/§11: check the budget locally, before the request. A prefix that
+        # overflows is dropped from the *front* by the server; sampling then
+        # succeeds at a state this run cannot describe, with a finite loss and
+        # every downstream assertion still passing.
+        budget = measure_prefix(
+            prefix.prefix_id,
+            prompt,
+            student_tok,
+            max_new_tokens=args.max_tokens,
+            max_model_len=args.max_model_len,
+        )
+        budgets.append(budget)
+        assert_prefix_fits(budget)
         for i in range(args.n_samples):
             status, body = post(
                 args.api_base.rstrip("/") + "/completions",
@@ -167,8 +186,12 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
                     policy_version=POLICY_VERSION,
                 )
             )
-        log(f"  sampled 4 at {prefix.prefix_id}")
-    return actions, {"rendered": rendered, "cap": summarize_cap_hits(actions)}
+        log(f"  sampled 4 at {prefix.prefix_id} ({budget.prefix_tokens} prefix tokens)")
+    return actions, {
+        "rendered": rendered,
+        "cap": summarize_cap_hits(actions),
+        "context": summarize_budgets(budgets),
+    }
 
 
 def score_actions(actions, rendered, args):
@@ -259,6 +282,10 @@ def main() -> int:
     ap.add_argument("--student-tokenizer", default="Qwen/Qwen3-14B")
     ap.add_argument("--adapter-path", default=None, help="the frozen v0 adapter")
     ap.add_argument("--max-tokens", type=int, default=9216)
+    ap.add_argument("--max-model-len", type=int, default=40960,
+                    help="serving context window; SOL-HANDOFF pins the L40S "
+                         "server to 40960. Changing it here without changing "
+                         "the server makes the budget check a lie.")
     ap.add_argument("--temperature", type=float, default=1.0)
     # teacher
     ap.add_argument("--teacher-model", default=DEFAULT_TEACHER)
@@ -319,6 +346,47 @@ def main() -> int:
             total += sum(len(m.get("content") or "") for m in turns_to_messages(p.prefix_turns))
         report["dry_run"] = True
         report["approx_prefix_chars"] = total
+
+        # Measure the real context budget when a tokenizer is reachable. Chars
+        # are not a cost estimate — an approval granted against them is granted
+        # against the wrong number — and prefix overflow is the one failure the
+        # dry run can catch for free that would otherwise corrupt a paid run
+        # silently.
+        try:
+            import transformers
+
+            from vektori_trace.replay_context import measure_prefix, summarize_budgets
+
+            tok = transformers.AutoTokenizer.from_pretrained(
+                args.student_tokenizer, trust_remote_code=True
+            )
+            budgets = []
+            for p in prefixes:
+                prompt = tok.apply_chat_template(
+                    turns_to_messages(p.prefix_turns),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                budgets.append(
+                    measure_prefix(
+                        p.prefix_id, prompt, tok,
+                        max_new_tokens=args.max_tokens,
+                        max_model_len=args.max_model_len,
+                    )
+                )
+            report["context"] = summarize_budgets(budgets)
+            report["context_per_prefix"] = [b.to_dict() for b in budgets]
+            over = report["context"]["n_overflow"]
+            log(
+                f"context: max prefix {report['context']['max_prefix_tokens']} tokens, "
+                f"min headroom {report['context']['min_headroom']}, "
+                f"{over} would overflow"
+            )
+            if over:
+                log(f"OVERFLOW would block sampling: {report['context']['overflow_prefix_ids']}")
+        except Exception as e:  # tokenizer unreachable offline
+            report["context_error"] = f"{type(e).__name__}: {e}"
+            log(f"context budget not measured ({type(e).__name__}); chars only")
         # A dry run *reports* what is unpinned rather than refusing: knowing
         # which pins are missing is exactly what it is for.
         manifest = _build_manifest(args)
@@ -406,6 +474,7 @@ def main() -> int:
     log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
     actions, samp = sample_actions(prefixes, student_tok, args)
     report["cap"] = samp["cap"]
+    report["context"] = samp["context"]
 
     log("stage 3/4: scoring with DeepSeek")
     scored, ledger, teacher_prov = score_actions(actions, samp["rendered"], args)
