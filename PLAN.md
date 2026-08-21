@@ -1,6 +1,10 @@
 Capability Routing — Design Doc
 ===============================
 
+> **Superseded for OPD execution.** This remains background routing context only;
+> the current replay-prefix-only OPD experiment is specified in
+> `docs/OPD-MULTITURN-PLAN.md`.
+
 **Date:** 2026-07-28 · **Branch:** `step6-train-arms` · **Supersedes:** the Step-6
 experiment design in `V0_PLAN.md`. Mining, verification and diagnosis sections of
 `V0_PLAN.md` remain authoritative.

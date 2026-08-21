@@ -1,5 +1,8 @@
 # Cross-tokenizer OPD — full build plan
 
+> **Superseded.** Historical build plan. Do not execute it; use
+> `docs/OPD-MULTITURN-PLAN.md` for the current replay-prefix-only experiment.
+
 **This file is the single source of truth for the cross-tokenizer OPD work.**
 It is self-contained: a reader with **zero prior context** can build the whole
 thing from this document alone, without opening another doc. It deliberately

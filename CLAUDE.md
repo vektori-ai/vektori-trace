@@ -63,6 +63,32 @@ EC2 `i-0a348ff3d7be9769a` (ap-south-1), reachable **only via AWS SSM** —
 Repo lives at `/data/vektori-trace`. Heredocs are unreliable over SSM and the
 box's python3 has no `tomllib`; keep remote commands simple.
 
+## The OPD plan of record
+
+**`docs/OPD-MULTITURN-PLAN.md` is authoritative.** Read it before touching
+anything OPD — the loss, alignment, teacher scoring, prefix selection, or a GPU
+run. It supersedes `FINAL-PLAN.md` and `docs/OPD-RUN-PLAN.md`, which are
+provenance only; `docs/OPD.md` remains a method survey, not a design.
+
+Three things settled 2026-08-21, each of which cost a wrong turn to find:
+
+- **Replay-prefix only.** Live multi-turn Harbor OPD is out of scope. The
+  trained artifact is `v_replay`, parented on frozen `v0` — *not* on a
+  live-updated adapter, because a v1-parented result cannot answer whether
+  replay itself helps.
+- **The loss is `chunk_opd.py`**, the semantic-prior port of arXiv:2606.09456
+  (`vektori_trace/opd_reference/`, pinned at `927a8264`). `cross_kl.py`'s
+  estimator B is legacy/diagnostic and `assert_chunk_loss_selected` refuses it
+  on a cross-tokenizer training path.
+- **Fireworks has no `/tokenize`.** Teacher ids come from the pinned local
+  encoder (`encoding_dsv4` + `providers/teacher/cross.py`) and go to
+  `/completions` as an integer array. §6.3 probe passed 2026-08-21.
+
+Do not reintroduce the 256-token per-turn cap: a truncated action still aligns
+and still yields a finite loss, so the error is invisible downstream.
+`FireworksOPDConfig.max_new_tokens` still defaults to it, and
+`validate_cross_opd_config` is what refuses it.
+
 ## The SFT plan of record
 
 **`docs/SFT-SCRATCH-PLAN.md` is authoritative.** Read it before touching

@@ -1,7 +1,11 @@
 On-Policy Distillation — Reference
 ==================================
 
-**Date:** 2026-07-28 · Research reference for `PLAN.md`. Not a design doc.
+**Date:** 2026-07-28 · Research reference. Not a design doc.
+
+> Still current as *background* — the method survey below is unchanged. The
+> experiment it was written alongside is not: see
+> `docs/OPD-MULTITURN-PLAN.md` for the replay-prefix-only design of record.
 
 This file characterises on-policy distillation (OPD): what it is, the design
 space, every method family that exists, and which are viable for agentic coding

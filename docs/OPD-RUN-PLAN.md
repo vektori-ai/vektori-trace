@@ -1,5 +1,9 @@
 # Cross-tokenizer OPD run — DeepSeek-V4-Flash → Qwen3-14B on 2 tasks
 
+> **Superseded.** Historical plan for the pre-chunk estimator-A/B objective.
+> Do not execute it; use `docs/OPD-MULTITURN-PLAN.md` for the current
+> replay-prefix-only experiment.
+
 **Status:** approved 2026-08-13, Phase 0 executing.
 **Self-contained by design** — a fresh model with no chat history should be able
 to execute this cold. Everything needed is below or at a named path.
