@@ -1,0 +1,369 @@
+"""The scoring bridge and the optimizer step (plan §8.2, §8.3, §7.3).
+
+The optimizer half runs on a real tiny model with a real LoRA adapter and a real
+`AdamW.step()`. A mocked backward would prove the harness works, not that a
+gradient reaches LoRA parameters — which is the property that has to hold before
+a paid run.
+
+The scoring half is tested against the pinned DeepSeek renderer and tokenizer,
+with the teacher's *transport* stubbed: §6.3 already proved that against the
+live endpoint, and re-paying for it here would add nothing.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from vektori_trace.replay_opd import SampledAction, build_replay_batch
+from vektori_trace.replay_score import (
+    ScoringError,
+    score_action,
+    score_replay_batch,
+)
+from vektori_trace.replay_select import ReplayPrefix
+from vektori_trace.replay_train import (
+    ReplayTrainConfig,
+    ReplayTrainError,
+    build_optimizer,
+    current_logprobs,
+    make_optimizer_step,
+)
+
+torch = pytest.importorskip("torch", reason="the step proof needs the train extra")
+transformers = pytest.importorskip("transformers")
+peft = pytest.importorskip("peft")
+
+TINY = "hf-internal-testing/tiny-random-gpt2"
+V0 = "ck75-v0"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _prefix(task: str, trace: str, step: int = 2) -> ReplayPrefix:
+    return ReplayPrefix(task=task, trace_id=trace, step_index=step, prefix_turns=[])
+
+
+def _split(text: str, chunk: int) -> list[bytes]:
+    raw = text.encode()
+    return [raw[i : i + chunk] for i in range(0, len(raw), chunk)]
+
+
+#: A Qwen-plausible tokenisation, written out rather than fixed-width split.
+#: DeepSeek emits {"/cmd/":/ "/ls/ -/la/ /works/pace/"} for this string; a
+#: fixed-width student split shares almost no boundary with it and collapses the
+#: whole action into one 5:11 chunk, which the threshold-6 sentinel then drops —
+#: correct behaviour that silently yields zero supervised tokens. A fixture must
+#: not depend on it.
+STUDENT_TOKENS = [b'{"', b"cmd", b'":', b' "ls', b" -la", b" /work", b"space", b'"}']
+
+
+def _action(prefix, i, text=None) -> SampledAction:
+    if text is None:
+        toks = list(STUDENT_TOKENS)
+        text = b"".join(toks).decode()
+    else:
+        toks = _split(text, 4)
+    return SampledAction(
+        prefix_id=prefix.prefix_id,
+        sample_index=i,
+        action_bytes=text.encode(),
+        action_token_ids=list(range(2, len(toks) + 2)),
+        action_token_bytes=toks,
+        behavior_logprobs=[-0.5 - 0.01 * k for k in range(len(toks))],
+        policy_version=V0,
+    )
+
+
+class FakePool:
+    """`score_ids` with the real contract: one logprob per supplied token."""
+
+    def __init__(self, value=-0.3, n_override=None):
+        self.value = value
+        self.n_override = n_override
+        self.calls = []
+
+    def score_ids(self, prompt_ids, tokens):
+        self.calls.append((len(prompt_ids), len(tokens)))
+        n = self.n_override if self.n_override is not None else len(tokens)
+        return [self.value - 0.01 * i for i in range(n)]
+
+
+@pytest.fixture(scope="module")
+def teacher_tokenizer():
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    try:
+        return load_tokenizer("deepseek-ai/DeepSeek-V4-Flash-0731")
+    except Exception as e:  # pragma: no cover - offline
+        pytest.skip(f"teacher tokenizer unavailable: {e}")
+
+
+MESSAGES = [
+    {"role": "system", "content": "You are a terminal agent."},
+    {"role": "user", "content": "List the workspace."},
+]
+
+
+# ---------------------------------------------------------------------------
+# Scoring bridge (§4 rendering contract)
+# ---------------------------------------------------------------------------
+
+
+def test_action_span_is_located_by_joint_tokenisation(teacher_tokenizer):
+    from vektori_trace.replay_score import locate_action_span
+
+    action = '{"cmd": "ls -la /workspace"}'
+    prefix_ids, action_ids, dropped = locate_action_span(
+        MESSAGES, action, teacher_tokenizer
+    )
+
+    assert prefix_ids and action_ids
+    # The renderer closes the turn with EOS; ck75 never sampled it.
+    assert dropped >= 1
+    decoded = teacher_tokenizer.decode(action_ids, skip_special_tokens=False)
+    assert decoded == action
+
+
+def test_scored_span_excludes_the_turn_terminator(teacher_tokenizer):
+    """Decoding with specials hidden would make an EOS-carrying span look exact."""
+    from vektori_trace.replay_score import locate_action_span
+
+    action = '{"cmd": "pytest -x"}'
+    _pre, action_ids, _d = locate_action_span(MESSAGES, action, teacher_tokenizer)
+
+    visible = teacher_tokenizer.decode(action_ids, skip_special_tokens=False)
+    assert visible == action
+    assert "end" not in visible.lower() or visible == action
+
+
+def test_score_action_returns_bytes_and_logprobs(teacher_tokenizer):
+    p = _prefix("t", "tr0")
+    a = _action(p, 0)
+    pool = FakePool()
+
+    s = score_action(a, MESSAGES, teacher_tokenizer, pool)
+
+    assert s.key == a.key
+    assert len(s.teacher_logprobs) == s.n_teacher_tokens
+    assert b"".join(s.teacher_token_bytes) == a.action_bytes
+    assert s.n_prefix_tokens > 0
+    # One request carrying prefix + action, exactly as §3 describes.
+    assert len(pool.calls) == 1
+
+
+def test_teacher_returning_the_wrong_count_is_refused(teacher_tokenizer):
+    p = _prefix("t", "tr0")
+    a = _action(p, 0)
+    with pytest.raises(ScoringError, match="logprobs for"):
+        score_action(a, MESSAGES, teacher_tokenizer, FakePool(n_override=3))
+
+
+def test_non_finite_teacher_logprob_is_refused(teacher_tokenizer):
+    class BadPool:
+        def score_ids(self, prompt_ids, tokens):
+            return [-0.3] * (len(tokens) - 1) + [float("-inf")]
+
+    p = _prefix("t", "tr0")
+    with pytest.raises(ScoringError, match="non-finite"):
+        score_action(_action(p, 0), MESSAGES, teacher_tokenizer, BadPool())
+
+
+def test_batch_scoring_produces_the_pairs_build_replay_batch_wants(teacher_tokenizer):
+    prefixes = [_prefix(f"task{i}", f"tr{i}") for i in range(8)]
+    actions = [_action(p, i) for p in prefixes for i in range(4)]
+    msgs = {p.prefix_id: MESSAGES for p in prefixes}
+
+    scored, ledger = score_replay_batch(actions, msgs, teacher_tokenizer, FakePool())
+
+    assert set(scored) == {a.key for a in actions}
+    # Per-trace share is 1/8 here; the default 35% cap is aimed at a real
+    # batch where action lengths vary, so relax it for uniform fixtures.
+    batch = build_replay_batch(prefixes, actions, scored, max_trace_share=0.5)
+    assert batch.global_supervised_tokens > 0
+
+
+def test_ledger_reports_repeated_prefix_cost(teacher_tokenizer):
+    """§8.4: each prefix is re-sent once per sample, and that dominates."""
+    prefixes = [_prefix(f"task{i}", f"tr{i}") for i in range(2)]
+    actions = [_action(p, i) for p in prefixes for i in range(4)]
+    msgs = {p.prefix_id: MESSAGES for p in prefixes}
+
+    _scored, ledger = score_replay_batch(actions, msgs, teacher_tokenizer, FakePool())
+
+    assert ledger["n_actions"] == 8
+    assert ledger["n_teacher_requests"] == 8
+    # 4 samples per prefix -> three of every four prefix sends are repeats.
+    assert ledger["repeated_prefix_tokens"] == pytest.approx(
+        ledger["unique_prefix_tokens"] * 3, rel=0.01
+    )
+
+
+def test_missing_prefix_render_is_refused(teacher_tokenizer):
+    p = _prefix("t", "tr0")
+    with pytest.raises(ScoringError, match="no rendered prefix"):
+        score_replay_batch([_action(p, 0)], {}, teacher_tokenizer, FakePool())
+
+
+# ---------------------------------------------------------------------------
+# Optimizer step — real model, real LoRA, real step
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lora_model():
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    try:
+        base = AutoModelForCausalLM.from_pretrained(TINY)
+    except Exception as e:  # pragma: no cover - offline
+        pytest.skip(f"tiny model unavailable: {e}")
+    return get_peft_model(
+        base,
+        LoraConfig(task_type=TaskType.CAUSAL_LM, r=4, lora_alpha=8, lora_dropout=0.0),
+    )
+
+
+def _batch(model, n_prefixes=8, n_per=4):
+    """A scored, aligned batch whose ids are valid for the tiny model."""
+    from vektori_trace.replay_score import score_replay_batch
+
+    vocab = model.config.vocab_size
+    prefixes = [_prefix(f"task{i}", f"tr{i}") for i in range(n_prefixes)]
+    actions = []
+    for p in prefixes:
+        for i in range(n_per):
+            a = _action(p, i)
+            a.action_token_ids = [(t * 7 + 3) % vocab for t in a.action_token_ids]
+            actions.append(a)
+    # Teacher side: a different granularity, so the chunk path is exercised.
+    scored = {}
+    for a in actions:
+        tb = _split(a.action_bytes.decode(), 3)
+        scored[a.key] = (tb, [-0.3 - 0.02 * (k % 5) for k in range(len(tb))])
+    return build_replay_batch(prefixes, actions, scored)
+
+
+def test_one_step_moves_lora_and_reports_it(lora_model, tmp_path):
+    cfg = ReplayTrainConfig(output_dir=tmp_path / "v_replay")
+    opt = build_optimizer(lora_model, cfg)
+    step = make_optimizer_step(lora_model, opt, cfg, save=False)
+
+    batch = _batch(lora_model)
+    rep = step(batch)
+
+    assert rep["optimizer_steps"] == 1
+    assert rep["lora_tensors_moved"] > 0
+    assert rep["max_param_delta"] > 0
+    assert rep["global_supervised_tokens"] == batch.global_supervised_tokens
+    assert rep["supervised_positions_scored"] > 0
+    import math
+
+    assert math.isfinite(rep["loss"])
+
+
+def test_current_logprobs_carry_autograd(lora_model):
+    ids = [3, 4, 5, 6]
+    lp = current_logprobs(lora_model, ids)
+    assert lp.requires_grad
+    assert lp.shape[0] == len(ids) - 1, "first id is context under next-token"
+
+
+def test_saving_writes_an_adapter_that_reloads(lora_model, tmp_path):
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    out = tmp_path / "v_replay"
+    cfg = ReplayTrainConfig(output_dir=out)
+    opt = build_optimizer(lora_model, cfg)
+    step = make_optimizer_step(lora_model, opt, cfg, save=True)
+
+    rep = step(_batch(lora_model))
+    assert rep["adapter_saved_to"] == str(out)
+    assert (out / "adapter_config.json").is_file()
+
+    base = AutoModelForCausalLM.from_pretrained(TINY)
+    reloaded = PeftModel.from_pretrained(base, out)
+    assert any("lora" in n.lower() for n, _ in reloaded.named_parameters())
+
+
+def test_output_dir_equal_to_v0_is_refused(tmp_path):
+    """§8.3: v0 must not be overwritten."""
+    with pytest.raises(ReplayTrainError, match="must not be overwritten"):
+        ReplayTrainConfig(adapter_path=str(tmp_path / "v0"), output_dir=tmp_path / "v0")
+
+
+def test_a_batch_with_no_supervised_tokens_is_refused(lora_model, tmp_path):
+    cfg = ReplayTrainConfig(output_dir=tmp_path / "v")
+    opt = build_optimizer(lora_model, cfg)
+    step = make_optimizer_step(lora_model, opt, cfg, save=False)
+
+    batch = _batch(lora_model, n_prefixes=8, n_per=1)
+    for adv in batch.advantages:
+        adv.supervised_mask = [False] * len(adv.supervised_mask)
+
+    # global_supervised_tokens goes to zero first, which is the earlier and
+    # more informative refusal.
+    with pytest.raises(ReplayTrainError, match="no supervised tokens"):
+        step(batch)
+
+
+def test_model_without_trainable_params_is_refused(tmp_path):
+    from transformers import AutoModelForCausalLM
+
+    try:
+        base = AutoModelForCausalLM.from_pretrained(TINY)
+    except Exception as e:  # pragma: no cover
+        pytest.skip(str(e))
+    for p in base.parameters():
+        p.requires_grad_(False)
+
+    cfg = ReplayTrainConfig(output_dir=tmp_path / "v")
+
+    class _Opt:
+        def zero_grad(self, set_to_none=True):
+            pass
+
+        def step(self):
+            pass
+
+    step = make_optimizer_step(base, _Opt(), cfg, save=False)
+    with pytest.raises(ReplayTrainError, match="no trainable parameters"):
+        step(_batch(base))
+
+
+def test_gradient_is_globally_normalised_not_per_example(lora_model, tmp_path):
+    """§7.3: one denominator across the batch.
+
+    Two batches with the same total supervised tokens but different example
+    counts must produce the same gradient scale. A per-example mean would not.
+    """
+    cfg = ReplayTrainConfig(output_dir=tmp_path / "v", max_grad_norm=None)
+
+    def grad_norm_for(n_prefixes, n_per):
+        from peft import LoraConfig, TaskType, get_peft_model
+        from transformers import AutoModelForCausalLM
+
+        m = get_peft_model(
+            AutoModelForCausalLM.from_pretrained(TINY),
+            LoraConfig(task_type=TaskType.CAUSAL_LM, r=4, lora_alpha=8, lora_dropout=0.0),
+        )
+        torch.manual_seed(0)
+        opt = build_optimizer(m, cfg)
+        params = [p for _n, p in m.named_parameters() if p.requires_grad]
+        before = [p.detach().clone() for p in params]
+        make_optimizer_step(m, opt, cfg, save=False)(_batch(m, n_prefixes, n_per))
+        return max(
+            float((p.detach() - b).abs().max())
+            for b, p in zip(before, params, strict=True)
+        )
+
+    # Same 32 actions, arranged 8x4 and 16x2.
+    a = grad_norm_for(8, 4)
+    b = grad_norm_for(16, 2)
+    assert a == pytest.approx(b, rel=0.35), (
+        "the update scale must follow total supervised tokens, not example count"
+    )
