@@ -372,3 +372,62 @@ def test_unreadable_result_is_unknown(tmp_path):
     d = _write_trial(root, "t__x", "bad", reward=None)
     (d / "result.json").write_text("{not json")
     assert load_trace(d).passed is None
+
+
+# ---------------------------------------------------------------------------
+# The capture -> action -> advantages seam for prompt ids
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_token_ids_survive_capture_to_action():
+    """The exact ids, not a count.
+
+    The optimizer recomputes log pi_current over prompt+action. A capture that
+    records only `n_prompt_tokens` produces an action the optimizer refuses,
+    and the tiny-model tests populate prompt ids by hand so they cannot see it.
+    """
+    cap = FakeCapture([1, 2, 3], [-0.1, -0.2, -0.3])
+    cap.prompt_token_ids = [77, 88, 99, 111]
+
+    a = sampled_action_from_capture(
+        cap, FakeTokenizer(), prefix_id="tr0@2", sample_index=0, policy_version="v0"
+    )
+
+    assert a.prompt_token_ids == [77, 88, 99, 111], "exact ids, in order"
+    assert a.meta["n_prompt_tokens"] == 4
+
+
+def test_prompt_ids_reach_turn_advantages():
+    """End of the seam: what the optimizer actually reads."""
+    from vektori_trace.replay_opd import build_replay_batch
+    from vektori_trace.replay_select import ReplayPrefix
+
+    cap = FakeCapture([1, 2, 3, 4], [-0.1] * 4)
+    cap.prompt_token_ids = [5, 6, 7]
+    prefix = ReplayPrefix(task="t", trace_id="tr0", step_index=2, prefix_turns=[])
+    action = sampled_action_from_capture(
+        cap,
+        FakeTokenizer(),
+        prefix_id=prefix.prefix_id,
+        sample_index=0,
+        policy_version="v0",
+    )
+    # One teacher token per student token keeps the alignment 1:1.
+    scored = {action.key: ([b"a", b"b", b"c", b"d"], [-0.2] * 4)}
+
+    # One prefix is 100% of one task by construction; the spread rules target a
+    # real batch, so both caps are lifted for this seam check.
+    batch = build_replay_batch(
+        [prefix], [action], scored, max_trace_share=1.0, max_task_share=1.0
+    )
+
+    assert batch.advantages[0].prompt_token_ids == [5, 6, 7]
+
+
+def test_capture_without_prompt_ids_is_refused():
+    cap = FakeCapture([1, 2], [-0.1, -0.2])
+    cap.prompt_token_ids = []
+    with pytest.raises(CaptureAdaptError, match="no prompt token ids"):
+        sampled_action_from_capture(
+            cap, FakeTokenizer(), prefix_id="p", sample_index=0, policy_version="v0"
+        )

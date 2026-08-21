@@ -6,7 +6,9 @@ verified end to end:
 
   A. the endpoint answers as ck75 (base + the pinned adapter, not the base alone);
   B. a stored replay prefix renders and is accepted;
-  C. the response carries per-token ids for the sampled action;
+  C. the response carries per-token ids for the sampled action, and the prompt
+     token ids training needs to recompute log pi_current in the same
+     conditioning;
   D. it carries one behaviour log probability per sampled token;
   E. those survive `replay_sample.sampled_action_from_capture` into a
      `SampledAction` whose bytes reconstruct exactly;
@@ -265,6 +267,18 @@ def main() -> int:
         all(a.action_token_ids for a in actions),
         f"{len(actions)} samples carry token ids "
         f"({[len(a.action_token_ids) for a in actions]} tokens)",
+    )
+    # Separate gate: action ids alone are not enough to train. log pi_current
+    # must be recomputed over prompt+action, so the prompt ids have to come back
+    # AND survive into the SampledAction.
+    prompt_lens = [len(a.prompt_token_ids or []) for a in actions]
+    g.check(
+        "C-prompt-ids",
+        all(n > 0 for n in prompt_lens),
+        f"prompt token ids returned and retained ({prompt_lens} tokens)"
+        if all(n > 0 for n in prompt_lens)
+        else "a sample carries no prompt token ids — training cannot recompute "
+        "log pi_current in the conditioning log pi_old was captured under",
     )
     g.check(
         "D-logprobs",

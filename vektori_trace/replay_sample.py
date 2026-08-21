@@ -10,6 +10,9 @@ boundary and none of them is checkable later:
    without `capture_logprobs=True` has `logprobs=None`, and `log pi_old` cannot
    be recovered afterwards — the sampling run would have to be repeated. Failing
    here costs one error message; failing at training time costs the rollout.
+   The same applies to `prompt_token_ids`: the optimizer recomputes
+   `log pi_current` over `prompt + action`, so the exact prompt ids are part of
+   what makes the ratio meaningful and are carried through rather than counted.
 2. **The ids must be the bytes.** `action_token_bytes` is what
    `align.align_by_bytes` aligns against, so it is derived from the ids with the
    pinned student tokenizer rather than from `text`. For a reasoning model the
@@ -113,6 +116,16 @@ def sampled_action_from_capture(
             "pass allow_truncated=True and record the cap-hit rate (§10)."
         )
 
+    prompt_token_ids = [int(t) for t in (getattr(capture, "prompt_token_ids", None) or [])]
+    if not prompt_token_ids:
+        raise CaptureAdaptError(
+            f"{prefix_id}#{sample_index}: capture carries no prompt token ids. "
+            "log pi_current must be recomputed in the same conditioning "
+            "log pi_old was captured under, so training needs the exact prompt "
+            "ids — a count is not enough. Request them with "
+            "`return_token_ids: true`."
+        )
+
     token_bytes = token_bytes_from_ids(tokenizer, token_ids)
     action_bytes = b"".join(token_bytes)
 
@@ -124,11 +137,15 @@ def sampled_action_from_capture(
         action_token_bytes=token_bytes,
         behavior_logprobs=logprobs,
         policy_version=policy_version,
+        # The exact conditioning this action was sampled under. Carried, not
+        # counted: without it the optimizer cannot recompute log pi_current
+        # comparably and refuses the action.
+        prompt_token_ids=prompt_token_ids,
         termination_reason=finish,
         meta={
             "request_id": getattr(capture, "request_id", None),
             "model": getattr(capture, "model", None),
-            "n_prompt_tokens": len(getattr(capture, "prompt_token_ids", None) or []),
+            "n_prompt_tokens": len(prompt_token_ids),
             "truncated": finish == "length",
         },
     )
