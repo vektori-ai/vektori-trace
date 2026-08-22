@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -294,13 +295,38 @@ def sample_actions(prefixes, student_tok, args, on_capture=None) -> tuple[list, 
     }
 
 
-def _load_scores(path: Path) -> dict:
+def _score_fingerprint(action, teacher_model: str, teacher_tokenizer: str) -> str:
+    """What a cached teacher score is only valid for.
+
+    Keying the cache on `prefix#sample` alone is not enough: those ids are
+    positional and get reused the moment a prefix is replaced, so a stale file
+    would be silently accepted for a *different* action. Bind the score to the
+    bytes scored, the prompt they were conditioned on, and the teacher that
+    produced them.
+    """
+    h = hashlib.sha256()
+    h.update(action.action_bytes)
+    h.update(b"\0")
+    h.update(json.dumps(list(action.prompt_token_ids or [])).encode())
+    h.update(b"\0")
+    h.update(teacher_model.encode())
+    h.update(b"\0")
+    h.update(teacher_tokenizer.encode())
+    return h.hexdigest()
+
+
+def _load_scores(path: Path, expected: dict[str, str] | None = None) -> dict:
     """Teacher scores already on disk from an earlier attempt.
 
     Tolerates a truncated final line: a crash mid-write must not invalidate the
     requests before it, which is the entire point of writing them one at a time.
+
+    Rows whose fingerprint does not match the action now in hand are dropped
+    rather than reused. Paying for one request again is cheaper than training
+    on a score that belongs to different bytes.
     """
     out: dict = {}
+    stale = 0
     if not path.exists():
         return out
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -312,12 +338,19 @@ def _load_scores(path: Path) -> dict:
         except json.JSONDecodeError:
             break
         key = row["key"]
+        if expected is not None:
+            want = expected.get(key)
+            if want is None or row.get("fingerprint") != want:
+                stale += 1
+                continue
         if key in out:
             raise ValueError(f"duplicate teacher score for {key} in {path}")
         out[key] = (
             [base64.b64decode(b) for b in row["teacher_token_bytes_b64"]],
             row["teacher_logprobs"],
         )
+    if stale:
+        log(f"ignored {stale} cached score(s) whose fingerprint no longer matches")
     return out
 
 
@@ -329,7 +362,11 @@ def score_actions(actions, rendered, args, scores_path=None):
     teacher_tok = load_tokenizer(args.teacher_tokenizer)
     pool = FireworksTeacherPool(model=args.teacher_model)
 
-    prior = _load_scores(scores_path) if scores_path else {}
+    fingerprints = {
+        a.key: _score_fingerprint(a, args.teacher_model, args.teacher_tokenizer)
+        for a in actions
+    }
+    prior = _load_scores(scores_path, fingerprints) if scores_path else {}
     expected = {a.key for a in actions}
     foreign = sorted(set(prior) - expected)
     if foreign:
@@ -346,6 +383,7 @@ def score_actions(actions, rendered, args, scores_path=None):
             return
         fh.write(json.dumps({
             "key": sc.key,
+            "fingerprint": fingerprints.get(sc.key),
             "teacher_token_bytes_b64": [
                 base64.b64encode(b).decode() for b in sc.teacher_token_bytes
             ],
@@ -393,11 +431,24 @@ def train(batch_inputs, args):
     model = load_v0_for_training(cfg)
     opt = build_optimizer(model, cfg)
 
+    progress = Path(args.out) / "train_progress.jsonl"
+
+    def _log_example(row):
+        log(
+            f"  ex {row['example']:>2}/{len(actions)} "
+            f"{row.get('key','')} tok={row.get('total_tokens')} "
+            f"sup={row.get('supervised')} "
+            f"loss/tok={row.get('loss_per_token')!s:.8} "
+            f"peak={row.get('peak_gib')}GiB {row.get('seconds')}s"
+        )
+
     return run_replay_chunk_opd(
         prefixes,
         actions,
         scored,
-        make_optimizer_step(model, opt, cfg),
+        make_optimizer_step(
+            model, opt, cfg, progress_path=progress, on_example=_log_example
+        ),
         max_new_tokens=args.max_tokens,
         n_samples_per_prefix=args.n_samples,
         stored_teacher_actions=stored,

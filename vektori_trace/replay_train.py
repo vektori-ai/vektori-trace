@@ -34,6 +34,8 @@ around it) import without the train extra.
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -171,12 +173,63 @@ def action_logprobs_under_prefix(
     return scored
 
 
+def _system_metrics() -> dict[str, Any]:
+    """Host and device utilisation alongside each example.
+
+    Recorded per example rather than sampled separately so a slow or failing
+    example carries its own machine state: a stall shows up as GPU util near
+    zero, host RAM pressure shows up before an OOM killer intervenes, and
+    neither is recoverable after the fact from a torch-only counter.
+
+    Every probe is optional — a metrics call must never be the thing that kills
+    a training run.
+    """
+    out: dict[str, Any] = {}
+    try:
+        import os as _os
+
+        load1, load5, _ = _os.getloadavg()
+        out["load1"] = round(load1, 2)
+        out["load5"] = round(load5, 2)
+        out["cpu_count"] = _os.cpu_count()
+    except Exception:
+        pass
+    try:
+        import resource
+
+        # ru_maxrss is KiB on Linux: peak resident set of this process.
+        out["host_rss_gib"] = round(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2, 2
+        )
+    except Exception:
+        pass
+    try:
+        import subprocess
+
+        raw = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,power.draw,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().splitlines()[0]
+        util, mem, power, temp = [x.strip() for x in raw.split(",")]
+        out["gpu_util_pct"] = int(float(util))
+        out["gpu_mem_used_gib"] = round(float(mem) / 1024, 2)
+        out["gpu_power_w"] = float(power)
+        out["gpu_temp_c"] = int(float(temp))
+    except Exception:
+        pass
+    return out
+
+
 def make_optimizer_step(
     model: Any,
     optimizer: Any,
     cfg: ReplayTrainConfig,
     *,
     save: bool = True,
+    progress_path: Path | None = None,
+    on_example: Any = None,
 ):
     """Build the `optimizer_step` callable `run_replay_chunk_opd` expects.
 
@@ -190,6 +243,25 @@ def make_optimizer_step(
     from .chunk_opd import DEFAULT_CLIP_EPS, clip_fraction, clipped_is_policy_loss
 
     clip_eps = cfg.clip_eps if cfg.clip_eps is not None else DEFAULT_CLIP_EPS
+
+    def _emit(row: dict[str, Any]) -> None:
+        """One durable line per example, written as it completes.
+
+        The accumulation loop is 32 full 14B forward/backward passes — minutes
+        of wall time on a billing GPU — and it used to print nothing until the
+        optimizer step returned. A crash at example 30 then produced a
+        traceback and no record of the 29 that worked: not the loss
+        trajectory, not the memory approaching the OOM, not which example was
+        being processed. Appended and fsync'd so the file survives the process
+        that wrote it.
+        """
+        if progress_path is not None:
+            with Path(progress_path).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        if on_example is not None:
+            on_example(row)
 
     def step(batch: ReplayBatch) -> dict[str, Any]:
         denom = batch.global_supervised_tokens
@@ -211,9 +283,11 @@ def make_optimizer_step(
         loss_total = 0.0
         clip_fracs: list[float] = []
 
-        for adv in batch.advantages:
+        for i_ex, adv in enumerate(batch.advantages):
+            t_ex = time.time()
             ids = adv.action_token_ids
             if not ids:
+                _emit({"example": i_ex, "skipped": "no action tokens"})
                 continue
             if not adv.prompt_token_ids:
                 raise ReplayTrainError(
@@ -250,10 +324,33 @@ def make_optimizer_step(
             # keeping every graph alive.
             (loss / denom).backward()
 
-            loss_total += float(loss.detach().item())
-            n_supervised += int(mask.sum().item())
+            ex_loss = float(loss.detach().item())
+            ex_sup = int(mask.sum().item())
+            loss_total += ex_loss
+            n_supervised += ex_sup
+            ex_clip = None
             if bool((mask > 0).any()):
-                clip_fracs.append(clip_fraction(cur.detach(), beh, mask, clip_eps=clip_eps))
+                ex_clip = clip_fraction(cur.detach(), beh, mask, clip_eps=clip_eps)
+                clip_fracs.append(ex_clip)
+
+            row = {
+                "example": i_ex,
+                "key": batch.keys[i_ex] if i_ex < len(batch.keys) else None,
+                "prompt_tokens": len(adv.prompt_token_ids or []),
+                "action_tokens": n,
+                "total_tokens": len(adv.prompt_token_ids or []) + n,
+                "supervised": ex_sup,
+                "loss_sum": ex_loss,
+                "loss_per_token": ex_loss / ex_sup if ex_sup else None,
+                "clip_fraction": ex_clip,
+                "seconds": round(time.time() - t_ex, 2),
+                "running_supervised": n_supervised,
+            }
+            if torch.cuda.is_available():
+                row["peak_gib"] = round(torch.cuda.max_memory_allocated() / 1024**3, 2)
+                row["reserved_gib"] = round(torch.cuda.max_memory_reserved() / 1024**3, 2)
+            row.update(_system_metrics())
+            _emit(row)
 
         if n_supervised == 0:
             raise ReplayTrainError(
@@ -294,6 +391,22 @@ def make_optimizer_step(
         saved: str | None = None
         reload_check: dict[str, Any] | None = None
         if save:
+            # Refuse to write into a directory that already holds an adapter.
+            # save_pretrained overwrites the files it writes and leaves the
+            # rest, so a second run into the same directory can leave a mix of
+            # old weights and a new config that loads without complaint.
+            existing = (
+                [f.name for f in cfg.output_dir.iterdir()
+                 if f.name.startswith("adapter_")]
+                if cfg.output_dir.is_dir() else []
+            )
+            if existing:
+                raise ReplayTrainError(
+                    f"{cfg.output_dir} already contains {sorted(existing)}. "
+                    "Refusing to overwrite: a partial mix of old weights and a "
+                    "new config reloads without error and is not v_replay. "
+                    "Move it aside or pass a fresh --out."
+                )
             cfg.output_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(cfg.output_dir))
             saved = str(cfg.output_dir)
