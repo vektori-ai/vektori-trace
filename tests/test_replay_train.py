@@ -202,6 +202,26 @@ def test_ledger_reports_repeated_prefix_cost(teacher_tokenizer):
     )
 
 
+def test_ledger_counts_reused_scores_as_actions_not_new_requests(teacher_tokenizer):
+    p = _prefix("task", "tr")
+    actions = [_action(p, i) for i in range(2)]
+    prior = {actions[0].key: ([b"cached"], [-0.2])}
+
+    scored, ledger = score_replay_batch(
+        actions,
+        {p.prefix_id: MESSAGES},
+        teacher_tokenizer,
+        FakePool(),
+        already_scored=prior,
+    )
+
+    assert set(scored) == {a.key for a in actions}
+    assert ledger["n_actions"] == 2
+    assert ledger["n_newly_scored"] == 1
+    assert ledger["n_reused_from_disk"] == 1
+    assert ledger["n_teacher_requests"] == 1
+
+
 def test_missing_prefix_render_is_refused(teacher_tokenizer):
     p = _prefix("t", "tr0")
     with pytest.raises(ScoringError, match="no rendered prefix"):

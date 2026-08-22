@@ -22,6 +22,7 @@ from vektori_trace.replay_opd import (
     assert_action_is_student_sampled,
     build_replay_batch,
     run_replay_chunk_opd,
+    validate_sample_set,
 )
 from vektori_trace.replay_select import (
     REOPD_DEFAULT_KAPPA,
@@ -79,6 +80,35 @@ def _batch_of(n_prefixes: int = 8, per_prefix: int = 4):
 
 def _noop_step(batch):
     return {"stepped": True, "tokens": batch.global_supervised_tokens}
+
+
+def test_capture_set_must_be_complete_before_scoring():
+    prefixes, actions, _scores = _batch_of(2, 4)
+    for action in actions:
+        action.prompt_token_ids = [1, 2, 3]
+
+    validate_sample_set(prefixes, actions, n_samples_per_prefix=4)
+
+    with pytest.raises(ReplayOPDError, match="7/8 rows"):
+        validate_sample_set(prefixes, actions[:-1], n_samples_per_prefix=4)
+
+
+def test_capture_set_refuses_duplicates_foreign_rows_and_missing_prompts():
+    prefixes, actions, _scores = _batch_of(2, 2)
+    for action in actions:
+        action.prompt_token_ids = [1, 2, 3]
+
+    with pytest.raises(ReplayOPDError, match="duplicates"):
+        validate_sample_set(prefixes, [*actions, actions[0]], n_samples_per_prefix=2)
+
+    foreign = _action(_prefix("other", "foreign"), 0)
+    foreign.prompt_token_ids = [1]
+    with pytest.raises(ReplayOPDError, match="unexpected"):
+        validate_sample_set(prefixes, [*actions, foreign], n_samples_per_prefix=2)
+
+    actions[0].prompt_token_ids = None
+    with pytest.raises(ReplayOPDError, match="lacks prompt_token_ids"):
+        validate_sample_set(prefixes, actions, n_samples_per_prefix=2)
 
 
 # ---------------------------------------------------------------------------

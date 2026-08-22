@@ -243,7 +243,8 @@ def score_replay_batch(
     total_prefix_sent = sum(s.n_prefix_tokens for s in rows)
 
     ledger = {
-        "n_actions": len(rows),
+        "n_actions": len(actions),
+        "n_newly_scored": len(rows),
         "n_reused_from_disk": reused,
         "n_teacher_requests": len(rows),
         "teacher_scored_tokens": total_scored,
@@ -251,6 +252,7 @@ def score_replay_batch(
         "unique_prefix_tokens": sum(prefix_tokens.values()),
         "repeated_prefix_tokens": total_prefix_sent - sum(prefix_tokens.values()),
         "teacher_input_tokens": total_prefix_sent + total_scored,
+        "cost_scope": "new teacher requests in this invocation only",
         "n_trailing_tokens_dropped": sum(s.n_trailing_dropped for s in rows),
         "student_vs_teacher_tokens": {
             s.key: (s.meta["n_student_tokens"], s.meta["n_teacher_tokens"])

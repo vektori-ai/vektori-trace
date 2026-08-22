@@ -31,6 +31,7 @@ wearing an OPD label, so `assert_action_is_student_sampled` checks it explicitly
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -96,6 +97,48 @@ class SampledAction:
     @property
     def key(self) -> str:
         return f"{self.prefix_id}#{self.sample_index}"
+
+
+def validate_sample_set(
+    prefixes: list[ReplayPrefix],
+    actions: list[SampledAction],
+    *,
+    n_samples_per_prefix: int,
+    require_prompt_ids: bool = True,
+) -> None:
+    """Refuse a partial, duplicated, or foreign replay capture set.
+
+    A JSONL file is intentionally useful after an interrupted sampling run,
+    but an interrupted file is *not* a trainable batch. Resuming scoring with
+    2/32 captures changes both the per-prefix baseline and the global loss
+    denominator while still producing finite numbers, so completeness must be
+    checked before the first teacher request.
+    """
+    expected = {
+        f"{p.prefix_id}#{i}"
+        for p in prefixes
+        for i in range(n_samples_per_prefix)
+    }
+    keys = [a.key for a in actions]
+    duplicates = sorted(k for k, n in Counter(keys).items() if n > 1)
+    observed = set(keys)
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    if duplicates or missing or unexpected:
+        raise ReplayOPDError(
+            "capture set is not the exact selected batch: "
+            f"{len(actions)}/{len(expected)} rows; "
+            f"duplicates={duplicates[:4]}, missing={missing[:4]}, "
+            f"unexpected={unexpected[:4]}"
+        )
+    if require_prompt_ids:
+        without_prompt = sorted(a.key for a in actions if not a.prompt_token_ids)
+        if without_prompt:
+            raise ReplayOPDError(
+                "capture set lacks prompt_token_ids for "
+                f"{without_prompt[:4]}; current/behaviour logprobs would use "
+                "different conditioning"
+            )
 
 
 @dataclass
