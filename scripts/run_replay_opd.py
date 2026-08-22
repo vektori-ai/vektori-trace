@@ -33,6 +33,7 @@ should be granted against.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -348,11 +349,12 @@ def main() -> int:
     ap.add_argument("--n-samples", type=int, default=4)
     ap.add_argument("--max-step", type=int, default=None,
                     help="cap the replay step; long prefixes eat the context window")
-    ap.add_argument("--require-post-compaction", type=int, default=0,
-                    help="§8.3 wants 2, but compaction boundaries are not "
-                         "derived from the corpus yet (plan §15), so the pool "
-                         "is empty and any value > 0 refuses. Default 0 means "
-                         "this run makes no post-compaction claim.")
+    ap.add_argument("--require-post-compaction", type=int, default=2,
+                    help="§8.3's two authentic post-compaction prefixes. "
+                         "Satisfiable since the SFT reconstruction was ported: "
+                         "candidates come from the retained segment, not a flat "
+                         "slice. Selection refuses a non-zero value if "
+                         "reconstruction is ever turned off again.")
     # student
     ap.add_argument("--api-base", default=os.environ.get("STUDENT_API_BASE"))
     ap.add_argument("--model", default=os.environ.get("STUDENT_MODEL"))
@@ -360,6 +362,13 @@ def main() -> int:
     ap.add_argument("--student-tokenizer", default="Qwen/Qwen3-14B")
     ap.add_argument("--adapter-path", default=None, help="the frozen v0 adapter")
     ap.add_argument("--max-tokens", type=int, default=9216)
+    ap.add_argument("--max-train-tokens", type=int, default=35687,
+                    help="measured training envelope: prefix+action that a "
+                         "forward/backward/step actually survived on an "
+                         "A100-80GB (67.2 GiB peak, 12.6 GiB headroom). "
+                         "Distinct from --max-tokens, which is the sampling "
+                         "loop guard: an action may sample fine and still be "
+                         "outside what training was proven to hold.")
     ap.add_argument("--max-model-len", type=int, default=40960,
                     help="serving context window; SOL-HANDOFF pins the L40S "
                          "server to 40960. Changing it here without changing "
@@ -387,6 +396,10 @@ def main() -> int:
                          "different host, and an inferred device is how the "
                          "step silently ran on CPU.")
     ap.add_argument("--out", default="./vektori-out/opd-replay")
+    ap.add_argument("--stop-after-sampling", action="store_true",
+                    help="sample, save captures, check the training envelope "
+                         "and report projected cost — then stop, before any "
+                         "paid teacher call")
     ap.add_argument("--dry-run", action="store_true",
                     help="select and render only; spend nothing")
     args = ap.parse_args()
@@ -591,6 +604,98 @@ def main() -> int:
     actions, samp = sample_actions(prefixes, student_tok, args)
     report["cap"] = samp["cap"]
     report["context"] = samp["context"]
+
+    # Persist the captures *before* the first paid call. `log pi_old` is
+    # captured under a frozen policy and cannot be recomputed once anything
+    # moves, so an unsaved batch is unrecoverable — and until now the script
+    # went straight from sampling into Fireworks, where a crash would have cost
+    # both the sampling and the ability to retry scoring against it.
+    caps_path = out / "captures.jsonl"
+    with caps_path.open("w", encoding="utf-8") as fh:
+        for a in actions:
+            fh.write(json.dumps({
+                "key": a.key,
+                "prefix_id": a.prefix_id,
+                "sample_index": a.sample_index,
+                "policy_version": a.policy_version,
+                "termination_reason": a.termination_reason,
+                "action_bytes_b64": base64.b64encode(a.action_bytes).decode(),
+                "action_token_ids": list(a.action_token_ids),
+                "behavior_logprobs": list(a.behavior_logprobs),
+                "prompt_token_ids": list(a.prompt_token_ids or []),
+            }) + "\n")
+    report["captures_path"] = str(caps_path)
+    log(f"saved {len(actions)} captures to {caps_path}")
+
+    # The measured training envelope (§14). An action can sample fine under the
+    # 9,216 loop guard and still land outside what a forward/backward was
+    # actually proven to hold, and the only place to find that out cheaply is
+    # here — before Fireworks, not after the optimizer OOMs on a batch whose
+    # teacher scores are already paid for.
+    lengths = [
+        (a.key, len(a.prompt_token_ids or []) + len(a.action_token_ids))
+        for a in actions
+    ]
+    oversize = [(k, n) for k, n in lengths if n > args.max_train_tokens]
+    report["train_envelope"] = {
+        "max_train_tokens": args.max_train_tokens,
+        "max_observed": max(n for _k, n in lengths),
+        "median_observed": sorted(n for _k, n in lengths)[len(lengths) // 2],
+        "n_oversize": len(oversize),
+        "oversize": oversize[:20],
+        "action_tokens": {
+            "max": max(len(a.action_token_ids) for a in actions),
+            "median": sorted(len(a.action_token_ids) for a in actions)[len(actions) // 2],
+        },
+    }
+    log(
+        f"train envelope: max {report['train_envelope']['max_observed']} of "
+        f"{args.max_train_tokens}; actions max "
+        f"{report['train_envelope']['action_tokens']['max']}"
+    )
+    if oversize:
+        (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
+        print(
+            f"{len(oversize)} sampled example(s) exceed the measured training "
+            f"envelope of {args.max_train_tokens} tokens: "
+            f"{oversize[:5]}. Refusing to pay Fireworks for examples the "
+            "optimizer was never proven to hold. Captures are saved at "
+            f"{caps_path}; re-preflight at the larger size or drop them.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Projected teacher cost, from the real prefixes and realized actions
+    # rather than a guess. DeepSeek re-reads the whole prefix for every one of
+    # the four samples at a prefix, so repeated-prefix tokens dominate and are
+    # reported separately — that is the number a cheaper batching decision
+    # would act on.
+    by_prefix_prompt = {}
+    for a in actions:
+        by_prefix_prompt.setdefault(a.prefix_id, len(a.prompt_token_ids or []))
+    unique_prefix_tokens = sum(by_prefix_prompt.values())
+    total_prompt_tokens = sum(len(a.prompt_token_ids or []) for a in actions)
+    total_action_tokens = sum(len(a.action_token_ids) for a in actions)
+    report["projected_teacher_cost"] = {
+        "n_requests": len(actions),
+        "unique_prefix_tokens": unique_prefix_tokens,
+        "repeated_prefix_tokens": total_prompt_tokens - unique_prefix_tokens,
+        "total_prompt_tokens_qwen": total_prompt_tokens,
+        "total_action_tokens_qwen": total_action_tokens,
+        "note": "Qwen-tokenizer counts; DeepSeek's tokenization differs, so "
+                "these bound the request shape rather than the exact bill",
+    }
+    log(
+        f"projected teacher input ~{total_prompt_tokens:,} prompt tokens "
+        f"({total_prompt_tokens - unique_prefix_tokens:,} repeated) + "
+        f"{total_action_tokens:,} action tokens over {len(actions)} requests"
+    )
+
+    if args.stop_after_sampling:
+        (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
+        log("--stop-after-sampling: captures saved and gated, nothing spent")
+        log("TEAR DOWN the ck75 endpoint now.")
+        return 0
 
     log("stage 3/4: scoring with DeepSeek")
     scored, ledger, teacher_prov = score_actions(actions, samp["rendered"], args)

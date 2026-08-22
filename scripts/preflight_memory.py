@@ -125,13 +125,23 @@ class GPUSampler:
 
 
 def mem_components(torch) -> dict:
-    """Allocator view, broken out. `reserved - allocated` is fragmentation."""
+    """Allocator view, broken out.
+
+    `reserved - allocated` is torch's **cache**, not necessarily wasted space.
+    The allocator holds freed blocks rather than returning them to CUDA, so a
+    large gap mostly means transient peaks have already been released and are
+    available for reuse inside this process. Some of it is genuine
+    fragmentation — blocks too small for the next request — but the split is
+    not observable from these counters. Do not treat the whole gap as
+    reclaimable headroom.
+    """
     a = torch.cuda.memory_allocated()
     r = torch.cuda.memory_reserved()
     return {
         "allocated_gib": round(a / 1024**3, 2),
         "reserved_gib": round(r / 1024**3, 2),
-        "fragmentation_gib": round((r - a) / 1024**3, 2),
+        # Cached-but-unallocated. See the docstring: not all of it is waste.
+        "cached_unallocated_gib": round((r - a) / 1024**3, 2),
     }
 
 

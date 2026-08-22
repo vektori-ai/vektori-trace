@@ -1,0 +1,410 @@
+{
+  "returncode": 0,
+  "report": {
+    "base_model": "Qwen/Qwen3-14B",
+    "adapter_path": "/adapters/sft/qwen3-14b-stage-b-lora/checkpoint-75",
+    "prefix_tokens": 31591,
+    "action_tokens": 4096,
+    "total_tokens": 35687,
+    "gradient_checkpointing": true,
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_total_gib": 79.25,
+    "components": {
+      "weights": {
+        "allocated_gib": 28.0,
+        "reserved_gib": 28.51,
+        "fragmentation_gib": 0.51
+      },
+      "after_optimizer_built": {
+        "allocated_gib": 28.0,
+        "reserved_gib": 28.51,
+        "fragmentation_gib": 0.51
+      },
+      "after_forward": {
+        "allocated_gib": 44.64,
+        "reserved_gib": 57.42,
+        "fragmentation_gib": 12.78
+      },
+      "after_backward": {
+        "allocated_gib": 29.18,
+        "reserved_gib": 66.68,
+        "fragmentation_gib": 37.5
+      },
+      "after_opt_step": {
+        "allocated_gib": 30.14,
+        "reserved_gib": 67.39,
+        "fragmentation_gib": 37.25
+      }
+    },
+    "load_seconds": 27.2,
+    "after_load_gib": 28.0,
+    "forward_seconds": 12.7,
+    "after_forward_peak_gib": 49.95,
+    "backward_seconds": 25.3,
+    "peak_gib": 62.01,
+    "peak_reserved_gib": 66.68,
+    "loss": -0.10000000149011612,
+    "params_with_grad": 560,
+    "all_grads_finite": true,
+    "grad_bytes_gib": 0.479,
+    "optimizer_state_gib": 0.957,
+    "after_step_peak_gib": 67.39,
+    "headroom_gib": 12.57,
+    "passed": true,
+    "gpu_sampler": {
+      "n_samples": 33,
+      "peak_mem_used_mib": 68813,
+      "peak_mem_used_gib": 67.2,
+      "mem_total_mib": 81920,
+      "peak_by_phase_mib": {
+        "load": 29229,
+        "forward": 59319,
+        "backward": 68811,
+        "opt_step": 68813
+      },
+      "max_util_gpu_pct": 100,
+      "mean_util_gpu_pct": 58.4,
+      "max_power_w": 458.17,
+      "max_temp_c": 67
+    },
+    "l40s_verdict": {
+      "l40s_total_gib": 48.0,
+      "observed_peak_gib": 67.2,
+      "fits_l40s": false,
+      "margin_gib": -22.2,
+      "note": "nvidia-smi peak includes CUDA context, cuBLAS workspaces and fragmentation, which torch's allocator counters do not. 45 GiB rather than 48 leaves room for run-to-run variance."
+    }
+  },
+  "gpu_log": [
+    {
+      "t": 1787364157.85,
+      "phase": "load",
+      "mem_used_mib": 4,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 45,
+      "power_w": 71.54
+    },
+    {
+      "t": 1787364159.88,
+      "phase": "load",
+      "mem_used_mib": 4,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 45,
+      "power_w": 71.2
+    },
+    {
+      "t": 1787364161.91,
+      "phase": "load",
+      "mem_used_mib": 4,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 71.2
+    },
+    {
+      "t": 1787364164.24,
+      "phase": "load",
+      "mem_used_mib": 28595,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.48
+    },
+    {
+      "t": 1787364166.27,
+      "phase": "load",
+      "mem_used_mib": 28595,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 13,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.21
+    },
+    {
+      "t": 1787364168.31,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 19,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.4
+    },
+    {
+      "t": 1787364170.34,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 10,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.21
+    },
+    {
+      "t": 1787364172.36,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 15,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.13
+    },
+    {
+      "t": 1787364174.4,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 16,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.21
+    },
+    {
+      "t": 1787364176.42,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 15,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.4
+    },
+    {
+      "t": 1787364178.52,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 18,
+      "util_mem_pct": 0,
+      "temp_c": 44,
+      "power_w": 78.13
+    },
+    {
+      "t": 1787364180.54,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 20,
+      "util_mem_pct": 0,
+      "temp_c": 43,
+      "power_w": 78.48
+    },
+    {
+      "t": 1787364182.56,
+      "phase": "load",
+      "mem_used_mib": 28597,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 43,
+      "power_w": 77.8
+    },
+    {
+      "t": 1787364184.6,
+      "phase": "load",
+      "mem_used_mib": 29229,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 2,
+      "util_mem_pct": 0,
+      "temp_c": 43,
+      "power_w": 78.4
+    },
+    {
+      "t": 1787364186.63,
+      "phase": "forward",
+      "mem_used_mib": 30043,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 0,
+      "util_mem_pct": 0,
+      "temp_c": 43,
+      "power_w": 77.8
+    },
+    {
+      "t": 1787364188.65,
+      "phase": "forward",
+      "mem_used_mib": 45091,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 39,
+      "temp_c": 56,
+      "power_w": 408.81
+    },
+    {
+      "t": 1787364190.68,
+      "phase": "forward",
+      "mem_used_mib": 47461,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 36,
+      "temp_c": 60,
+      "power_w": 441.35
+    },
+    {
+      "t": 1787364192.71,
+      "phase": "forward",
+      "mem_used_mib": 49831,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 47,
+      "temp_c": 62,
+      "power_w": 349.59
+    },
+    {
+      "t": 1787364194.73,
+      "phase": "forward",
+      "mem_used_mib": 54571,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 39,
+      "temp_c": 63,
+      "power_w": 397.66
+    },
+    {
+      "t": 1787364196.75,
+      "phase": "forward",
+      "mem_used_mib": 59319,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 39,
+      "temp_c": 63,
+      "power_w": 401.89
+    },
+    {
+      "t": 1787364198.78,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 43,
+      "temp_c": 64,
+      "power_w": 367.07
+    },
+    {
+      "t": 1787364200.8,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 52,
+      "temp_c": 63,
+      "power_w": 351.7
+    },
+    {
+      "t": 1787364202.83,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 39,
+      "temp_c": 66,
+      "power_w": 383.31
+    },
+    {
+      "t": 1787364204.85,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 56,
+      "temp_c": 64,
+      "power_w": 369.78
+    },
+    {
+      "t": 1787364206.88,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 21,
+      "temp_c": 66,
+      "power_w": 409.55
+    },
+    {
+      "t": 1787364208.91,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 36,
+      "temp_c": 65,
+      "power_w": 346.23
+    },
+    {
+      "t": 1787364210.93,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 55,
+      "temp_c": 66,
+      "power_w": 336.33
+    },
+    {
+      "t": 1787364212.96,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 22,
+      "temp_c": 67,
+      "power_w": 402.03
+    },
+    {
+      "t": 1787364214.98,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 37,
+      "temp_c": 67,
+      "power_w": 377.9
+    },
+    {
+      "t": 1787364217.01,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 41,
+      "temp_c": 67,
+      "power_w": 446.3
+    },
+    {
+      "t": 1787364219.06,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 41,
+      "temp_c": 66,
+      "power_w": 458.17
+    },
+    {
+      "t": 1787364221.12,
+      "phase": "backward",
+      "mem_used_mib": 68811,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 38,
+      "temp_c": 66,
+      "power_w": 397.99
+    },
+    {
+      "t": 1787364223.17,
+      "phase": "opt_step",
+      "mem_used_mib": 68813,
+      "mem_total_mib": 81920,
+      "util_gpu_pct": 100,
+      "util_mem_pct": 15,
+      "temp_c": 61,
+      "power_w": 120.07
+    }
+  ]
+}
