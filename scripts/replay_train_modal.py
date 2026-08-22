@@ -26,6 +26,8 @@ HF_CACHE_VOLUME_NAME = "hf-model-cache"
 HF_CACHE_MOUNT = "/root/.cache/huggingface"
 
 ADAPTER_IN_VOLUME = "sft/qwen3-14b-stage-b-lora/checkpoint-75"
+#: Where the trained adapter lands. On the volume so it survives the container.
+V_REPLAY_IN_VOLUME = os.environ.get("V_REPLAY_PATH", "opd/v_replay")
 
 #: Where captures.jsonl / teacher_scores.jsonl / replay_run.json live on the
 #: launching host. Defaults to the box's run directory so training launches
@@ -44,7 +46,15 @@ image = (
         "peft==0.19.1",
         "accelerate==1.14.0",
     )
-    .env({"HF_HOME": HF_CACHE_MOUNT})
+    .env({
+        "HF_HOME": HF_CACHE_MOUNT,
+        # The run at 07:55 logged "memory allocation failed with OOM ... while
+        # trying to allocate 2.82 GB (free: 2.73 GB)" and then recovered: a
+        # fragmentation stall, not exhaustion. Expandable segments let a
+        # segment grow rather than stranding freed blocks at the wrong size.
+        # A mitigation, not extra memory — the batch already fits.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    })
     .add_local_dir("vektori_trace", remote_path="/root/vektori_trace",
                    ignore=["__pycache__"])
     .add_local_dir(BATCH_DIR, remote_path="/root/batch")
@@ -174,7 +184,8 @@ def train(
             f"  ex {row['example']:>2} {row.get('key','')} "
             f"tok={row.get('total_tokens')} sup={row.get('supervised')} "
             f"loss/tok={row.get('loss_per_token')} "
-            f"peak={row.get('peak_gib')}GiB gpu={row.get('gpu_util_pct')}% "
+            f"peak={row.get('peak_gib')}/{row.get('reserved_gib')}GiB "
+            f"gpu={row.get('gpu_util_pct')}% "
             f"{row.get('seconds')}s"
         )
 
@@ -198,14 +209,30 @@ def train(
     if progress.exists():
         rows = [json.loads(x) for x in progress.read_text().splitlines() if x.strip()]
 
-    adapter_files = {}
-    v = out / "v_replay"
-    if v.is_dir():
-        for f in sorted(v.iterdir()):
-            if f.is_file() and f.stat().st_size < 200 * 1024 * 1024:
-                adapter_files[f.name] = base64.b64encode(f.read_bytes()).decode()
+    # Persist v_replay to the volume, not through the function result. A LoRA
+    # over all six projection modules is ~490 MB — returning it base64-encoded
+    # was both a size limit waiting to be hit and a guarantee that the weights
+    # die with the container's /tmp. The volume outlives the run.
+    dest = Path(VOLUME_MOUNT) / V_REPLAY_IN_VOLUME
+    if dest.exists():
+        raise SystemExit(
+            f"{dest} already exists — refusing to overwrite a previous v_replay"
+        )
+    dest.mkdir(parents=True)
+    saved = []
+    for f in sorted((out / "v_replay").iterdir()):
+        if f.is_file():
+            (dest / f.name).write_bytes(f.read_bytes())
+            saved.append((f.name, f.stat().st_size))
+    vol.commit()
+    log(f"v_replay -> {dest}: " + ", ".join(f"{n} ({b:,}B)" for n, b in saved))
 
-    return {"result": result, "progress": rows, "adapter_files": adapter_files}
+    return {
+        "result": result,
+        "progress": rows,
+        "v_replay_volume_path": str(dest),
+        "v_replay_files": dict(saved),
+    }
 
 
 @app.local_entrypoint()
@@ -228,8 +255,9 @@ def main(
         json.dumps({k: v for k, v in res.items() if k != "adapter_files"},
                    indent=2, default=str)
     )
-    for name, b64 in (res.get("adapter_files") or {}).items():
-        (out / "v_replay" / name).write_bytes(base64.b64decode(b64))
+    print(f"v_replay on volume: {res.get('v_replay_volume_path')}")
+    for n, b in (res.get("v_replay_files") or {}).items():
+        print(f"  {n}  {b:,} bytes")
 
     r = res["result"]["optimizer"]
     print("\n=== REPLAY OPD TRAINING ===")

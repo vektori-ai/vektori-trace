@@ -439,7 +439,8 @@ def train(batch_inputs, args):
             f"{row.get('key','')} tok={row.get('total_tokens')} "
             f"sup={row.get('supervised')} "
             f"loss/tok={row.get('loss_per_token')!s:.8} "
-            f"peak={row.get('peak_gib')}GiB {row.get('seconds')}s"
+            f"peak={row.get('peak_gib')}/{row.get('reserved_gib')}GiB "
+            f"{row.get('seconds')}s"
         )
 
     return run_replay_chunk_opd(
