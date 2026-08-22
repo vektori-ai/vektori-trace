@@ -300,6 +300,7 @@ def run_replay_chunk_opd(
     optimizer_step: Callable[[ReplayBatch], dict[str, Any]],
     *,
     max_new_tokens: int,
+    max_trace_share: float = 0.35,
     n_samples_per_prefix: int = 4,
     stored_teacher_actions: dict[str, bytes] | None = None,
     selection_policy: str = "stratified-diagnostic",
@@ -345,6 +346,7 @@ def run_replay_chunk_opd(
         actions,
         teacher_tokenizations,
         stored_teacher_actions=stored_teacher_actions,
+        max_trace_share=max_trace_share,
         large_chunk_threshold=large_chunk_threshold,
         advantage_clamp=advantage_clamp,
     )

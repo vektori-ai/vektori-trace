@@ -450,6 +450,7 @@ def train(batch_inputs, args):
             model, opt, cfg, progress_path=progress, on_example=_log_example
         ),
         max_new_tokens=args.max_tokens,
+        max_trace_share=args.max_trace_share,
         n_samples_per_prefix=args.n_samples,
         stored_teacher_actions=stored,
         selection_policy=_selection_policy(),
@@ -559,6 +560,10 @@ def main() -> int:
                          "override what is actually installed.")
     # training
     ap.add_argument("--learning-rate", type=float, default=1e-5)
+    ap.add_argument("--max-trace-share", type=float, default=0.35,
+                    help="§8.4 concentration limit. Raise it only for a run "
+                         "where the concentration is understood and recorded — "
+                         "the report states the observed share either way.")
     ap.add_argument("--device", default=os.environ.get("REPLAY_TRAIN_DEVICE"),
                     help='CUDA device for the optimizer step, e.g. "cuda" or '
                          '"cuda:0". Required for a real run and deliberately '
@@ -1065,7 +1070,8 @@ def main() -> int:
     # kind of drift the archive exists to detect.
     from vektori_trace.replay_opd import build_replay_batch
 
-    batch = build_replay_batch(prefixes, actions, scored, stored_teacher_actions=stored)
+    batch = build_replay_batch(prefixes, actions, scored, stored_teacher_actions=stored,
+                               max_trace_share=args.max_trace_share)
     by_prefix = {p.prefix_id: p for p in prefixes}
     by_action = {a.key: a for a in actions}
     records = []
