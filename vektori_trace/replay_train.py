@@ -471,10 +471,42 @@ def load_v0_for_training(cfg: ReplayTrainConfig):
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
+        # Assert it actually engaged. `gradient_checkpointing_enable()` returns
+        # None whether or not it took, and HF's decoder layer skips
+        # recomputation unless BOTH the module flag is set and the model is in
+        # training mode — so a silently-disabled checkpoint looks identical to
+        # an enabled one until the backward OOMs. At a 31.6k prefix the MLP
+        # intermediates alone are ~53 GiB, so this is the difference between
+        # fitting an 80 GB card and not.
+        inner = getattr(getattr(model, "base_model", model), "model", None)
+        decoder = getattr(inner, "model", inner)
+        flag = getattr(decoder, "gradient_checkpointing", None)
+        if flag is not True:
+            raise ReplayTrainError(
+                "gradient_checkpointing_enable() did not set "
+                f"gradient_checkpointing on {type(decoder).__name__} (got "
+                f"{flag!r}). Refusing to run: the backward would silently "
+                "retain every layer's activations."
+            )
+        if not model.training:
+            raise ReplayTrainError(
+                "model is in eval mode, so HF skips checkpointing "
+                "(`if self.gradient_checkpointing and self.training`). "
+                "Call model.train() before the forward."
+            )
+        if getattr(model.config, "use_cache", False):
+            raise ReplayTrainError(
+                "use_cache is still True; checkpointing warns and disables "
+                "itself rather than failing"
+            )
+
     if not _lora_params(model):
         raise ReplayTrainError(
             f"{cfg.adapter_path} loaded but exposes no trainable LoRA parameters"
         )
+    # Checkpointing is gated on `self.training`; from_pretrained does not
+    # guarantee it, and eval mode would silently cost ~53 GiB of activations.
+    model.train()
     return model
 
 
