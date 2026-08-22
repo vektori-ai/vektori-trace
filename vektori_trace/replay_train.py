@@ -66,6 +66,10 @@ class ReplayTrainConfig:
     adam_eps: float = 1e-8
     weight_decay: float = 0.0
     device: str | None = None
+    #: Trade compute for memory in the backward pass. On by default: the
+    #: replay prefixes run to ~31.6k tokens and SFT trained this model at this
+    #: context with checkpointing on.
+    gradient_checkpointing: bool = True
     meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -141,11 +145,21 @@ def action_logprobs_under_prefix(
     full = list(prompt_token_ids) + list(action_token_ids)
     n_prompt = len(prompt_token_ids)
 
+    n_action = len(action_token_ids)
+
     x = torch.tensor([full], device=device)
-    out = model(input_ids=x)
-    # Position t predicts token t+1, so the logit that scores action token j is
-    # at index (n_prompt + j - 1). For j = 0 that is the final prefix position.
-    logits = out.logits[0, n_prompt - 1 : -1, :].float()
+    # `logits_to_keep` slices the hidden states *before* `lm_head`
+    # (`transformers.models.qwen3.modeling_qwen3`: `slice_indices =
+    # slice(-logits_to_keep, None)`), so the full-sequence logit tensor is never
+    # allocated rather than allocated and then discarded. At a 31.6k prefix with
+    # a 9,216-token action that is 11.5 GiB of bf16 logits down to 2.6 — the
+    # difference between needing an 80 GB card and fitting the L40S this runs on.
+    #
+    # Keep `n_action + 1` positions: the last prefix position is what predicts
+    # action token 0, and the final sequence position predicts an unused next
+    # token which the `:-1` below drops.
+    out = model(input_ids=x, use_cache=False, logits_to_keep=n_action + 1)
+    logits = out.logits[0, :-1, :].float()
     targets = x[0, n_prompt:]
     lp = torch.log_softmax(logits, dim=-1)
     scored = lp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
@@ -439,6 +453,24 @@ def load_v0_for_training(cfg: ReplayTrainConfig):
         device_map={"": cfg.device},
     )
     model = PeftModel.from_pretrained(base, cfg.adapter_path, is_trainable=True)
+
+    if cfg.gradient_checkpointing:
+        # Recompute hidden activations in the backward instead of storing all
+        # 40 layers' worth — ~15.6 GiB at a 40k sequence. SFT trained this same
+        # model at this same context with it on (`sft_train_modal.py`), peaking
+        # 39.6 GiB, which is the evidence that the L40S is the right card.
+        #
+        # `use_cache` must be off or checkpointing warns and silently disables
+        # itself, which would look like a memory regression with no error.
+        model.config.use_cache = False
+        base.config.use_cache = False
+        model.gradient_checkpointing_enable()
+        # LoRA inputs need grad for checkpointing to have anything to
+        # recompute through; without this the backward is a no-op past the
+        # checkpoint boundary.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
     if not _lora_params(model):
         raise ReplayTrainError(
             f"{cfg.adapter_path} loaded but exposes no trainable LoRA parameters"

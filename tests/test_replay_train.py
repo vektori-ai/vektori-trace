@@ -583,3 +583,81 @@ class TestAdapterReloadable:
         d.mkdir()
         with pytest.raises(ReplayTrainError, match="adapter_config.json is missing"):
             verify_adapter_reloadable(d)
+
+
+class TestLogitsToKeep:
+    """`logits_to_keep` must be a pure memory optimisation, not a value change.
+
+    It slices hidden states before `lm_head`, so the full-sequence logit tensor
+    is never allocated — 11.5 GiB down to 2.6 at a 31.6k prefix with a
+    9,216-token action. That only helps if the scores are unchanged, which is
+    what these pin.
+    """
+
+    def _tiny(self):
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        torch.manual_seed(0)
+        cfg = AutoConfig.for_model(
+            "qwen3", vocab_size=256, hidden_size=64, intermediate_size=128,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+            head_dim=16,
+        )
+        return AutoModelForCausalLM.from_config(cfg).eval()
+
+    def _reference(self, model, prompt, action):
+        """The pre-optimisation path: full logits, then slice."""
+        import torch
+
+        x = torch.tensor([list(prompt) + list(action)])
+        with torch.no_grad():
+            out = model(input_ids=x)
+        logits = out.logits[0, len(prompt) - 1 : -1, :].float()
+        targets = x[0, len(prompt):]
+        return torch.log_softmax(logits, -1).gather(
+            -1, targets.unsqueeze(-1)
+        ).squeeze(-1)
+
+    def test_scores_match_the_full_logit_path(self):
+        import torch
+
+        from vektori_trace.replay_train import action_logprobs_under_prefix
+
+        model = self._tiny()
+        prompt, action = list(range(5, 45)), [7, 11, 23, 4, 99]
+        got = action_logprobs_under_prefix(model, prompt, action)
+        want = self._reference(model, prompt, action)
+        assert got.shape == want.shape == (len(action),)
+        assert torch.allclose(got, want, atol=1e-6)
+
+    def test_single_token_action(self):
+        """n_action+1 = 2 kept positions; the off-by-one is easiest to get
+        wrong at length 1."""
+        import torch
+
+        from vektori_trace.replay_train import action_logprobs_under_prefix
+
+        model = self._tiny()
+        prompt, action = list(range(5, 45)), [42]
+        got = action_logprobs_under_prefix(model, prompt, action)
+        assert got.shape == (1,)
+        assert torch.allclose(got, self._reference(model, prompt, action), atol=1e-6)
+
+    def test_gradient_still_reaches_parameters(self):
+        import torch
+
+        from vektori_trace.replay_train import action_logprobs_under_prefix
+
+        model = self._tiny()
+        model.train()
+        out = action_logprobs_under_prefix(model, list(range(5, 45)), [7, 11, 23])
+        out.sum().backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads
+        assert all(torch.isfinite(g).all() for g in grads)
+
+    def test_config_defaults_to_checkpointing(self):
+        from vektori_trace.replay_train import ReplayTrainConfig
+
+        assert ReplayTrainConfig().gradient_checkpointing is True
