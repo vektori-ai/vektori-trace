@@ -28,6 +28,9 @@ HF_CACHE_MOUNT = "/root/.cache/huggingface"
 ADAPTER_IN_VOLUME = "sft/qwen3-14b-stage-b-lora/checkpoint-75"
 #: Where the trained adapter lands. On the volume so it survives the container.
 V_REPLAY_IN_VOLUME = os.environ.get("V_REPLAY_PATH", "opd/v_replay")
+#: ck75's own adapter is 513,877,864 bytes and one Adam step does not shrink it.
+#: A file materially smaller than this is a truncated write, not an adapter.
+MIN_ADAPTER_BYTES = 400 * 1024 * 1024
 
 #: Where captures.jsonl / teacher_scores.jsonl / replay_run.json live on the
 #: launching host. Defaults to the box's run directory so training launches
@@ -146,6 +149,18 @@ def train(
         )
 
     prior = json.loads((batch_dir / "replay_run.json").read_text())
+    # §8.4: the supervised action must be ck75's, not the stored DeepSeek one.
+    # Omitting this made assert_action_is_student_sampled a silent no-op.
+    stored_actions = {}
+    stored_path = batch_dir / "stored_teacher_actions.json"
+    if stored_path.is_file():
+        stored_actions = {
+            k: base64.b64decode(v)
+            for k, v in json.loads(stored_path.read_text()).items()
+        }
+        log(f"loaded {len(stored_actions)} stored DeepSeek actions for the §8.4 check")
+    else:
+        log("no stored_teacher_actions.json — §8.4 identity check will be skipped")
     prefixes = [
         ReplayPrefix(
             task=p["task"],
@@ -165,10 +180,20 @@ def train(
     )
     log("sample set validated")
 
+    # Write the adapter onto the volume directly, the way sft_train_modal does.
+    # Saving to /tmp and copying afterwards is what lost the last run.
+    dest_dir = Path(VOLUME_MOUNT) / V_REPLAY_IN_VOLUME
+    if dest_dir.exists() and any(dest_dir.iterdir()):
+        raise SystemExit(
+            f"{dest_dir} already exists and is not empty — refusing to "
+            "overwrite a previous v_replay. Move it aside or set V_REPLAY_PATH."
+        )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
     cfg = ReplayTrainConfig(
         base_model="Qwen/Qwen3-14B",
         adapter_path=str(adapter),
-        output_dir=out / "v_replay",
+        output_dir=dest_dir,
         learning_rate=learning_rate,
         device="cuda",
     )
@@ -190,18 +215,32 @@ def train(
         )
 
     log("stage 4/4: one optimizer step")
-    result = run_replay_chunk_opd(
+    try:
+        result = run_replay_chunk_opd(
         prefixes,
         actions,
         scored,
         make_optimizer_step(
             model, opt, cfg, progress_path=progress, on_example=_echo
         ),
-        max_new_tokens=max_new_tokens,
-        max_trace_share=max_trace_share,
-        n_samples_per_prefix=n_samples_per_prefix,
-        selection_policy="stratified-diagnostic",
-    )
+            max_new_tokens=max_new_tokens,
+            max_trace_share=max_trace_share,
+            n_samples_per_prefix=n_samples_per_prefix,
+            stored_teacher_actions=stored_actions or None,
+            selection_policy="stratified-diagnostic",
+        )
+    finally:
+        # Commit whatever exists even on an abort: the per-example rows are the
+        # only record of how far a failed step got, and they live on the volume
+        # rather than the container's /tmp precisely so a crash cannot take
+        # them. GPU time is already spent by the time anything here runs.
+        try:
+            if progress.exists():
+                (dest_dir / "train_progress.jsonl").write_bytes(progress.read_bytes())
+            vol.commit()
+        except Exception as e:  # never mask the original failure
+            print(f"[warn] progress commit failed: {type(e).__name__}: {e}", flush=True)
+
     log(f"loss {result['optimizer']['loss']:.6f}, "
         f"{result['optimizer']['lora_tensors_moved']} tensors moved")
 
@@ -209,35 +248,50 @@ def train(
     if progress.exists():
         rows = [json.loads(x) for x in progress.read_text().splitlines() if x.strip()]
 
-    # Persist v_replay to the volume, not through the function result. A LoRA
-    # over all six projection modules is ~490 MB — returning it base64-encoded
-    # was both a size limit waiting to be hit and a guarantee that the weights
-    # die with the container's /tmp. The volume outlives the run.
-    dest = Path(VOLUME_MOUNT) / V_REPLAY_IN_VOLUME
-    if dest.exists():
-        raise SystemExit(
-            f"{dest} already exists — refusing to overwrite a previous v_replay"
-        )
-    dest.mkdir(parents=True)
-    saved = []
-    for f in sorted((out / "v_replay").iterdir()):
-        if f.is_file():
-            (dest / f.name).write_bytes(f.read_bytes())
-            saved.append((f.name, f.stat().st_size))
+    # `output_dir` is already on the volume, so save_pretrained wrote the
+    # weights there directly — no /tmp copy to lose. What remains is proving it
+    # before claiming success: the previous run reported a perfect optimizer
+    # step while adapter_model.safetensors never left the container.
     vol.commit()
-    log(f"v_replay -> {dest}: " + ", ".join(f"{n} ({b:,}B)" for n, b in saved))
+    weights = dest_dir / "adapter_model.safetensors"
+    if not weights.is_file():
+        raise SystemExit(
+            f"v_replay has no adapter_model.safetensors at {dest_dir}. The "
+            "optimizer step ran but produced no durable artifact (§8.4)."
+        )
+    size = weights.stat().st_size
+    if size < MIN_ADAPTER_BYTES:
+        raise SystemExit(
+            f"v_replay weights are {size:,} bytes, below the {MIN_ADAPTER_BYTES:,} "
+            "floor — a truncated or partial write, not a usable adapter."
+        )
+
+    # §8.4 wants the *archived* artifact reloadable, not a file about to be
+    # garbage-collected. Verified on the volume path for that reason.
+    from vektori_trace.replay_train import verify_adapter_reloadable
+
+    reload_check = verify_adapter_reloadable(dest_dir)
+    saved = {f.name: f.stat().st_size for f in sorted(dest_dir.iterdir()) if f.is_file()}
+    log(f"v_replay verified on volume: {weights.name} {size:,}B, "
+        f"{reload_check.get('n_tensors')} tensors")
 
     return {
         "result": result,
         "progress": rows,
-        "v_replay_volume_path": str(dest),
-        "v_replay_files": dict(saved),
+        "v_replay_volume_path": str(dest_dir),
+        "v_replay_files": saved,
+        "v_replay_weights_bytes": size,
+        "v_replay_reload_check": reload_check,
     }
 
 
 @app.local_entrypoint()
 def main(
-    max_trace_share: float = 0.35,
+    # 0.45, not the library default of 0.35: this batch's click-3482@37 prefix
+    # holds 43.01% of the supervised tokens because ck75 wrote two ~4k-token
+    # actions there. Accepted and recorded rather than excluded — see the run
+    # report's post_compaction_coverage / spread block.
+    max_trace_share: float = 0.45,
     learning_rate: float = 1e-5,
     out_dir: str = "./replay-train-out",
 ):
@@ -252,12 +306,27 @@ def main(
     (out / "v_replay").mkdir(parents=True, exist_ok=True)
 
     (out / "replay_train_result.json").write_text(
-        json.dumps({k: v for k, v in res.items() if k != "adapter_files"},
-                   indent=2, default=str)
+        json.dumps(res, indent=2, default=str)
     )
+    files = res.get("v_replay_files") or {}
+    weights = files.get("adapter_model.safetensors")
     print(f"v_replay on volume: {res.get('v_replay_volume_path')}")
-    for n, b in (res.get("v_replay_files") or {}).items():
+    for n, b in sorted(files.items()):
         print(f"  {n}  {b:,} bytes")
+
+    # The banner is not the artifact. The previous run printed a perfect
+    # optimizer report while the weights stayed in a container that had already
+    # exited, so success is asserted against the file, not the metrics.
+    if not weights:
+        raise SystemExit(
+            "TRAINING REPORTED SUCCESS BUT NO adapter_model.safetensors IS ON "
+            "THE VOLUME — the run produced no durable v_replay."
+        )
+    if weights < 400 * 1024 * 1024:
+        raise SystemExit(
+            f"v_replay weights are only {weights:,} bytes — truncated write."
+        )
+    print(f"\nv_replay VERIFIED on volume: {weights:,} bytes")
 
     r = res["result"]["optimizer"]
     print("\n=== REPLAY OPD TRAINING ===")
