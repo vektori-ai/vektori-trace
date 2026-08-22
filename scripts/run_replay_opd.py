@@ -80,7 +80,15 @@ class _Capture:
     def __init__(self, body: dict, choice: dict):
         lp = choice.get("logprobs") or {}
         self.token_ids = choice.get("token_ids") or body.get("token_ids") or []
-        self.prompt_token_ids = body.get("prompt_token_ids") or []
+        # vLLM returns prompt_token_ids inside the *choice*, not at the top
+        # level of the body (verified against vllm-0.21.0). Reading only the
+        # body left it empty, and the parity check correctly refused rather
+        # than letting the run proceed with no proof of what the server
+        # actually consumed. Choice first, body as a fallback for servers that
+        # place it there.
+        self.prompt_token_ids = (
+            choice.get("prompt_token_ids") or body.get("prompt_token_ids") or []
+        )
         self.logprobs = lp.get("token_logprobs")
         self.finish_reason = choice.get("finish_reason")
         self.text = choice.get("text")
