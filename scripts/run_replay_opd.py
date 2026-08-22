@@ -165,7 +165,7 @@ def select_prefixes(args, student_tok=None) -> tuple[list, dict[str, Any]]:
     }
 
 
-def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
+def sample_actions(prefixes, student_tok, args, on_capture=None) -> tuple[list, dict[str, Any]]:
     """Four ck75 actions per prefix, with ids and behaviour logprobs."""
     from vektori_trace.dataset import turns_to_messages
     from vektori_trace.replay_sample import (
@@ -231,15 +231,19 @@ def sample_actions(prefixes, student_tok, args) -> tuple[list, dict[str, Any]]:
             )
             # Refuses a missing logprob, a missing prompt id, or a cap hit —
             # all three are unrecoverable after sampling.
-            actions.append(
-                sampled_action_from_capture(
-                    cap,
-                    student_tok,
-                    prefix_id=prefix.prefix_id,
-                    sample_index=i,
-                    policy_version=POLICY_VERSION,
-                )
+            act = sampled_action_from_capture(
+                cap,
+                student_tok,
+                prefix_id=prefix.prefix_id,
+                sample_index=i,
+                policy_version=POLICY_VERSION,
             )
+            actions.append(act)
+            # Append each capture as it lands rather than after all 32. A
+            # crash at sample 30 otherwise discards 29 GPU-generated actions
+            # whose behaviour logprobs cannot be recreated.
+            if on_capture is not None:
+                on_capture(act)
         log(f"  sampled 4 at {prefix.prefix_id} ({budget.prefix_tokens} prefix tokens)")
     return actions, {
         "rendered": rendered,
@@ -318,6 +322,26 @@ def _selection_policy() -> str:
     )
 
 
+def _harbor_revision(explicit: str | None) -> str | None:
+    """The installed harbor version, unless overridden.
+
+    §6.1 lists this as a pin and an earlier version of this script demanded it
+    be typed. That was wrong twice over: the value *is* observable here, and a
+    hand-typed pin can disagree with what the corpus was actually produced
+    under, which is the one thing a pin exists to prevent.
+    """
+    if explicit:
+        return explicit
+    if os.environ.get("HARBOR_REVISION"):
+        return os.environ["HARBOR_REVISION"]
+    try:
+        import importlib.metadata as md
+
+        return f"harbor=={md.version('harbor')}"
+    except Exception:
+        return None
+
+
 def _build_manifest(args):
     """The §6.1 manifest for this invocation.
 
@@ -334,7 +358,7 @@ def _build_manifest(args):
         fireworks_model_id=args.teacher_model,
         student_tokenizer=args.student_tokenizer,
         tokenizer_dir=args.tokenizer_dir or args.adapter_path,
-        harbor_revision=args.harbor_revision,
+        harbor_revision=_harbor_revision(args.harbor_revision),
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
         teacher_serving_precision=args.teacher_precision,
@@ -384,9 +408,10 @@ def main() -> int:
     ap.add_argument("--tokenizer-dir", default=None,
                     help="directory whose tokenizer/chat-template files are hashed "
                          "for the pin; defaults to --adapter-path")
-    ap.add_argument("--harbor-revision", default=os.environ.get("HARBOR_REVISION"),
-                    help="§6.1 pin; this process cannot observe it, so it must be "
-                         "supplied for a paid run")
+    ap.add_argument("--harbor-revision", default=None,
+                    help="§6.1 pin. Auto-derived from the installed harbor "
+                         "distribution when omitted; pass explicitly only to "
+                         "override what is actually installed.")
     # training
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--device", default=os.environ.get("REPLAY_TRAIN_DEVICE"),
@@ -411,6 +436,21 @@ def main() -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    def flush(stage: str) -> None:
+        """Write the report after every stage, not at the end.
+
+        The expensive states are mid-run: sampling holds a GPU, scoring is
+        paid, and the optimizer step is where an OOM is most likely. A report
+        written only on success loses exactly the runs worth diagnosing — and
+        loses the Fireworks spend with them. Written atomically so a crash
+        mid-write cannot leave a truncated file where a readable older one was.
+        """
+        report["last_stage"] = stage
+        report["last_write"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        tmp = out / "replay_run.json.tmp"
+        tmp.write_text(json.dumps(report, indent=2, default=str))
+        tmp.replace(out / "replay_run.json")
     report: dict[str, Any] = {
         "policy_version": POLICY_VERSION,
         "n_prefixes": args.n_prefixes,
@@ -446,6 +486,7 @@ def main() -> int:
     prefixes, sel = select_prefixes(args, student_tok)
     report["corpus"] = sel["corpus"]
     report["context_filter"] = sel["context_filter"]
+    flush("selected")
     report["selection_policy"] = _selection_policy()
     report["post_compaction_coverage"] = {
         "claimed": False,
@@ -601,7 +642,28 @@ def main() -> int:
         return 2
 
     log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
-    actions, samp = sample_actions(prefixes, student_tok, args)
+    caps_path = out / "captures.jsonl"
+    caps_fh = caps_path.open("w", encoding="utf-8")
+
+    def _persist(a) -> None:
+        caps_fh.write(json.dumps({
+            "key": a.key,
+            "prefix_id": a.prefix_id,
+            "sample_index": a.sample_index,
+            "policy_version": a.policy_version,
+            "termination_reason": a.termination_reason,
+            "action_bytes_b64": base64.b64encode(a.action_bytes).decode(),
+            "action_token_ids": list(a.action_token_ids),
+            "behavior_logprobs": list(a.behavior_logprobs),
+            "prompt_token_ids": list(a.prompt_token_ids or []),
+        }) + "\n")
+        caps_fh.flush()
+        os.fsync(caps_fh.fileno())
+
+    try:
+        actions, samp = sample_actions(prefixes, student_tok, args, on_capture=_persist)
+    finally:
+        caps_fh.close()
     report["cap"] = samp["cap"]
     report["context"] = samp["context"]
 
@@ -610,21 +672,8 @@ def main() -> int:
     # moves, so an unsaved batch is unrecoverable — and until now the script
     # went straight from sampling into Fireworks, where a crash would have cost
     # both the sampling and the ability to retry scoring against it.
-    caps_path = out / "captures.jsonl"
-    with caps_path.open("w", encoding="utf-8") as fh:
-        for a in actions:
-            fh.write(json.dumps({
-                "key": a.key,
-                "prefix_id": a.prefix_id,
-                "sample_index": a.sample_index,
-                "policy_version": a.policy_version,
-                "termination_reason": a.termination_reason,
-                "action_bytes_b64": base64.b64encode(a.action_bytes).decode(),
-                "action_token_ids": list(a.action_token_ids),
-                "behavior_logprobs": list(a.behavior_logprobs),
-                "prompt_token_ids": list(a.prompt_token_ids or []),
-            }) + "\n")
     report["captures_path"] = str(caps_path)
+    flush("sampled")
     log(f"saved {len(actions)} captures to {caps_path}")
 
     # The measured training envelope (§14). An action can sample fine under the
@@ -654,7 +703,7 @@ def main() -> int:
         f"{report['train_envelope']['action_tokens']['max']}"
     )
     if oversize:
-        (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
+        flush("envelope_refused")
         print(
             f"{len(oversize)} sampled example(s) exceed the measured training "
             f"envelope of {args.max_train_tokens} tokens: "
@@ -692,7 +741,7 @@ def main() -> int:
     )
 
     if args.stop_after_sampling:
-        (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
+        flush("stopped_after_sampling")
         log("--stop-after-sampling: captures saved and gated, nothing spent")
         log("TEAR DOWN the ck75 endpoint now.")
         return 0
@@ -701,6 +750,8 @@ def main() -> int:
     scored, ledger, teacher_prov = score_actions(actions, samp["rendered"], args)
     report["teacher_ledger"] = ledger
     report["teacher"] = teacher_prov
+    # Scoring is the paid stage: flush before anything can OOM.
+    flush("scored")
 
     # The stored DeepSeek action at each replay step, so the driver can assert
     # ck75 did not simply reproduce it. Never a training target.
@@ -745,6 +796,7 @@ def main() -> int:
             )
         )
     report["archive"] = write_examples(out / "examples.jsonl", records)
+    flush("archived")
     log(
         f"archived {report['archive']['n_examples']} examples "
         f"({report['archive']['bytes_written']:,} bytes); "
@@ -752,8 +804,19 @@ def main() -> int:
     )
 
     log("stage 4/4: one optimizer step")
-    result = train((prefixes, actions, scored, stored), args)
+    try:
+        result = train((prefixes, actions, scored, stored), args)
+    except BaseException as e:
+        # Including OOM and KeyboardInterrupt: the scores are already paid for
+        # and the captures are on disk, so the report must record what killed
+        # the step rather than vanishing with it.
+        report["training_error"] = f"{type(e).__name__}: {e}"
+        flush("training_failed")
+        log(f"training failed after paid scoring: {type(e).__name__}: {e}")
+        log(f"captures + scores preserved under {out}")
+        raise
     report["run"] = result
+    flush("trained")
 
     (out / "replay_run.json").write_text(json.dumps(report, indent=2, default=str))
     log(f"v_replay: {result['optimizer'].get('adapter_saved_to')}")
