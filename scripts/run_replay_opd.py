@@ -661,7 +661,10 @@ def main() -> int:
         if not need:
             print(f"{flag} is required for a real run", file=sys.stderr)
             return 2
-    if not os.environ.get("FIREWORKS_API_KEY"):
+    # Only the scoring stage spends Fireworks money. A sampling-only run must
+    # not require the key: it lets the sampling half run on a host that has no
+    # business holding a billing credential.
+    if not args.stop_after_sampling and not os.environ.get("FIREWORKS_API_KEY"):
         print("FIREWORKS_API_KEY is not set", file=sys.stderr)
         return 2
 
@@ -710,8 +713,20 @@ def main() -> int:
 
     manifest = _build_manifest(args)
     report["manifest"] = manifest.to_dict()
+    report["missing_pins"] = manifest.missing_pins()
+    if args.stop_after_sampling and manifest.missing_pins():
+        # The adapter lives on a Modal volume, so its hashes cannot derive on a
+        # host that only *serves* it over HTTP. Sampling is attributable by
+        # policy_version and the served model id; the pins that require local
+        # files are enforced on the training host, which does mount them.
+        log(
+            "sampling-only stage: unpinned "
+            f"[{', '.join(manifest.missing_pins())}] — recorded, and required "
+            "before the optimizer step"
+        )
     try:
-        manifest.require_complete()
+        if not args.stop_after_sampling:
+            manifest.require_complete()
     except PinError as e:
         print(f"{e}", file=sys.stderr)
         print(
