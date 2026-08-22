@@ -193,17 +193,31 @@ def score_replay_batch(
     pool: Any,
     *,
     thinking_mode: str = "chat",
+    on_scored: Any = None,
+    already_scored: dict[str, tuple[list[bytes], list[float]]] | None = None,
 ) -> tuple[dict[str, tuple[list[bytes], list[float]]], dict[str, Any]]:
     """Score every action; return the mapping `build_replay_batch` wants plus a ledger.
 
     Fails on the first unscoreable action rather than returning a partial map:
     `build_replay_batch` refuses a batch with a missing score anyway, and
     stopping here means the error names the action instead of the absence.
+
+    `on_scored` is called with each `ScoredAction` as it returns, so a caller
+    can persist results incrementally. Every call is paid, so a failure at
+    request 30 must not discard the 29 already billed.
+
+    `already_scored` skips actions whose teacher scores are on disk from an
+    earlier attempt — the same money twice is the thing to avoid.
     """
     scored: dict[str, tuple[list[bytes], list[float]]] = {}
     rows: list[ScoredAction] = []
+    reused = 0
 
     for action in actions:
+        if already_scored and action.key in already_scored:
+            scored[action.key] = already_scored[action.key]
+            reused += 1
+            continue
         messages = prefix_messages_by_id.get(action.prefix_id)
         if messages is None:
             raise ScoringError(
@@ -214,17 +228,23 @@ def score_replay_batch(
         )
         scored[action.key] = s.as_pair()
         rows.append(s)
+        if on_scored is not None:
+            on_scored(s)
 
     # §8.4's ledger. Prefix tokens dominate: each is re-sent once per sample, so
     # the repeated cost is what a batch actually pays the teacher for.
     prefix_tokens = {}
-    for a, s in zip(actions, rows, strict=True):
-        prefix_tokens.setdefault(a.prefix_id, s.n_prefix_tokens)
+    by_key = {a.key: a for a in actions}
+    for s in rows:
+        a = by_key.get(s.key)
+        if a is not None:
+            prefix_tokens.setdefault(a.prefix_id, s.n_prefix_tokens)
     total_scored = sum(s.n_teacher_tokens for s in rows)
     total_prefix_sent = sum(s.n_prefix_tokens for s in rows)
 
     ledger = {
         "n_actions": len(rows),
+        "n_reused_from_disk": reused,
         "n_teacher_requests": len(rows),
         "teacher_scored_tokens": total_scored,
         "teacher_prefix_tokens_sent": total_prefix_sent,

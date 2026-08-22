@@ -256,14 +256,67 @@ def sample_actions(prefixes, student_tok, args, on_capture=None) -> tuple[list, 
     }
 
 
-def score_actions(actions, rendered, args):
+def _load_scores(path: Path) -> dict:
+    """Teacher scores already on disk from an earlier attempt.
+
+    Tolerates a truncated final line: a crash mid-write must not invalidate the
+    requests before it, which is the entire point of writing them one at a time.
+    """
+    out: dict = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        out[row["key"]] = (
+            [base64.b64decode(b) for b in row["teacher_token_bytes_b64"]],
+            row["teacher_logprobs"],
+        )
+    return out
+
+
+def score_actions(actions, rendered, args, scores_path=None):
     from vektori_trace.providers.teacher.fireworks import FireworksTeacherPool
     from vektori_trace.replay_score import score_replay_batch
     from vektori_trace.vocab_bridge import load_tokenizer
 
     teacher_tok = load_tokenizer(args.teacher_tokenizer)
     pool = FireworksTeacherPool(model=args.teacher_model)
-    scored, ledger = score_replay_batch(actions, rendered, teacher_tok, pool)
+
+    prior = _load_scores(scores_path) if scores_path else {}
+    if prior:
+        log(f"reusing {len(prior)} teacher scores already on disk")
+
+    fh = scores_path.open("a", encoding="utf-8") if scores_path else None
+
+    def _persist(sc) -> None:
+        if fh is None:
+            return
+        fh.write(json.dumps({
+            "key": sc.key,
+            "teacher_token_bytes_b64": [
+                base64.b64encode(b).decode() for b in sc.teacher_token_bytes
+            ],
+            "teacher_logprobs": list(sc.teacher_logprobs),
+            "n_prefix_tokens": sc.n_prefix_tokens,
+            "n_trailing_dropped": sc.n_trailing_dropped,
+        }) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    try:
+        scored, ledger = score_replay_batch(
+            actions, rendered, teacher_tok, pool,
+            on_scored=_persist, already_scored=prior,
+        )
+    finally:
+        if fh is not None:
+            fh.close()
     log(
         f"scored {ledger['n_actions']} actions; "
         f"{ledger['teacher_input_tokens']:,} teacher input tokens "
@@ -421,6 +474,10 @@ def main() -> int:
                          "different host, and an inferred device is how the "
                          "step silently ran on CPU.")
     ap.add_argument("--out", default="./vektori-out/opd-replay")
+    ap.add_argument("--resume-from-captures", default=None,
+                    help="path to a captures.jsonl from an earlier "
+                         "--stop-after-sampling run: reload those actions "
+                         "instead of paying to sample them again")
     ap.add_argument("--stop-after-sampling", action="store_true",
                     help="sample, save captures, check the training envelope "
                          "and report projected cost — then stop, before any "
@@ -488,21 +545,35 @@ def main() -> int:
     report["context_filter"] = sel["context_filter"]
     flush("selected")
     report["selection_policy"] = _selection_policy()
+    # Derived, never asserted: this block described the pre-port state as a
+    # pair of literals and kept saying so after reconstruction landed. A report
+    # that hardcodes its own provenance is the failure it exists to prevent.
+    from vektori_trace.compaction import reconstruction_is_implemented
+
+    _recon = reconstruction_is_implemented()
+    _n_pc = sum(1 for p in prefixes if p.post_compaction)
     report["post_compaction_coverage"] = {
-        "claimed": False,
-        "eligible_pool": "pre-compaction only — candidates at or after a trace's "
-                         "first boundary are excluded, not merely un-required",
-        "reason": "boundaries ARE detected (compaction.boundaries_from_raw), but "
-                  "post-compaction prefixes are not reconstructed: "
-                  "prefix_turns_through_step still slices from step 0, so a "
-                  "marked prefix carries the pre-boundary history that "
-                  "boundary:replace discarded. SFT solved this in "
-                  "sft_export_traces.split_on_compaction/handoff_head, which "
-                  "also pulls the retained head from the questions sidecar; "
-                  "porting that is the open work (docs/OPD-MULTITURN-PLAN.md §15)",
+        "claimed": bool(_recon and _n_pc),
+        "reconstruction_implemented": _recon,
         "boundaries_detected": True,
-        "reconstruction_implemented": False,
         "required": args.require_post_compaction,
+        "selected": _n_pc,
+        "eligible_pool": (
+            "reconstructed — compacted traces are enumerated from "
+            "compaction.current_segment (retained handoff head from the "
+            "questions sidecar + subsequent turns), the definition "
+            "sft_export_traces used and ck75 was trained on"
+            if _recon else
+            "pre-compaction only — candidates at or after a trace's first "
+            "boundary are excluded, not merely un-required"
+        ),
+        "reason": (
+            "post-compaction prefixes carry the retained state, so §8.3 "
+            "coverage is real (docs/OPD-MULTITURN-PLAN.md §15)"
+            if _recon else
+            "prefix_turns_through_step slices from step 0, so a marked prefix "
+            "carries the pre-boundary history boundary:replace discarded"
+        ),
     }
     report["prefixes"] = [
         {"prefix_id": p.prefix_id, "task": p.task, "step": p.step_index,
@@ -641,29 +712,97 @@ def main() -> int:
         print("student tokenizer was not loaded", file=sys.stderr)
         return 2
 
-    log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
     caps_path = out / "captures.jsonl"
-    caps_fh = caps_path.open("w", encoding="utf-8")
 
-    def _persist(a) -> None:
-        caps_fh.write(json.dumps({
-            "key": a.key,
-            "prefix_id": a.prefix_id,
-            "sample_index": a.sample_index,
-            "policy_version": a.policy_version,
-            "termination_reason": a.termination_reason,
-            "action_bytes_b64": base64.b64encode(a.action_bytes).decode(),
-            "action_token_ids": list(a.action_token_ids),
-            "behavior_logprobs": list(a.behavior_logprobs),
-            "prompt_token_ids": list(a.prompt_token_ids or []),
-        }) + "\n")
-        caps_fh.flush()
-        os.fsync(caps_fh.fileno())
+    if args.resume_from_captures:
+        # Sampling held a GPU and its behaviour logprobs cannot be recreated,
+        # so a second stage must reload them rather than re-sample. Without
+        # this, `--stop-after-sampling` was a dead end: the only way forward
+        # was to pay for all 32 actions again.
+        from vektori_trace.replay_opd import SampledAction
+        from vektori_trace.replay_sample import token_bytes_from_ids
 
-    try:
-        actions, samp = sample_actions(prefixes, student_tok, args, on_capture=_persist)
-    finally:
-        caps_fh.close()
+        src = Path(args.resume_from_captures)
+        if not src.exists():
+            print(f"--resume-from-captures: {src} does not exist", file=sys.stderr)
+            return 2
+        actions = []
+        for line in src.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                log("captures.jsonl ends in a partial line; using the complete ones")
+                break
+            raw = base64.b64decode(row["action_bytes_b64"])
+            ids = row["action_token_ids"]
+            actions.append(
+                SampledAction(
+                    prefix_id=row["prefix_id"],
+                    sample_index=row["sample_index"],
+                    action_bytes=raw,
+                    action_token_ids=ids,
+                    action_token_bytes=token_bytes_from_ids(student_tok, ids),
+                    behavior_logprobs=row["behavior_logprobs"],
+                    policy_version=row["policy_version"],
+                    prompt_token_ids=row.get("prompt_token_ids") or None,
+                    termination_reason=row.get("termination_reason"),
+                )
+            )
+        if not actions:
+            print(f"--resume-from-captures: no complete captures in {src}",
+                  file=sys.stderr)
+            return 2
+        log(f"resumed {len(actions)} captures from {src}")
+
+        # The renderings the resumed actions were sampled under. Rebuilt from
+        # the same prefixes, and the prompt-id parity check below is what
+        # proves the rebuild matches what the server actually consumed.
+        from vektori_trace.dataset import turns_to_messages
+        from vektori_trace.replay_context import assert_prompt_ids_match
+
+        rendered = {}
+        for p_ in prefixes:
+            msgs = turns_to_messages(p_.prefix_turns)
+            rendered[p_.prefix_id] = msgs
+            prompt = student_tok.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
+            local = student_tok(prompt, add_special_tokens=False)["input_ids"]
+            for a in actions:
+                if a.prefix_id == p_.prefix_id and a.prompt_token_ids:
+                    assert_prompt_ids_match(p_.prefix_id, list(local), a.prompt_token_ids)
+                    break
+        samp = {"rendered": rendered, "cap": {"resumed": True}, "context": {}}
+        report["resumed_from"] = str(src)
+    else:
+        log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
+        caps_fh = caps_path.open("w", encoding="utf-8")
+
+        def _persist(a) -> None:
+            caps_fh.write(json.dumps({
+                "key": a.key,
+                "prefix_id": a.prefix_id,
+                "sample_index": a.sample_index,
+                "policy_version": a.policy_version,
+                "termination_reason": a.termination_reason,
+                "action_bytes_b64": base64.b64encode(a.action_bytes).decode(),
+                "action_token_ids": list(a.action_token_ids),
+                "behavior_logprobs": list(a.behavior_logprobs),
+                "prompt_token_ids": list(a.prompt_token_ids or []),
+            }) + "\n")
+            caps_fh.flush()
+            os.fsync(caps_fh.fileno())
+
+        try:
+            actions, samp = sample_actions(
+                prefixes, student_tok, args, on_capture=_persist
+            )
+        finally:
+            caps_fh.close()
+
     report["cap"] = samp["cap"]
     report["context"] = samp["context"]
 
@@ -747,7 +886,9 @@ def main() -> int:
         return 0
 
     log("stage 3/4: scoring with DeepSeek")
-    scored, ledger, teacher_prov = score_actions(actions, samp["rendered"], args)
+    scored, ledger, teacher_prov = score_actions(
+        actions, samp["rendered"], args, scores_path=out / "teacher_scores.jsonl"
+    )
     report["teacher_ledger"] = ledger
     report["teacher"] = teacher_prov
     # Scoring is the paid stage: flush before anything can OOM.
