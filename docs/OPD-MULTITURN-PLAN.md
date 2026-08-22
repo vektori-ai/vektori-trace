@@ -553,12 +553,15 @@ Stop without scaling for any of the following:
 Ask separately before:
 
 1. the minimal Fireworks scoring probe — **done, passed 2026-08-21**;
-2. **the one-example GPU training memory preflight** (§14) — one selected
-   prefix, one action, one forward/backward. Inserted ahead of the 32-action
-   run on 2026-08-21: it is the cheaper question and it determines the other's
-   design;
-3. the 32-action replay-prefix update (sampling + teacher scoring + one GPU
-   optimizer step);
+2. the one-example GPU training memory preflight (§14.2) — **done, passed
+   2026-08-22**, 67.2 GiB on A100-80GB at 35,687 tokens;
+3. the 32-action replay-prefix update, now split into three approvals because
+   the stages use different resources:
+   a. **sampling** (L40S serving) — **done 2026-08-22**, 32/32 captures, max
+      total 27,043 tokens against the 35,687 envelope, longest ck75 action
+      4,636 tokens. Endpoint torn down;
+   b. **teacher scoring** (Fireworks, no GPU) — in progress;
+   c. **one optimizer step** (A100-80GB) — not started;
 4. the `v0` vs `v_replay` evaluation, if it needs GPU serving;
 5. any larger replay pilot.
 
@@ -598,17 +601,43 @@ Three reasons, each learned from a specific failure:
   policy and cannot be recomputed once the policy moves, so the training step
   must be resumable against saved captures rather than re-sampling.
 
-The runner is **not** built around this topology yet, deliberately: it should
-not be designed against an L40S assumption that a backward pass at real context
-may not survive.
+The runner now implements this topology: `--stop-after-sampling` ends the
+serving stage, `--resume-from-captures` reloads it, and `--stop-after-scoring`
+separates the paid teacher calls from the GPU step.
 
-**The memory preflight is the next paid gate.** A bf16 14B is ~28 GB of weights
-before activations, gradients or optimizer state; LoRA keeps the optimizer
-state small but activation memory at a long prefix does not shrink with it. The
-prefix measured for §14's own preflight was ~95k tokens rendered — well past
-the 30k earlier drafts assumed — so the prefix used must be chosen from the
-measured distribution, not assumed. Fail the preflight and the 32-action run's
-hardware and configuration are wrong as specified.
+### 14.2 Preflight result — measured 2026-08-22
+
+**Passed on A100-80GB.** `docs/preflight/preflight_a100_35687.json`.
+
+| | |
+| --- | --- |
+| prefix + action | 31,591 + 4,096 = **35,687** tokens |
+| peak (nvidia-smi) | **67.2 GiB** of 79.25 |
+| torch peak reserved | 66.68 GiB |
+| headroom | 12.57 GiB |
+| gradients | 560 LoRA tensors, all finite |
+
+Two fixes were required to get there, and both matter beyond this run:
+
+- **`logits_to_keep`.** `action_logprobs_under_prefix` asked for logits over the
+  whole sequence and then sliced the action out — 11.5 GiB of bf16 logits
+  allocated to keep 2.6, plus 46 GiB of fp32 + log_softmax downstream. Qwen3
+  slices hidden states *before* `lm_head`, so the full tensor is never built.
+  Verified bit-identical to the previous path.
+- **Gradient checkpointing**, asserted rather than assumed: `enable()` returns
+  None whether or not it engaged, and HF skips recomputation unless the module
+  flag is set *and* the model is training. A silently-disabled checkpoint is
+  indistinguishable from an enabled one until the backward OOMs.
+
+A first attempt at 31,591 + **9,216** (the sampling loop guard, wrongly used as
+a training budget) OOMed at 77.26 GiB. The cap bounds what may be *generated*;
+it is not what training must reserve.
+
+**L40S is out for training** — 67.2 GiB against 48. It remains correct for
+*serving*, which needs ~28 GiB of weights plus a 14.3 GiB KV cache.
+
+**The measured training envelope is 35,687 tokens**, enforced by
+`--max-train-tokens` before any teacher call.
 
 ### 14.1 Prefix context budget
 
@@ -677,3 +706,18 @@ still selected them — 7 of 8 on a mixed pool), and exclusion keys off
 carrying replaced history; reconstruction makes compacted prefixes far shorter,
 and SFT's own `COMPACTION_TRIGGER` (40448 − 8000 = 32,448) bounds a correctly
 rebuilt segment just above this run's 31,744 budget.
+
+**Confirmed 2026-08-22.** The census re-run on reconstructed prefixes:
+
+| | flat (bug) | reconstructed |
+| --- | --- | --- |
+| candidates | 7,443 | **4,305** |
+| overflow | **38.02%** | **0.79%** |
+| median tokens | 24,141 | 12,853 |
+| max tokens | 102,996 | **34,784** |
+
+The reconstructed max lands right at SFT's own `COMPACTION_TRIGGER` (32,448),
+which is the independent check that the rebuild matches what terminus-2
+actually ran. The 38% figure measured the bug, not the corpus. Post-compaction
+coverage went from unusable to **1,605 fitting candidates**, so §8.3's two
+prefixes are satisfiable rather than aspirational.
