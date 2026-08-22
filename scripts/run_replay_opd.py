@@ -74,6 +74,36 @@ def post(url: str, payload: dict, timeout: float = 900.0):
         return 0, {"unreachable": str(e)}
 
 
+def endpoint_models(api_base: str, timeout: float = 30.0) -> tuple[int, dict]:
+    """Cheap readiness/model check that does not advance the sampler RNG."""
+    url = api_base.rstrip("/") + "/models"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, {"raw": e.read().decode("utf-8", "replace")[:800]}
+    except urllib.error.URLError as e:
+        return 0, {"unreachable": str(e)}
+
+
+def require_endpoint_model(api_base: str, model: str) -> None:
+    """Fail before the 4,305-prefix census if the endpoint is unusable."""
+    status, body = endpoint_models(api_base)
+    if status != 200:
+        raise SystemExit(
+            f"student endpoint readiness failed HTTP {status}: {str(body)[:300]}"
+        )
+    advertised = {
+        str(row.get("id")) for row in (body.get("data") or []) if isinstance(row, dict)
+    }
+    if model not in advertised:
+        raise SystemExit(
+            f"student endpoint does not advertise model {model!r}; "
+            f"available={sorted(advertised)}"
+        )
+
+
 class _Capture:
     """Duck-typed `CapturedCompletion` over a raw vLLM completion choice."""
 
@@ -281,7 +311,10 @@ def _load_scores(path: Path) -> dict:
             row = json.loads(line)
         except json.JSONDecodeError:
             break
-        out[row["key"]] = (
+        key = row["key"]
+        if key in out:
+            raise ValueError(f"duplicate teacher score for {key} in {path}")
+        out[key] = (
             [base64.b64decode(b) for b in row["teacher_token_bytes_b64"]],
             row["teacher_logprobs"],
         )
@@ -297,6 +330,12 @@ def score_actions(actions, rendered, args, scores_path=None):
     pool = FireworksTeacherPool(model=args.teacher_model)
 
     prior = _load_scores(scores_path) if scores_path else {}
+    expected = {a.key for a in actions}
+    foreign = sorted(set(prior) - expected)
+    if foreign:
+        raise ValueError(
+            f"teacher score file contains keys outside this capture batch: {foreign[:4]}"
+        )
     if prior:
         log(f"reusing {len(prior)} teacher scores already on disk")
 
@@ -366,18 +405,8 @@ def train(batch_inputs, args):
     )
 
 
-class _SkipDeviceCheck(Exception):
-    """Control flow: the training device is irrelevant to a sampling-only run."""
-
-
 def _selection_policy() -> str:
-    """What the batch actually sampled from, not what §8.3 asked for.
-
-    Until reconstruction lands, every candidate at or after a trace's first
-    compaction boundary is excluded, so this run stresses pre-compaction states
-    only. §8.3's "two authentic post-compaction prefixes" is not met and the
-    report must not imply otherwise.
-    """
+    """Name the effective policy from the reconstruction capability."""
     from vektori_trace.compaction import reconstruction_is_implemented
 
     return (
@@ -494,10 +523,25 @@ def main() -> int:
                     help="sample, save captures, check the training envelope "
                          "and report projected cost — then stop, before any "
                          "paid teacher call")
+    ap.add_argument("--stop-after-scoring", action="store_true",
+                    help="score a complete saved capture batch, persist every "
+                         "teacher result, then stop before allocating a "
+                         "training GPU")
     ap.add_argument("--dry-run", action="store_true",
                     help="select and render only; spend nothing")
     args = ap.parse_args()
     args.corpus = args.corpus or DEFAULT_CORPUS
+
+    if args.stop_after_sampling and args.stop_after_scoring:
+        print("choose only one of --stop-after-sampling/--stop-after-scoring",
+              file=sys.stderr)
+        return 2
+    if args.stop_after_scoring and not args.resume_from_captures:
+        print("--stop-after-scoring requires --resume-from-captures", file=sys.stderr)
+        return 2
+    will_sample = not bool(args.resume_from_captures)
+    will_score = not args.stop_after_sampling
+    will_train = will_score and not args.stop_after_scoring
 
     from vektori_trace.chunk_opd import assert_token_cap_is_task_derived
 
@@ -529,6 +573,75 @@ def main() -> int:
         "learning_rate": args.learning_rate,
     }
 
+    # Cheap invocation gates belong before tokenizer loading and the 3.5-minute
+    # all-candidate budget census. These used to fire only after the census,
+    # leaving an already-warm L40S idle for every typo or missing credential.
+    if not args.dry_run:
+        needed = []
+        if will_sample:
+            needed.extend(((args.api_base, "--api-base"), (args.model, "--model")))
+        if will_train:
+            needed.append((args.adapter_path, "--adapter-path"))
+            needed.append((args.device, "--device"))
+        for need, flag in needed:
+            if not need:
+                print(f"{flag} is required for this run stage", file=sys.stderr)
+                return 2
+        if will_score and not os.environ.get("FIREWORKS_API_KEY"):
+            print("FIREWORKS_API_KEY is not set", file=sys.stderr)
+            return 2
+        missing_corpus = [str(p) for p in args.corpus if not Path(p).exists()]
+        if missing_corpus:
+            print(f"corpus path(s) do not exist: {missing_corpus}", file=sys.stderr)
+            return 2
+        if will_sample:
+            require_endpoint_model(args.api_base, args.model)
+
+        # Device and pin failures are also setup failures. Check them before
+        # the all-candidate census, never after minutes of idle GPU time.
+        if will_train:
+            try:
+                import torch
+            except ImportError:
+                raise SystemExit("torch is not importable; this host cannot train")
+            if not str(args.device).startswith("cuda"):
+                raise SystemExit(f"--device {args.device!r} is not a CUDA device")
+            if not torch.cuda.is_available():
+                raise SystemExit(
+                    f"--device {args.device!r} but torch.cuda.is_available() is False"
+                )
+            idx = torch.device(args.device).index or 0
+            if idx >= torch.cuda.device_count():
+                raise SystemExit(
+                    f"--device {args.device!r} but only {torch.cuda.device_count()} "
+                    "CUDA device(s) visible"
+                )
+            log(f"training device: {args.device} ({torch.cuda.get_device_name(idx)})")
+
+        from vektori_trace.opd_manifest import PinError, verify_reference_pins
+
+        try:
+            report["reference_sha256_observed"] = verify_reference_pins()
+        except PinError as e:
+            print(f"reference pin check failed: {e}", file=sys.stderr)
+            return 2
+        manifest = _build_manifest(args)
+        report["manifest"] = manifest.to_dict()
+        report["missing_pins"] = manifest.missing_pins()
+        if will_train:
+            try:
+                manifest.require_complete()
+            except PinError as e:
+                print(f"{e}", file=sys.stderr)
+                return 2
+        if manifest.missing_pins():
+            log(
+                "non-training stage: pins incomplete but deferred "
+                f"[{', '.join(manifest.missing_pins())}]"
+            )
+        else:
+            log(f"pins complete; commit {manifest.vektori_trace_commit}")
+
     # The tokenizer is needed *before* selection now: the context-budget filter
     # measures rendered prompts, and it must run on the candidate pool rather
     # than on the eight already chosen.
@@ -555,7 +668,6 @@ def main() -> int:
     prefixes, sel = select_prefixes(args, student_tok)
     report["corpus"] = sel["corpus"]
     report["context_filter"] = sel["context_filter"]
-    flush("selected")
     report["selection_policy"] = _selection_policy()
     # Derived, never asserted: this block described the pre-port state as a
     # pair of literals and kept saying so after reconstruction landed. A report
@@ -594,6 +706,7 @@ def main() -> int:
         # derived from the corpus (plan §15). Reported, not claimed.
         for p in prefixes
     ]
+    flush("selected")
 
     if args.dry_run:
         from vektori_trace.dataset import turns_to_messages
@@ -661,89 +774,9 @@ def main() -> int:
     # --device gates the optimizer step, so a sampling-only stage does not need
     # one. Demanding it there forced a fake value onto a run that never trains,
     # which is how a wrong device reaches a real run unnoticed.
-    needed = [(args.api_base, "--api-base"), (args.model, "--model"),
-              (args.adapter_path, "--adapter-path")]
-    if not args.stop_after_sampling:
-        needed.append((args.device, "--device"))
-    for need, flag in needed:
-        if not need:
-            print(f"{flag} is required for a real run", file=sys.stderr)
-            return 2
     # Only the scoring stage spends Fireworks money. A sampling-only run must
     # not require the key: it lets the sampling half run on a host that has no
     # business holding a billing credential.
-    if not args.stop_after_sampling and not os.environ.get("FIREWORKS_API_KEY"):
-        print("FIREWORKS_API_KEY is not set", file=sys.stderr)
-        return 2
-
-    # Validate the training device *now*, not at stage 4. `load_v0_for_training`
-    # would catch a bad device anyway, but only after 32 samples and every
-    # teacher call have been paid for. The check is free; the ordering is the
-    # whole point.
-    try:
-        import torch
-
-        if args.stop_after_sampling:
-            log("sampling-only stage: skipping the training-device check")
-            raise _SkipDeviceCheck
-        if not str(args.device).startswith("cuda"):
-            raise SystemExit(f"--device {args.device!r} is not a CUDA device")
-        if not torch.cuda.is_available():
-            raise SystemExit(
-                f"--device {args.device!r} but torch.cuda.is_available() is False — "
-                "this host has no GPU. The ck75 serving endpoint is a separate "
-                "machine and does not provide one to this process."
-            )
-        idx = torch.device(args.device).index or 0
-        if idx >= torch.cuda.device_count():
-            raise SystemExit(
-                f"--device {args.device!r} but only {torch.cuda.device_count()} "
-                "CUDA device(s) visible"
-            )
-        log(f"training device: {args.device} ({torch.cuda.get_device_name(idx)})")
-    except _SkipDeviceCheck:
-        pass
-    except ImportError:
-        raise SystemExit("torch is not importable; this host cannot train")
-
-    # §6.1 pin gate. Before sampling, before Fireworks, before weights: an
-    # unpinned run produces numbers that cannot be attributed to a
-    # configuration, which §11 makes a stop condition rather than a reporting
-    # gap. `verify_reference_pins` re-hashes the vendored paper code, so an edit
-    # to the reference implementation the loss claims to port fails here.
-    from vektori_trace.opd_manifest import PinError, verify_reference_pins
-
-    try:
-        report["reference_sha256_observed"] = verify_reference_pins()
-    except PinError as e:
-        print(f"reference pin check failed: {e}", file=sys.stderr)
-        return 2
-
-    manifest = _build_manifest(args)
-    report["manifest"] = manifest.to_dict()
-    report["missing_pins"] = manifest.missing_pins()
-    if args.stop_after_sampling and manifest.missing_pins():
-        # The adapter lives on a Modal volume, so its hashes cannot derive on a
-        # host that only *serves* it over HTTP. Sampling is attributable by
-        # policy_version and the served model id; the pins that require local
-        # files are enforced on the training host, which does mount them.
-        log(
-            "sampling-only stage: unpinned "
-            f"[{', '.join(manifest.missing_pins())}] — recorded, and required "
-            "before the optimizer step"
-        )
-    try:
-        if not args.stop_after_sampling:
-            manifest.require_complete()
-    except PinError as e:
-        print(f"{e}", file=sys.stderr)
-        print(
-            "Fill the missing pins (adapter/tokenizer hashes are derived from "
-            "--adapter-path; harbor revision via --harbor-revision) and re-run.",
-            file=sys.stderr,
-        )
-        return 2
-    log(f"pins complete; commit {manifest.vektori_trace_commit}")
 
     if student_tok is None:  # unreachable on a real run; guarded, not assumed
         print("student tokenizer was not loaded", file=sys.stderr)
@@ -816,6 +849,13 @@ def main() -> int:
         report["resumed_from"] = str(src)
     else:
         log(f"stage 2/4: sampling {args.n_prefixes * args.n_samples} actions from ck75")
+        if caps_path.exists() and caps_path.stat().st_size:
+            print(
+                f"refusing to overwrite non-empty capture file {caps_path}; "
+                "resume it with --resume-from-captures or choose a new --out",
+                file=sys.stderr,
+            )
+            return 2
         caps_fh = caps_path.open("w", encoding="utf-8")
 
         def _persist(a) -> None:
@@ -834,11 +874,24 @@ def main() -> int:
             os.fsync(caps_fh.fileno())
 
         try:
-            actions, samp = sample_actions(
-                prefixes, student_tok, args, on_capture=_persist
-            )
+            actions, samp = sample_actions(prefixes, student_tok, args, on_capture=_persist)
+        except BaseException as e:
+            report["sampling_error"] = f"{type(e).__name__}: {e}"
+            report["captures_path"] = str(caps_path)
+            report["captures_complete"] = False
+            flush("sampling_failed")
+            raise
         finally:
             caps_fh.close()
+
+    from vektori_trace.replay_opd import validate_sample_set
+
+    validate_sample_set(
+        prefixes,
+        actions,
+        n_samples_per_prefix=args.n_samples,
+        require_prompt_ids=True,
+    )
 
     report["cap"] = samp["cap"]
     report["context"] = samp["context"]
@@ -848,7 +901,10 @@ def main() -> int:
     # moves, so an unsaved batch is unrecoverable — and until now the script
     # went straight from sampling into Fireworks, where a crash would have cost
     # both the sampling and the ability to retry scoring against it.
-    report["captures_path"] = str(caps_path)
+    report["captures_path"] = str(
+        Path(args.resume_from_captures) if args.resume_from_captures else caps_path
+    )
+    report["captures_complete"] = True
     flush("sampled")
     log(f"saved {len(actions)} captures to {caps_path}")
 
@@ -930,6 +986,10 @@ def main() -> int:
     report["teacher"] = teacher_prov
     # Scoring is the paid stage: flush before anything can OOM.
     flush("scored")
+
+    if args.stop_after_scoring:
+        log("--stop-after-scoring: all paid scores saved; no training GPU used")
+        return 0
 
     # The stored DeepSeek action at each replay step, so the driver can assert
     # ck75 did not simply reproduce it. Never a training target.
