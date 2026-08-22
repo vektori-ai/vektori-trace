@@ -358,6 +358,10 @@ def train(batch_inputs, args):
     )
 
 
+class _SkipDeviceCheck(Exception):
+    """Control flow: the training device is irrelevant to a sampling-only run."""
+
+
 def _selection_policy() -> str:
     """What the batch actually sampled from, not what §8.3 asked for.
 
@@ -646,9 +650,14 @@ def main() -> int:
         log(f"report: {out / 'dry_run.json'}")
         return 0
 
-    for need, flag in ((args.api_base, "--api-base"), (args.model, "--model"),
-                       (args.adapter_path, "--adapter-path"),
-                       (args.device, "--device")):
+    # --device gates the optimizer step, so a sampling-only stage does not need
+    # one. Demanding it there forced a fake value onto a run that never trains,
+    # which is how a wrong device reaches a real run unnoticed.
+    needed = [(args.api_base, "--api-base"), (args.model, "--model"),
+              (args.adapter_path, "--adapter-path")]
+    if not args.stop_after_sampling:
+        needed.append((args.device, "--device"))
+    for need, flag in needed:
         if not need:
             print(f"{flag} is required for a real run", file=sys.stderr)
             return 2
@@ -663,6 +672,9 @@ def main() -> int:
     try:
         import torch
 
+        if args.stop_after_sampling:
+            log("sampling-only stage: skipping the training-device check")
+            raise _SkipDeviceCheck
         if not str(args.device).startswith("cuda"):
             raise SystemExit(f"--device {args.device!r} is not a CUDA device")
         if not torch.cuda.is_available():
@@ -678,6 +690,8 @@ def main() -> int:
                 "CUDA device(s) visible"
             )
         log(f"training device: {args.device} ({torch.cuda.get_device_name(idx)})")
+    except _SkipDeviceCheck:
+        pass
     except ImportError:
         raise SystemExit("torch is not importable; this host cannot train")
 
