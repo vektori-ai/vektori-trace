@@ -91,7 +91,8 @@ def main() -> int:
     ap.add_argument("--gpu", default="A100-80GB")
     ap.add_argument("--tool-parser", default=None,
                     help="override; default is per-model in TOOL_PARSERS")
-    ap.add_argument("--tasks", nargs="+", default=TASKS)
+    ap.add_argument("--tasks", nargs="*", default=TASKS,
+                    help="empty (--tasks) runs every task in the domain")
     ap.add_argument("--num-trials", type=int, default=1)
     ap.add_argument("--domain", default="retail")
     ap.add_argument("--max-concurrency", type=int, default=4)
@@ -143,14 +144,16 @@ def main() -> int:
     # prefix: "Qwen/Qwen3.8-27B" is served as "Qwen3.8-27B", and asking for the
     # full HF path 404s every call. A LoRA registers a different name again, so
     # the only correct source is the live `ServedModel`.
-    def tau2_cmd(api_base: str, agent_llm: str) -> list[str]:
+    def tau2_cmd(api_base: str | None, agent_llm: str) -> list[str]:
+        args = ('{"temperature": 0.0}' if api_base is None
+                else f'{{"api_base": "{api_base}", "temperature": 0.0}}')
         return [
             tau2_bin, "run",
             "--domain", a.domain,
-            "--task-ids", *a.tasks,
+            *(["--task-ids", *a.tasks] if a.tasks else []),
             "--num-trials", str(a.num_trials),
             "--agent-llm", agent_llm,
-            "--agent-llm-args", f'{{"api_base": "{api_base}", "temperature": 0.0}}',
+            "--agent-llm-args", args,
             "--user-llm", a.user_llm,
             "--user-llm-args", '{"temperature": 0.0}',
             "--max-concurrency", str(a.max_concurrency),
@@ -160,6 +163,24 @@ def main() -> int:
             # (`--verbose-logs` / `--auto-resume` are tau3 flags; not here.)
             "--log-level", "DEBUG",
         ]
+
+    # A hosted agent (fireworks_ai/..., openai/...) is reached by slug through
+    # litellm; there is nothing to serve, so skip serve_model entirely rather
+    # than allocating a GPU that would sit idle for the whole sweep.
+    hosted = "/" in a.model and a.model.split("/")[0] in {
+        "fireworks_ai", "openai", "anthropic", "together_ai", "deepseek"}
+
+    if hosted:
+        cmd = tau2_cmd(None, a.model)
+        print(f"[hosted] agent={a.model} (no GPU)", flush=True)
+        print(f"[tau2  ] {' '.join(cmd)}", flush=True)
+        if a.dry_run:
+            return 0
+        t0 = time.time()
+        rc = subprocess.run(cmd, cwd=a.tau2_dir, stdin=subprocess.DEVNULL).returncode
+        print(f"[tau2  ] exit {rc} after {time.time()-t0:.0f}s", flush=True)
+        print(f"[done  ] results in {a.tau2_dir}/data/simulations/{a.save_to}.json")
+        return rc
 
     if a.dry_run:
         print("would serve:", a.model, "on", a.gpu, "with", " ".join(vllm_args))
