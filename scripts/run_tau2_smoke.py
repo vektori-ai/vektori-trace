@@ -72,8 +72,11 @@ def main() -> int:
     ap.add_argument("--domain", default="retail")
     ap.add_argument("--max-concurrency", type=int, default=4)
     ap.add_argument("--max-model-len", type=int, default=32768)
+    # The date suffix is part of the slug: bare `deepseek-v4-flash` 404s with
+    # "Model not found, inaccessible, and/or not deployed". Confirm any change
+    # against `GET /v1/models` rather than the docs.
     ap.add_argument("--user-llm",
-                    default="fireworks_ai/accounts/fireworks/models/deepseek-v4-flash")
+                    default="fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731")
     ap.add_argument("--save-to", default="qwen38_27b_smoke")
     ap.add_argument("--tau2-dir", default="/data/tau2")
     ap.add_argument("--dry-run", action="store_true",
