@@ -1,0 +1,22 @@
+{
+  "note": "20 tau2-bench v0.2.0 retail tasks, spread across frontier difficulty. Teacher-trace + gap-band survey set.",
+  "selected": "2026-08-24",
+  "tau2_version": "v0.2.0 (tau2, NOT tau3 -- tau3 is v1.0.0 and revises ~10% of retail expected actions)",
+  "tau2_commit": "f8de30c",
+  "task_ids": ["2","25","27","28","44","45","54","57","59","70","73","75","83","87","92","93","97","98","99","108"],
+  "anchors": {
+    "ids": ["73","75","57","93"],
+    "why": "the only tasks with measured Qwen numbers: Qwen3-14B 2/4 (73,57 pass; 75,93 fail), Qwen3.8-27B 4/4, both n=1"
+  },
+  "difficulty_source": {
+    "metric": "frontier pass rate over 12 trials (claude-3.7 / gpt-4.1 / o4-mini, 4 each), from data/tau2/results/final/",
+    "caveat": "a CEILING measure. Those three sit well above any open model, so it orders difficulty but does not predict Flash or Qwen. Treat the bands as a prior, not a prediction."
+  },
+  "bands": {
+    "easy 100%":  ["75","73","97","70","44"],
+    "med 66-92%": ["87","54","108","25","93","57","83","45","92","2"],
+    "hard 25-42%": ["27","99","59","98","28"]
+  },
+  "excluded": "retail has no 0/12 tasks -- all 114 are solved at least once by frontier models",
+  "next": "run Flash as agent on these; tasks Flash passes and 14B fails are the gap band ReOPD needs"
+}
