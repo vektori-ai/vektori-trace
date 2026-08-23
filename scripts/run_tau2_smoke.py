@@ -70,14 +70,27 @@ VLLM_ARGS = [
     "--enforce-eager",
     "--reasoning-parser", "qwen3",
     "--enable-auto-tool-choice",
-    "--tool-call-parser", "qwen3_coder",
 ]
+
+# The tool-call parser must match what the model's chat template emits. Both
+# Qwen3-14B and Qwen3.8-27B wrap calls in <tool_call> tags, but qwen3_coder --
+# taken from the 27B vLLM recipe -- extracted nothing from 14B: 22 raw blocks
+# left in message content, 0 parsed, so no tool ever executed and the model
+# hallucinated order data to keep the conversation going. Per model, verified
+# against the template, never carried across.
+TOOL_PARSERS = {
+    "Qwen3.8-27B": "qwen3_coder",
+    "Qwen3-14B": "hermes",
+}
+DEFAULT_TOOL_PARSER = "hermes"
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--gpu", default="A100-80GB")
+    ap.add_argument("--tool-parser", default=None,
+                    help="override; default is per-model in TOOL_PARSERS")
     ap.add_argument("--tasks", nargs="+", default=TASKS)
     ap.add_argument("--num-trials", type=int, default=1)
     ap.add_argument("--domain", default="retail")
@@ -106,6 +119,8 @@ def main() -> int:
                     f"_smoke_{time.strftime('%Y%m%d_%H%M%S')}"
 
     vllm_args = list(VLLM_ARGS)
+    vllm_args += ["--tool-call-parser",
+                  a.tool_parser or TOOL_PARSERS.get(short, DEFAULT_TOOL_PARSER)]
     if short in VISION_MODELS:
         # Text-only benchmark: tell vLLM to expect no images so it skips the
         # multi-modal warmup, ~3.5 min of every 27B boot. Harmless to omit on a
