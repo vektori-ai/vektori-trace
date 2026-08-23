@@ -38,6 +38,9 @@ sys.path.insert(0, str(REPO))
 
 from vektori_trace.runtime.serve import serve_model  # noqa: E402
 
+sys.path.insert(0, str(REPO / "scripts"))
+from run_replay_opd import require_endpoint_model  # noqa: E402
+
 MODEL = "Qwen/Qwen3.8-27B"
 
 # tau2 v0.2.0 retail, ranked by measured frontier pass rate (12 trials each:
@@ -100,24 +103,36 @@ def main() -> int:
         if not (Path(a.tau2_dir) / ".env").exists():
             sys.exit("FIREWORKS_API_KEY unset and no .env; the user simulator cannot run")
 
-    def tau2_cmd(api_base: str) -> list[str]:
+    # `agent_llm` is a parameter, never `f"hosted_vllm/{MODEL}"`. serve_model
+    # registers vLLM under `_canonical_name(base_model)`, which strips the org
+    # prefix: "Qwen/Qwen3.8-27B" is served as "Qwen3.8-27B", and asking for the
+    # full HF path 404s every call. A LoRA registers a different name again, so
+    # the only correct source is the live `ServedModel`.
+    def tau2_cmd(api_base: str, agent_llm: str) -> list[str]:
         return [
             tau2_bin, "run",
             "--domain", a.domain,
             "--task-ids", *a.tasks,
             "--num-trials", str(a.num_trials),
-            "--agent-llm", f"hosted_vllm/{MODEL}",
+            "--agent-llm", agent_llm,
             "--agent-llm-args", f'{{"api_base": "{api_base}", "temperature": 0.0}}',
             "--user-llm", a.user_llm,
             "--user-llm-args", '{"temperature": 0.0}',
             "--max-concurrency", str(a.max_concurrency),
             "--save-to", a.save_to,
-            "--log-level", "INFO",
+            # tau2 v0.2.0 defaults to ERROR, which hides the request/response
+            # detail that tells an empty tool_calls apart from a routing 404.
+            # (`--verbose-logs` / `--auto-resume` are tau3 flags; not here.)
+            "--log-level", "DEBUG",
         ]
 
     if a.dry_run:
         print("would serve:", MODEL, "on", a.gpu, "with", " ".join(VLLM_ARGS))
-        print("would run:  ", " ".join(tau2_cmd("<api_base>")))
+        # Deliberately a placeholder: the real value is only known once the
+        # endpoint is up. Printing a guess here is what let a wrong model name
+        # survive a dry-run and 404 four minutes into a paid run.
+        print("would run:  ", " ".join(
+            tau2_cmd("<api_base>", "hosted_vllm/<served.model_name @ boot>")))
         return 0
 
     print(f"[serve] {MODEL} on {a.gpu} (first boot pulls ~52 GiB into the HF cache "
@@ -131,7 +146,12 @@ def main() -> int:
         extra_vllm_args=VLLM_ARGS,
     ) as served:
         print(f"[serve] up in {time.time()-t0:.0f}s at {served.api_base}", flush=True)
-        cmd = tau2_cmd(served.api_base)
+        # Ask the server what it advertises rather than trusting the name we
+        # think we passed it. Wrong name = 404 on every rollout, discovered
+        # minutes in with the GPU already billing; this fails in seconds.
+        require_endpoint_model(served.api_base, served.model_name)
+        print(f"[serve] endpoint advertises {served.model_name!r}", flush=True)
+        cmd = tau2_cmd(served.api_base, served.harbor_model)
         print(f"[tau2 ] {' '.join(cmd)}", flush=True)
         # Inherit stdout/stderr so `tail -f` on the log shows tau2's own
         # progress lines as they happen rather than in one dump at the end.
