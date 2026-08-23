@@ -26,6 +26,7 @@ costs almost nothing and the card is sized by weights alone.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -85,6 +86,21 @@ TOOL_PARSERS = {
 DEFAULT_TOOL_PARSER = "hermes"
 
 
+def _spend_so_far(results: Path) -> float | None:
+    """Agent + user cost across every simulation written so far, or None.
+
+    Partial reads are expected -- tau2 rewrites the file as it goes, so a poll
+    can land mid-write and fail to parse. That is not an error; the next poll
+    20s later sees a complete file.
+    """
+    try:
+        d = json.loads(results.read_text())
+    except Exception:
+        return None
+    return sum((s.get("agent_cost") or 0) + (s.get("user_cost") or 0)
+               for s in d.get("simulations", []))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -110,6 +126,8 @@ def main() -> int:
     ap.add_argument("--save-to", default=None,
                     help="default: <model>_smoke_<timestamp>")
     ap.add_argument("--tau2-dir", default="/data/tau2")
+    ap.add_argument("--max-cost", type=float, default=10.0,
+                    help="stop the sweep once agent+user spend exceeds this (USD)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the tau2 command and exit without allocating a GPU")
     a = ap.parse_args()
@@ -177,7 +195,30 @@ def main() -> int:
         if a.dry_run:
             return 0
         t0 = time.time()
-        rc = subprocess.run(cmd, cwd=a.tau2_dir, stdin=subprocess.DEVNULL).returncode
+        # Watchdog: tau2 writes every finished simulation into save_to as it
+        # goes, and each carries its own agent_cost/user_cost. Poll that file
+        # and kill the sweep the moment spend crosses --max-cost, so a pricing
+        # surprise or a runaway retry loop cannot quietly bill all night.
+        # Killing is safe: rerunning with the same --save-to resumes.
+        proc = subprocess.Popen(cmd, cwd=a.tau2_dir, stdin=subprocess.DEVNULL)
+        results = Path(a.tau2_dir) / "data" / "simulations" / f"{a.save_to}.json"
+        while proc.poll() is None:
+            time.sleep(20)
+            spent = _spend_so_far(results)
+            if spent is None:
+                continue
+            if spent > a.max_cost:
+                print(f"[budget] ${spent:.2f} > --max-cost ${a.max_cost:.2f}; "
+                      f"stopping. Rerun with --save-to {a.save_to} to resume.",
+                      flush=True)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
+        rc = proc.returncode if proc.returncode is not None else 1
+        print(f"[budget] spent ~${_spend_so_far(results) or 0:.2f}", flush=True)
         print(f"[tau2  ] exit {rc} after {time.time()-t0:.0f}s", flush=True)
         print(f"[done  ] results in {a.tau2_dir}/data/simulations/{a.save_to}.json")
         return rc
