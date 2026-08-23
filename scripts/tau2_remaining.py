@@ -24,6 +24,10 @@ def main() -> int:
     ap.add_argument("--domain", required=True)
     ap.add_argument("--tau2-dir", default="/data/tau2")
     ap.add_argument("--count", action="store_true", help="print the count, not the ids")
+    ap.add_argument("--prefix", default=None,
+                    help="only count results files whose name starts with this "
+                         "(e.g. 'flash_'). Without it, a different model's runs "
+                         "on the same domain count as done.")
     a = ap.parse_args()
 
     root = Path(a.tau2_dir)
@@ -32,9 +36,14 @@ def main() -> int:
                            "tasks.json").read_text())]
 
     # Any simulation already on disk counts as done, whichever run produced it --
-    # results files are per-run, and a domain may be spread over several.
+    # results files are per-run, and a domain may be spread over several. But
+    # "whichever run" must mean *this model's* runs: the Qwen smoke tests wrote
+    # retail results too, and counting those made a 94-task Flash sweep report
+    # 114 done. Airline ids are also a strict subset of retail's, so the file
+    # name is the only reliable domain signal -- match on it, not on the ids.
+    pat = f"{a.prefix}*{a.domain}*.json" if a.prefix else f"*{a.domain}*.json"
     done: set[str] = set()
-    for f in glob.glob(str(root / "data" / "simulations" / "*.json")):
+    for f in glob.glob(str(root / "data" / "simulations" / pat)):
         try:
             d = json.loads(Path(f).read_text())
         except Exception:
