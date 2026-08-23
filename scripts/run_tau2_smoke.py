@@ -126,7 +126,12 @@ def main() -> int:
     ap.add_argument("--save-to", default=None,
                     help="default: <model>_smoke_<timestamp>")
     ap.add_argument("--tau2-dir", default="/data/tau2")
-    ap.add_argument("--max-cost", type=float, default=10.0,
+    # Measured: ~$0.0075 per retail task with deepseek-v4-flash on both sides,
+    # so a 114-task domain sweep is under $1. A default of $1 is roughly 6x the
+    # expected spend of the largest sweep here -- enough headroom for a pricing
+    # surprise, low enough that a runaway retry loop stops in minutes. Raise it
+    # deliberately for a bigger run; never inherit a ceiling you did not pick.
+    ap.add_argument("--max-cost", type=float, default=1.0,
                     help="stop the sweep once agent+user spend exceeds this (USD)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the tau2 command and exit without allocating a GPU")
