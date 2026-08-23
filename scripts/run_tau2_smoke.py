@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test Qwen3.8-27B on four tau2-bench retail tasks.
+"""Smoke-test a served model on four tau2-bench retail tasks.
 
 Capability probe, not a measurement: 1 rollout per task cannot produce a pass
 rate. tau2's user simulator is an LLM, so the same task varies run to run --
@@ -41,7 +41,14 @@ from vektori_trace.runtime.serve import serve_model  # noqa: E402
 sys.path.insert(0, str(REPO / "scripts"))
 from run_replay_opd import require_endpoint_model  # noqa: E402
 
-MODEL = "Qwen/Qwen3.8-27B"
+DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
+
+# Qwen3-14B is the model the rest of this repo is built around, so the
+# interesting comparison is 14B vs 27B on identical tasks: frontier pass rates
+# are a ceiling measure and do not predict where an open model fails. 14B is a
+# plain dense Qwen3 -- no vision tower, so it skips the ~3.5 min multimodal
+# warmup, and the qwen3_coder tool parser still applies.
+VISION_MODELS = ("Qwen3.8-27B",)
 
 # tau2 v0.2.0 retail, ranked by measured frontier pass rate (12 trials each:
 # claude-3.7 / gpt-4.1 / o4-mini x 4). Retail only, so one policy document and
@@ -69,6 +76,7 @@ VLLM_ARGS = [
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--gpu", default="A100-80GB")
     ap.add_argument("--tasks", nargs="+", default=TASKS)
     ap.add_argument("--num-trials", type=int, default=1)
@@ -85,12 +93,24 @@ def main() -> int:
     # detached, nobody answers, so the endpoint idles on a paid GPU until
     # something kills it. Keeping runs in separate files also means every run
     # stays on disk to compare against.
-    ap.add_argument("--save-to",
-                    default=f"qwen38_27b_smoke_{time.strftime('%Y%m%d_%H%M%S')}")
+    ap.add_argument("--save-to", default=None,
+                    help="default: <model>_smoke_<timestamp>")
     ap.add_argument("--tau2-dir", default="/data/tau2")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the tau2 command and exit without allocating a GPU")
     a = ap.parse_args()
+
+    short = a.model.split("/")[-1]
+    if a.save_to is None:
+        a.save_to = f"{short.replace('.', '_').replace('-', '_').lower()}" \
+                    f"_smoke_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    vllm_args = list(VLLM_ARGS)
+    if short in VISION_MODELS:
+        # Text-only benchmark: tell vLLM to expect no images so it skips the
+        # multi-modal warmup, ~3.5 min of every 27B boot. Harmless to omit on a
+        # text model, which has no vision tower to profile.
+        vllm_args += ["--limit-mm-per-prompt", '{"image": 0}']
 
     tau2_bin = shutil.which("tau2") or str(Path(sys.executable).parent / "tau2")
     if not Path(tau2_bin).exists():
@@ -127,7 +147,7 @@ def main() -> int:
         ]
 
     if a.dry_run:
-        print("would serve:", MODEL, "on", a.gpu, "with", " ".join(VLLM_ARGS))
+        print("would serve:", a.model, "on", a.gpu, "with", " ".join(vllm_args))
         # Deliberately a placeholder: the real value is only known once the
         # endpoint is up. Printing a guess here is what let a wrong model name
         # survive a dry-run and 404 four minutes into a paid run.
@@ -135,15 +155,15 @@ def main() -> int:
             tau2_cmd("<api_base>", "hosted_vllm/<served.model_name @ boot>")))
         return 0
 
-    print(f"[serve] {MODEL} on {a.gpu} (first boot pulls ~52 GiB into the HF cache "
+    print(f"[serve] {a.model} on {a.gpu} (first boot pulls the weights into the HF cache "
           f"volume; subsequent runs reuse it)", flush=True)
     t0 = time.time()
     with serve_model(
-        MODEL,
+        a.model,
         gpu=a.gpu,
         max_model_len=a.max_model_len,
         gpu_memory_utilization=0.90,
-        extra_vllm_args=VLLM_ARGS,
+        extra_vllm_args=vllm_args,
     ) as served:
         print(f"[serve] up in {time.time()-t0:.0f}s at {served.api_base}", flush=True)
         # Ask the server what it advertises rather than trusting the name we
