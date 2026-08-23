@@ -77,7 +77,13 @@ def main() -> int:
     # against `GET /v1/models` rather than the docs.
     ap.add_argument("--user-llm",
                     default="fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731")
-    ap.add_argument("--save-to", default="qwen38_27b_smoke")
+    # Unique per run. A fixed name collides with the previous run's results
+    # file, and tau2 then asks "resume the run? (y/n)" on stdin -- which,
+    # detached, nobody answers, so the endpoint idles on a paid GPU until
+    # something kills it. Keeping runs in separate files also means every run
+    # stays on disk to compare against.
+    ap.add_argument("--save-to",
+                    default=f"qwen38_27b_smoke_{time.strftime('%Y%m%d_%H%M%S')}")
     ap.add_argument("--tau2-dir", default="/data/tau2")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the tau2 command and exit without allocating a GPU")
@@ -129,7 +135,11 @@ def main() -> int:
         print(f"[tau2 ] {' '.join(cmd)}", flush=True)
         # Inherit stdout/stderr so `tail -f` on the log shows tau2's own
         # progress lines as they happen rather than in one dump at the end.
-        rc = subprocess.run(cmd, cwd=a.tau2_dir).returncode
+        # stdin is /dev/null on purpose: any prompt tau2 decides to ask reads
+        # EOF and the process exits, instead of blocking forever on input that
+        # will never arrive while the GPU bills by the second.
+        rc = subprocess.run(cmd, cwd=a.tau2_dir,
+                            stdin=subprocess.DEVNULL).returncode
         print(f"[tau2 ] exit {rc} after {time.time()-t0:.0f}s total", flush=True)
 
     print(f"[serve] torn down; results in {a.tau2_dir}/data/simulations/{a.save_to}.json")
