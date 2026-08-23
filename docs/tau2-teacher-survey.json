@@ -1,0 +1,98 @@
+{
+ "note": "tau2-bench v0.2.0 task sets for the DeepSeek-Flash teacher survey, one per domain.",
+ "tau2_version": "v0.2.0 (tau2, NOT tau3)",
+ "tau2_commit": "f8de30c",
+ "selected": "2026-08-24",
+ "difficulty_source": {
+  "metric": "frontier pass rate over 12 trials (claude-3.7 / gpt-4.1 / o4-mini, 4 each), from data/tau2/results/final/",
+  "caveat": "a CEILING measure. Those three sit well above any open model, so it orders difficulty but does not predict Flash or Qwen. Treat the bands as a prior, not a prediction."
+ },
+ "domains": {
+  "retail": {
+   "task_ids": [
+    "2",
+    "25",
+    "27",
+    "28",
+    "44",
+    "45",
+    "54",
+    "57",
+    "59",
+    "70",
+    "73",
+    "75",
+    "83",
+    "87",
+    "92",
+    "93",
+    "97",
+    "98",
+    "99",
+    "108"
+   ],
+   "anchors": {
+    "ids": [
+     "73",
+     "75",
+     "57",
+     "93"
+    ],
+    "why": "the only tasks with measured Qwen numbers: Qwen3-14B 2/4 (73,57 pass; 75,93 fail), Qwen3.8-27B 4/4, both n=1"
+   },
+   "flash_result": "18/20 (90%), $0.21, 7 min, concurrency 4; failures: 59, 83"
+  },
+  "airline": {
+   "task_ids": [
+    "6",
+    "46",
+    "40",
+    "3",
+    "28",
+    "49",
+    "31",
+    "25",
+    "34",
+    "0",
+    "36",
+    "11",
+    "17",
+    "15",
+    "44",
+    "45",
+    "48",
+    "21",
+    "1",
+    "38"
+   ],
+   "caveat": "much of airline grades 'correctly refuse' -- a successful trace there often means no action taken, which is thin material for prefix distillation"
+  },
+  "telecom": {
+   "task_ids": [
+    "[service_issue]contract_end_suspension|lock_sim_card_pin[PERSONA:Hard]",
+    "[service_issue]break_apn_settings|contract_end_suspension|lock_sim_card_pin[PERSONA:Hard]",
+    "[service_issue]airplane_mode_on|unseat_sim_card[PERSONA:None]",
+    "[service_issue]airplane_mode_on|overdue_bill_suspension[PERSONA:None]",
+    "[service_issue]airplane_mode_on|lock_sim_card_pin|overdue_bill_suspension|unseat_sim_card[PERSONA:Easy]",
+    "[service_issue]lock_sim_card_pin|overdue_bill_suspension[PERSONA:Easy]",
+    "[service_issue]airplane_mode_on|break_apn_settings|contract_end_suspension|lock_sim_card_pin|unseat_sim_card[PERSONA:Easy]",
+    "[service_issue]break_apn_settings|lock_sim_card_pin[PERSONA:None]",
+    "[mobile_data_issue]data_saver_mode_on|user_abroad_roaming_enabled_off[PERSONA:Easy]",
+    "[mms_issue]airplane_mode_on|break_app_both_permissions[PERSONA:Hard]",
+    "[service_issue]airplane_mode_on|break_apn_settings|lock_sim_card_pin[PERSONA:None]",
+    "[mobile_data_issue]bad_network_preference|bad_vpn|data_mode_off|data_saver_mode_on[PERSONA:None]",
+    "[mobile_data_issue]airplane_mode_on|bad_network_preference|data_usage_exceeded|user_abroad_roaming_disabled_off[PERSONA:Easy]",
+    "[service_issue]airplane_mode_on|break_apn_settings|contract_end_suspension|unseat_sim_card[PERSONA:Easy]",
+    "[mobile_data_issue]bad_network_preference|bad_vpn|data_saver_mode_on|data_usage_exceeded|user_abroad_roaming_disabled_off[PERSONA:Easy]",
+    "[mobile_data_issue]bad_network_preference|bad_vpn|user_abroad_roaming_disabled_on[PERSONA:None]",
+    "[service_issue]contract_end_suspension|unseat_sim_card[PERSONA:Hard]",
+    "[mms_issue]bad_wifi_calling|break_apn_mms_setting|data_mode_off|data_usage_exceeded|unseat_sim_card[PERSONA:None]",
+    "[mms_issue]airplane_mode_on|bad_network_preference|bad_wifi_calling|break_apn_mms_setting|break_app_storage_permission|data_mode_off|data_usage_exceeded|unseat_sim_card[PERSONA:Easy]",
+    "[mms_issue]bad_wifi_calling|break_apn_mms_setting|break_app_sms_permission|data_usage_exceeded[PERSONA:Hard]"
+   ],
+   "caveat": "29 of 114 telecom tasks are 0/12 for frontier models and were excluded as possibly mis-specified rather than hard; trajectories run ~2x longer than retail"
+  }
+ },
+ "excluded": "0/12 frontier tasks (airline 7, telecom 29). retail has none.",
+ "known_grader_defects": "2 of the 20 retail runs hit broken golden actions (missing product / missing user). tau3 shipped 75+ such fixes; v0.2.0 has none of them."
+}
