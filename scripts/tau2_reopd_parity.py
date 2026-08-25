@@ -56,7 +56,10 @@ def main() -> int:
     ap.add_argument("--policy-file", default=None,
                     help="use this policy text instead of recovering it")
     ap.add_argument("--out", default=None,
-                    help="default: <artifacts>/reopd_parity_report.json")
+                    help="default: ./reopd_parity_report.json. Deliberately NOT "
+                         "inside --artifacts: a frozen corpus directory should "
+                         "be read-only, and writing a report into it would "
+                         "change bytes that artifact_hashes.json pins.")
     a = ap.parse_args()
 
     art = a.artifacts
@@ -102,7 +105,7 @@ def main() -> int:
     )
     print(f"PARITY OK {parity['n_checked']} prefixes re-render exactly")
 
-    out = a.out or os.path.join(art, "reopd_parity_report.json")
+    out = a.out or "reopd_parity_report.json"
     payload = {
         "artifacts": art,
         "tokenizer": a.tokenizer,
@@ -114,8 +117,16 @@ def main() -> int:
         "max_prompt_tokens": tok_max,
         "partial": bool(a.limit),
     }
-    json.dump(payload, open(out, "w"), indent=1)
-    print(f"wrote     {out}")
+    try:
+        json.dump(payload, open(out, "w"), indent=1)
+        print(f"wrote     {out}")
+    except OSError as e:
+        # The gate already passed; failing to file the receipt must not read as
+        # a parity failure.
+        print(f"PARITY PASSED but the report could not be written: {e}",
+              file=sys.stderr)
+        print(json.dumps(payload, indent=1))
+        return 0
 
     if a.limit:
         print("\nNOTE partial run: the gate requires all prefixes, not a sample.")
