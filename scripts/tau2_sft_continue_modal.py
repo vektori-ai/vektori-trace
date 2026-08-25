@@ -124,7 +124,8 @@ def train(run_id: str, epochs: float, lr: float, schedule: str = "") -> dict:
 
 @app.local_entrypoint()
 def main(yes: bool = False, epochs: float = 1.0, lr: float = 1e-4,
-         run_id: str = "", schedule: str = ""):
+         run_id: str = "", schedule: str = "",
+         allow_unmatched: bool = False):
     import json
     import time
 
@@ -138,10 +139,22 @@ def main(yes: bool = False, epochs: float = 1.0, lr: float = 1e-4,
     rid = run_id or f"a_sft_c30_ck35_{time.strftime('%Y%m%d_%H%M%S')}"
     print("continued SFT: CK35 -> C30")
     print(f"epochs: {epochs} | lr: {lr} | output: {RUNS_IN_VOLUME}/{rid}")
+    if not schedule and not allow_unmatched:
+        raise SystemExit(
+            "--schedule is required. This arm is the CONTROL for the replay "
+            "arm, and without the frozen stream it differs on updates (~37 vs "
+            "32), effective batch (8 vs 16), exposures (~289 vs 512) and order "
+            "(TRL shuffle vs frozen) -- while still logging 'one epoch over "
+            "C30'. An unmatched control is worse than none, because it reads "
+            "like one.\n\n"
+            "  --schedule /adapters/tau2/reopd/schedule.json\n\n"
+            "Stage it first with scripts/tau2_stage_policy_modal.py. Pass "
+            "--allow-unmatched only for a deliberately unmatched diagnostic, "
+            "which must be reported as such."
+        )
     if not schedule:
-        print("WARNING no --schedule: this run will NOT be budget-matched to "
-              "the replay arm (updates, exposures and order all differ). Pass "
-              "the frozen schedule to make it the control the comparison needs.")
+        print("WARNING running UNMATCHED by explicit request; this is not the "
+              "control the primary comparison needs.")
     result = train.remote(rid, epochs, lr, schedule)
     print(json.dumps(result, indent=2))
     if result["returncode"] != 0 or result.get("failure.json"):

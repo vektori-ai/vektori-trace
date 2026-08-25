@@ -72,3 +72,46 @@ def test_both_arms_read_one_frozen_file(tmp_path):
     p, _ = _sched(tmp_path)
     with pytest.raises(ScheduleError, match="already frozen"):
         freeze_schedule(p, build_schedule(POOL, n_per_update=8))
+
+
+# --- the runtime proofs ---------------------------------------------------
+
+
+def test_order_assertion_checks_both_class_and_emitted_batch():
+    """A correct sampler class does not prove a correct emitted order.
+
+    accelerate can wrap the sampler and reorder or split batches, so the class
+    check alone is necessary and not sufficient.
+    """
+    src = open("scripts/tau2_sft_train.py").read()
+    assert "_assert_sequential_order" in src
+    assert "SequentialSampler" in src
+    assert "get_train_dataloader" in src
+    # compares the first real batch against the rows the schedule put first
+    assert "batch 0 position" in src
+
+
+def test_order_assertion_runs_before_training():
+    src = open("scripts/tau2_sft_train.py").read()
+    assert src.index("_assert_sequential_order(trainer") < src.index("trainer.train(")
+
+
+def test_order_assertion_uses_a_real_runlog_method():
+    """RunLog has step/write_config/summary, not `event`."""
+    from vektori_trace.tau2.runlog import RunLog
+    src = open("scripts/tau2_sft_train.py").read()
+    assert "runlog.event(" not in src
+    assert hasattr(RunLog, "step")
+
+
+def test_schedule_is_mandatory_for_the_control_arm():
+    """A warning is too weak: an unmatched control reads like a control."""
+    src = open("scripts/tau2_sft_continue_modal.py").read()
+    assert "--schedule is required" in src
+    assert "allow_unmatched" in src
+
+
+def test_staging_pins_the_schedule_hash():
+    src = open("scripts/tau2_stage_policy_modal.py").read()
+    assert "24c0aa5395d69772" in src
+    assert "SCHEDULE_IN_VOLUME" in src

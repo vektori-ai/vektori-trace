@@ -482,6 +482,68 @@ def main() -> int:
         runlog.close()
 
 
+def _assert_sequential_order(trainer, rows, runlog) -> None:
+    """Prove the dataloader really emits the frozen order, before GPU spend.
+
+    Two separate failures, and the class check alone catches only the first:
+
+    - `_get_train_sampler`'s signature has moved between transformers versions.
+      If the override is never called the run shuffles while every other matched
+      quantity stays correct -- the exact divergence the schedule exists to
+      prevent, and invisible in the logs.
+    - a sampler that *is* sequential can still be wrapped by an accelerate
+      dispatcher that reorders or splits batches, so the class being right does
+      not prove the emitted order is.
+
+    So this checks the class AND compares the first real batch against the rows
+    the schedule put first. Hard-fails: an unmatched control is worse than no
+    control, because it looks like one.
+    """
+    from torch.utils.data import SequentialSampler
+
+    sampler = trainer._get_train_sampler(trainer.train_dataset) \
+        if trainer._get_train_sampler.__code__.co_argcount > 1 \
+        else trainer._get_train_sampler()
+    if not isinstance(sampler, SequentialSampler):
+        raise RuntimeError(
+            f"the train sampler is {type(sampler).__name__}, not "
+            "SequentialSampler. The frozen schedule would be reshuffled into a "
+            "different stream while the run still reported the same update "
+            "count, so this arm would not be budget-matched to the replay arm."
+        )
+
+    loader = trainer.get_train_dataloader()
+    first = next(iter(loader))
+    got = first["input_ids"]
+    n = int(got.shape[0]) if hasattr(got, "shape") else len(got)
+
+    # Compare against the rows the schedule placed first. Token ids, not row
+    # ids: the dataloader carries tensors, and the ids are what training sees.
+    for i in range(n):
+        want = rows[i]["input_ids"]
+        row = got[i]
+        row = row.tolist() if hasattr(row, "tolist") else list(row)
+        # right-padded by the collator, so compare the unpadded head
+        if row[: len(want)] != list(want):
+            raise RuntimeError(
+                f"batch 0 position {i} is not schedule row {i} "
+                f"({rows[i]['task_id']}#{rows[i]['position']}). The sampler "
+                "class is correct but the emitted order is not; something "
+                "between the sampler and the batch is reordering."
+            )
+
+    print(f"order verified: {type(sampler).__name__}, batch 0 == schedule "
+          f"rows 0..{n - 1}", flush=True)
+    # `step` is the runlog's append-only event stream; there is no `event`.
+    runlog.step({
+        "event": "order_verified",
+        "sampler": type(sampler).__name__,
+        "batch_size": n,
+        "first_row_ids": [f"{rows[i]['task_id']}#{rows[i]['position']}"
+                          for i in range(n)],
+    })
+
+
 def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
     import torch
     from datasets import Dataset
