@@ -184,7 +184,7 @@ def serve_model(
         # input + output must fit the window *together* -- they share it. The
         # old arithmetic gave input `L-512` and output `min(8192, L-512)`, i.e.
         # 15 360 tokens of advertised budget for an 8 192-token context.
-        out_cap = int(info.get("max_output_tokens", 8192))
+        out_cap = int(info.get("max_output_tokens", 16384))
         out_cap = max(1, min(out_cap, max_model_len // 2))
         in_cap = max(1, max_model_len - out_cap)
         if int(info.get("max_input_tokens", 0)) > in_cap:
@@ -198,6 +198,16 @@ def serve_model(
             )
         info["max_input_tokens"] = min(int(info.get("max_input_tokens", in_cap)), in_cap)
         info["max_output_tokens"] = out_cap
+        # Diagnostic: litellm forwards max_output_tokens as the request's
+        # `max_tokens`, so this is the completion ceiling every rollout runs
+        # under. A truncated completion arrives as finish_reason="length", and
+        # with a reasoning parser an unterminated <think> leaves an empty
+        # message that tau2 rejects outright -- so the number matters.
+        _log.warning(
+            "advertising max_input_tokens=%s max_output_tokens=%s "
+            "(max_model_len=%s)",
+            info["max_input_tokens"], out_cap, max_model_len,
+        )
     name = _canonical_name(base_model)
     vol_adapter = _resolve_volume_adapter(adapter_path)
     # The adapter gets its OWN served name, and that is what callers are handed.
