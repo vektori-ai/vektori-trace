@@ -253,3 +253,380 @@ def test_generated_paths_survive_the_resolver_prefix_check():
 
     for path in _mod._arms(_mod.DEFAULT_RUN, ["35"]).values():
         assert path.startswith(VOLUME_MOUNT)
+
+
+# --- checkpoint ordering -------------------------------------------------
+
+def test_checkpoints_run_in_numeric_not_string_order():
+    """sorted() puts ck105 first because "1" < "3" as strings.
+
+    Arms run sequentially, so on 2026-08-25 a hung ck105 consumed the whole
+    session and ck35/ck70 -- the checkpoints selection cared about -- never
+    started.
+    """
+    assert _mod._ck_order(["ck35", "ck70", "ck105"]) == ["ck35", "ck70", "ck105"]
+    assert sorted(["ck35", "ck70", "ck105"]) == ["ck105", "ck35", "ck70"]
+
+
+def test_ck_order_is_stable_regardless_of_input_order():
+    for perm in (["ck105", "ck35", "ck70"], ["ck70", "ck105", "ck35"]):
+        assert _mod._ck_order(perm) == ["ck35", "ck70", "ck105"]
+
+
+def test_ck_order_tolerates_a_non_numeric_suffix():
+    assert _mod._ck_order(["ck70", "final", "ck35"]) == ["ck35", "ck70", "final"]
+
+
+# --- simulator role gate -------------------------------------------------
+
+def test_real_role_confused_openings_are_caught():
+    """Verbatim from stored task-57 runs (Qwen3-14B and Qwen3-8B trial 1)."""
+    for text in (
+        "Hello! I'd be happy to help you with your order. Could you please "
+        "provide me with your account details or order number",
+        "Hi! I'd be happy to help you with your order. Could you please "
+        "provide your account email or order details",
+        "Hi! I'd be happy to help you with your order. Could you please "
+        "provide your order number",
+    ):
+        assert _mod._role_confused(text) is not None
+
+
+def test_real_valid_openings_are_not_flagged():
+    """Verbatim customer openings from the same stored runs."""
+    for text in (
+        "Hi, I'm calling about my order W4284542. Can you tell me when it's "
+        "supposed to arrive?",
+        "Hi, I'd like to check on my order W4284542. Can you tell me when "
+        "it's supposed to arrive, and if it's already been shipped?",
+        "Hi, I need to exchange the laptop I just received. I want to swap "
+        "it for one with better specs.",
+    ):
+        assert _mod._role_confused(text) is None
+
+
+def test_role_gate_flags_a_confused_sim_despite_reward_one(tmp_path):
+    """The Qwen3-14B case: role-confused opening, official reward 1.0.
+
+    Reward cannot filter these -- the simulator drifts into the wrong role and
+    still walks the agent to the expected DB state.
+    """
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps({"simulations": [{
+        "task_id": "57", "trial": 0,
+        "reward_info": {"reward": 1.0},
+        "messages": [
+            {"role": "assistant", "content": "Hi! How can I help you today?"},
+            {"role": "user",
+             "content": "Hello! I'd be happy to help you with your order."},
+        ],
+    }]}))
+    bad = _mod._audit_simulator_roles(p)
+    assert len(bad) == 1
+    assert bad[0]["reward"] == 1.0
+    assert bad[0]["task_id"] == "57"
+
+
+def test_role_gate_ignores_the_scripted_agent_greeting(tmp_path):
+    """Index 0 is always the agent's own greeting; only the USER turn counts."""
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps({"simulations": [{
+        "task_id": "93", "trial": 0,
+        "reward_info": {"reward": 1.0},
+        "messages": [
+            {"role": "assistant", "content": "Hi! How can I help you today?"},
+            {"role": "user", "content": "Hi, I need to exchange a laptop."},
+        ],
+    }]}))
+    assert _mod._audit_simulator_roles(p) == []
+
+
+def test_role_gate_tolerates_a_partial_file(tmp_path):
+    p = tmp_path / "r.json"
+    p.write_text('{"simulations": [{"task_id": "5')
+    assert _mod._audit_simulator_roles(p) == []
+
+
+def test_stall_timeout_exceeds_the_slowest_observed_episode():
+    """The watchdog must not be stricter than one healthy episode.
+
+    Run 93c (2026-08-25) killed two good arms because the detector watched the
+    *results* file, which tau2 only writes when a simulation COMPLETES. A
+    task-93 episode runs 400+ s, so a healthy conversation looked idle. ck70 was
+    at "Step 12" and still progressing when it was shot.
+
+    Measured episode durations: task 73/75 ~200 s, task 93 ~427 s (ck105),
+    task 57 up to ~225 s. The default must clear the slowest of those, since a
+    per-episode signal cannot distinguish "slow" from "hung".
+    """
+    ap = _mod.argparse.ArgumentParser()
+    # Mirror the real parser's default rather than trusting a literal here.
+    src = (REPO / "scripts" / "tau2_eval_modal.py").read_text()
+    assert '"--stall-timeout", type=float, default=' in src
+    default = float(src.split('"--stall-timeout", type=float, default=')[1]
+                    .split(",")[0].split(")")[0])
+    # DeepSeek does task 93 in 43 s; ck105 took 427 s for the same task -- a 4B
+    # student is ~10x slower per turn, so the margin has to be generous or a
+    # slower checkpoint gets killed mid-conversation.
+    assert default > 2 * 427, (
+        f"--stall-timeout default {default}s leaves too little margin over the "
+        f"427s task-93 episode measured for ck105; a slower checkpoint would be "
+        f"killed mid-conversation"
+    )
+
+
+def test_progress_is_measured_per_turn_not_per_episode():
+    """The watchdog must poll tau2's own output, not the results file.
+
+    Results move once per completed episode -- coarser than any timeout worth
+    setting. tau2's stderr moves every orchestrator step, which is what
+    separates a slow episode from a hung provider call.
+    """
+    src = (REPO / "scripts" / "tau2_eval_modal.py").read_text()
+    assert "progress_log.stat().st_size" in src
+    assert "results.stat().st_size" not in src, (
+        "stall detection is back on the results file; that only updates once "
+        "per completed simulation and kills healthy slow arms"
+    )
+
+
+def test_user_simulator_timeout_is_passed_through():
+    """tau2 passes no timeout to litellm, which then defaults to 600s x 3 retries.
+
+    One dropped Fireworks connection therefore stalls a whole run for ~40 min
+    with no log output (litellm retries internally; tau2 logs only on the final
+    exception). `--user-llm-args` is json.loads'd straight into
+    litellm.completion, so these land as real kwargs.
+    """
+    src = (REPO / "scripts" / "tau2_eval_modal.py").read_text()
+    assert '"timeout": a.user_timeout' in src
+    assert '"num_retries": a.user_retries' in src
+    # It REPLACES tau2's defaults, so temperature must be restated or user
+    # sampling silently changes.
+    assert '"temperature": 0.0,' in src
+
+
+def test_progress_log_is_defined_before_it_is_opened():
+    """Catch the UnboundLocalError class of bug without paying for a boot.
+
+    2026-08-25: `progress_fh = open(progress_log, ...)` sat ABOVE
+    `progress_log = ...`. Every CPU test passed, the dry-run passed, and the arm
+    died with UnboundLocalError *after* a 106 s vLLM boot -- the failure lives
+    inside `with serve_model(...)`, which no CPU test reaches.
+
+    A line-order check is crude but exactly matches the defect: the name must be
+    bound before the open() that consumes it.
+    """
+    src = (REPO / "scripts" / "tau2_eval_modal.py").read_text().splitlines()
+    define = next(i for i, l in enumerate(src)
+                  if "progress_log = results_dir" in l)
+    open_at = next(i for i, l in enumerate(src) if "progress_fh = open(" in l)
+    assert define < open_at, (
+        f"progress_log is opened on line {open_at + 1} but only defined on line "
+        f"{define + 1}; this raises UnboundLocalError after the GPU has booted"
+    )
+
+
+def test_progress_file_is_wired_into_the_subprocess():
+    """The watchdog's signal only exists if tau2's output actually goes there."""
+    src = (REPO / "scripts" / "tau2_eval_modal.py").read_text()
+    assert "stdout=progress_fh" in src
+    assert "stderr=subprocess.STDOUT" in src
+
+
+# --- runtime: actually execute the paid arm-launch path ----------------------
+#
+# The tests above inspect source strings. That is why 39 of them passed while
+# the program still died with UnboundLocalError *after* a 132 s boot: no test
+# had ever executed the block inside `with serve_model(...)`.
+#
+# These run main() for real with serve_model, Popen and the endpoint check
+# mocked, so the arm loop executes on CPU in milliseconds.
+
+class _FakeProc:
+    """A tau2 subprocess that writes progress and exits after N polls."""
+
+    def __init__(self, progress_path, polls_before_exit=1, rc=0, write=True):
+        self._left = polls_before_exit
+        self._rc = rc
+        self._path = Path(progress_path)
+        self._write = write
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        if self._left <= 0:
+            self.returncode = self._rc
+            return self._rc
+        self._left -= 1
+        if self._write:
+            # Simulate tau2 emitting an orchestrator step.
+            with open(self._path, "ab") as fh:
+                fh.write(b"Step. Sending message from Role.AGENT to Role.USER\n")
+        return None
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.returncode = self.returncode if self.returncode is not None else -15
+        return self.returncode
+
+
+class _FakeServed:
+    api_base = "http://fake/v1"
+    model_name = "Qwen3-4B"
+    adapter_models = {"Qwen3-4B-ck35": "/adapters/x/checkpoint-35",
+                      "Qwen3-4B-ck70": "/adapters/x/checkpoint-70"}
+
+
+@pytest.fixture
+def runtime_env(monkeypatch, artifacts, tmp_path):
+    """Run main()'s paid path on CPU: no Modal, no GPU, no tau2, no network."""
+    import contextlib
+
+    tau2_dir = tmp_path / "tau2"
+    (tau2_dir / "data" / "simulations").mkdir(parents=True)
+    (tau2_dir / ".env").write_text("FIREWORKS_API_KEY=x\n")
+    # main() checks the tau2 entry point exists on a real run.
+    bin_dir = Path(sys.executable).parent
+    monkeypatch.setattr(_mod.shutil, "which", lambda _n: str(bin_dir / "python"))
+
+    @contextlib.contextmanager
+    def _fake_serve(*_args, **_kw):
+        yield _FakeServed()
+
+    monkeypatch.setattr(_mod, "serve_model", _fake_serve)
+    monkeypatch.setattr(_mod, "require_endpoint_model", lambda *_a, **_k: None)
+    monkeypatch.setattr(_mod.time, "sleep", lambda _s: None)
+    return {"artifacts": artifacts, "tau2_dir": str(tau2_dir)}
+
+
+def _argv(env, *extra):
+    return ["tau2_eval_modal.py", "--artifacts", env["artifacts"],
+            "--tau2-dir", env["tau2_dir"], "--tasks", "93",
+            "--checkpoints", "35", "70", "--no-base", "--yes", *extra]
+
+
+def test_arm_launch_path_executes_without_unbound_locals(runtime_env, monkeypatch):
+    """The regression test for run 93d.
+
+    Executes the real arm loop -- the code that only runs after a paid boot.
+    Before the fix this raised UnboundLocalError on `open(progress_log)`.
+    """
+    made = []
+
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        # stdout must be the progress file handle, or the watchdog is blind.
+        assert stdout is not None and hasattr(stdout, "write")
+        p = _FakeProc(stdout.name, polls_before_exit=1)
+        made.append(p)
+        return p
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env))
+    rc = _mod.main()
+    assert rc == 0
+    assert len(made) == 2, "both checkpoint arms should have launched"
+
+
+def test_arms_launch_in_numeric_order_at_runtime(runtime_env, monkeypatch):
+    """ck35 before ck70 -- not sorted() order, which puts ck105 first."""
+    order = []
+
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        order.append([c for c in cmd if c.startswith("hosted_vllm/")][0])
+        return _FakeProc(stdout.name, polls_before_exit=1)
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env))
+    _mod.main()
+    assert order == ["hosted_vllm/Qwen3-4B-ck35", "hosted_vllm/Qwen3-4B-ck70"]
+
+
+def test_a_progressing_arm_is_not_killed_by_the_watchdog(runtime_env, monkeypatch):
+    """A slow-but-progressing arm must survive.
+
+    This is run 93c's failure: ck35 and ck70 were at "Step 12" and still
+    progressing when a results-file-based watchdog shot them.
+    """
+    procs = []
+
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        # Writes on every poll -- i.e. healthy -- for many polls.
+        p = _FakeProc(stdout.name, polls_before_exit=50)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env, "--stall-timeout", "900"))
+    _mod.main()
+    assert all(not p.terminated for p in procs), (
+        "a progressing arm was killed; the watchdog is measuring the wrong thing"
+    )
+
+
+def test_infrastructure_failure_aborts_the_remaining_arms(runtime_env, monkeypatch):
+    """A stall is a session property, not a checkpoint property.
+
+    Run 93c burned two arms back to back on the same wall. The arms share one
+    endpoint and one user-simulator provider, so continuing spends GPU minutes
+    to collect another ungradeable result.
+    """
+    procs = []
+
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        # write=False -> the progress file never grows -> looks stalled.
+        p = _FakeProc(stdout.name, polls_before_exit=50, write=False)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    # A tiny stall budget so the fake stalls immediately.
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env, "--stall-timeout", "0"))
+    _mod.main()
+    assert len(procs) == 1, (
+        f"{len(procs)} arms launched; the second should have been skipped after "
+        f"the first failed for infrastructure reasons"
+    )
+    assert procs[0].terminated
+
+
+def test_continue_after_infra_overrides_the_abort(runtime_env, monkeypatch):
+    """The override exists for when you deliberately want every arm attempted."""
+    procs = []
+
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        p = _FakeProc(stdout.name, polls_before_exit=50, write=False)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env, "--stall-timeout", "0",
+                                           "--continue-after-infra"))
+    _mod.main()
+    assert len(procs) == 2
+
+
+def test_heartbeat_reports_progress_while_an_arm_runs(runtime_env, monkeypatch,
+                                                      capsys):
+    """The caller's log must show liveness during an arm, not only after it.
+
+    tau2's output goes to progress_log now, so without a heartbeat a healthy
+    400 s episode and a hung one look identical from outside.
+    """
+    def _popen(cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+        return _FakeProc(stdout.name, polls_before_exit=3)
+
+    monkeypatch.setattr(_mod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(sys, "argv", _argv(runtime_env))
+    _mod.main()
+    out = capsys.readouterr().out
+    assert "elapsed, last progress" in out
+    assert "kill at" in out, "the heartbeat should name the stall budget"

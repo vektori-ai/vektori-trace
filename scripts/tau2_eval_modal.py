@@ -174,6 +174,22 @@ def _canonical_base_name() -> str:
     return _canonical_name(BASE_MODEL)
 
 
+def _ck_order(suffixes) -> list[str]:
+    """Checkpoint suffixes in numeric order: ck35, ck70, ck105.
+
+    `sorted()` puts ck105 first, because "1" < "3" as strings. Arms run
+    sequentially, so on 2026-08-25 a hung ck105 arm consumed the whole session
+    and ck35/ck70 never started -- the two checkpoints the selection actually
+    cared about. Numeric order runs the earliest epoch first, which is both the
+    likeliest pick and the least likely to misbehave.
+    """
+    def key(s: str):
+        digits = "".join(c for c in s if c.isdigit())
+        return (0, int(digits)) if digits else (1, 0)
+
+    return sorted(suffixes, key=key)
+
+
 def _subset(ids: list[str], partition: str,
             tasks: list[str] | None, max_tasks: int | None) -> list[str]:
     """Narrow a partition to a probe-sized subset, without leaving it.
@@ -213,6 +229,64 @@ def _arms(run_dir: str, checkpoints: list[str]) -> dict[str, str]:
     for ck in checkpoints:
         table[f"ck{ck}"] = f"{run_dir.rstrip('/')}/checkpoint-{ck}"
     return table
+
+
+# The Tau2 user simulator sometimes opens a conversation playing the *agent*
+# rather than the customer. Measured 2026-08-25 over stored retail simulations:
+# task 57 shows this in 2 of 8 runs, task 93 in 0 of 10. One role-confused
+# task-57 run still scored reward 1.0 (Qwen3-14B), which is exactly why the
+# official reward cannot be trusted to filter these -- the simulator can drift
+# into the wrong role and still walk the agent to the expected DB state.
+_AGENT_TELLS = (
+    "happy to help",
+    "how can i assist",
+    "how may i assist",
+    "how can i help you with your order",
+    "please provide your order",
+    "please provide your account",
+    "could you please provide me with your",
+    "i'd be glad to",
+    "welcome to",
+)
+
+
+def _role_confused(text: str | None) -> str | None:
+    """Return the phrase that marks a simulator opening as agent-like, or None."""
+    t = (text or "").lower()
+    for tell in _AGENT_TELLS:
+        if tell in t:
+            return tell
+    return None
+
+
+def _audit_simulator_roles(results: Path) -> list[dict]:
+    """Flag simulations whose first user turn reads as the agent.
+
+    Post-hoc on the result file rather than inline: tau2 owns the conversation
+    loop, so checking mid-episode would mean patching tau2 itself. A flagged
+    trajectory is simulator failure -- it must not be graded as a checkpoint
+    result in either direction, whatever reward it carries.
+    """
+    try:
+        d = json.loads(results.read_text())
+    except Exception:
+        return []
+    bad = []
+    for sim in d.get("simulations", []):
+        first_user = next((m for m in (sim.get("messages") or [])
+                           if m.get("role") == "user"), None)
+        if not first_user:
+            continue
+        tell = _role_confused(first_user.get("content"))
+        if tell:
+            bad.append({
+                "task_id": str(sim.get("task_id")),
+                "trial": sim.get("trial"),
+                "reward": (sim.get("reward_info") or {}).get("reward"),
+                "tell": tell,
+                "opening": (first_user.get("content") or "")[:90],
+            })
+    return bad
 
 
 def _spend_so_far(results: Path) -> float | None:
@@ -263,6 +337,28 @@ def main() -> int:
     # arms x 16 tasks is well under $1; the cap stops a runaway retry loop.
     ap.add_argument("--max-cost", type=float, default=2.0,
                     help="stop an arm once agent+user spend exceeds this (USD)")
+    ap.add_argument("--user-timeout", type=float, default=60.0,
+                    help="per-request timeout (s) for the user simulator. "
+                         "Without it litellm defaults to 600 s and tau2 retries "
+                         "3x, so one dropped connection stalls the whole run "
+                         "for ~40 min with no log output.")
+    ap.add_argument("--user-retries", type=int, default=2,
+                    help="user-simulator retries. tau2 forces 3 when unset; "
+                         "setting it explicitly bounds the worst case.")
+    ap.add_argument("--continue-after-infra", action="store_true",
+                    help="keep running later arms after one fails for "
+                         "infrastructure reasons. Off by default: the arms "
+                         "share an endpoint and a provider, so the next arm "
+                         "usually hits the same wall and spends GPU minutes to "
+                         "produce another ungradeable result.")
+    ap.add_argument("--stall-timeout", type=float, default=900.0,
+                    help="kill an arm after this many seconds with no new "
+                         "results. Guards the hung-provider-call failure: the "
+                         "socket stays open, tau2 blocks forever, and the GPU "
+                         "bills. Recorded as infrastructure, never as a model "
+                         "result.")
+    ap.add_argument("--arm-timeout", type=float, default=1800.0,
+                    help="hard wall-clock cap per arm, in seconds")
     ap.add_argument("--dry-run", action="store_true",
                     help="print every command and exit; allocates nothing")
     ap.add_argument("--yes", action="store_true",
@@ -317,7 +413,32 @@ def main() -> int:
             "--agent-llm", agent_llm,
             "--agent-llm-args", args,
             "--user-llm", a.user_llm,
-            "--user-llm-args", '{"temperature": 0.0}',
+            "--user-llm-args", json.dumps({
+                "temperature": 0.0,
+                # tau2 passes no `timeout` to litellm for the user simulator
+                # (utils/llm_utils.py), so litellm falls back to 600 s -- and
+                # `litellm.request_timeout`'s 6000 is a sentinel that is never
+                # applied. tau2 then forces num_retries=3
+                # (llm_utils.py, config.DEFAULT_MAX_RETRIES), so ONE stalled
+                # Fireworks connection burns 600 s four times over: ~40 minutes
+                # of total silence, because litellm retries internally and tau2
+                # logs only on the final exception.
+                #
+                # It freezes the whole run rather than one episode because
+                # concurrency is `list(executor.map(...))` (run.py): results
+                # drain in submission order, so a single blocked worker parks
+                # the main thread on a futex and every other thread with it.
+                # Observed three times on 2026-08-25 -- twice mid-conversation,
+                # once before the first turn.
+                #
+                # `--user-llm-args` is json.loads'd by tau2's CLI and splatted
+                # straight into litellm.completion, so these land as real
+                # kwargs. It REPLACES tau2's default args, which is why
+                # temperature is restated here -- dropping it would silently
+                # change user-simulator sampling.
+                "timeout": a.user_timeout,
+                "num_retries": a.user_retries,
+            }),
             "--max-concurrency", str(a.max_concurrency),
             "--save-to", save_to,
             # tau2 v0.2.0 defaults to ERROR, which hides the request/response
@@ -325,7 +446,7 @@ def main() -> int:
             "--log-level", "DEBUG",
         ]
 
-    arm_names = ([] if a.no_base else ["A0"]) + sorted(adapters)
+    arm_names = ([] if a.no_base else ["A0"]) + _ck_order(adapters)
     subset = "" if len(task_ids) == all_n else f" (subset of {all_n})"
     print(f"partition   {a.partition}: {len(task_ids)} tasks{subset}, "
           f"manifest_hash={man_hash}")
@@ -340,8 +461,8 @@ def main() -> int:
     if a.dry_run:
         print("\nwould serve:", BASE_MODEL, "on", a.gpu,
               "with", " ".join(VLLM_ARGS))
-        for suffix, path in sorted(adapters.items()):
-            print(f"  lora {suffix:8s} {path}")
+        for suffix in _ck_order(adapters):
+            print(f"  lora {suffix:8s} {adapters[suffix]}")
         for arm in arm_names:
             # The served name is only knowable once the endpoint is up --
             # `serve_model` derives it from the base model and the suffix. A
@@ -355,6 +476,8 @@ def main() -> int:
 
     results_dir = Path(a.tau2_dir) / "data" / "simulations"
     rc_total = 0
+    infra_failures: list[dict] = []
+    confused: list[dict] = []
     t0 = time.time()
     with serve_model(
         BASE_MODEL,
@@ -383,7 +506,7 @@ def main() -> int:
             # baseline that is actually a trained arm makes every delta wrong
             # in a direction nothing in the logs would show.
             served_for["A0"] = _canonical_base_name()
-        for suffix in sorted(adapters):
+        for suffix in _ck_order(adapters):
             match = [n for n in served.adapter_models if n.endswith(f"-{suffix}")]
             if not match:
                 raise SystemExit(
@@ -401,28 +524,134 @@ def main() -> int:
             cmd = tau2_cmd(served.api_base, f"hosted_vllm/{name}", save_to)
             print(f"\n[{arm}] {' '.join(cmd)}", flush=True)
             ta = time.time()
-            # Inherit stdout/stderr so a `tail -f` shows tau2's own progress.
+            results = results_dir / f"{save_to}.json"
+            # Progress is measured from tau2's own output, captured to a file
+            # this process owns.
+            #
+            # It used to watch the RESULTS file, which was wrong in a way only a
+            # slow task exposed: tau2 writes results when a *simulation
+            # completes*, and a task-93 episode runs 400+ s on a 4B student
+            # (DeepSeek does the same task in 43 s). So the file sat untouched
+            # through a perfectly healthy conversation and the watchdog killed
+            # two good arms at 240 s (2026-08-25, run 93c -- ck70 was at
+            # "Step 12" and still progressing when it was shot). A per-turn
+            # signal is the only thing that separates "slow episode" from "hung
+            # provider call"; per-episode granularity cannot, because one
+            # episode outlasts any useful timeout.
+            #
+            # Defined BEFORE the Popen that opens it: an earlier edit left the
+            # open() above this line and the arm died with UnboundLocalError
+            # after paying the full 106 s boot.
+            progress_log = results_dir / f"{save_to}.progress.log"
             # stdin is /dev/null on purpose: a resume prompt nobody answers is
             # how an endpoint idles on a paid GPU.
-            proc = subprocess.Popen(cmd, cwd=a.tau2_dir, stdin=subprocess.DEVNULL)
-            results = results_dir / f"{save_to}.json"
+            progress_fh = open(progress_log, "wb")
+            proc = subprocess.Popen(cmd, cwd=a.tau2_dir, stdin=subprocess.DEVNULL,
+                                    stdout=progress_fh, stderr=subprocess.STDOUT)
+            last_size, last_change = -1, time.time()
+            killed_for = None
             while proc.poll() is None:
                 time.sleep(20)
+                now = time.time()
+                try:
+                    size = progress_log.stat().st_size
+                except OSError:
+                    size = -1
+                if size != last_size:
+                    last_size, last_change = size, now
+
+                # Heartbeat. tau2's own output now goes to progress_log, so the
+                # caller's `tee` log would otherwise sit silent for the whole
+                # arm -- which is precisely how a healthy 400 s episode and a
+                # hung one looked identical from the outside.
+                idle = now - last_change
+                print(f"[{arm}] {now - ta:6.0f}s elapsed, last progress "
+                      f"{idle:4.0f}s ago (kill at {a.stall_timeout:.0f}s)",
+                      flush=True)
+
                 spent = _spend_so_far(results)
                 if spent is not None and spent > a.max_cost:
-                    print(f"[budget] ${spent:.2f} > --max-cost ${a.max_cost:.2f}; "
-                          f"stopping {arm}. Rerun with --save-prefix {prefix} "
-                          f"to resume.", flush=True)
+                    killed_for = (f"[budget] ${spent:.2f} > --max-cost "
+                                  f"${a.max_cost:.2f}")
+                # A provider call with no read timeout hangs forever, and the
+                # GPU bills the whole time. Observed 2026-08-25: a task-57 arm
+                # sat on an idle socket for minutes and blocked every later
+                # arm, since arms run sequentially.
+                elif now - last_change > a.stall_timeout:
+                    killed_for = (f"[stall] no result activity for "
+                                  f"{now - last_change:.0f}s "
+                                  f"(--stall-timeout {a.stall_timeout})")
+                elif now - ta > a.arm_timeout:
+                    killed_for = (f"[timeout] arm exceeded "
+                                  f"{a.arm_timeout}s wall clock")
+
+                if killed_for:
+                    print(f"{killed_for}; stopping {arm}. Rerun with "
+                          f"--save-prefix {prefix} to resume.", flush=True)
                     proc.terminate()
                     try:
                         proc.wait(timeout=30)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     break
+            progress_fh.close()
+            # Replay what tau2 printed, so the caller's `tee` log keeps the full
+            # DEBUG trace it had before stdout was redirected.
+            try:
+                sys.stdout.write(progress_log.read_text(errors="replace"))
+                sys.stdout.flush()
+            except OSError:
+                pass
             rc = proc.returncode if proc.returncode is not None else 1
+            # An arm killed by a watchdog is INFRASTRUCTURE, not a model
+            # result. Grading a stalled arm as a checkpoint failure is how a
+            # provider outage turns into a wrong experimental conclusion.
+            if killed_for:
+                infra_failures.append({"arm": arm, "reason": killed_for})
             rc_total |= rc
             print(f"[{arm}] exit {rc} after {time.time()-ta:.0f}s, "
-                  f"~${_spend_so_far(results) or 0:.2f} -> {results}", flush=True)
+                  f"~${_spend_so_far(results) or 0:.2f} -> {results}"
+                  + ("  INFRASTRUCTURE FAILURE" if killed_for else ""), flush=True)
+
+            for bad in _audit_simulator_roles(results):
+                confused.append({"arm": arm, **bad})
+                print(f"[simulator] {arm} task {bad['task_id']} trial "
+                      f"{bad['trial']}: user opened in the AGENT role "
+                      f"({bad['tell']!r}, reward={bad['reward']}). Not a "
+                      f"checkpoint result.", flush=True)
+
+            # Stop the session on an infrastructure failure rather than running
+            # the remaining arms into the same wall.
+            #
+            # The arms share one endpoint and one user-simulator provider, so a
+            # stall or timeout is almost always a property of the *session*, not
+            # of the checkpoint that happened to be running. Continuing spends
+            # GPU minutes to collect more ungradeable arms -- run 93c produced
+            # two INFRASTRUCTURE FAILUREs back to back for exactly this reason.
+            # Teardown is the context manager's job and happens on the way out.
+            if killed_for and not a.continue_after_infra:
+                print(f"[abort] {arm} failed for infrastructure reasons; "
+                      f"skipping the remaining arms because they share this "
+                      f"endpoint and provider. Re-run with "
+                      f"--continue-after-infra to override.", flush=True)
+                break
+
+    if confused:
+        print(f"\n[SIMULATOR FAILURE] {len(confused)} simulation(s) opened with "
+              f"the user playing the agent:", flush=True)
+        for c in confused:
+            print(f"    {c['arm']} task {c['task_id']} trial {c['trial']} "
+                  f"(reward={c['reward']}): {c['opening']!r}", flush=True)
+        print("    Discard these and retry under a recorded seed. A reward of "
+              "1.0 here is not evidence the checkpoint solved the task.",
+              flush=True)
+
+    if infra_failures:
+        print(f"\n[INFRASTRUCTURE] {len(infra_failures)} arm(s) did not produce "
+              f"a gradeable result:", flush=True)
+        for f in infra_failures:
+            print(f"    {f['arm']}: {f['reason']}", flush=True)
+        print("    These are NOT model failures. Do not grade them.", flush=True)
 
     print(f"\n[done] {len(served_for)} arms in {time.time()-t0:.0f}s")
     print(f"       results: {results_dir}/{prefix}_*.json")

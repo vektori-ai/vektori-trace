@@ -170,6 +170,42 @@ drift — but that result belongs to *that* template. It is why
 
 ---
 
+### 4.6 Four harness bugs that each cost a paid boot (2026-08-25)
+
+Every failed eval run that day was harness code, not the adapters, the model,
+vLLM, or the provider. Recorded because three of the four passed every CPU test
+that existed at the time.
+
+- **`/vol/...` instead of `/adapters/...`.** `_resolve_volume_adapter` accepts a
+  path only if it starts with `VOLUME_MOUNT`; anything else it tries to stage as
+  a local directory. Written from the handoff's prose rather than the constant.
+  Now derived from `VOLUME_MOUNT`, with a test.
+- **Stall timeout shorter than one episode.** 240 s, against 427-521 s episodes.
+  Killed two healthy arms mid-conversation. The default is now 900 s and a test
+  asserts it clears the slowest measured episode.
+- **The watchdog watched the results file.** tau2 writes results when a
+  *simulation completes*, so a healthy 500 s episode looks idle the whole time.
+  Per-episode granularity structurally cannot separate "slow" from "hung". It
+  now watches tau2's own output, captured per turn.
+- **`UnboundLocalError`** -- `open(progress_log)` sat one line above
+  `progress_log = ...`. Died after a 132 s boot. 39 string-inspection tests
+  passed while the program crashed, because none executed the block inside
+  `with serve_model(...)`.
+
+The last one is the general lesson: **tests that grep source cannot catch a
+runtime crash on the paid path.** `tests/test_tau2_eval.py` now mocks
+`serve_model`, `Popen` and the endpoint check and runs `main()` for real, so the
+arm loop executes on CPU in milliseconds. Verified by reintroducing the bug --
+7 tests fail with it, all pass without.
+
+Also added, each because a run needed it: `--user-llm-args` now carries
+`{"timeout": 60, "num_retries": 2}` (tau2 passes no timeout, so litellm defaults
+to 600 s x 3 retries = ~40 min of silence on one dropped connection); arms run in
+numeric order (`sorted()` put ck105 first, so one hang blocked the two
+checkpoints that mattered); an infrastructure failure aborts the remaining arms
+rather than walking them into the same wall; and a heartbeat prints elapsed time
+and stall margin every 20 s.
+
 ## 5. Invariants that must not be relaxed
 
 ```
@@ -259,8 +295,44 @@ required — the stock LM collator regenerates labels on pad and erases every
    a separate boot and a separate approval, and is not needed for checkpoint
    selection.
 
-**2. Select `A_warm`** from checkpoints 35 / 70 / 105 on S16 live performance.
-   V2 §6.4: never on training loss. Expect epoch 1 to be competitive.
+**2. Select `A_warm`** — PARTIALLY MEASURED 2026-08-25. Not yet decided.
+
+   Three selection tasks, one trial each, live against the real simulator:
+
+   | arm | 73 | 75 | 93 | policy |
+   |---|---|---|---|---|
+   | ck35 | 1.0 | 1.0 | 0.0 | clean |
+   | ck70 | 1.0 | 1.0 | 0.0 | clean |
+   | ck105 | 1.0 | 1.0 | 0.0 | **violations** |
+   | DeepSeek | — | — | 1.0 | — |
+
+   **ck105 is eliminated**, and not on reward -- all three tie at 2/3. On task
+   75 it never called `find_user_id_*` before reading and mutating the order
+   (authentication is the policy's first hard rule); on 73 it emitted two tool
+   calls in one turn and made a spurious `transfer_to_human_agents` after the
+   return had already succeeded. Epoch 3 degraded process while holding reward
+   constant. Reward alone would have shown none of this -- the official score
+   is DB + communication, and the communication component reported
+   `"No communicate_info to evaluate"` and credited 1.0 anyway.
+
+   **ck35 vs ck70 are indistinguishable** on this evidence: same rewards, same
+   7 tool calls, same policy profile, same wrong answer on 93. Three tasks
+   cannot separate them. Decide with the §7.1a entropy gate below, which is a
+   required gate anyway -- not by adding more selection tasks.
+
+   **All three fail task 93 identically, and that is the more useful finding.**
+   Lei Wilson has two delivered orders each holding a laptop. The user says
+   "15-inch with 32GB RAM", which matches only `#W4073673`/`2216662955`. Every
+   checkpoint exchanged `#W2905754`/`3478699712` instead. ck70 fetched *both*
+   orders and still chose wrong. DeepSeek used the constraint and solved it in
+   43 s. Warm SFT did not teach constraint-based disambiguation; that is a
+   concrete instance of the gap the continuation arms exist to close.
+
+   Timing, which the watchdog design depends on: DeepSeek 43 s/episode, the 4B
+   checkpoints 427-521 s. ~12x, partly because `--enforce-eager` disables CUDA
+   graphs (~16 tok/s observed). That flag was inherited from a 27B recipe and is
+   probably unnecessary for a 4B on an L40S -- worth testing, since it would cut
+   episode time several-fold before scaling to all 16 tasks.
 
 **3. §7.1a sampling-entropy gate.** Before branching, sample k actions at C30
    prefixes and compare diversity against `A0`. If `A_warm` has collapsed to
