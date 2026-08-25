@@ -172,14 +172,44 @@ def test_commit_fires_on_every_paid_write(tmp_path):
         driver.set_commit_fn(None)
 
 
-def test_a_failing_commit_does_not_kill_the_run(tmp_path):
-    """A commit failure must not destroy a run still producing paid artifacts."""
+def test_a_failing_required_commit_stops_the_run(tmp_path):
+    """The worst outcome is a run that keeps spending while nothing reaches the
+    volume and still ends green. Required commits retry, then fail closed."""
     def boom():
         raise RuntimeError("volume unavailable")
 
     driver.set_commit_fn(boom)
     try:
-        driver.commit("score")          # must not raise
+        with pytest.raises(driver.CommitFailed, match="another paid request"):
+            driver.commit("score", attempts=2)
+    finally:
+        driver.set_commit_fn(None)
+
+
+def test_a_failing_optional_commit_is_survivable():
+    """Losing a telemetry line is not worth killing a paid run over."""
+    def boom():
+        raise RuntimeError("volume unavailable")
+
+    driver.set_commit_fn(boom)
+    try:
+        driver.commit("telemetry", required=False, attempts=1)   # no raise
+    finally:
+        driver.set_commit_fn(None)
+
+
+def test_required_commit_retries_before_giving_up():
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("transient")
+
+    driver.set_commit_fn(flaky)
+    try:
+        driver.commit("score", attempts=3)      # succeeds on the third
+        assert len(calls) == 3
     finally:
         driver.set_commit_fn(None)
 

@@ -129,15 +129,40 @@ def set_commit_fn(fn: Any) -> None:
     _COMMIT = fn
 
 
-def commit(why: str = "") -> None:
-    """Publish everything written so far. Never fatal: a failed commit must not
-    destroy the run that is still producing paid artifacts."""
+class CommitFailed(RuntimeError):
+    """A paid artifact could not be published to shared storage."""
+
+
+def commit(why: str = "", *, required: bool = True, attempts: int = 3) -> None:
+    """Publish everything written so far, and stop the run if it will not.
+
+    A swallowed commit failure is the worst available outcome: the run keeps
+    dispatching paid requests while nothing it produces reaches the volume, and
+    it can still end green. So a required commit retries briefly and then
+    raises -- better to stop before the next paid call than to finish a run
+    whose adapter was never published.
+
+    `required=False` is for telemetry-only commits, where losing a log line is
+    not worth killing a run over.
+    """
     if _COMMIT is None:
         return
-    try:
-        _COMMIT()
-    except Exception as e:
-        log(f"  WARNING volume commit failed ({why}): {e}")
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            _COMMIT()
+            return
+        except Exception as e:               # noqa: PERF203 - retry is the point
+            last = e
+            log(f"  commit failed ({why}, attempt {i + 1}/{attempts}): {e}")
+            time.sleep(2 ** i)
+    if required:
+        raise CommitFailed(
+            f"could not publish {why} to the volume after {attempts} attempts: "
+            f"{last}. Stopping before another paid request -- a run that keeps "
+            "spending while nothing reaches shared storage can still end green."
+        )
+    log(f"  WARNING dropping non-essential commit ({why}): {last}")
 
 
 def telemetry(run_dir: str | Path, row: dict[str, Any]) -> None:
@@ -391,13 +416,28 @@ def run_update(
 
     train_s = round(time.time() - t_train, 1)
     gpu = gpu_snapshot()
+    # run_replay_chunk_opd nests the optimizer's own report under "optimizer";
+    # reading `loss` off the top level silently logs null for the one number
+    # the canary exists to produce.
+    opt = report.get("optimizer") or {}
+    # Advantage spread is the collapse signal: if ck35 samples the same action
+    # every time the teacher scores it identically and every advantage is ~0.
+    advs = [a for st in (report.get("per_action_stats") or [])
+            for a in ([st.get("mean_advantage")] if isinstance(st, dict) else [])
+            if a is not None]
     telemetry(args.run_dir_resolved, {
         "event": "stage", "stage": "TRAINED", "update": idx,
         "seconds": train_s,
-        "loss": report.get("loss"),
+        "loss": opt.get("loss"),
+        "clip_fraction": opt.get("clip_fraction"),
+        "n_examples": opt.get("n_examples"),
+        "grad_norm": opt.get("grad_norm"),
         "supervised_tokens": report.get("global_supervised_tokens"),
-        "advantages": report.get("advantage_summary"),
-        "clip_fraction": report.get("clip_fraction"),
+        "advantage_spread": (
+            {"min": min(advs), "max": max(advs),
+             "n_distinct": len({round(a, 6) for a in advs})} if advs else None),
+        "spread": report.get("spread"),
+        "realized_step_histogram": report.get("realized_step_histogram"),
         **gpu,
     })
 
@@ -408,10 +448,10 @@ def run_update(
     # can fail, and again after the marker, so a container killed between the
     # two still leaves reloadable weights on the volume.
     commit("checkpoint")
-    u.mark("TRAINED", {"loss": report.get("loss"), "seconds": train_s,
+    u.mark("TRAINED", {"loss": opt.get("loss"), "seconds": train_s,
                        "adapter_hash": state.get("adapter_hash")})
     commit("trained marker")
-    log(f"  trained in {train_s}s; loss={report.get('loss')} "
+    log(f"  trained in {train_s}s; loss={opt.get('loss')} "
         f"adapter={state.get('adapter_hash')} "
         f"peak={gpu.get('torch_peak_gib')}GiB "
         f"util={gpu.get('gpu0', {}).get('util_pct')}%")

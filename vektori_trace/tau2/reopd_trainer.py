@@ -153,10 +153,19 @@ class ReOPDTrainer:
         )
 
         if verify:
-            state = self._verify(path, probe_ids or [1, 2, 3, 4, 5, 6, 7, 8])
+            # Two distinct claims, both needed.
+            #   _verify_bytes  : the file matches what is in memory
+            #   _verify_reload : a model built FROM the file behaves differently
+            #                    from the base weights
+            # The first is cheap and catches a truncated or empty write. Only
+            # the second catches an adapter that saves fine and is never
+            # applied, which makes the whole run a no-op that reports success.
+            state = self._verify_bytes(path)
+            state = self._verify_reload(
+                path, probe_ids or [1, 2, 3, 4, 5, 6, 7, 8])
         return state
 
-    def _verify(self, path: str | Path, probe_ids: list[int]) -> dict[str, Any]:
+    def _verify_bytes(self, path: str | Path) -> dict[str, Any]:
         """Confirm the checkpoint's logits differ from the in-memory model's by
         ~nothing, and from the *base* model's by something.
 
@@ -217,15 +226,84 @@ class ReOPDTrainer:
         except Exception:            # parent unreadable: not fatal, just unproven
             drift = float("nan")
 
+        from .reopd_state import atomic_write_json
         sp = p / "state.json"
         state = json.loads(sp.read_text())
-        state["reload_verified"] = True
-        state["reload_report"] = {
+        # Deliberately NOT reload_verified: matching bytes is not a reload.
+        state["bytes_verified"] = True
+        state["bytes_report"] = {
             "n_tensors": len(saved), "n_matched": matched,
             "max_delta_from_live": max_delta,
             "max_drift_from_parent": drift,
         }
+        atomic_write_json(sp, state)
+        return state
+
+    def _verify_reload(self, path: str | Path, probe_ids: list[int]) -> dict[str, Any]:
+        """Build a model FROM the checkpoint and prove the adapter is applied.
+
+        `_verify_bytes` proves the file matches memory. It cannot prove the file
+        is loadable, that peft recognises its tensor names, or that the adapter
+        actually alters the forward pass -- an adapter that loads cleanly and is
+        never applied looks identical from outside and makes every update a
+        no-op reporting success.
+
+        So this loads the checkpoint fresh and compares its logits against the
+        same model with the adapter disabled. Equal logits are fatal.
+        """
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM
+
         from .reopd_state import atomic_write_json
+
+        p = Path(path)
+        dev = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        base = AutoModelForCausalLM.from_pretrained(
+            self.base_model, torch_dtype=torch.bfloat16, device_map=dev)
+        try:
+            reloaded = PeftModel.from_pretrained(base, str(p))
+            reloaded.eval()
+            ids = torch.tensor([probe_ids], device=dev)
+
+            with torch.no_grad():
+                adapted = reloaded(ids).logits[0, -1].float().cpu()
+                # `disable_adapter` gives the base behaviour through the exact
+                # same graph, so a difference isolates the adapter rather than
+                # any loading difference between two model objects.
+                with reloaded.disable_adapter():
+                    plain = reloaded(ids).logits[0, -1].float().cpu()
+
+            delta = float((adapted - plain).abs().max())
+            n_lora = sum(1 for n, _ in reloaded.named_parameters()
+                         if "lora" in n.lower())
+            if n_lora == 0:
+                raise CheckpointError(
+                    f"{p}: reloaded model has no LoRA parameters; the adapter "
+                    "did not attach"
+                )
+            if delta == 0.0:
+                raise CheckpointError(
+                    f"{p}: the reloaded adapter produces logits identical to "
+                    "the base model. It loaded but is not applied, which makes "
+                    "every update a no-op that reports success."
+                )
+        finally:
+            del base
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        sp = p / "state.json"
+        state = json.loads(sp.read_text())
+        state["reload_verified"] = True
+        state["reload_report"] = {
+            **(state.get("bytes_report") or {}),
+            "fresh_load": True,
+            "n_lora_params": n_lora,
+            "max_logit_delta_vs_base": delta,
+            "n_probe_tokens": len(probe_ids),
+        }
         atomic_write_json(sp, state)
         return state
 
