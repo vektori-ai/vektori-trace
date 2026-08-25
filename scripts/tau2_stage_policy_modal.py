@@ -27,7 +27,10 @@ sys.path.insert(0, str(REPO))
 
 import modal  # noqa: E402
 
-from vektori_trace.tau2.c30_loader import recover_system_policy  # noqa: E402
+# `recover_system_policy` is imported inside the local entrypoint, not here.
+# Modal executes this module INSIDE the container as well, and the container
+# image carries no `vektori_trace` -- it only writes two files, so it needs
+# none. A module-level import fails there before any code runs.
 
 VOLUME_NAME = "vektori-trace-adapters"
 VOLUME_MOUNT = "/adapters"
@@ -99,6 +102,8 @@ def put(text: str, expect_sha: str, schedule_json: str = "") -> dict:
 def main(artifacts: str = "/data/tau2/artifacts_16384",
          simulations_dir: str = "/data/tau2/data/simulations",
          schedule: str = ""):
+    from vektori_trace.tau2.c30_loader import recover_system_policy
+
     policy, rep = recover_system_policy(artifacts, simulations_dir=simulations_dir)
     sha = hashlib.sha256(policy.encode()).hexdigest()
     print(f"recovered policy {sha[:16]} ({len(policy):,} chars, "
