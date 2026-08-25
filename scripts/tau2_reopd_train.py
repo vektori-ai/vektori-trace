@@ -378,6 +378,13 @@ def main() -> int:
     ap.add_argument("--n-updates", type=int, default=N_UPDATES)
     ap.add_argument("--n-per-update", type=int, default=N_PER_UPDATE)
     ap.add_argument("--expect-manifest-hash", default="8e78c7b96161d024")
+    ap.add_argument("--policy-file", default=None,
+                    help="read the system policy from this file instead of "
+                         "recovering it from the simulation files. Required "
+                         "wherever the simulations are not reachable (a Modal "
+                         "container cannot see the box's /data/tau2). The "
+                         "policy is hashed into the run manifest either way, "
+                         "and render parity proves it is the right one.")
 
     ap.add_argument("--dry-run", action="store_true",
                     help="plan and validate only: no endpoint, teacher or GPU")
@@ -391,8 +398,14 @@ def main() -> int:
     a.run_dir_resolved = run_dir
 
     # --- load and prove the context --------------------------------------
-    policy, prep = recover_system_policy(a.artifacts,
-                                         simulations_dir=a.simulations_dir)
+    if a.policy_file:
+        import hashlib
+        policy = Path(a.policy_file).read_text()
+        prep = {"policy_sha256": hashlib.sha256(policy.encode()).hexdigest(),
+                "policy_chars": len(policy), "source": a.policy_file}
+    else:
+        policy, prep = recover_system_policy(a.artifacts,
+                                             simulations_dir=a.simulations_dir)
     log(f"policy {prep['policy_sha256'][:16]} ({prep['policy_chars']:,} chars)")
 
     prefixes, corpus = load_c30_prefixes(
