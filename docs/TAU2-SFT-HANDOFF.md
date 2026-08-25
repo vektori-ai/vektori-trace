@@ -317,8 +317,28 @@ required — the stock LM collator regenerates labels on pad and erases every
 
    **ck35 vs ck70 are indistinguishable** on this evidence: same rewards, same
    7 tool calls, same policy profile, same wrong answer on 93. Three tasks
-   cannot separate them. Decide with the §7.1a entropy gate below, which is a
-   required gate anyway -- not by adding more selection tasks.
+   cannot separate them.
+
+   **DECIDED 2026-08-25: `A_warm` = ck35** (epoch 1,
+   `/adapters/tau2/runs/a_warm_20260825_003343/checkpoint-35`).
+
+   This is a **tiebreak, not a measurement**, and must be reported that way.
+   ck35 and ck70 were measured equal on every axis available; ck35 was taken
+   because it is the fewest updates over 273 rows and therefore the lowest
+   overfitting risk, and because the training loss was already flat by epoch 2
+   (0.532 -> 0.318 -> 0.264, with the largest drop in the first ten steps). No
+   evidence shows ck35 is *better* than ck70. Any claim that epoch 1 was
+   selected on merit is unsupported.
+
+   **The §7.1a entropy gate was skipped, and that is an open risk, not a
+   closed question.** V2 §10 lists it as gate 7: if `A_warm` has collapsed onto
+   near-deterministic actions relative to `A0`, the student samples the same
+   action at every replay prefix, DeepSeek scores the same thing, and the replay
+   gradient is flat. Replay OPD would then fail for a reason that has nothing to
+   do with the objective under test, and nothing in the training logs would show
+   it. If `A_reopd` underperforms, run the gate before concluding anything about
+   the method -- the remedy in that case is an earlier checkpoint, not more
+   replay updates.
 
    **All three fail task 93 identically, and that is the more useful finding.**
    Lei Wilson has two delivered orders each holding a laptop. The user says
@@ -334,15 +354,22 @@ required — the stock LM collator regenerates labels on pad and erases every
    probably unnecessary for a 4B on an L40S -- worth testing, since it would cut
    episode time several-fold before scaling to all 16 tasks.
 
-**3. §7.1a sampling-entropy gate.** Before branching, sample k actions at C30
-   prefixes and compare diversity against `A0`. If `A_warm` has collapsed to
-   near-deterministic sampling, replay OPD is dead on arrival and the right move
-   is an earlier checkpoint, not more replay updates. Cheap, and it prevents
-   mis-attributing a data problem to the objective.
+**3. §7.1a sampling-entropy gate — SKIPPED by decision 2026-08-25.**
+   Not built, not run. See the risk recorded in step 2: it is V2 §10's gate 7,
+   and skipping it means the continuation experiment runs without knowing
+   whether the launchpad can produce a usable replay gradient. Build it if
+   `A_reopd` underperforms, *before* concluding the objective is at fault.
 
-**4. Freeze the C30 prefix manifest** (§7.2). 289 rows, 30 tasks, already
-   preflight-passed. Build once, read twice — both branches must consume the
-   identical stream.
+**4. Freeze the C30 prefix manifest** (§7.2). **Not built — this is the next
+   task.** 289 rows, 30 tasks, already preflight-passed. Build once, read twice:
+   both branches must consume the identical stream, or the comparison measures
+   nothing and no log would show it.
+
+   Freeze all **289 uncapped rows**, not a ≤180 subset. V2 §6.2's `min(6, n)`
+   selector was superseded when the corpus was built -- W30 used every genuine
+   decision (273 rows) and C30 must match, since §6.2 itself requires the
+   representation to be identical on both sides of the train split. Supervised
+   mass is within ~3% (33,817 vs 34,893 tokens), so the halves are well matched.
 
 **5. Run the two continuation arms**, 32 updates each, from the identical
    `A_warm` with **fresh optimizer and scheduler state** and distinct recorded
