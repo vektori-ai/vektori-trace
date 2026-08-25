@@ -423,11 +423,45 @@ def main() -> int:
                   f"{sum(1 for l in r['labels'] if l != IGNORE):>4} supervised "
                   f"{r.get('tool_names') or ''}")
 
+    # The frozen schedule, if one was given, governs rows AND the step count.
+    # It must be applied before `steps` is derived below, or the run reports the
+    # epoch-derived number (36) while claiming to be budget-matched at 32.
+    schedule_meta = None
+    if getattr(args, "schedule", None):
+        from vektori_trace.tau2.reopd_schedule import load_schedule
+
+        by_id = {f"{r['task_id']}#{r['position']}": r for r in rows}
+        sched = load_schedule(args.schedule, expect_pool=list(by_id))
+
+        # One row per exposure, in the frozen order. A prefix drawn twice
+        # appears twice: that is the exposure count the replay arm pays for,
+        # and deduplicating would silently halve this arm.
+        rows = [by_id[pid] for up in sched["updates"] for pid in up["prefix_ids"]]
+
+        args.batch_size = 1
+        args.grad_accum = sched["n_per_update"]
+        args.epochs = 1.0
+        schedule_meta = {
+            "schedule_hash": sched["schedule_hash"],
+            "n_updates": sched["n_updates"],
+            "n_per_update": sched["n_per_update"],
+            "n_exposures": sched["n_exposures"],
+            "source": args.schedule,
+            "note": "budget-matched to the replay arm: same updates, exposures "
+                    "and order; TRL shuffling disabled",
+        }
+        print(f"schedule {sched['schedule_hash']}: {sched['n_updates']} updates "
+              f"x {sched['n_per_update']} = {len(rows)} exposures, frozen order",
+              flush=True)
+
     sup_before = {(r["task_id"], r["position"]):
                   sum(1 for l in r["labels"] if l != IGNORE) for r in rows}
     total_sup = sum(sup_before.values())
-    steps = max(3 if args.probe else 1,
-                int(len(rows) * args.epochs / (args.batch_size * args.grad_accum)))
+    if schedule_meta:
+        steps = schedule_meta["n_updates"]
+    else:
+        steps = max(3 if args.probe else 1,
+                    int(len(rows) * args.epochs / (args.batch_size * args.grad_accum)))
     print(f"supervised tokens {total_sup:,} | planned optimizer steps {steps}")
 
     if args.dry_run:

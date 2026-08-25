@@ -115,3 +115,35 @@ def test_staging_pins_the_schedule_hash():
     src = open("scripts/tau2_stage_policy_modal.py").read()
     assert "24c0aa5395d69772" in src
     assert "SCHEDULE_IN_VOLUME" in src
+
+
+# --- the schedule must actually take effect ------------------------------
+
+
+def test_schedule_governs_the_step_count_not_the_epoch_math():
+    """The run printed 'planned optimizer steps 36' while claiming a match.
+
+    An anchor that silently matched nothing left the schedule block out
+    entirely, so rows, batch size and step count were all epoch-derived. The
+    step count must come from the schedule, and it must be computed BEFORE the
+    epoch fallback.
+    """
+    src = open("scripts/tau2_sft_train.py").read()
+    i_apply = src.index("schedule_meta = None")
+    i_steps = src.index("planned optimizer steps")
+    assert i_apply < i_steps, "schedule must be applied before steps is printed"
+    assert 'steps = schedule_meta["n_updates"]' in src
+
+
+def test_no_dead_schedule_branch_survives():
+    src = open("scripts/tau2_sft_train.py").read()
+    assert "if False:" not in src, "dead branch left in the trainer"
+
+
+def test_schedule_meta_is_always_defined():
+    """It is read unconditionally by write_config; an unset name is a NameError
+    that only fires on the paid path."""
+    src = open("scripts/tau2_sft_train.py").read()
+    i_def = src.index("schedule_meta = None")
+    i_use = src.index('"schedule": schedule_meta')
+    assert i_def < i_use
