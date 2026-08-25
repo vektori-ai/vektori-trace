@@ -729,6 +729,14 @@ def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
                           "after collation")
     print(f"MASK OK: {sup} supervised in batch 0, lengths {lens}")
 
+    # The frozen order is the whole basis of the budget match, so it is proven
+    # here rather than assumed. Placed beside the mask gate because both
+    # inspect batch 0 of the real dataloader, and both must fail before the
+    # optimizer runs rather than after a paid run has produced an artifact
+    # that only looks like a matched control.
+    if getattr(args, "schedule", None):
+        _assert_sequential_order(trainer, rows, runlog)
+
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     result = trainer.train()
