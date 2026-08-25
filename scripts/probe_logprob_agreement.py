@@ -104,7 +104,10 @@ def trainer_logprobs(model_path: str, token_ids: list[int], load_4bit: bool,
     logprobs = torch.log_softmax(logits[0, :-1], dim=-1)
     targets = ids[0, 1:]
     picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    return [float(x) for x in picked.cpu()], model.config
+    # `targets` is exactly what was scored: token_ids[1:], the first token being
+    # unconditioned. Returned so the caller can prove SGLang scored the same
+    # ids rather than merely the same number of them.
+    return [float(x) for x in picked.cpu()], [int(t) for t in targets.cpu()]
 
 
 def sglang_logprobs(url: str, token_ids: list[int]):
@@ -124,8 +127,15 @@ def sglang_logprobs(url: str, token_ids: list[int]):
     if not entries:
         sys.exit(f"no input_token_logprobs in response; got keys "
                  f"{list((out.get('meta_info') or {}).keys())}")
-    # entries are [logprob, token_id, text]; first token is unconditioned (null)
-    return [e[0] for e in entries if e[0] is not None]
+    # entries are [logprob, token_id, text]; first token is unconditioned (null).
+    #
+    # The token ids are returned, not discarded. Comparing only logprob *counts*
+    # lets two different tokenizations of the same text line up by length and
+    # then be compared position-by-position as if they described the same
+    # tokens -- which is the failure this probe exists to detect, passing the
+    # probe. The ids are what prove the two sides scored the same sequence.
+    scored = [e for e in entries if e[0] is not None]
+    return [e[0] for e in scored], [int(e[1]) for e in scored]
 
 
 def main() -> int:
@@ -154,8 +164,8 @@ def main() -> int:
     print(f"probe: {len(token_ids)} tokens | model={a.model} "
           f"| trainer={'nf4' if a.load_4bit else a.dtype}")
 
-    tr, cfg = trainer_logprobs(a.model, token_ids, a.load_4bit, a.dtype)
-    sg = sglang_logprobs(a.sglang_url, token_ids)
+    tr, tr_ids = trainer_logprobs(a.model, token_ids, a.load_4bit, a.dtype)
+    sg, sg_ids = sglang_logprobs(a.sglang_url, token_ids)
 
     # A length mismatch is FATAL, never a warning.
     #
@@ -172,9 +182,23 @@ def main() -> int:
               f"is meaningless.\n  Fix the tokenizer/offset alignment; do not "
               f"compare a truncated prefix.", file=sys.stderr)
         return 2
+
+    # Equal length is necessary but nowhere near sufficient: two tokenizations
+    # can agree on count and disagree on every token. Only the ids prove the two
+    # sides scored the same sequence.
+    if tr_ids != sg_ids:
+        bad = [i for i, (x, y) in enumerate(zip(tr_ids, sg_ids, strict=True)) if x != y]
+        head = ", ".join(f"[{i}] trainer={tr_ids[i]} sglang={sg_ids[i]}"
+                         for i in bad[:5])
+        print(f"\n  FATAL token-id mismatch at {len(bad)}/{len(tr_ids)} "
+              f"positions: {head}\n"
+              f"  Both sides scored {len(tr_ids)} tokens, but not the SAME "
+              f"tokens -- the logprobs are not comparable and any agreement "
+              f"between them would be coincidental.", file=sys.stderr)
+        return 2
     n = len(tr)
 
-    deltas = [abs(x - y) for x, y in zip(tr, sg)]
+    deltas = [abs(x - y) for x, y in zip(tr, sg, strict=True)]
     mean_d = statistics.fmean(deltas)
     max_d = max(deltas)
 
@@ -210,6 +234,9 @@ def main() -> int:
             json.dump({
                 "model": a.model, "trainer": "nf4" if a.load_4bit else a.dtype,
                 "n_tokens": n, "mean_abs": mean_d, "max_abs": max_d,
+                # Recorded so a later reader can verify the two sides scored the
+                # same sequence without rerunning the probe.
+                "scored_token_ids": tr_ids,
                 "pass": ok, "trainer_logprobs": tr, "sglang_logprobs": sg,
             }, f, indent=1)
         print(f"  wrote {a.json_out}")
