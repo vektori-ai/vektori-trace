@@ -60,6 +60,14 @@ def atomic_write_json(path: Path, payload: Any) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        # Fsync the directory too. Without it the rename itself can be lost on
+        # power failure, leaving the marker absent or -- worse -- present but
+        # empty, which is the state `validate()` exists to make impossible.
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -84,14 +92,22 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """
     if not path.exists():
         return []
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
+    for i, line in enumerate(lines):
         try:
             rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            break
+        except json.JSONDecodeError as e:
+            # Only the LAST line may be torn: that is the one an interrupted
+            # append was writing. A malformed line anywhere else means the file
+            # was corrupted after it was durably written, and silently dropping
+            # the remainder would hide however many paid results follow it.
+            if i != len(lines) - 1:
+                raise ReOPDStateError(
+                    f"{path}: malformed JSON at line {i + 1} of {len(lines)}. "
+                    "Only a torn final line is recoverable; a bad line in the "
+                    "middle means the file was corrupted after it was written."
+                ) from e
     return rows
 
 
@@ -158,19 +174,99 @@ class UpdateDir:
                 "is missing; the marker is ahead of its outputs"
             )
         if self.reached("SCORED"):
-            n_actions = len(read_jsonl(self.actions_path))
-            n_scores = len(read_jsonl(self.scores_path))
-            if n_scores < n_actions:
+            actions = read_jsonl(self.actions_path)
+            scores = read_jsonl(self.scores_path)
+
+            # Exact key-set equality, not a count. A count comparison accepts a
+            # duplicate score standing in for a missing one, and accepts scores
+            # for actions that are not in this batch at all -- both of which
+            # change the global denominator while looking complete.
+            a_keys = [r.get("key") for r in actions]
+            s_keys = [r.get("key") for r in scores]
+            dupes = {k for k in s_keys if s_keys.count(k) > 1}
+            if dupes:
                 raise ReOPDStateError(
-                    f"update {self.index} is marked SCORED with {n_scores} scores "
-                    f"for {n_actions} actions; a short batch silently changes the "
-                    "global denominator"
+                    f"update {self.index}: duplicate score keys {sorted(dupes)[:4]}; "
+                    "a duplicate can mask a missing score in a count check"
                 )
-        if self.reached("TRAINED") and not self.checkpoint_path.exists():
+            missing = set(a_keys) - set(s_keys)
+            foreign = set(s_keys) - set(a_keys)
+            if missing:
+                raise ReOPDStateError(
+                    f"update {self.index} is marked SCORED but {len(missing)} "
+                    f"actions have no score: {sorted(missing)[:4]}"
+                )
+            if foreign:
+                raise ReOPDStateError(
+                    f"update {self.index}: score keys outside this batch: "
+                    f"{sorted(foreign)[:4]}"
+                )
+
+            # Fingerprints bind a score to the exact action bytes and teacher
+            # it was bought for. A stale score that survives a resume grades an
+            # action the current policy never sampled.
+            by_key = {r.get("key"): r for r in actions}
+            for s in scores:
+                want = by_key[s["key"]].get("score_fingerprint")
+                got = s.get("fingerprint")
+                if want and got and want != got:
+                    raise ReOPDStateError(
+                        f"update {self.index}: score for {s['key']} was bought "
+                        f"for a different action or teacher ({got} != {want})"
+                    )
+
+        if self.reached("TRAINED"):
+            self.validate_checkpoint()
+
+    #: What a resumable checkpoint must contain. Model weights alone are not
+    #: enough: resuming with a fresh optimizer discards Adam's moments, which
+    #: silently changes the effective learning rate for the updates that follow.
+    CHECKPOINT_REQUIRED = ("adapter_config.json", "optimizer.pt", "state.json")
+
+    def validate_checkpoint(self) -> dict[str, Any]:
+        """Fail unless the checkpoint can actually resume the run.
+
+        An empty directory passing this check is the failure mode that turns a
+        crash at update 20 into a silent restart from an untrained adapter.
+        """
+        cp = self.checkpoint_path
+        if not cp.exists():
             raise ReOPDStateError(
                 f"update {self.index} is marked TRAINED but has no checkpoint; "
                 "the next update would resume from the wrong policy version"
             )
+        missing = [f for f in self.CHECKPOINT_REQUIRED if not (cp / f).exists()]
+        # Adapter weights are written under either name depending on peft
+        # version, so they are checked as an either/or rather than by name.
+        if not any((cp / n).exists()
+                   for n in ("adapter_model.safetensors", "adapter_model.bin")):
+            missing.append("adapter_model.safetensors")
+        if missing:
+            raise ReOPDStateError(
+                f"update {self.index} checkpoint is incomplete, missing "
+                f"{missing}. A checkpoint without optimizer, scheduler and RNG "
+                "state cannot resume the run it claims to belong to."
+            )
+
+        state = json.loads((cp / "state.json").read_text())
+        for field in ("update_index", "policy_version", "parent_policy_hash",
+                      "rng_state", "scheduler_state"):
+            if field not in state:
+                raise ReOPDStateError(
+                    f"update {self.index} checkpoint state.json lacks {field!r}"
+                )
+        if int(state["update_index"]) != self.index:
+            raise ReOPDStateError(
+                f"checkpoint in update-{self.index:03d} claims update "
+                f"{state['update_index']}; the run would resume at the wrong point"
+            )
+        if not state.get("reload_verified"):
+            raise ReOPDStateError(
+                f"update {self.index} checkpoint was never reload-verified. A "
+                "saved adapter that does not change logits on reload is the "
+                "failure that makes a whole run a no-op."
+            )
+        return state
 
 
 class RunState:

@@ -73,6 +73,11 @@ class C30Prefix:
 
     prefix_id: str                       # "42#5" -- frozen, not derived
     task_id: str
+    #: The selected trace's hash from the frozen eligibility record. Real
+    #: provenance, never a fabricated Harbor-style id: `replay_archive` records
+    #: it as the reproducibility key, and a synthetic value there would make the
+    #: archive claim a lineage that does not exist.
+    trace_id: str
     position: int
     action_type: str
     tool_names: list[str]
@@ -82,8 +87,21 @@ class C30Prefix:
     #: label. This is what the student is sampled from, verbatim.
     prompt_token_ids: list[int]
 
-    #: The chat history DeepSeek re-renders under its own template.
+    #: The chat history DeepSeek re-renders under its own template, **including
+    #: the system policy**. `rows.semantic.jsonl` stores only `decision.prompt`,
+    #: but the tokenized row the student samples from was built as
+    #: `[system] + prompt + [target]` with the retail tool schemas passed to the
+    #: template (`export.build_row`). Handing the teacher the bare prompt would
+    #: score the student's action under a strictly smaller context than the
+    #: student saw -- a finite loss computed against the wrong conditioning,
+    #: with nothing in any metric to show for it.
     canonical_messages: list[dict[str, Any]]
+
+    #: The tool schemas the student's prompt was rendered with. The teacher
+    #: needs them to render an equivalent state; passing them separately rather
+    #: than folding them into the messages is how both providers' templates
+    #: expect to receive tools.
+    tools: list[dict[str, Any]]
 
     #: The recorded DeepSeek action at this state. ReOPD does not train on it
     #: -- that is `A_sft_new`'s signal -- but `replay_opd` accepts stored
@@ -97,6 +115,11 @@ class C30Prefix:
     def step_index(self) -> int:
         """Position within the trace. `replay_opd` reads this for reporting."""
         return self.position
+
+    @property
+    def task(self) -> str:
+        """`replay_archive` reads `.task`; C30's task identity is `task_id`."""
+        return self.task_id
 
     @property
     def n_prompt_tokens(self) -> int:
@@ -162,9 +185,63 @@ def _verify_corpus_bytes(artifacts: str) -> dict[str, str]:
     return frozen
 
 
+def load_policy_and_tools(
+    artifacts: str,
+    *,
+    system_policy: str,
+    tools: list[dict[str, Any]] | None = None,
+    domain: str = "retail",
+) -> tuple[str, list[dict[str, Any]]]:
+    """The system policy and tool schemas the corpus was rendered with.
+
+    Neither is stored in the artifacts directory: the policy came from the
+    simulation files and the schemas from the live Tau2 registry
+    (`tau2_build_corpus`). Both must therefore be supplied or re-derived, and
+    then *verified* against what the corpus recorded -- an unverified
+    reconstruction is how the teacher ends up scoring under a different policy
+    revision than the student was trained on, which no downstream check would
+    notice.
+
+    `system_policy` has no recorded hash to check against in the current
+    corpus metadata, so it is the caller's responsibility to pass the same
+    string `tau2_build_corpus` used. The tool schemas *are* hashed, and a
+    mismatch here is fatal.
+    """
+    from .tools import load_domain_tools, tools_hash
+
+    if not system_policy or not system_policy.strip():
+        raise C30LoadError(
+            "system_policy is required: the student's prompt ids were rendered "
+            "with it, so scoring without it grades the action under a strictly "
+            "smaller context than the student saw"
+        )
+
+    schemas = list(tools) if tools is not None else load_domain_tools(domain)
+
+    elig_path = os.path.join(artifacts, "eligibility.json")
+    recorded = None
+    for cand in (elig_path, os.path.join(artifacts, "data_census.json")):
+        if os.path.exists(cand):
+            meta = json.load(open(cand))
+            recorded = meta.get("tools_hash") or recorded
+    if recorded:
+        got = tools_hash(schemas)
+        if got != recorded:
+            raise C30LoadError(
+                f"tool schema hash {got} != corpus-recorded {recorded}. The "
+                "student's prompts were rendered against a different tool set; "
+                "scoring against this one compares two different states."
+            )
+    return system_policy, schemas
+
+
 def load_c30_prefixes(
     artifacts: str,
     *,
+    system_policy: str,
+    tools: list[dict[str, Any]] | None = None,
+    domain: str = "retail",
+    trace_ids: dict[str, str] | None = None,
     manifest_path: str | None = None,
     expect_manifest_hash: str | None = None,
 ) -> tuple[list[C30Prefix], dict[str, Any]]:
@@ -196,6 +273,22 @@ def load_c30_prefixes(
         )
 
     _verify_corpus_bytes(artifacts)
+    policy, schemas = load_policy_and_tools(
+        artifacts, system_policy=system_policy, tools=tools, domain=domain
+    )
+
+    # Real trace provenance, from the frozen eligibility record when it is
+    # present. Absent, `trace_id` falls back to the task id rather than to a
+    # fabricated identifier -- an archive that records a synthetic trace hash
+    # claims a lineage that cannot be reproduced.
+    traces = dict(trace_ids or {})
+    if not traces:
+        elig = os.path.join(artifacts, "eligibility.json")
+        if os.path.exists(elig):
+            meta = json.load(open(elig))
+            for t, rec in (meta.get("selected_traces") or {}).items():
+                if isinstance(rec, dict) and rec.get("trace_hash"):
+                    traces[str(t)] = rec["trace_hash"]
 
     want = {p["prefix_id"]: p for p in manifest["prefixes"]}
 
@@ -256,15 +349,28 @@ def load_c30_prefixes(
         if not target:
             raise C30LoadError(f"{pid}: semantic row has no target action")
 
+        # The system policy is prepended here, not stored in the semantic row.
+        # `export.build_row` rendered the student's ids from
+        # `[system] + prompt + [target]`; reconstructing the same head is what
+        # makes the teacher's context equivalent rather than merely similar.
+        if messages[0].get("role") == "system":
+            raise C30LoadError(
+                f"{pid}: semantic prompt already begins with a system message; "
+                "prepending the policy would duplicate it"
+            )
+        canonical = [{"role": "system", "content": policy}] + list(messages)
+
         prefixes.append(C30Prefix(
             prefix_id=pid,
             task_id=w["task_id"],
+            trace_id=traces.get(str(w["task_id"]), str(w["task_id"])),
             position=int(w["position"]),
             action_type=w["action_type"],
             tool_names=list(w.get("tool_names") or []),
             semantic_hash=w["semantic_hash"],
             prompt_token_ids=prompt_ids_from_row(tok),
-            canonical_messages=messages,
+            canonical_messages=canonical,
+            tools=schemas,
             stored_teacher_action=target,
             meta={
                 "n_supervised_tokens": w["n_supervised_tokens"],
