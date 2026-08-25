@@ -358,7 +358,16 @@ def load_c30_prefixes(
                 f"{pid}: semantic prompt already begins with a system message; "
                 "prepending the policy would duplicate it"
             )
-        canonical = [{"role": "system", "content": policy}] + list(messages)
+        # Tools ride on the system message, not as a separate argument.
+        # `render_teacher_prefix` takes only (messages, thinking_mode), and
+        # `encoding_dsv4` reads `msg["tools"]` off the system/developer turn
+        # (`_render_system`, line ~352) converting it with
+        # `tools_from_openai_format` -- the same OpenAI shape
+        # `load_domain_tools` returns. Carrying `tools` on the prefix object
+        # alone would leave DeepSeek unconditioned on them while the student's
+        # ids contain the full schema block.
+        canonical = [{"role": "system", "content": policy, "tools": schemas}]
+        canonical += list(messages)
 
         prefixes.append(C30Prefix(
             prefix_id=pid,
@@ -400,6 +409,73 @@ def load_c30_prefixes(
     return prefixes, report
 
 
+def assert_render_parity(
+    prefixes: list[C30Prefix],
+    tokenizer: Any,
+    *,
+    max_length: int,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Prove the reconstructed context re-renders to the frozen prompt ids.
+
+    This is the check that makes the policy string *proven* rather than merely
+    plausible. `load_policy_and_tools` verifies the tool hash, but nothing
+    verifies the policy text -- and a policy that is close but not identical
+    produces a valid-looking prefix whose every downstream assertion passes.
+
+    Re-rendering `[system+tools] + prompt` under the pinned Qwen tokenizer must
+    reproduce `prompt_token_ids` exactly. If it does for all 289, the
+    reconstruction is the corpus's own, byte for byte.
+
+    Run this before the first paid call, not during training: it costs one
+    tokenizer render per prefix and answers a question that cannot be answered
+    later from any log.
+    """
+    from ..dataset import tokenize_messages
+
+    checked = mismatched = 0
+    failures: list[dict[str, Any]] = []
+    for p in prefixes[:limit] if limit else prefixes:
+        messages = list(p.canonical_messages) + [p.stored_teacher_action]
+        supervise = [False] * (len(messages) - 1) + [True]
+        ex = tokenize_messages(
+            messages, tokenizer, supervise,
+            max_length=max_length, truncate=False,
+            template_kwargs={"tools": p.tools, "enable_thinking": True},
+            mask_think_wrapper=True,
+        )
+        checked += 1
+        if ex is None:
+            failures.append({"prefix_id": p.prefix_id, "why": "over length"})
+            mismatched += 1
+            continue
+        n_target = sum(1 for l in ex.labels if l != -100)
+        got = list(ex.input_ids[: len(ex.input_ids) - n_target])
+        if got != p.prompt_token_ids:
+            mismatched += 1
+            if len(failures) < 5:
+                first = next(
+                    (i for i, (a, b) in enumerate(zip(got, p.prompt_token_ids))
+                     if a != b),
+                    min(len(got), p.n_prompt_tokens),
+                )
+                failures.append({
+                    "prefix_id": p.prefix_id,
+                    "n_rendered": len(got),
+                    "n_frozen": p.n_prompt_tokens,
+                    "first_divergence": first,
+                })
+
+    if mismatched:
+        raise C30LoadError(
+            f"render parity failed for {mismatched}/{checked} prefixes: "
+            f"{failures}. The reconstructed system policy or tool schema is not "
+            "what the corpus was built with, so the teacher would score under "
+            "different conditioning than the student sampled under."
+        )
+    return {"n_checked": checked, "all_exact": True}
+
+
 def cycle_updates(
     prefixes: list[C30Prefix], *, n_per_update: int, n_updates: int
 ) -> list[list[C30Prefix]]:
@@ -432,7 +508,9 @@ __all__ = [
     "C30LoadError",
     "C30Prefix",
     "PARTITION",
+    "assert_render_parity",
     "cycle_updates",
     "load_c30_prefixes",
+    "load_policy_and_tools",
     "prompt_ids_from_row",
 ]

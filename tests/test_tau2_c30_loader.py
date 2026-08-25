@@ -125,7 +125,8 @@ def test_joins_all_three_files(tmp_path):
 
     p = prefixes[0]
     assert p.prefix_id == "10#0"
-    assert p.canonical_messages[0] == {"role": "system", "content": POLICY}
+    assert p.canonical_messages[0]["role"] == "system"
+    assert p.canonical_messages[0]["content"] == POLICY
     assert p.stored_teacher_action["content"] == "action 10/0"
     # prompt ids stop at the label boundary, not at the end of the sequence
     assert p.n_prompt_tokens == 5
@@ -252,7 +253,8 @@ def test_system_policy_is_prepended_for_the_teacher(tmp_path):
     prefixes, _ = load_c30_prefixes(str(_build(tmp_path)),
                                     system_policy=POLICY, tools=TOOLS)
     m = prefixes[0].canonical_messages
-    assert m[0] == {"role": "system", "content": POLICY}
+    assert m[0]["role"] == "system"
+    assert m[0]["content"] == POLICY
     # and the semantic prompt still follows, unmodified
     assert m[1]["role"] == "user"
     assert len(m) == 3
@@ -262,6 +264,20 @@ def test_tools_are_carried_for_the_teacher_render(tmp_path):
     prefixes, _ = load_c30_prefixes(str(_build(tmp_path)),
                                     system_policy=POLICY, tools=TOOLS)
     assert prefixes[0].tools == TOOLS
+
+
+def test_tools_ride_on_the_system_message(tmp_path):
+    """encoding_dsv4 reads msg['tools']; a separate field reaches nothing.
+
+    `render_teacher_prefix` takes only (messages, thinking_mode), so tools that
+    live solely on the prefix object never enter DeepSeek's context while the
+    student's ids carry the full schema block.
+    """
+    prefixes, _ = load_c30_prefixes(str(_build(tmp_path)),
+                                    system_policy=POLICY, tools=TOOLS)
+    sysmsg = prefixes[0].canonical_messages[0]
+    assert sysmsg["role"] == "system"
+    assert sysmsg["tools"] == TOOLS
 
 
 def test_empty_policy_is_refused(tmp_path):
