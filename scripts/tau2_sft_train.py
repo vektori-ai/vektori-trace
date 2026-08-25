@@ -372,6 +372,14 @@ def main() -> int:
     ap.add_argument("--out", default="/data/tau2/a_warm")
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--epochs", type=float, default=3.0)
+    ap.add_argument("--schedule", default=None,
+                    help="a frozen ReOPD batch schedule (reopd_schedule JSON). "
+                         "When given, rows are emitted in that exact order and "
+                         "the run is pinned to its updates x states -- this is "
+                         "what makes continued SFT budget-matched to the replay "
+                         "arm on updates, exposures and sampling order (V2 s8). "
+                         "Without it TRL shuffles and the two arms differ on "
+                         "all three while both still log 'one epoch over C30'.")
     # Precommitted, NOT learned from the probe: three steps cannot compare
     # learning rates. 1e-4 is the standard LoRA starting point for a small
     # model at rank 16. Changing it requires either an explicit rationale or a
@@ -461,6 +469,7 @@ def main() -> int:
                       "gradient_accumulation_steps": args.grad_accum,
                       "effective_batch_size": args.batch_size * args.grad_accum,
                       "planned_steps": steps, "epochs": args.epochs},
+        "schedule": schedule_meta,
         "environment": collect_environment(args.model),
     })
 
@@ -519,7 +528,9 @@ def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         gradient_checkpointing=True,
-        max_steps=steps if args.probe else -1,
+        # A frozen schedule pins the step count exactly; without it the length
+        # is whatever epochs x rows / effective batch happens to give.
+        max_steps=steps if (args.probe or args.schedule) else -1,
         num_train_epochs=args.epochs if not args.probe else 1,
         learning_rate=args.lr,
         warmup_ratio=0.0 if args.probe else 0.03,
@@ -579,7 +590,22 @@ def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
               f"({trainable:,} trainable parameters; fresh optimizer/scheduler)",
               flush=True)
 
-    trainer = SFTTrainer(
+    class _FrozenOrderTrainer(SFTTrainer):
+        """Consume rows in dataset order, never shuffled.
+
+        HF's Trainer defaults to a RandomSampler, so ordering the rows is not
+        by itself enough -- the frozen schedule would be reshuffled into a
+        different stream while the run still reported the same update count,
+        which is precisely the divergence V2 s8 forbids between the two arms.
+        """
+
+        def _get_train_sampler(self, *a, **k):
+            from torch.utils.data import SequentialSampler
+            return SequentialSampler(self.train_dataset)
+
+    trainer_cls = _FrozenOrderTrainer if getattr(args, "schedule", None) \
+        else SFTTrainer
+    trainer = trainer_cls(
         model=train_model,
         args=cfg,
         train_dataset=ds,

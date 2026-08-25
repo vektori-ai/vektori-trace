@@ -57,7 +57,7 @@ image = (
     timeout=60 * 60,
     max_containers=1,
 )
-def train(run_id: str, epochs: float, lr: float) -> dict:
+def train(run_id: str, epochs: float, lr: float, schedule: str = "") -> dict:
     import importlib.util
     import json
     import os
@@ -84,7 +84,14 @@ def train(run_id: str, epochs: float, lr: float) -> dict:
         "--out", out,
         "--epochs", str(epochs),
         "--lr", str(lr),
-    ]
+        # Budget matching (V2 s8): the same updates, exposures and order the
+        # replay arm consumes. Without it this arm runs ~37 steps at effective
+        # batch 8 in TRL's shuffled order against the replay arm's 32 x 16
+        # frozen stream, and both still log "one epoch over C30".
+    ] + ([] if not schedule else ["--schedule", schedule])
+    if schedule and not os.path.isfile(schedule):
+        raise SystemExit(f"schedule not found on the volume: {schedule}")
+
     sys.path.insert(0, "/root")
     spec = importlib.util.spec_from_file_location(
         "tau2_sft_train", "/root/scripts/tau2_sft_train.py")
@@ -117,7 +124,7 @@ def train(run_id: str, epochs: float, lr: float) -> dict:
 
 @app.local_entrypoint()
 def main(yes: bool = False, epochs: float = 1.0, lr: float = 1e-4,
-         run_id: str = ""):
+         run_id: str = "", schedule: str = ""):
     import json
     import time
 
@@ -131,7 +138,11 @@ def main(yes: bool = False, epochs: float = 1.0, lr: float = 1e-4,
     rid = run_id or f"a_sft_c30_ck35_{time.strftime('%Y%m%d_%H%M%S')}"
     print("continued SFT: CK35 -> C30")
     print(f"epochs: {epochs} | lr: {lr} | output: {RUNS_IN_VOLUME}/{rid}")
-    result = train.remote(rid, epochs, lr)
+    if not schedule:
+        print("WARNING no --schedule: this run will NOT be budget-matched to "
+              "the replay arm (updates, exposures and order all differ). Pass "
+              "the frozen schedule to make it the control the comparison needs.")
+    result = train.remote(rid, epochs, lr, schedule)
     print(json.dumps(result, indent=2))
     if result["returncode"] != 0 or result.get("failure.json"):
         raise SystemExit("continued SFT failed; inspect the persisted run artifacts")
