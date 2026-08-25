@@ -348,9 +348,12 @@ def test_task_property_for_replay_archive(tmp_path):
 def _sims(tmp_path, policy="retail policy v1", name="flash_retail20.json"):
     d = tmp_path / "sims"
     d.mkdir(exist_ok=True)
-    (d / name).write_text(json.dumps({"simulations": [
-        {"info": {"environment_info": {"policy": policy}}},
-    ]}))
+    # Real files carry the policy at the FILE's top-level info block, which
+    # is where tau2_build_corpus reads it.
+    (d / name).write_text(json.dumps({
+        "info": {"environment_info": {"policy": policy}},
+        "simulations": [{"id": 0}],
+    }))
     return d
 
 
@@ -388,8 +391,9 @@ def test_disagreeing_policies_are_fatal(tmp_path):
     }))
     d = tmp_path / "sims"; d.mkdir()
     for n, pol in (("one.json", "policy A"), ("two.json", "policy B")):
-        (d / n).write_text(json.dumps({"simulations": [
-            {"info": {"environment_info": {"policy": pol}}}]}))
+        (d / n).write_text(json.dumps({
+            "info": {"environment_info": {"policy": pol}},
+            "simulations": [{"id": 0}]}))
     with pytest.raises(C30LoadError, match="different policies"):
         recover_system_policy(str(art), simulations_dir=str(d))
 
@@ -405,3 +409,28 @@ def test_trace_id_falls_back_to_task_id_never_fabricated(tmp_path):
     art = _build(tmp_path)
     prefixes, _ = load_c30_prefixes(str(art), system_policy=POLICY, tools=TOOLS)
     assert all(p.trace_id == p.task_id for p in prefixes)
+
+
+def test_policy_read_from_file_level_info(tmp_path):
+    """tau2_build_corpus reads data["info"]["environment_info"]["policy"]."""
+    art = _build(tmp_path)
+    _with_report(art, ["10"])
+    d = tmp_path / "sims"; d.mkdir(exist_ok=True)
+    (d / "flash_retail20.json").write_text(json.dumps({
+        "info": {"environment_info": {"policy": "top level policy"}},
+        "simulations": [{"id": 0}, {"id": 1}],
+    }))
+    policy, _ = recover_system_policy(str(art), simulations_dir=str(d))
+    assert policy == "top level policy"
+
+
+def test_policy_falls_back_to_per_simulation(tmp_path):
+    """Some files carry it inside a record instead; fallback, never primary."""
+    art = _build(tmp_path)
+    _with_report(art, ["10"])
+    d = tmp_path / "sims"; d.mkdir(exist_ok=True)
+    (d / "flash_retail20.json").write_text(json.dumps({
+        "simulations": [{"info": {"environment_info": {"policy": "nested"}}}],
+    }))
+    policy, _ = recover_system_policy(str(art), simulations_dir=str(d))
+    assert policy == "nested"

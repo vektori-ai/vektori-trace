@@ -222,6 +222,35 @@ def selected_source_files(artifacts: str) -> dict[str, str]:
             if isinstance(rec, dict) and rec.get("source_file")}
 
 
+def _policy_from_simulation_file(path: str) -> str | None:
+    """The environment policy, read the way `tau2_build_corpus` reads it.
+
+    The builder takes it from the **file's** top-level info block:
+
+        data["info"]["environment_info"]["policy"]
+
+    Not from inside each simulation record -- an earlier draft here invented
+    that nesting level and failed on every real file. The per-simulation lookup
+    is kept only as a fallback for files that carry it there instead, and never
+    as the primary path.
+    """
+    data = json.load(open(path))
+
+    info = (data.get("info") or {}) if isinstance(data, dict) else {}
+    policy = ((info.get("environment_info") or {}).get("policy"))
+    if policy:
+        return policy
+
+    sims = data.get("simulations") if isinstance(data, dict) else data
+    for sim in (sims or []):
+        if not isinstance(sim, dict):
+            continue
+        env = (sim.get("info") or {}).get("environment_info") or {}
+        if env.get("policy"):
+            return env["policy"]
+    return None
+
+
 def recover_system_policy(
     artifacts: str,
     *,
@@ -260,17 +289,13 @@ def recover_system_policy(
                 "--simulations-dir pointing at the directory the corpus was "
                 "built from."
             )
-        data = json.load(open(path))
-        sims = data.get("simulations") or data if isinstance(data, list) else \
-            data.get("simulations") or []
-        policy = None
-        for sim in sims:
-            info = (sim.get("info") or {}).get("environment_info") or {}
-            if info.get("policy"):
-                policy = info["policy"]
-                break
+        policy = _policy_from_simulation_file(path)
         if not policy:
-            raise C30LoadError(f"no environment policy in {path}")
+            raise C30LoadError(
+                f"no environment policy in {path}. `tau2_build_corpus` reads it "
+                'at `data["info"]["environment_info"]["policy"]`; this file has '
+                "neither that nor a per-simulation copy."
+            )
         seen.setdefault(policy, []).append(task_id)
 
     if len(seen) > 1:
