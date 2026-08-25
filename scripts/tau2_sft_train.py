@@ -97,6 +97,36 @@ def sha256_file(path: str) -> str:
 TRAINABLE_PARTITIONS = ("W30", "C30")
 
 
+def parent_adapter_manifest(path: str, base_model: str) -> dict:
+    """Validate and fingerprint the LoRA that a continuation starts from."""
+    required = ("adapter_config.json", "adapter_model.safetensors")
+    missing = [name for name in required if not os.path.isfile(os.path.join(path, name))]
+    if missing:
+        raise GateFailure(f"parent adapter {path} is incomplete, missing {missing}")
+    config = json.load(open(os.path.join(path, "adapter_config.json")))
+    parent_base = config.get("base_model_name_or_path")
+    if parent_base and parent_base != base_model:
+        raise GateFailure(
+            f"parent adapter base {parent_base!r} != requested {base_model!r}"
+        )
+    if int(config.get("r", -1)) != LORA_R:
+        raise GateFailure(
+            f"parent adapter rank {config.get('r')!r} != expected {LORA_R}"
+        )
+    files = {}
+    for name in sorted(os.listdir(path)):
+        fp = os.path.join(path, name)
+        if os.path.isfile(fp) and name in INFERENCE_FILES:
+            files[name] = sha256_file(fp)
+    return {
+        "path": path,
+        "base_model_name_or_path": parent_base,
+        "r": config["r"],
+        "lora_alpha": config.get("lora_alpha"),
+        "files_sha256": files,
+    }
+
+
 def load_rows(artifacts: str, partition: str, expect_manifest: str | None):
     """Trainable-partition rows only, proven against the frozen manifest."""
     if partition not in TRAINABLE_PARTITIONS:
@@ -335,6 +365,10 @@ def main() -> int:
                     help="W30 builds A_warm; C30 is the continuation pool")
     ap.add_argument("--manifest-hash", default="b741bfceb1f3d027")
     ap.add_argument("--model", default="Qwen/Qwen3-4B")
+    ap.add_argument("--init-adapter", default=None,
+                    help="trainable parent LoRA for continued SFT. Required for "
+                         "C30 continuation; optimizer and scheduler state are "
+                         "always fresh and are never loaded from this path")
     ap.add_argument("--out", default="/data/tau2/a_warm")
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--epochs", type=float, default=3.0)
@@ -353,6 +387,19 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="run every CPU gate and print the plan, load no weights")
     args = ap.parse_args()
+
+    if args.partition == "C30" and not args.init_adapter:
+        print("--init-adapter is required for C30 continued SFT; starting C30 "
+              "from a fresh LoRA would discard A_warm", file=sys.stderr)
+        return 2
+    if args.partition != "C30" and args.init_adapter:
+        print("--init-adapter is only valid with --partition C30", file=sys.stderr)
+        return 2
+
+    parent_manifest = (
+        parent_adapter_manifest(args.init_adapter, args.model)
+        if args.init_adapter else None
+    )
 
     rows, manifest = load_rows(args.artifacts, args.partition, args.manifest_hash)
     print(f"{args.partition}: {len(rows)} rows, "
@@ -387,6 +434,8 @@ def main() -> int:
     runlog.write_config({
         "mode": "probe" if args.probe else "full",
         "partition": args.partition,
+        "init_adapter": args.init_adapter,
+        "parent_adapter": parent_manifest,
         "manifest_hash": manifest["manifest_hash"],
         "tools_hash": manifest.get("tools_hash"),
         # The frozen full-corpus hashes stay authoritative; the subset hash is
@@ -427,8 +476,8 @@ def main() -> int:
 def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
     import torch
     from datasets import Dataset
-    from peft import LoraConfig
-    from transformers import AutoTokenizer
+    from peft import LoraConfig, PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
     from vektori_trace.dataset import LabelPreservingCollator
@@ -505,15 +554,37 @@ def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
           f"assistant_only_loss={cfg.assistant_only_loss}, "
           f"skip_prepare_dataset=True, packing={cfg.packing}", flush=True)
 
+    peft_config = LoraConfig(
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES, task_type="CAUSAL_LM",
+    )
+    train_model = args.model
+    if args.init_adapter:
+        # Load only the parent adapter weights/config. Deliberately do not call
+        # Trainer.resume_from_checkpoint: C30 is a new branch and must start
+        # with fresh optimizer, scheduler and RNG state rather than inheriting
+        # W30 momentum. PeftModel marks the existing adapter trainable so the
+        # saved result is CK35 + the C30 update, not a second stacked LoRA.
+        base = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        )
+        train_model = PeftModel.from_pretrained(
+            base, args.init_adapter, is_trainable=True,
+        )
+        peft_config = None
+        trainable = sum(p.numel() for p in train_model.parameters() if p.requires_grad)
+        if trainable == 0:
+            raise GateFailure(f"parent adapter {args.init_adapter} has no trainable parameters")
+        print(f"continued SFT parent: {args.init_adapter} "
+              f"({trainable:,} trainable parameters; fresh optimizer/scheduler)",
+              flush=True)
+
     trainer = SFTTrainer(
-        model=args.model,
+        model=train_model,
         args=cfg,
         train_dataset=ds,
         data_collator=collator,
-        peft_config=LoraConfig(
-            r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
-            target_modules=LORA_TARGET_MODULES, task_type="CAUSAL_LM",
-        ),
+        peft_config=peft_config,
         callbacks=[
             make_callback(runlog,
                           supervised_per_step=max(1, total_sup // max(1, steps))),
@@ -622,6 +693,9 @@ def _train(args, rows, manifest, total_sup, steps, runlog) -> int:
         "steps_logged": len(logged),
         "base_model": args.model,
         "base_model_revision": base_revision,
+        "init_adapter": args.init_adapter,
+        "optimizer_state_source": "fresh",
+        "scheduler_state_source": "fresh",
         "artifact_files": {
             "inference": list(INFERENCE_FILES),
             "resume": list(RESUME_FILES),

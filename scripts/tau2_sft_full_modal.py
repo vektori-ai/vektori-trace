@@ -65,7 +65,8 @@ image = (
     timeout=100 * 60,
     max_containers=1,
 )
-def train(run_id: str, epochs: float = 3.0, lr: float = 1e-4) -> dict:
+def train(run_id: str, epochs: float = 3.0, lr: float = 1e-4,
+          partition: str = "W30", init_adapter: str = "") -> dict:
     import json
     import os
     import sys
@@ -87,12 +88,22 @@ def train(run_id: str, epochs: float = 3.0, lr: float = 1e-4) -> dict:
     sys.argv = [
         "tau2_sft_train.py",
         "--artifacts", art,
-        "--partition", "W30",
+        "--partition", partition,
         "--manifest-hash", EXPECT_MANIFEST,
         "--out", out_dir,
         "--epochs", str(epochs),
         "--lr", str(lr),
     ]
+    if init_adapter:
+        # The continued-SFT branch: C30 adaptation starting from A_warm. The
+        # trainer loads these weights as the trainable parent and refuses C30
+        # without them, since a fresh LoRA would discard the warm start. Its
+        # optimizer and scheduler are always fresh -- carrying warm-SFT momentum
+        # into one branch and not the other would break the budget match
+        # silently, with nothing in either training log showing it (V2 §8).
+        sys.argv += ["--init-adapter", init_adapter]
+    print(f"partition: {partition}"
+          + (f"  parent: {init_adapter}" if init_adapter else ""), flush=True)
     sys.path.insert(0, "/root")
 
     import importlib.util
@@ -138,7 +149,8 @@ def train(run_id: str, epochs: float = 3.0, lr: float = 1e-4) -> dict:
 
 
 @app.local_entrypoint()
-def main(epochs: float = 3.0, lr: float = 1e-4, run_id: str = ""):
+def main(epochs: float = 3.0, lr: float = 1e-4, run_id: str = "",
+         partition: str = "W30", init_adapter: str = ""):
     import json
     import time
 
@@ -148,7 +160,8 @@ def main(epochs: float = 3.0, lr: float = 1e-4, run_id: str = ""):
     print(f"watch : modal app logs tau2-sft-full -f")
     print()
 
-    res = train.remote(rid, epochs=epochs, lr=lr)
+    res = train.remote(rid, epochs=epochs, lr=lr,
+                       partition=partition, init_adapter=init_adapter)
 
     print("\n" + "=" * 70)
     print(f"FULL W30 RUN {res['run_id']}  returncode {res['returncode']}")

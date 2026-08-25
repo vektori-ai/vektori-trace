@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import re
 import hashlib
 import json
 import os
@@ -95,6 +96,10 @@ DEFAULT_MODEL = "Qwen3-4B-ck35"
 # `A_warm` as decided 2026-08-25 (handoff §7 step 2): ck35, taken as a tiebreak
 # against ck70 after both measured equal on three selection tasks.
 POLICY_VERSION = "tau2-a_warm-ck35"
+
+# What may legitimately follow the rendered text in a reconstruction: chat
+# special tokens the server strips from `text` but keeps in `token_ids`.
+_ONLY_SPECIALS = re.compile(r"(<\|[^|>]+\|>|\s)+")
 
 # Label value marking an unsupervised position.
 IGNORE = -100
@@ -373,11 +378,32 @@ def _capture(prefix_id: str, sample_index: int, body: dict,
     # and the replay path cannot drift.
     token_bytes = token_bytes_from_ids(tokenizer, [int(x) for x in token_ids])
     action_bytes = b"".join(token_bytes)
-    if action_bytes.decode("utf-8", "replace") != text:
+
+    # The ids must reconstruct the text as a PREFIX, not exactly.
+    #
+    # vLLM returns the sampled ids including the stop token but renders `text`
+    # without it, so a healthy capture reconstructs to `text + "<|im_end|>"`.
+    # `token_bytes_from_ids` keeps special tokens deliberately -- dropping them
+    # once let a span carrying a template token decode to exactly the action
+    # bytes while still containing a token the model never sampled as content.
+    #
+    # Demanding equality here rejected the first sample of a perfectly good run
+    # (2026-08-25). What matters is that nothing *other than* trailing special
+    # tokens separates the two: a real id/text disagreement shows up inside the
+    # common prefix, which this still catches.
+    recon = action_bytes.decode("utf-8", "replace")
+    if not recon.startswith(text):
         raise CanaryError(
             f"{tag}: the returned token ids do not reconstruct the returned "
             f"text. One of them is wrong, and a capture that cannot be "
-            f"reproduced from its own ids is not scorable.")
+            f"reproduced from its own ids is not scorable.\n"
+            f"  text  {text[:80]!r}\n  recon {recon[:80]!r}")
+    trailer = recon[len(text):]
+    if trailer and not _ONLY_SPECIALS.fullmatch(trailer):
+        raise CanaryError(
+            f"{tag}: ids reconstruct {trailer!r} beyond the returned text, "
+            f"which is not a trailing special token. The capture carries "
+            f"content the server did not report.")
 
     return {
         "prefix_id": prefix_id,

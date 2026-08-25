@@ -88,6 +88,7 @@ def train(
     learning_rate: float,
     temperature: float,
     policy_file: str | None,
+    teacher_tokenizer: str,
 ) -> dict:
     import importlib.util
     import json
@@ -121,6 +122,7 @@ def train(
         "--temperature", str(temperature),
         "--n-updates", str(n_updates),
         "--n-per-update", str(n_per_update),
+        "--teacher-tokenizer", teacher_tokenizer,
     ]
     if policy_file:
         argv += ["--policy-file", policy_file]
@@ -136,15 +138,55 @@ def train(
     assert spec.loader is not None
     spec.loader.exec_module(mod)
 
+    # The critical wiring. fsync reaches only the container's local disk; a
+    # Modal Volume publishes nothing to shared storage until commit(). A
+    # container killed by OOM, timeout, `app stop` or an infrastructure fault
+    # never runs a `finally`, so without per-write commits every paid score and
+    # -- worse -- the trained adapter would be lost with the container.
+    mod.set_commit_fn(vol.commit)
+
+    rc = 1
     try:
         rc = mod.main()
+    except BaseException:
+        # Publish before re-raising: a partial run's markers are what a resume
+        # reads, and its captures and scores were already billed.
+        try:
+            vol.commit()
+        except Exception:
+            pass
+        raise
     finally:
-        # Commit whatever landed, including a partial run: the durable markers
-        # are what a resume reads, and losing them means re-buying every score.
-        vol.commit()
+        try:
+            vol.commit()
+        except Exception:
+            pass
+
+    # Last line of defence: prove the adapter that this run exists to produce
+    # is actually on the volume and reloadable, rather than trusting that a
+    # commit somewhere upstream worked.
+    saved = []
+    if os.path.isdir(out):
+        for d in sorted(os.listdir(out)):
+            cp = os.path.join(out, d, "checkpoint")
+            if os.path.isdir(cp):
+                ok = all(os.path.isfile(os.path.join(cp, f))
+                         for f in ("adapter_config.json", "state.json"))
+                w = any(os.path.isfile(os.path.join(cp, f)) for f in
+                        ("adapter_model.safetensors", "adapter_model.bin"))
+                saved.append({"update": d, "complete": bool(ok and w),
+                              "path": os.path.join(RUNS_IN_VOLUME, run_id, d,
+                                                   "checkpoint")})
+    if rc == 0 and not saved:
+        raise SystemExit(
+            f"the run reported success but no checkpoint is on the volume "
+            f"under {out}. Refusing to report a trained adapter that does not "
+            "exist."
+        )
 
     result = {"returncode": rc, "run_id": run_id,
-              "out_dir": f"{RUNS_IN_VOLUME}/{run_id}"}
+              "out_dir": f"{RUNS_IN_VOLUME}/{run_id}",
+              "checkpoints": saved}
     for fn in ("manifest.json", "schedule.json"):
         p = os.path.join(out, fn)
         if os.path.exists(p):
@@ -169,6 +211,7 @@ def main(
     learning_rate: float = 1e-5,
     temperature: float = 1.0,
     policy_file: str = "",
+    teacher_tokenizer: str = "deepseek-ai/DeepSeek-V4-Flash-0731",
 ):
     import json
     import time
@@ -192,13 +235,26 @@ def main(
     print(f"  endpoint {api_base}")
     print(f"  output   {RUNS_IN_VOLUME}/{rid}")
 
+    if not policy_file:
+        raise SystemExit(
+            "--policy-file is required on Modal: the container cannot see the "
+            "box's simulation files, so the policy cannot be recovered there. "
+            "Stage it on the volume and pass its remote path, e.g. "
+            "/adapters/tau2/reopd/retail_policy.txt. Render parity verifies it."
+        )
+
     result = train.remote(api_base, model, rid, canary, n_updates,
                           n_per_update, learning_rate, temperature,
-                          policy_file or None)
+                          policy_file, teacher_tokenizer)
     print(json.dumps({k: v for k, v in result.items()
                       if k != "stages"}, indent=2))
     for s in result.get("stages", []):
         print(f"  u{s.get('update')} {s.get('stage'):8s} "
               f"{s.get('seconds')}s {s.get('loss', '')}")
+    print("\ncheckpoints on the volume:")
+    for c in result.get("checkpoints", []):
+        print(f"  {'OK ' if c['complete'] else 'INCOMPLETE'} {c['path']}")
+    if not result.get("checkpoints"):
+        print("  NONE -- no adapter was persisted")
     if result["returncode"] != 0:
         raise SystemExit("ReOPD failed; inspect the persisted run artifacts")

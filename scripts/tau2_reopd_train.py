@@ -115,6 +115,31 @@ def gpu_snapshot() -> dict[str, Any]:
     return out
 
 
+#: Called after every durable write. On Modal, fsync only reaches the
+#: container's local disk -- a Volume publishes nothing to shared storage until
+#: `vol.commit()`. A container killed by OOM, timeout, `app stop` or an
+#: infrastructure fault never runs a `finally`, so an uncommitted score is a
+#: score that was paid for and lost.
+_COMMIT: Any = None
+
+
+def set_commit_fn(fn: Any) -> None:
+    """Install the volume-commit callback (Modal), or leave it None locally."""
+    global _COMMIT
+    _COMMIT = fn
+
+
+def commit(why: str = "") -> None:
+    """Publish everything written so far. Never fatal: a failed commit must not
+    destroy the run that is still producing paid artifacts."""
+    if _COMMIT is None:
+        return
+    try:
+        _COMMIT()
+    except Exception as e:
+        log(f"  WARNING volume commit failed ({why}): {e}")
+
+
 def telemetry(run_dir: str | Path, row: dict[str, Any]) -> None:
     """One durable line per timed event, fsync'd as it happens.
 
@@ -172,6 +197,35 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
     return {"served_model": model, "max_model_len": int(ctx), "models": served}
 
 
+def assert_serving_policy_matches(
+    api_base: str, model: str, expect_adapter_hash: str | None, idx: int,
+) -> None:
+    """Refuse to sample update `idx` from a stale adapter.
+
+    ReOPD is on-policy in the action: `log pi_old` in the importance ratio must
+    come from the *current* policy. If the endpoint still serves CK35 while the
+    trainer has moved on, every ratio compares two different distributions --
+    finite loss, plausible metrics, wrong gradient, and no log would show it.
+
+    Update 0 is exempt: CK35 *is* the current policy there, which is why the
+    one-update canary is valid against a static endpoint.
+    """
+    from vektori_trace.tau2.reopd_sample import ReOPDSampleError
+
+    if idx == 0 or not expect_adapter_hash:
+        return
+    raise ReOPDSampleError(
+        f"update {idx} would sample from an endpoint still serving the update-"
+        f"{idx - 1} policy is unverified. vLLM cannot hot-swap a LoRA adapter "
+        "in place, so the serving side must be refreshed and re-verified "
+        "between updates. Implement --refresh-cmd, or run the arm one update "
+        "at a time, reloading the endpoint from each checkpoint.\n"
+        "This is a correctness stop, not a convenience one: sampling update "
+        f"{idx} from CK35 makes log pi_old the wrong distribution for every "
+        "action in the batch."
+    )
+
+
 # ---------------------------------------------------------------------------
 # one update
 # ---------------------------------------------------------------------------
@@ -200,6 +254,10 @@ def run_update(
 
     u = run.update(idx)
     u.validate()
+    # Before anything is sampled or paid for.
+    assert_serving_policy_matches(
+        args.api_base, args.model,
+        getattr(args, "served_adapter_hash", None), idx)
     batch_ids = batch_for(schedule, idx)
     prefixes = [prefixes_by_id[pid] for pid in batch_ids]
 
@@ -217,6 +275,9 @@ def run_update(
 
         def _landed(c: dict) -> None:
             append_jsonl(u.actions_path, c)
+            # Behaviour logprobs cannot be recreated after sampling, so each
+            # capture is published the moment it lands.
+            commit("capture")
             n_done[0] += 1
             telemetry(args.run_dir_resolved, {
                 "event": "sample", "update": idx, "key": c["key"],
@@ -245,6 +306,7 @@ def run_update(
             "n_action_tokens": sum(len(c["action_token_ids"]) for c in captures),
         })
         u.mark("SAMPLED", {"n_actions": len(captures), "seconds": sample_s})
+        commit("sampled marker")
         log(f"  sampling took {sample_s}s")
     captures = _read(u.actions_path)
     log(f"  sampled {len(captures)} actions")
@@ -266,6 +328,8 @@ def run_update(
         }
 
         def _persist(sc) -> None:
+            # Every one of these was billed. Committing per score is the
+            # difference between a crash costing seconds and costing the batch.
             append_jsonl(u.scores_path, {
                 "key": sc.key,
                 "teacher_token_bytes_b64": [
@@ -274,6 +338,7 @@ def run_update(
                 "n_prefix_tokens": sc.n_prefix_tokens,
                 "n_trailing_dropped": sc.n_trailing_dropped,
             })
+            commit("score")
 
         t_score = time.time()
         scored, ledger = score_replay_batch(
@@ -293,6 +358,7 @@ def run_update(
         })
         u.mark("SCORED", {"n_scores": len(scored), "seconds": score_s,
                           "teacher_input_tokens": tin})
+        commit("scored marker")
         log(f"  scored {len(scored)} in {score_s}s; {tin:,} teacher input "
             f"tokens (<= ${tin * 0.22 / 1e6:.4f})")
     else:
@@ -338,8 +404,13 @@ def run_update(
     state = trainer.checkpoint(
         u.checkpoint_path, update_index=idx, policy_version=policy_version,
     )
+    # The adapter is the run's entire output. Commit it before anything else
+    # can fail, and again after the marker, so a container killed between the
+    # two still leaves reloadable weights on the volume.
+    commit("checkpoint")
     u.mark("TRAINED", {"loss": report.get("loss"), "seconds": train_s,
                        "adapter_hash": state.get("adapter_hash")})
+    commit("trained marker")
     log(f"  trained in {train_s}s; loss={report.get('loss')} "
         f"adapter={state.get('adapter_hash')} "
         f"peak={gpu.get('torch_peak_gib')}GiB "
@@ -371,7 +442,12 @@ def main() -> int:
     ap.add_argument("--model", default="ck35")
     ap.add_argument("--teacher-model",
                     default="accounts/fireworks/models/deepseek-v4-flash-0731")
-    ap.add_argument("--teacher-tokenizer", default="deepseek-ai/DeepSeek-V3")
+    # Must match the served teacher. A different DeepSeek tokenizer produces
+    # different token boundaries for the same bytes, so every logprob would be
+    # indexed against a span the teacher never scored -- finite, plausible, and
+    # wrong. This is the pin OPD-MULTITURN-PLAN records and run_replay_opd uses.
+    ap.add_argument("--teacher-tokenizer",
+                    default="deepseek-ai/DeepSeek-V4-Flash-0731")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--max-task-share", type=float, default=0.5)
@@ -504,6 +580,13 @@ def main() -> int:
                  if start > 0 else None)
 
     by_id = {p.prefix_id: p for p in prefixes}
+    if schedule["n_updates"] > 1:
+        # The serving side is CK35 and stays CK35: nothing here reloads vLLM.
+        # Rather than silently produce 31 off-policy updates, stop now.
+        log("NOTE a multi-update run needs the endpoint refreshed from each "
+            "checkpoint between updates; that is not implemented.")
+        setattr(a, "served_adapter_hash", "ck35")
+
     for idx in range(start, schedule["n_updates"]):
         log(f"update {idx}/{schedule['n_updates'] - 1}")
         run_update(idx, by_id, schedule, run, a,

@@ -153,3 +153,58 @@ def test_resuming_under_a_changed_recipe_is_refused(tmp_path):
     rs.freeze_manifest({"max_action_tokens": 2048, "n_per_update": 16})
     with pytest.raises(ReOPDStateError, match="two recipes"):
         rs.freeze_manifest({"max_action_tokens": 512, "n_per_update": 16})
+
+
+# --- the adapter must never be stranded ----------------------------------
+
+
+def test_commit_fires_on_every_paid_write(tmp_path):
+    """On Modal, fsync reaches only the container. Nothing is durable until
+    commit(), and a killed container never runs a finally."""
+    calls = []
+    driver.set_commit_fn(lambda: calls.append(1))
+    try:
+        driver.commit("capture")
+        driver.commit("score")
+        driver.commit("checkpoint")
+        assert len(calls) == 3
+    finally:
+        driver.set_commit_fn(None)
+
+
+def test_a_failing_commit_does_not_kill_the_run(tmp_path):
+    """A commit failure must not destroy a run still producing paid artifacts."""
+    def boom():
+        raise RuntimeError("volume unavailable")
+
+    driver.set_commit_fn(boom)
+    try:
+        driver.commit("score")          # must not raise
+    finally:
+        driver.set_commit_fn(None)
+
+
+def test_commit_is_a_noop_without_a_callback():
+    driver.set_commit_fn(None)
+    driver.commit("anything")
+
+
+def test_teacher_tokenizer_matches_the_served_teacher():
+    """A different DeepSeek tokenizer indexes logprobs against spans the
+    teacher never scored: finite, plausible, and wrong.
+
+    The served model is deepseek-v4-flash-0731, so the tokenizer must be
+    DeepSeek-V4-Flash-0731 -- the pin OPD-MULTITURN-PLAN records.
+    """
+    src = (REPO / "scripts" / "tau2_reopd_train.py").read_text()
+    assert 'default="deepseek-ai/DeepSeek-V4-Flash-0731"' in src
+    assert "DeepSeek-V3" not in src
+
+
+def test_stale_serving_policy_is_refused_after_update_0():
+    """Update 0 is exempt -- CK35 is the current policy there. Update 1 is not."""
+    from vektori_trace.tau2.reopd_sample import ReOPDSampleError
+
+    driver.assert_serving_policy_matches("http://x", "ck35", "ck35", 0)   # ok
+    with pytest.raises(ReOPDSampleError, match="log pi_old"):
+        driver.assert_serving_policy_matches("http://x", "ck35", "ck35", 1)

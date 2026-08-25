@@ -341,6 +341,36 @@ def test_a_capture_records_byte_exact_identity():
         b"he", b"llo"]
 
 
+def test_a_trailing_eos_token_is_accepted():
+    """The real shape of a healthy vLLM capture.
+
+    vLLM returns the sampled ids INCLUDING the stop token but renders `text`
+    without it, so a good capture reconstructs to `text + "<|im_end|>"`.
+    Demanding exact equality rejected the first sample of a perfectly good run
+    (2026-08-25); `token_bytes_from_ids` keeps special tokens on purpose.
+    """
+    tok = _FakeTok({1: "he", 2: "llo", 3: "<|im_end|>", 9: "P"})
+    body = {"choices": [{"text": "hello", "token_ids": [1, 2, 3],
+                         "prompt_token_ids": [9], "finish_reason": "stop",
+                         "logprobs": {"token_logprobs": [-0.1, -0.2, -0.3]}}]}
+    cap = _mod._capture("31#0", 0, body, [9], "fp", tok)
+    # The EOS byte stays in the capture: a scorer needs the tokens the model
+    # actually emitted, not a cleaned-up rendering.
+    assert cap["n_action_bytes"] == len(b"hello<|im_end|>")
+
+
+def test_trailing_content_that_is_not_special_is_refused():
+    """A trailer that is real content means the capture carries what the server
+    never reported, which is a genuine disagreement rather than an EOS."""
+    tok = _FakeTok({1: "he", 2: "llo", 3: " and more", 9: "P"})
+    body = {"choices": [{"text": "hello", "token_ids": [1, 2, 3],
+                         "prompt_token_ids": [9], "finish_reason": "stop",
+                         "logprobs": {"token_logprobs": [-0.1, -0.2, -0.3]}}]}
+    with pytest.raises(_mod.CanaryError) as e:
+        _mod._capture("31#0", 0, body, [9], "fp", tok)
+    assert "beyond the returned text" in str(e.value)
+
+
 def test_ids_that_do_not_reconstruct_the_text_are_refused():
     """The check `text.encode()` could never make.
 
