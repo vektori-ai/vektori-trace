@@ -26,6 +26,7 @@ will.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -239,7 +240,18 @@ def main() -> int:
                          "no gap it was never needed.")
     args = ap.parse_args()
 
-    manifest = json.loads(args.manifest.read_text())
+    # Hash the exact bytes this run reads, not a sibling sidecar.
+    #
+    # This used to read `<manifest dir>/manifest_sha256.txt` "if it exists",
+    # which is wrong in both directions: a derived subset written beside its
+    # parent (scripts/opd_canary_manifest.py does exactly that) silently
+    # inherits the PARENT's digest, and a manifest with no sidecar is recorded
+    # as null. Either way the report names a digest that is not the manifest it
+    # graded. One generic filename cannot represent several manifests in one
+    # directory, so the sidecar is not consulted at all.
+    manifest_bytes = args.manifest.read_bytes()
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest = json.loads(manifest_bytes)
     prefixes = manifest["prefixes"]
     if args.suites:
         prefixes = [p for p in prefixes if p["suite"] in set(args.suites)]
@@ -589,9 +601,7 @@ def main() -> int:
         )
     report = {
         "manifest": str(args.manifest),
-        "manifest_sha256": (args.manifest.parent / "manifest_sha256.txt").read_text().strip()
-        if (args.manifest.parent / "manifest_sha256.txt").exists()
-        else None,
+        "manifest_sha256": manifest_sha256,
         "api_base": args.api_base,
         "checkpoint_order": order,
         "strategy": args.strategy,
