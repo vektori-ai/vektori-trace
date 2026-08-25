@@ -81,6 +81,51 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def gpu_snapshot() -> dict[str, Any]:
+    """Training-GPU telemetry, best effort.
+
+    Never raises: a missing nvidia-smi or a CPU-only box must not stop a run,
+    and an absent metric is more honest than a fabricated zero.
+    """
+    out: dict[str, Any] = {}
+    try:
+        import subprocess
+        raw = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        for i, line in enumerate(raw.splitlines()):
+            util, used, total, temp = [x.strip() for x in line.split(",")]
+            out[f"gpu{i}"] = {"util_pct": int(float(util)),
+                              "mem_used_mib": int(float(used)),
+                              "mem_total_mib": int(float(total)),
+                              "temp_c": int(float(temp))}
+    except Exception as e:
+        out["nvidia_smi_error"] = str(e)[:120]
+    try:
+        import torch
+        if torch.cuda.is_available():
+            out["torch_peak_gib"] = round(
+                torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+            out["torch_reserved_gib"] = round(
+                torch.cuda.max_memory_reserved() / 1024 ** 3, 2)
+    except Exception:
+        pass
+    return out
+
+
+def telemetry(run_dir: str | Path, row: dict[str, Any]) -> None:
+    """One durable line per timed event, fsync'd as it happens.
+
+    Separate from train_progress.jsonl, which replay_train owns and which only
+    covers the optimizer step. This covers sampling and scoring too -- the two
+    stages that dominate wall clock and therefore dominate GPU cost.
+    """
+    row = {"t": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), **row}
+    append_jsonl(Path(run_dir) / "telemetry.jsonl", row)
+
+
 # ---------------------------------------------------------------------------
 # endpoint
 # ---------------------------------------------------------------------------
@@ -167,15 +212,40 @@ def run_update(
         prior = {r["key"]: r for r in _read(u.actions_path)}
         if prior:
             log(f"  reusing {len(prior)} captures already on disk")
+        t_sample = time.time()
+        n_done = [0]
+
+        def _landed(c: dict) -> None:
+            append_jsonl(u.actions_path, c)
+            n_done[0] += 1
+            telemetry(args.run_dir_resolved, {
+                "event": "sample", "update": idx, "key": c["key"],
+                "n_prompt_tokens": len(c["prompt_token_ids"]),
+                "n_action_tokens": len(c["action_token_ids"]),
+                "finish_reason": c.get("finish_reason"),
+                "elapsed_s": round(time.time() - t_sample, 2),
+                "i": n_done[0], "of": len(prefixes),
+            })
+            log(f"    sample {n_done[0]}/{len(prefixes)} {c['key']} "
+                f"prompt={len(c['prompt_token_ids'])} "
+                f"action={len(c['action_token_ids'])} tok")
+
         captures = sample_batch(
             prefixes,
             api_base=args.api_base, model=args.model,
             tokenizer=student_tok, policy_version=policy_version,
             max_tokens=MAX_ACTION_TOKENS, temperature=args.temperature,
             n_samples=1, already=prior,
-            on_capture=lambda c: append_jsonl(u.actions_path, c),
+            on_capture=_landed,
         )
-        u.mark("SAMPLED", {"n_actions": len(captures)})
+        sample_s = round(time.time() - t_sample, 1)
+        telemetry(args.run_dir_resolved, {
+            "event": "stage", "stage": "SAMPLED", "update": idx,
+            "seconds": sample_s, "n_actions": len(captures),
+            "n_action_tokens": sum(len(c["action_token_ids"]) for c in captures),
+        })
+        u.mark("SAMPLED", {"n_actions": len(captures), "seconds": sample_s})
+        log(f"  sampling took {sample_s}s")
     captures = _read(u.actions_path)
     log(f"  sampled {len(captures)} actions")
 
@@ -205,14 +275,26 @@ def run_update(
                 "n_trailing_dropped": sc.n_trailing_dropped,
             })
 
+        t_score = time.time()
         scored, ledger = score_replay_batch(
             actions, rendered, teacher_tok, pool,
             on_scored=_persist, already_scored=already,
         )
-        u.mark("SCORED", {"n_scores": len(scored),
-                          "teacher_input_tokens": ledger.get("teacher_input_tokens")})
-        log(f"  scored {len(scored)}; "
-            f"{ledger.get('teacher_input_tokens', 0):,} teacher input tokens")
+        score_s = round(time.time() - t_score, 1)
+        tin = ledger.get("teacher_input_tokens", 0)
+        telemetry(args.run_dir_resolved, {
+            "event": "stage", "stage": "SCORED", "update": idx,
+            "seconds": score_s, "n_scores": len(scored),
+            "teacher_input_tokens": tin,
+            "repeated_prefix_tokens": ledger.get("repeated_prefix_tokens"),
+            # $0.22/M uncached, $0.007/M cached (Fireworks deepseek-v4-flash).
+            # Upper bound: assumes nothing cached.
+            "est_cost_usd_uncached": round(tin * 0.22 / 1e6, 4),
+        })
+        u.mark("SCORED", {"n_scores": len(scored), "seconds": score_s,
+                          "teacher_input_tokens": tin})
+        log(f"  scored {len(scored)} in {score_s}s; {tin:,} teacher input "
+            f"tokens (<= ${tin * 0.22 / 1e6:.4f})")
     else:
         import base64
         scored = {
@@ -226,6 +308,10 @@ def run_update(
         log("  already trained; skipping")
         return json.loads((u.checkpoint_path / "state.json").read_text())
 
+    t_train = time.time()
+    telemetry(args.run_dir_resolved,
+              {"event": "gpu", "when": "pre_train", "update": idx,
+               **gpu_snapshot()})
     report = run_replay_chunk_opd(
         prefixes, actions, scored, trainer.step,
         max_new_tokens=MAX_ACTION_TOKENS,
@@ -237,12 +323,27 @@ def run_update(
     )
     atomic_write_json(u.report_path, report)
 
+    train_s = round(time.time() - t_train, 1)
+    gpu = gpu_snapshot()
+    telemetry(args.run_dir_resolved, {
+        "event": "stage", "stage": "TRAINED", "update": idx,
+        "seconds": train_s,
+        "loss": report.get("loss"),
+        "supervised_tokens": report.get("global_supervised_tokens"),
+        "advantages": report.get("advantage_summary"),
+        "clip_fraction": report.get("clip_fraction"),
+        **gpu,
+    })
+
     state = trainer.checkpoint(
         u.checkpoint_path, update_index=idx, policy_version=policy_version,
     )
-    u.mark("TRAINED", {"loss": report.get("loss"),
+    u.mark("TRAINED", {"loss": report.get("loss"), "seconds": train_s,
                        "adapter_hash": state.get("adapter_hash")})
-    log(f"  trained; adapter {state.get('adapter_hash')}")
+    log(f"  trained in {train_s}s; loss={report.get('loss')} "
+        f"adapter={state.get('adapter_hash')} "
+        f"peak={gpu.get('torch_peak_gib')}GiB "
+        f"util={gpu.get('gpu0', {}).get('util_pct')}%")
     return state
 
 
@@ -287,6 +388,7 @@ def main() -> int:
     a = ap.parse_args()
 
     run_dir = a.run_dir or f"runs/reopd-{time.strftime('%Y%m%d-%H%M%S')}"
+    a.run_dir_resolved = run_dir
 
     # --- load and prove the context --------------------------------------
     policy, prep = recover_system_policy(a.artifacts,
