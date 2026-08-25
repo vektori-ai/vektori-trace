@@ -20,14 +20,14 @@ handing it Qwen ids would be meaningless.
 sampling-only canary. Scoring needs the semantic side too, and that join is
 what this module adds.
 
-Why not `ReplayPrefix`
-----------------------
-`replay_select.ReplayPrefix` computes its identity as `f"{trace_id}@{step_index}"`
-from a Harbor trace id. C30's frozen identity is `task_id#position`. Faking a
-`trace_id` to reproduce that string would put a fabricated value into the
-manifest checks that exist to catch exactly this kind of substitution. So this
-is a separate type that carries `prefix_id` explicitly and satisfies the same
-structural contract the downstream reads (`prefix_id`, `step_index`).
+Why C30Prefix is its own type
+-----------------------------
+C30's frozen identity is `task_id#position`, assigned by the manifest and
+hashed into it. The shared replay dataclass derives its identity from other
+fields instead, so adopting it would mean synthesising values to reproduce the
+frozen string -- feeding invented data to the very checks that exist to catch
+substitution. This type carries `prefix_id` explicitly and satisfies the
+structural contract the loss path reads (`prefix_id`, `step_index`, `task`).
 
 What it refuses
 ---------------
@@ -68,15 +68,15 @@ class C30Prefix:
     """One frozen replay state, with both renderings joined.
 
     `step_index` mirrors `position` so this satisfies the structural contract
-    `replay_opd` reads without inheriting Harbor's trace-derived identity.
+    `replay_opd` reads while keeping C30's own frozen identity.
     """
 
     prefix_id: str                       # "42#5" -- frozen, not derived
     task_id: str
-    #: The selected trace's hash from the frozen eligibility record. Real
-    #: provenance, never a fabricated Harbor-style id: `replay_archive` records
-    #: it as the reproducibility key, and a synthetic value there would make the
-    #: archive claim a lineage that does not exist.
+    #: The selected trace's hash from `eligibility_report.json`. Real
+    #: provenance, never synthesised: the archive records it as the
+    #: reproducibility key, and an invented value would make it claim a lineage
+    #: that cannot be reproduced.
     trace_id: str
     position: int
     action_type: str
