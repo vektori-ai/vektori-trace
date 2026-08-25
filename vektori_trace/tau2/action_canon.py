@@ -49,6 +49,9 @@ _CALL_ID = re.compile(r"^(chatcmpl-tool-|call_|toolu_)[A-Za-z0-9_-]+$")
 _TOOL_CALL_BLOCK = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
+# An opening marker on its own: the call was cut off or never closed.
+_TOOL_CALL_OPEN = re.compile(r"<tool_call>")
+
 PARSE_FAILURE = "<<unparseable>>"
 
 
@@ -107,7 +110,14 @@ def canonical_action(text: str) -> tuple[str, bool]:
 
     blocks = _TOOL_CALL_BLOCK.findall(text)
     if not blocks:
-        # No tool-call markup: an ordinary assistant message.
+        # An OPENING marker with no complete block is a truncated or malformed
+        # tool call, not prose. Falling through to the message branch here would
+        # classify broken output as a valid ordinary message -- and since each
+        # truncation differs, a sampler emitting nothing but broken calls would
+        # score as maximally diverse.
+        if _TOOL_CALL_OPEN.search(text):
+            return PARSE_FAILURE, False
+        # No tool-call markup at all: an ordinary assistant message.
         return json.dumps(
             {"kind": "message", "text": _normalize_text(text)},
             sort_keys=True, ensure_ascii=False), True

@@ -175,6 +175,11 @@ def frozen(tmp_path):
                 "prefixes": prefixes, "sampling_order": order,
                 "prefix_manifest_hash": "deadbeefdeadbeef"}
     (tmp_path / "c30_prefix_manifest.json").write_text(json.dumps(manifest))
+    # The corpus byte hashes the loader verifies: semantic hashes do not cover
+    # tokenization, so a retokenized corpus would otherwise pass unnoticed.
+    (tmp_path / "artifact_hashes.json").write_text(json.dumps({
+        "rows.tokenized.jsonl": hashlib.sha256(
+            (tmp_path / "rows.tokenized.jsonl").read_bytes()).hexdigest()}))
     return tmp_path
 
 
@@ -192,14 +197,39 @@ def test_the_frozen_hash_is_the_real_one():
     assert _mod.FROZEN_PREFIX_MANIFEST_HASH == "8e78c7b96161d024"
 
 
-def test_a_corpus_row_that_moved_is_refused(frozen):
-    """A position id can be reused; the semantic hash is what pins identity."""
+def test_a_retokenized_corpus_is_refused(frozen):
+    """Byte hashes catch what semantic hashes cannot.
+
+    `semantic_hash` covers messages and target, not tokenization, so a corpus
+    retokenized under a different tokenizer or template keeps every semantic
+    hash while every `input_ids` changes -- and the prompts would silently stop
+    matching the ones the manifest was frozen against.
+    """
+    p = frozen / "rows.tokenized.jsonl"
+    lines = p.read_text().splitlines()
+    row = json.loads(lines[0])
+    row["input_ids"] = [999, 998, 997, 996, 995]   # same semantics, new tokens
+    lines[0] = json.dumps(row)
+    p.write_text("\n".join(lines) + "\n")
+    with pytest.raises(_mod.CanaryError) as e:
+        _mod.load_frozen_prefixes(frozen, frozen / "c30_prefix_manifest.json",
+                                  "deadbeefdeadbeef")
+    assert "moved under the prefix manifest" in str(e.value)
+
+
+def test_a_corpus_row_whose_identity_moved_is_refused(frozen):
+    """A position id can be reused; the semantic hash is what pins identity.
+
+    Byte hashes are refreshed here so the *semantic* check is what fires.
+    """
     p = frozen / "rows.tokenized.jsonl"
     lines = p.read_text().splitlines()
     row = json.loads(lines[0])
     row["semantic_hash"] = "0" * 64
     lines[0] = json.dumps(row)
     p.write_text("\n".join(lines) + "\n")
+    (frozen / "artifact_hashes.json").write_text(json.dumps({
+        "rows.tokenized.jsonl": hashlib.sha256(p.read_bytes()).hexdigest()}))
     with pytest.raises(_mod.CanaryError) as e:
         _mod.load_frozen_prefixes(frozen, frozen / "c30_prefix_manifest.json",
                                   "deadbeefdeadbeef")
@@ -222,16 +252,16 @@ def test_asking_for_more_prefixes_than_exist_is_refused(frozen):
 
 def test_fingerprint_binds_model_temperature_and_prompt():
     """A stale capture from another configuration must not be resumed into."""
-    base = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2, 3])
-    assert base != _mod.capture_fingerprint("31#0", 0, "ck70", 1.0, [1, 2, 3])
-    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 0.7, [1, 2, 3])
-    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2, 4])
-    assert base != _mod.capture_fingerprint("31#1", 0, "ck35", 1.0, [1, 2, 3])
-    assert base == _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2, 3])
+    base = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2, 3])
+    assert base != _mod.capture_fingerprint("31#0", 0, "ck70", 1.0, 2048, [1, 2, 3])
+    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 0.7, 2048, [1, 2, 3])
+    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2, 4])
+    assert base != _mod.capture_fingerprint("31#1", 0, "ck35", 1.0, 2048, [1, 2, 3])
+    assert base == _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2, 3])
 
 
 def test_resume_keeps_matching_captures(tmp_path):
-    fp = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2])
+    fp = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2])
     p = tmp_path / "captures.jsonl"
     p.write_text(json.dumps(
         {"prefix_id": "31#0", "sample_index": 0, "fingerprint": fp}) + "\n")
@@ -240,8 +270,8 @@ def test_resume_keeps_matching_captures(tmp_path):
 
 def test_resume_drops_captures_from_another_run(tmp_path):
     """A transient failure must not let a ck70 capture into a ck35 run."""
-    stale = _mod.capture_fingerprint("31#0", 0, "ck70", 1.0, [1, 2])
-    want = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2])
+    stale = _mod.capture_fingerprint("31#0", 0, "ck70", 1.0, 2048, [1, 2])
+    want = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2])
     p = tmp_path / "captures.jsonl"
     p.write_text(json.dumps(
         {"prefix_id": "31#0", "sample_index": 0, "fingerprint": stale}) + "\n")
@@ -250,12 +280,26 @@ def test_resume_drops_captures_from_another_run(tmp_path):
 
 def test_resume_tolerates_a_truncated_final_line(tmp_path):
     """A crash mid-write must not discard the samples already paid for."""
-    fp = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, [1, 2])
+    fp = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2])
     p = tmp_path / "captures.jsonl"
     p.write_text(json.dumps(
         {"prefix_id": "31#0", "sample_index": 0, "fingerprint": fp})
         + "\n{\"prefix_id\": \"31#0\", \"sample_ind")
     assert list(_mod.load_captures(p, {"31#0#0": fp})) == ["31#0#0"]
+
+
+class _FakeTok:
+    """Decodes one id at a time, matching `token_bytes_from_ids`'s contract."""
+
+    def __init__(self, table):
+        self._t = table
+
+    def decode(self, ids, **_kw):
+        return "".join(self._t[int(i)] for i in ids)
+
+
+def _tok(table=None):
+    return _FakeTok(table or {1: "he", 2: "llo", 9: "P"})
 
 
 def test_a_truncated_action_is_refused():
@@ -264,7 +308,7 @@ def test_a_truncated_action_is_refused():
                          "prompt_token_ids": [9], "finish_reason": "length",
                          "logprobs": {"token_logprobs": [-0.1]}}]}
     with pytest.raises(_mod.CanaryError) as e:
-        _mod._capture("31#0", 0, body, [9], "fp")
+        _mod._capture("31#0", 0, body, [9], "fp", _tok())
     assert "max_tokens" in str(e.value)
 
 
@@ -273,18 +317,43 @@ def test_a_different_prompt_than_the_manifest_is_refused():
                          "prompt_token_ids": [7], "finish_reason": "stop",
                          "logprobs": {"token_logprobs": [-0.1]}}]}
     with pytest.raises(_mod.CanaryError) as e:
-        _mod._capture("31#0", 0, body, [9], "fp")
+        _mod._capture("31#0", 0, body, [9], "fp", _tok())
     assert "different prompt ids" in str(e.value)
 
 
 def test_a_capture_records_byte_exact_identity():
+    """Bytes come from the TOKENS, and the per-token split is persisted.
+
+    `text.encode()` would assert nothing: it produces bytes for whatever string
+    the server rendered, which does not prove the returned ids reconstruct them.
+    A cross-tokenizer scorer needs the per-token bytes anyway.
+    """
+    import base64
     body = {"choices": [{"text": "hello", "token_ids": [1, 2],
                          "prompt_token_ids": [9], "finish_reason": "stop",
                          "logprobs": {"token_logprobs": [-0.1, -0.2]}}]}
-    cap = _mod._capture("31#0", 0, body, [9], "fp")
+    cap = _mod._capture("31#0", 0, body, [9], "fp", _tok())
     assert cap["action_sha256"] == hashlib.sha256(b"hello").hexdigest()
     assert cap["n_action_bytes"] == 5
     assert cap["behavior_logprobs"] == [-0.1, -0.2]
+    assert base64.b64decode(cap["action_bytes_b64"]) == b"hello"
+    assert [base64.b64decode(b) for b in cap["action_token_bytes_b64"]] == [
+        b"he", b"llo"]
+
+
+def test_ids_that_do_not_reconstruct_the_text_are_refused():
+    """The check `text.encode()` could never make.
+
+    If the server's ids and its rendered text disagree, one of them is wrong and
+    the capture cannot be reproduced from its own ids -- so it is not scorable,
+    however plausible it looks.
+    """
+    body = {"choices": [{"text": "goodbye", "token_ids": [1, 2],
+                         "prompt_token_ids": [9], "finish_reason": "stop",
+                         "logprobs": {"token_logprobs": [-0.1, -0.2]}}]}
+    with pytest.raises(_mod.CanaryError) as e:
+        _mod._capture("31#0", 0, body, [9], "fp", _tok())
+    assert "do not reconstruct" in str(e.value)
 
 
 def test_missing_behavior_logprobs_are_refused():
@@ -292,7 +361,7 @@ def test_missing_behavior_logprobs_are_refused():
                          "prompt_token_ids": [9], "finish_reason": "stop",
                          "logprobs": {"token_logprobs": [-0.1]}}]}
     with pytest.raises(_mod.CanaryError):
-        _mod._capture("31#0", 0, body, [9], "fp")
+        _mod._capture("31#0", 0, body, [9], "fp", _tok())
 
 
 def test_report_fails_a_collapsed_policy():
@@ -329,3 +398,74 @@ def test_report_says_it_is_not_the_v2_gate():
             for i in range(4)]
     r = _mod.build_report(caps, ["31#0"], 4, 0.25, 0.75, 0.20)
     assert "7.1a" in r["note"]
+
+
+# --- the prefix/target boundary ------------------------------------------
+
+def test_prompt_excludes_the_supervised_target(frozen):
+    """The bug this test exists for.
+
+    A corpus row is prefix + DeepSeek's recorded action, with labels masked to
+    -100 everywhere but the action. Sending the whole row hands the student the
+    answer and asks it to continue AFTER it -- so the measured "diversity" is
+    diversity of continuation-after-the-target, a plausible number describing
+    the wrong quantity. On the real corpus a row is ~4,840 tokens of which the
+    last ~54 are supervised, so length alone never reveals it.
+    """
+    row = {"task_id": "31", "position": 0,
+           "input_ids": [10, 11, 12, 13, 14],
+           "labels": [-100, -100, -100, 13, 14]}
+    assert _mod.prompt_ids_for(row) == [10, 11, 12]
+
+
+def test_prompt_stops_at_the_first_supervised_token(frozen):
+    row = {"task_id": "31", "position": 0,
+           "input_ids": [1, 2, 3, 4],
+           "labels": [-100, 2, 3, 4]}
+    assert _mod.prompt_ids_for(row) == [1]
+
+
+def test_a_row_with_no_prefix_is_refused():
+    row = {"task_id": "31", "position": 0,
+           "input_ids": [1, 2], "labels": [1, 2]}
+    with pytest.raises(_mod.CanaryError) as e:
+        _mod.prompt_ids_for(row)
+    assert "no prefix" in str(e.value)
+
+
+def test_a_row_with_no_supervision_is_refused():
+    row = {"task_id": "31", "position": 0,
+           "input_ids": [1, 2], "labels": [-100, -100]}
+    with pytest.raises(_mod.CanaryError):
+        _mod.prompt_ids_for(row)
+
+
+def test_the_real_corpus_shape_would_have_leaked_the_answer(frozen):
+    """Guard the specific ratio: a tiny target inside a long row."""
+    row = {"task_id": "31", "position": 0,
+           "input_ids": list(range(4840)),
+           "labels": [-100] * 4786 + list(range(54))}
+    prompt = _mod.prompt_ids_for(row)
+    assert len(prompt) == 4786
+    assert len(prompt) < len(row["input_ids"])
+
+
+def test_fingerprint_binds_max_tokens_and_policy_hash():
+    base = _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2], "h1")
+    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 512, [1, 2], "h1")
+    assert base != _mod.capture_fingerprint("31#0", 0, "ck35", 1.0, 2048, [1, 2], "h2")
+
+
+def test_an_unclosed_tool_call_is_not_an_ordinary_message():
+    """Otherwise broken output reads as prose, and every truncation looks unique."""
+    canon, ok = canonical_action('<tool_call>{"name": "f", "argum')
+    assert canon == PARSE_FAILURE
+    assert ok is False
+
+
+def test_truncated_calls_do_not_inflate_diversity():
+    d = diversity(['<tool_call>{"name":"f","a',
+                   '<tool_call>{"name":"f","ab',
+                   '<tool_call>{"name":"f","abc'])
+    assert d["n_canonical_distinct"] == 1     # all one bucket
+    assert d["unparseable_rate"] == 1.0

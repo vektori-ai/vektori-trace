@@ -53,6 +53,16 @@ Resumable by design. Captures are appended one line at a time and fsync'd, so a
 transient failure keeps every sample already paid for; rerunning fills only the
 gaps.
 
+What it shares with the replay path, and what it does not
+---------------------------------------------------------
+Byte reconstruction is delegated to `replay_sample.token_bytes_from_ids`, so
+this path and the training path derive action bytes identically. The HTTP
+request, the resume bookkeeping and the fingerprint are written here rather than
+reused: `run_replay_opd` samples through Harbor's corpus objects, which is a
+different input shape from a frozen C30 row. Calling that "reusing the capture
+pipeline" would overstate it -- the byte-exactness is shared, the plumbing is
+not.
+
     python scripts/tau2_swr_canary.py --dry-run
     python scripts/tau2_swr_canary.py --api-base "$STUDENT_API_BASE"
 """
@@ -60,6 +70,7 @@ gaps.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -72,16 +83,21 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from vektori_trace.tau2.action_canon import diversity  # noqa: E402
+from vektori_trace.replay_sample import token_bytes_from_ids  # noqa: E402
 
 # The frozen C30 prefix manifest (scripts/tau2_freeze_c30_prefixes.py).
 # Pinned, not discovered: a canary run against a different prefix pool produces
 # numbers that cannot be compared with anything else.
 FROZEN_PREFIX_MANIFEST_HASH = "8e78c7b96161d024"
 
+BASE_MODEL = "Qwen/Qwen3-4B"
 DEFAULT_MODEL = "Qwen3-4B-ck35"
 # `A_warm` as decided 2026-08-25 (handoff §7 step 2): ck35, taken as a tiebreak
 # against ck70 after both measured equal on three selection tasks.
 POLICY_VERSION = "tau2-a_warm-ck35"
+
+# Label value marking an unsupervised position.
+IGNORE = -100
 
 
 class CanaryError(RuntimeError):
@@ -146,6 +162,28 @@ def load_frozen_prefixes(artifacts: Path, manifest_path: Path,
     if not rows_path.exists():
         raise CanaryError(f"missing {rows_path}")
 
+    # Verify the corpus bytes, not just per-row semantic hashes.
+    #
+    # `semantic_hash` covers the *semantic* row -- messages and target. It does
+    # not cover the tokenization, so a corpus retokenized under a different
+    # tokenizer or template keeps every semantic hash while every `input_ids`
+    # changes. Prompts would then differ from the ones the manifest was frozen
+    # against, silently.
+    hash_path = artifacts / "artifact_hashes.json"
+    if not hash_path.exists():
+        raise CanaryError(
+            f"missing {hash_path}; the corpus cannot be proven unchanged")
+    for fn, want in json.loads(hash_path.read_text()).items():
+        fp = artifacts / fn
+        if not fp.exists():
+            raise CanaryError(f"hash manifest names {fn}, which is missing")
+        got = hashlib.sha256(fp.read_bytes()).hexdigest()
+        if got != want:
+            raise CanaryError(
+                f"{fn} hash {got[:16]} != frozen {want[:16]}; the corpus moved "
+                f"under the prefix manifest, so the tokenized prompts may "
+                f"differ from the ones it was frozen against")
+
     wanted = {p["prefix_id"]: p for p in manifest["prefixes"]}
     rows: dict[str, dict] = {}
     for line in rows_path.open():
@@ -169,6 +207,35 @@ def load_frozen_prefixes(artifacts: Path, manifest_path: Path,
     return manifest, rows
 
 
+def prompt_ids_for(row: dict) -> list[int]:
+    """The prefix ONLY -- everything before the supervised action.
+
+    A corpus row's `input_ids` is the whole training sequence: prefix followed
+    by DeepSeek's recorded action, with `labels` masked to -100 everywhere
+    except that action. Sending the whole row would hand the student the answer
+    and ask it to continue *after* it, so the "diversity" measured would be
+    diversity of continuation-after-the-target -- a plausible number describing
+    the wrong quantity entirely.
+
+    Measured on the real corpus: a row is ~4,840 tokens of which the last ~54
+    are supervised, so the mistake is ~99% invisible by length alone.
+
+    The split point is the first non-masked label, which is exactly where the
+    replay branch will sample from.
+    """
+    labels = row["labels"]
+    target_start = next((i for i, l in enumerate(labels) if l != IGNORE), None)
+    if target_start is None:
+        raise CanaryError(
+            f"{row['task_id']}#{row['position']}: no supervised tokens, so "
+            f"there is no prefix/target boundary to sample at")
+    if target_start == 0:
+        raise CanaryError(
+            f"{row['task_id']}#{row['position']}: supervision starts at token "
+            f"0, leaving no prefix to condition on")
+    return [int(x) for x in row["input_ids"][:target_start]]
+
+
 def choose_prefixes(manifest: dict, n: int) -> list[str]:
     """Task-balanced prefixes, taken in the manifest's own frozen order.
 
@@ -190,20 +257,54 @@ def choose_prefixes(manifest: dict, n: int) -> list[str]:
 
 
 def capture_fingerprint(prefix_id: str, sample_index: int, model: str,
-                        temperature: float, prompt_ids: list[int]) -> str:
+                        temperature: float, max_tokens: int,
+                        prompt_ids: list[int],
+                        policy_hash: str = "") -> str:
     """What an existing capture is valid for.
 
     Keying on `prefix#sample` alone is not enough -- those ids are positional
     and get reused the moment the pool or the model changes, so a stale file
-    would be silently accepted for a different run. Bind the capture to the
-    policy, the sampling temperature and the exact prompt it was conditioned on.
+    would be silently accepted for a different run.
+
+    Every sampling parameter that changes the distribution is bound in, not just
+    the obvious ones. `max_tokens` matters because it decides whether an action
+    could be truncated, so captures taken under different caps are not
+    interchangeable. `policy_hash` binds the adapter and tokenizer bytes: two
+    runs can name the same served model while the volume underneath it holds a
+    different adapter, and a served *name* is not a policy identity.
     """
     h = hashlib.sha256()
-    for part in (prefix_id, str(sample_index), model, f"{temperature:.6f}"):
+    for part in (prefix_id, str(sample_index), model, f"{temperature:.6f}",
+                 str(max_tokens), policy_hash):
         h.update(part.encode())
         h.update(b"\0")
     h.update(json.dumps(prompt_ids).encode())
     return h.hexdigest()[:32]
+
+
+def _policy_hash(adapter_dir: str | None) -> str:
+    """Hash of the adapter weights and tokenizer, or "" when unpinned.
+
+    A served *name* is not a policy identity: the same name can front a
+    different adapter after a redeploy, so captures keyed on the name alone
+    could be resumed across two different policies. Hashing the files makes
+    that impossible. Empty when the adapter is not reachable locally -- the run
+    still works, it simply cannot prove which weights produced it, and the
+    report says so.
+    """
+    if not adapter_dir:
+        return ""
+    d = Path(adapter_dir)
+    if not d.is_dir():
+        raise CanaryError(f"--adapter-dir {adapter_dir} is not a directory")
+    h = hashlib.sha256()
+    for name in ("adapter_model.safetensors", "adapter_config.json",
+                 "tokenizer.json", "chat_template.jinja"):
+        fp = d / name
+        if fp.exists():
+            h.update(name.encode())
+            h.update(hashlib.sha256(fp.read_bytes()).digest())
+    return h.hexdigest()[:16]
 
 
 def load_captures(path: Path, expected: dict[str, str]) -> dict[str, dict]:
@@ -236,7 +337,7 @@ def load_captures(path: Path, expected: dict[str, str]) -> dict[str, dict]:
 
 
 def _capture(prefix_id: str, sample_index: int, body: dict,
-             prompt_ids: list[int], fingerprint: str) -> dict:
+             prompt_ids: list[int], fingerprint: str, tokenizer) -> dict:
     choice = (body.get("choices") or [{}])[0]
     token_ids = choice.get("token_ids") or body.get("token_ids") or []
     got_prompt = choice.get("prompt_token_ids") or body.get("prompt_token_ids") or []
@@ -261,7 +362,23 @@ def _capture(prefix_id: str, sample_index: int, body: dict,
         raise CanaryError(f"{tag}: action hit max_tokens; raise --max-tokens "
                           f"rather than scoring a fragment")
 
-    action_bytes = text.encode("utf-8")
+    # Byte-exact identity comes from the TOKENS, not from re-encoding the text.
+    #
+    # `text.encode("utf-8")` asserts nothing: it produces bytes for whatever
+    # string the server rendered, which does not prove the returned token ids
+    # reconstruct those bytes. A scorer downstream needs per-token bytes anyway
+    # (cross-tokenizer alignment operates on them), and deriving them here from
+    # the pinned tokenizer is what makes the capture usable rather than merely
+    # plausible. Delegated to the repo's existing capture adapter so this path
+    # and the replay path cannot drift.
+    token_bytes = token_bytes_from_ids(tokenizer, [int(x) for x in token_ids])
+    action_bytes = b"".join(token_bytes)
+    if action_bytes.decode("utf-8", "replace") != text:
+        raise CanaryError(
+            f"{tag}: the returned token ids do not reconstruct the returned "
+            f"text. One of them is wrong, and a capture that cannot be "
+            f"reproduced from its own ids is not scorable.")
+
     return {
         "prefix_id": prefix_id,
         "sample_index": sample_index,
@@ -273,7 +390,11 @@ def _capture(prefix_id: str, sample_index: int, body: dict,
         "action_token_ids": [int(x) for x in token_ids],
         "behavior_logprobs": [float(x) for x in logprobs],
         "action_text": text,
-        # Byte-exact, so a later scorer never has to re-derive bytes from text.
+        # Persisted the way the replay path expects: whole-action bytes plus the
+        # per-token split, both base64'd because JSONL cannot hold raw bytes.
+        "action_bytes_b64": base64.b64encode(action_bytes).decode(),
+        "action_token_bytes_b64": [base64.b64encode(b).decode()
+                                   for b in token_bytes],
         "action_sha256": hashlib.sha256(action_bytes).hexdigest(),
         "n_action_bytes": len(action_bytes),
         "finish_reason": choice.get("finish_reason"),
@@ -355,6 +476,14 @@ def main() -> int:
     ap.add_argument("--min-canonical-rate", type=float, default=0.25)
     ap.add_argument("--min-diverse-prefix-fraction", type=float, default=0.75)
     ap.add_argument("--max-unparseable-rate", type=float, default=0.20)
+    ap.add_argument("--adapter-dir", default=None,
+                    help="local path to the served adapter. Used to hash the "
+                         "policy into the capture fingerprint and to load the "
+                         "adapter's own tokenizer; without it the run cannot "
+                         "prove which weights produced the samples.")
+    ap.add_argument("--tokenizer", default=None,
+                    help="override the tokenizer path (default: --adapter-dir, "
+                         "else the base model)")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--out", default="/data/tau2/swr_ck35_canary")
     ap.add_argument("--dry-run", action="store_true",
@@ -394,13 +523,26 @@ def main() -> int:
     require_endpoint_model(a.api_base, a.model, a.timeout)
     print(f"\nendpoint advertises {a.model!r}", flush=True)
 
+    # The tokenizer that turns returned ids back into bytes. Pinned to the
+    # adapter's own directory, not the base model's: the adapter ships its
+    # tokenizer and chat template precisely so serve and score cannot drift.
+    from vektori_trace.vocab_bridge import load_tokenizer
+    tokenizer = load_tokenizer(a.tokenizer or a.adapter_dir or BASE_MODEL)
+
+    # Policy identity is the adapter bytes, not the served name. Two runs can
+    # name the same model while the volume underneath holds a different
+    # adapter; binding the hash means captures from those runs cannot be mixed.
+    policy_hash = _policy_hash(a.adapter_dir)
+    print(f"policy hash {policy_hash or '(unpinned)'}", flush=True)
+
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     captures_path = out / "captures.jsonl"
 
     expected = {
         f"{pid}#{i}": capture_fingerprint(
-            pid, i, a.model, a.temperature, rows[pid]["input_ids"])
+            pid, i, a.model, a.temperature, a.max_tokens,
+            prompt_ids_for(rows[pid]), policy_hash)
         for pid in prefix_ids for i in range(a.n_samples)
     }
     have = load_captures(captures_path, expected)
@@ -410,7 +552,7 @@ def main() -> int:
 
     with captures_path.open("a", encoding="utf-8") as fh:
         for pid in prefix_ids:
-            prompt_ids = rows[pid]["input_ids"]
+            prompt_ids = prompt_ids_for(rows[pid])
             for i in range(a.n_samples):
                 key = f"{pid}#{i}"
                 if key in have:
@@ -423,7 +565,7 @@ def main() -> int:
                     a.timeout)
                 if status != 200:
                     raise CanaryError(f"{key}: HTTP {status}: {body}")
-                cap = _capture(pid, i, body, prompt_ids, expected[key])
+                cap = _capture(pid, i, body, prompt_ids, expected[key], tokenizer)
                 have[key] = cap
                 fh.write(json.dumps(cap) + "\n")
                 fh.flush()
