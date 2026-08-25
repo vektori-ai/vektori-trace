@@ -18,6 +18,9 @@ from vektori_trace.tau2.c30_loader import (
     cycle_updates,
     load_c30_prefixes,
     prompt_ids_from_row,
+    recover_system_policy,
+    selected_source_files,
+    selected_trace_hashes,
 )
 
 IGNORE = -100
@@ -288,7 +291,7 @@ def test_empty_policy_is_refused(tmp_path):
 def test_tool_hash_mismatch_is_refused(tmp_path):
     """Rendering against a different tool set compares two different states."""
     art = _build(tmp_path)
-    (art / "eligibility.json").write_text(json.dumps({"tools_hash": "0" * 16}))
+    (art / "eligibility_report.json").write_text(json.dumps({"tools_hash": "0" * 16}))
     with pytest.raises(C30LoadError, match="tool schema hash"):
         load_c30_prefixes(str(art), system_policy=POLICY, tools=TOOLS)
 
@@ -320,9 +323,11 @@ def test_duplicate_system_message_is_refused(tmp_path):
 
 
 def test_trace_id_comes_from_the_eligibility_record(tmp_path):
+    """Reads eligibility_report.json/per_task, the name the corpus writes."""
     art = _build(tmp_path)
-    (art / "eligibility.json").write_text(json.dumps({
-        "selected_traces": {"10": {"trace_hash": "abc123"}},
+    (art / "eligibility_report.json").write_text(json.dumps({
+        "per_task": {"10": {"trace_hash": "abc123",
+                            "source_file": "flash_retail20.json"}},
     }))
     prefixes, _ = load_c30_prefixes(str(art), system_policy=POLICY, tools=TOOLS)
     by_task = {p.task_id: p for p in prefixes}
@@ -335,3 +340,68 @@ def test_task_property_for_replay_archive(tmp_path):
     prefixes, _ = load_c30_prefixes(str(_build(tmp_path)),
                                     system_policy=POLICY, tools=TOOLS)
     assert prefixes[0].task == prefixes[0].task_id
+
+
+# --- policy recovery ------------------------------------------------------
+
+
+def _sims(tmp_path, policy="retail policy v1", name="flash_retail20.json"):
+    d = tmp_path / "sims"
+    d.mkdir(exist_ok=True)
+    (d / name).write_text(json.dumps({"simulations": [
+        {"info": {"environment_info": {"policy": policy}}},
+    ]}))
+    return d
+
+
+def _with_report(art, tasks, source="flash_retail20.json"):
+    (art / "eligibility_report.json").write_text(json.dumps({
+        "per_task": {t: {"trace_hash": f"hash-{t}", "source_file": source}
+                     for t in tasks},
+    }))
+
+
+def test_reads_eligibility_report_not_eligibility_json(tmp_path):
+    art = _build(tmp_path)
+    _with_report(art, ["10", "11", "12"])
+    assert selected_trace_hashes(str(art)) == {
+        "10": "hash-10", "11": "hash-11", "12": "hash-12"}
+    assert set(selected_source_files(str(art))) == {"10", "11", "12"}
+
+
+def test_recovers_policy_from_selected_simulations(tmp_path):
+    art = _build(tmp_path)
+    _with_report(art, ["10", "11", "12"])
+    d = _sims(tmp_path)
+    policy, rep = recover_system_policy(str(art), simulations_dir=str(d))
+    assert policy == "retail policy v1"
+    assert rep["n_tasks_agreeing"] == 3
+    assert len(rep["policy_sha256"]) == 64
+
+
+def test_disagreeing_policies_are_fatal(tmp_path):
+    """A corpus spanning a policy revision has no single context to score under."""
+    art = _build(tmp_path)
+    (art / "eligibility_report.json").write_text(json.dumps({
+        "per_task": {"10": {"trace_hash": "a", "source_file": "one.json"},
+                     "11": {"trace_hash": "b", "source_file": "two.json"}},
+    }))
+    d = tmp_path / "sims"; d.mkdir()
+    for n, pol in (("one.json", "policy A"), ("two.json", "policy B")):
+        (d / n).write_text(json.dumps({"simulations": [
+            {"info": {"environment_info": {"policy": pol}}}]}))
+    with pytest.raises(C30LoadError, match="different policies"):
+        recover_system_policy(str(art), simulations_dir=str(d))
+
+
+def test_missing_simulation_file_is_named(tmp_path):
+    art = _build(tmp_path)
+    _with_report(art, ["10"], source="absent.json")
+    with pytest.raises(C30LoadError, match="not found"):
+        recover_system_policy(str(art), simulations_dir=str(tmp_path / "sims"))
+
+
+def test_trace_id_falls_back_to_task_id_never_fabricated(tmp_path):
+    art = _build(tmp_path)
+    prefixes, _ = load_c30_prefixes(str(art), system_policy=POLICY, tools=TOOLS)
+    assert all(p.trace_id == p.task_id for p in prefixes)

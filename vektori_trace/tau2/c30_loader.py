@@ -185,6 +185,112 @@ def _verify_corpus_bytes(artifacts: str) -> dict[str, str]:
     return frozen
 
 
+def _eligibility_report(artifacts: str) -> dict[str, Any]:
+    """The corpus's own record of which trace it selected per task.
+
+    Written by `tau2_build_corpus` as `eligibility_report.json`, keyed
+    `per_task[task_id]` -- not `eligibility.json`/`selected_traces`, which do
+    not exist. Reading the wrong name is not a gradient bug, but it makes every
+    archived `trace_id` fall back to the task id, so the archive claims a
+    provenance it never read.
+    """
+    path = os.path.join(artifacts, "eligibility_report.json")
+    if not os.path.exists(path):
+        return {}
+    return json.load(open(path))
+
+
+def selected_trace_hashes(artifacts: str) -> dict[str, str]:
+    """`task_id -> trace_hash` for the trace each task's rows were built from."""
+    per_task = (_eligibility_report(artifacts).get("per_task") or {})
+    return {str(t): rec["trace_hash"]
+            for t, rec in per_task.items()
+            if isinstance(rec, dict) and rec.get("trace_hash")}
+
+
+def selected_source_files(artifacts: str) -> dict[str, str]:
+    """`task_id -> source simulation file` for the selected trace.
+
+    The system policy is not stored in the artifacts directory; it came from
+    `simulation["info"]["environment_info"]["policy"]` at corpus build. These
+    are the files to recover it from, named by the corpus itself rather than
+    guessed.
+    """
+    per_task = (_eligibility_report(artifacts).get("per_task") or {})
+    return {str(t): rec["source_file"]
+            for t, rec in per_task.items()
+            if isinstance(rec, dict) and rec.get("source_file")}
+
+
+def recover_system_policy(
+    artifacts: str,
+    *,
+    simulations_dir: str | None = None,
+    task_ids: list[str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Recover the system policy from the simulations the corpus selected.
+
+    Every selected trace must carry an identical policy string. If two differ,
+    the corpus was built across a policy revision and there is no single
+    context to score under -- that must stop the run rather than be resolved by
+    picking one.
+
+    Returns `(policy, report)` where the report carries the policy's sha256 for
+    the run manifest. Recovery is not proof: only `assert_render_parity`
+    establishes that this string is the one the frozen ids were rendered from.
+    """
+    sources = selected_source_files(artifacts)
+    if not sources:
+        raise C30LoadError(
+            f"no per_task source files in {artifacts}/eligibility_report.json; "
+            "cannot recover the policy the corpus was built with"
+        )
+    if task_ids:
+        keep = {str(t) for t in task_ids}
+        sources = {t: f for t, f in sources.items() if t in keep}
+
+    seen: dict[str, list[str]] = {}
+    for task_id, fn in sorted(sources.items()):
+        path = fn if os.path.isabs(fn) else os.path.join(
+            simulations_dir or os.path.dirname(fn) or ".", os.path.basename(fn)
+        )
+        if not os.path.exists(path):
+            raise C30LoadError(
+                f"simulation file for task {task_id} not found: {path}. Pass "
+                "--simulations-dir pointing at the directory the corpus was "
+                "built from."
+            )
+        data = json.load(open(path))
+        sims = data.get("simulations") or data if isinstance(data, list) else \
+            data.get("simulations") or []
+        policy = None
+        for sim in sims:
+            info = (sim.get("info") or {}).get("environment_info") or {}
+            if info.get("policy"):
+                policy = info["policy"]
+                break
+        if not policy:
+            raise C30LoadError(f"no environment policy in {path}")
+        seen.setdefault(policy, []).append(task_id)
+
+    if len(seen) > 1:
+        sizes = {hashlib.sha256(p.encode()).hexdigest()[:12]: len(t)
+                 for p, t in seen.items()}
+        raise C30LoadError(
+            f"selected traces carry {len(seen)} different policies {sizes}. The "
+            "corpus spans a policy revision, so there is no single context to "
+            "score under."
+        )
+
+    policy = next(iter(seen))
+    return policy, {
+        "policy_sha256": hashlib.sha256(policy.encode()).hexdigest(),
+        "policy_chars": len(policy),
+        "n_tasks_agreeing": len(sources),
+        "n_source_files": len({os.path.basename(f) for f in sources.values()}),
+    }
+
+
 def load_policy_and_tools(
     artifacts: str,
     *,
@@ -218,12 +324,14 @@ def load_policy_and_tools(
 
     schemas = list(tools) if tools is not None else load_domain_tools(domain)
 
-    elig_path = os.path.join(artifacts, "eligibility.json")
+    # Both files record it; `eligibility_report.json` is the name the corpus
+    # builder actually writes. Reading a name that does not exist made this
+    # check silently pass for every real corpus.
     recorded = None
-    for cand in (elig_path, os.path.join(artifacts, "data_census.json")):
-        if os.path.exists(cand):
-            meta = json.load(open(cand))
-            recorded = meta.get("tools_hash") or recorded
+    for cand in ("eligibility_report.json", "data_census.json"):
+        path = os.path.join(artifacts, cand)
+        if os.path.exists(path):
+            recorded = json.load(open(path)).get("tools_hash") or recorded
     if recorded:
         got = tools_hash(schemas)
         if got != recorded:
@@ -283,12 +391,7 @@ def load_c30_prefixes(
     # claims a lineage that cannot be reproduced.
     traces = dict(trace_ids or {})
     if not traces:
-        elig = os.path.join(artifacts, "eligibility.json")
-        if os.path.exists(elig):
-            meta = json.load(open(elig))
-            for t, rec in (meta.get("selected_traces") or {}).items():
-                if isinstance(rec, dict) and rec.get("trace_hash"):
-                    traces[str(t)] = rec["trace_hash"]
+        traces = selected_trace_hashes(artifacts)
 
     want = {p["prefix_id"]: p for p in manifest["prefixes"]}
 
