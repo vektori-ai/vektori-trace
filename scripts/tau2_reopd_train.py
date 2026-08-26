@@ -410,38 +410,45 @@ def run_update(
     rendered = {p.prefix_id: p.canonical_messages for p in prefixes}
 
     # --- score ------------------------------------------------------------
+    # Validate cached bytes even after the SCORED marker exists.  An earlier
+    # tokenizer bug can leave a paid row whose logprobs are valid for the token
+    # ids but whose reconstructed bytes contain U+FFFD.  Blindly trusting the
+    # marker makes every resume fail forever in the optimizer.  The scorer
+    # reuses byte-exact rows and repairs only mismatches, appending a last-row-
+    # wins replacement under the same key.
+    paid = run.paid_scores(idx)
+    if paid:
+        log(f"  checking {len(paid)} cached teacher scores")
+
+    import base64
+    already = {
+        k: ([base64.b64decode(b) for b in r["teacher_token_bytes_b64"]],
+            [float(x) for x in r["teacher_logprobs"]])
+        for k, r in paid.items() if r.get("teacher_token_bytes_b64")
+    }
+
+    def _persist(sc) -> None:
+        # Every one of these was billed. Committing per score is the
+        # difference between a crash costing seconds and costing the batch.
+        append_jsonl(u.scores_path, {
+            "key": sc.key,
+            "teacher_token_bytes_b64": [
+                base64.b64encode(b).decode() for b in sc.teacher_token_bytes],
+            "teacher_logprobs": list(sc.teacher_logprobs),
+            "n_prefix_tokens": sc.n_prefix_tokens,
+            "n_trailing_dropped": sc.n_trailing_dropped,
+        })
+        commit("score")
+
+    t_score = time.time()
+    scored, ledger = score_replay_batch(
+        actions, rendered, teacher_tok, pool,
+        on_scored=_persist, already_scored=already,
+    )
+    score_s = round(time.time() - t_score, 1)
+    tin = ledger.get("teacher_input_tokens", 0)
+    n_new = int(ledger.get("n_newly_scored", 0))
     if not u.reached("SCORED"):
-        paid = run.paid_scores(idx)
-        if paid:
-            log(f"  reusing {len(paid)} teacher scores already paid for")
-
-        import base64
-        already = {
-            k: ([base64.b64decode(b) for b in r["teacher_token_bytes_b64"]],
-                [float(x) for x in r["teacher_logprobs"]])
-            for k, r in paid.items() if r.get("teacher_token_bytes_b64")
-        }
-
-        def _persist(sc) -> None:
-            # Every one of these was billed. Committing per score is the
-            # difference between a crash costing seconds and costing the batch.
-            append_jsonl(u.scores_path, {
-                "key": sc.key,
-                "teacher_token_bytes_b64": [
-                    base64.b64encode(b).decode() for b in sc.teacher_token_bytes],
-                "teacher_logprobs": list(sc.teacher_logprobs),
-                "n_prefix_tokens": sc.n_prefix_tokens,
-                "n_trailing_dropped": sc.n_trailing_dropped,
-            })
-            commit("score")
-
-        t_score = time.time()
-        scored, ledger = score_replay_batch(
-            actions, rendered, teacher_tok, pool,
-            on_scored=_persist, already_scored=already,
-        )
-        score_s = round(time.time() - t_score, 1)
-        tin = ledger.get("teacher_input_tokens", 0)
         telemetry(args.run_dir_resolved, {
             "event": "stage", "stage": "SCORED", "update": idx,
             "seconds": score_s, "n_scores": len(scored),
@@ -456,13 +463,18 @@ def run_update(
         commit("scored marker")
         log(f"  scored {len(scored)} in {score_s}s; {tin:,} teacher input "
             f"tokens (<= ${tin * 0.22 / 1e6:.4f})")
+    elif n_new:
+        telemetry(args.run_dir_resolved, {
+            "event": "score_cache_repair", "update": idx,
+            "n_repaired": n_new, "seconds": score_s,
+            "teacher_input_tokens": tin,
+        })
+        commit("score cache repair")
+        log(f"  repaired {n_new} cached teacher score(s) in {score_s}s; "
+            f"reused {ledger.get('n_reused_from_disk', 0)}")
     else:
-        import base64
-        scored = {
-            k: ([base64.b64decode(b) for b in r["teacher_token_bytes_b64"]],
-                [float(x) for x in r["teacher_logprobs"]])
-            for k, r in run.paid_scores(idx).items()
-        }
+        log(f"  reused all {ledger.get('n_reused_from_disk', 0)} cached "
+            "teacher scores")
 
     # --- train ------------------------------------------------------------
     if u.reached("TRAINED"):
