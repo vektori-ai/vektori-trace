@@ -70,6 +70,22 @@ def token_bytes_from_ids(tokenizer: Any, token_ids: list[int]) -> list[bytes]:
             )
         return [_token_str_to_bytes(str(s)) for s in strings]
 
+    # `load_tokenizer` deliberately falls back to a bare
+    # `tokenizers.Tokenizer` for DeepSeek-V4 when transformers cannot parse the
+    # model config.  That flavour exposes `id_to_token`, not
+    # `convert_ids_to_tokens`, but its vocabulary strings are the same
+    # pre-decoder ByteLevel representation.  Falling through to single-id
+    # decode here turns an emoji split across tokens into one U+FFFD per token.
+    if hasattr(tokenizer, "id_to_token"):
+        from .vocab_bridge import _token_str_to_bytes
+
+        strings = [tokenizer.id_to_token(int(t)) for t in token_ids]
+        if any(s is None for s in strings):
+            raise CaptureAdaptError(
+                "tokenizer did not return one vocabulary token for every id"
+            )
+        return [_token_str_to_bytes(str(s)) for s in strings]
+
     # Compatibility fallback for simple/non-fast tokenizers.  This is safe
     # only for tokenizers whose single-id decode is compositional; callers
     # still verify the joined result against the server's returned text.

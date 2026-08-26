@@ -205,7 +205,8 @@ def test_ledger_reports_repeated_prefix_cost(teacher_tokenizer):
 def test_ledger_counts_reused_scores_as_actions_not_new_requests(teacher_tokenizer):
     p = _prefix("task", "tr")
     actions = [_action(p, i) for i in range(2)]
-    prior = {actions[0].key: ([b"cached"], [-0.2])}
+    prior_bytes = _split(actions[0].action_bytes.decode(), 3)
+    prior = {actions[0].key: (prior_bytes, [-0.2] * len(prior_bytes))}
 
     scored, ledger = score_replay_batch(
         actions,
@@ -219,6 +220,26 @@ def test_ledger_counts_reused_scores_as_actions_not_new_requests(teacher_tokeniz
     assert ledger["n_actions"] == 2
     assert ledger["n_newly_scored"] == 1
     assert ledger["n_reused_from_disk"] == 1
+    assert ledger["n_teacher_requests"] == 1
+
+
+def test_cached_score_with_wrong_bytes_is_rescored(teacher_tokenizer):
+    """A tokenizer-byte bug in a paid row must not poison every resume."""
+    p = _prefix("task", "tr")
+    action = _action(p, 0)
+    pool = FakePool()
+
+    scored, ledger = score_replay_batch(
+        [action],
+        {p.prefix_id: MESSAGES},
+        teacher_tokenizer,
+        pool,
+        already_scored={action.key: ([b"wrong bytes"], [-0.2])},
+    )
+
+    assert b"".join(scored[action.key][0]) == action.action_bytes
+    assert ledger["n_reused_from_disk"] == 0
+    assert ledger["n_newly_scored"] == 1
     assert ledger["n_teacher_requests"] == 1
 
 

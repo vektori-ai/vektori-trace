@@ -80,7 +80,13 @@ def _decode(tok: Any, ids: list[int]) -> str:
 
 def _token_bytes(tok: Any, ids: list[int]) -> list[bytes]:
     """Per-token byte strings, which is what `align_by_bytes` consumes."""
-    return [_decode(tok, [int(i)]).encode() for i in ids]
+    # Shared with the student capture path.  In particular, never decode one
+    # id at a time: DeepSeek's bare `tokenizers.Tokenizer` can split one UTF-8
+    # character across two tokens, and independent decode replaces both halves
+    # with U+FFFD even though the complete token sequence is byte-exact.
+    from .replay_sample import token_bytes_from_ids
+
+    return token_bytes_from_ids(tok, ids)
 
 
 def locate_action_span(
@@ -215,9 +221,16 @@ def score_replay_batch(
 
     for action in actions:
         if already_scored and action.key in already_scored:
-            scored[action.key] = already_scored[action.key]
-            reused += 1
-            continue
+            cached = already_scored[action.key]
+            # Cached rows predate neither the action nor its immutable bytes.
+            # Validate before reuse so a byte-extraction bug fixed between
+            # attempts does not make a resume fail forever on the same paid
+            # score.  A mismatching row is rescored and appended under the same
+            # key; RunState's last-row-wins index then repairs the durable cache.
+            if b"".join(cached[0]) == action.action_bytes:
+                scored[action.key] = cached
+                reused += 1
+                continue
         messages = prefix_messages_by_id.get(action.prefix_id)
         if messages is None:
             raise ScoringError(

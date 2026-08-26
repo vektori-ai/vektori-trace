@@ -285,6 +285,22 @@ def test_token_bytes_survive_utf8_split_across_bytelevel_tokens():
     assert b"".join(got).decode() == "\u20ac"
 
 
+def test_bare_tokenizer_token_bytes_survive_utf8_split():
+    """DeepSeek can load as tokenizers.Tokenizer, which uses id_to_token."""
+    class BareSplitUtf8Tokenizer:
+        pieces = {1: "\u00f0", 2: "\u0141", 3: "\u013a", 4: "\u012c"}
+
+        def id_to_token(self, tid):
+            return self.pieces[tid]
+
+        def decode(self, ids, **kwargs):
+            return "\ufffd"
+
+    got = token_bytes_from_ids(BareSplitUtf8Tokenizer(), [1, 2, 3, 4])
+    assert got == [b"\xf0", b"\x9f", b"\x98", b"\x8a"]
+    assert b"".join(got).decode() == "\U0001f60a"
+
+
 def test_cap_hit_summary():
     tok = FakeTokenizer()
     ok = sampled_action_from_capture(
