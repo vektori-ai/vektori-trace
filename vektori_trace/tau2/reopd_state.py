@@ -83,6 +83,28 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         os.fsync(fh.fileno())
 
 
+def atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Atomically replace a JSONL file after validating repaired rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Read a JSONL file, tolerating a torn final line.
 

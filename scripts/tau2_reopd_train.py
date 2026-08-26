@@ -63,6 +63,7 @@ from vektori_trace.tau2.reopd_state import (  # noqa: E402
     RunState,
     append_jsonl,
     atomic_write_json,
+    atomic_write_jsonl,
 )
 
 #: Stored max action is 592 tokens; 2048 is ~3.5x that. A cap hit invalidates
@@ -199,6 +200,40 @@ def telemetry(run_dir: str | Path, row: dict[str, Any]) -> None:
     """
     row = {"t": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), **row}
     append_jsonl(Path(run_dir) / "telemetry.jsonl", row)
+
+
+def repair_duplicate_score_rows(run: RunState) -> int:
+    """Keep a duplicate only when exactly one row matches sampled bytes."""
+    import base64
+    repaired = 0
+    for u in run.updates():
+        actions = {r.get("key"): r for r in _read(u.actions_path)}
+        rows = _read(u.scores_path)
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_key.setdefault(row.get("key"), []).append(row)
+        if not any(len(v) > 1 for v in by_key.values()):
+            continue
+        out: list[dict[str, Any]] = []
+        safe = True
+        for key, variants in by_key.items():
+            if len(variants) == 1:
+                out.append(variants[0])
+                continue
+            action = actions.get(key) or {}
+            want = base64.b64decode(action.get("action_bytes_b64", ""))
+            good = [r for r in variants if b"".join(
+                base64.b64decode(b) for b in r.get("teacher_token_bytes_b64", [])
+            ) == want]
+            if len(good) != 1:
+                safe = False
+                break
+            out.append(good[0])
+            repaired += len(variants) - 1
+        if safe:
+            atomic_write_jsonl(u.scores_path, out)
+            commit("deduplicated score cache")
+    return repaired
 
 
 # ---------------------------------------------------------------------------
@@ -430,14 +465,22 @@ def run_update(
     def _persist(sc) -> None:
         # Every one of these was billed. Committing per score is the
         # difference between a crash costing seconds and costing the batch.
-        append_jsonl(u.scores_path, {
+        row = {
             "key": sc.key,
             "teacher_token_bytes_b64": [
                 base64.b64encode(b).decode() for b in sc.teacher_token_bytes],
             "teacher_logprobs": list(sc.teacher_logprobs),
             "n_prefix_tokens": sc.n_prefix_tokens,
             "n_trailing_dropped": sc.n_trailing_dropped,
-        })
+        }
+        existing = _read(u.scores_path)
+        if any(r.get("key") == sc.key for r in existing):
+            atomic_write_jsonl(
+                u.scores_path,
+                [row if r.get("key") == sc.key else r for r in existing],
+            )
+        else:
+            append_jsonl(u.scores_path, row)
         commit("score")
 
     t_score = time.time()
@@ -701,6 +744,10 @@ def main() -> int:
     os.makedirs(run_dir, exist_ok=True)
     freeze_schedule(os.path.join(run_dir, "schedule.json"), schedule)
     run.freeze_manifest(manifest)
+
+    n_deduped = repair_duplicate_score_rows(run)
+    if n_deduped:
+        log(f"repaired {n_deduped} duplicate cached score row(s)")
 
     # --- resume ------------------------------------------------------------
     start = run.resume_point()
