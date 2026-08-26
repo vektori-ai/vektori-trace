@@ -501,6 +501,12 @@ def main() -> int:
     ap.add_argument("--n-updates", type=int, default=N_UPDATES)
     ap.add_argument("--n-per-update", type=int, default=N_PER_UPDATE)
     ap.add_argument("--expect-manifest-hash", default="8e78c7b96161d024")
+    ap.add_argument("--tools-file", default=None,
+                    help="retail tool schemas as JSON. Required wherever the "
+                         "tau2 package is not installed -- a Modal training "
+                         "image has no reason to carry a benchmark harness just "
+                         "to read a static schema list. The hash is verified "
+                         "against the corpus either way.")
     ap.add_argument("--policy-file", default=None,
                     help="read the system policy from this file instead of "
                          "recovering it from the simulation files. Required "
@@ -531,8 +537,13 @@ def main() -> int:
                                              simulations_dir=a.simulations_dir)
     log(f"policy {prep['policy_sha256'][:16]} ({prep['policy_chars']:,} chars)")
 
+    tools = None
+    if a.tools_file:
+        tools = json.load(open(a.tools_file))
+        log(f"tools {len(tools)} schemas from {a.tools_file}")
+
     prefixes, corpus = load_c30_prefixes(
-        a.artifacts, system_policy=policy,
+        a.artifacts, system_policy=policy, tools=tools,
         expect_manifest_hash=a.expect_manifest_hash,
     )
     log(f"corpus {corpus['n_prefixes']} prefixes / {corpus['n_tasks']} tasks, "

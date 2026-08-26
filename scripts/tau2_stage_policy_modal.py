@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ VOLUME_NAME = "vektori-trace-adapters"
 VOLUME_MOUNT = "/adapters"
 POLICY_IN_VOLUME = "tau2/reopd/retail_policy.txt"
 SCHEDULE_IN_VOLUME = "tau2/reopd/schedule.json"
+TOOLS_IN_VOLUME = "tau2/reopd/retail_tools.json"
 
 #: The frozen 32x16 stream both continuation arms must consume. Pinned by hash
 #: so a regenerated schedule cannot be staged over it silently -- that would
@@ -47,7 +49,8 @@ vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
 
 
 @app.function(volumes={VOLUME_MOUNT: vol}, timeout=300)
-def put(text: str, expect_sha: str, schedule_json: str = "") -> dict:
+def put(text: str, expect_sha: str, schedule_json: str = "",
+        tools_json: str = "", expect_tools_hash: str = "") -> dict:
     import hashlib as h
     import os
 
@@ -95,6 +98,25 @@ def put(text: str, expect_sha: str, schedule_json: str = "") -> dict:
             "n_per_update": back.get("n_per_update"),
             "n_exposures": back.get("n_exposures"),
         })
+    if tools_json:
+        import hashlib as h2
+        import json as j2
+
+        tdst = os.path.join(VOLUME_MOUNT, TOOLS_IN_VOLUME)
+        with open(tdst, "w", encoding="utf-8") as fh:
+            fh.write(tools_json)
+        vol.commit()
+
+        back = j2.load(open(tdst, encoding="utf-8"))
+        got = h2.sha256(j2.dumps(back, sort_keys=True,
+                                 default=str).encode()).hexdigest()[:16]
+        if expect_tools_hash and got != expect_tools_hash:
+            raise SystemExit(
+                f"staged tool hash {got} != corpus-recorded {expect_tools_hash}; "
+                "the student's prompts were rendered against a different tool set"
+            )
+        out.update({"tools_path": f"{VOLUME_MOUNT}/{TOOLS_IN_VOLUME}",
+                    "tools_hash": got, "n_tools": len(back)})
     return out
 
 
@@ -125,7 +147,30 @@ def main(artifacts: str = "/data/tau2/artifacts_16384",
         print(f"schedule  {describe(sched)}")
         sched_json = j.dumps(sched, indent=1)
 
-    out = put.remote(policy, sha, sched_json)
+    # Stage the tool schemas too. The container would otherwise need the whole
+    # tau2 package just to call load_domain_tools(), and the schemas are a
+    # deterministic artifact with a hash the corpus already recorded -- so a
+    # staged JSON file is both lighter and more auditable than a live registry
+    # lookup inside the training image.
+    import json as j3
+
+    from vektori_trace.tau2.tools import load_domain_tools, tools_hash
+
+    schemas = load_domain_tools("retail")
+    thash = tools_hash(schemas)
+    recorded = (json.load(open(f"{artifacts}/eligibility_report.json"))
+                .get("tools_hash")) if __import__("os").path.exists(
+                    f"{artifacts}/eligibility_report.json") else None
+    print(f"tools     {len(schemas)} schemas, hash {thash}"
+          + (f" (corpus recorded {recorded})" if recorded else ""))
+    if recorded and thash != recorded:
+        raise SystemExit(
+            f"live tool hash {thash} != corpus-recorded {recorded}; the "
+            "registry has changed since the corpus was built"
+        )
+
+    out = put.remote(policy, sha, sched_json, j3.dumps(schemas, indent=1),
+                     recorded or thash)
     print(f"\nstaged policy   -> {out['policy_path']}")
     print(f"  sha256 {out['policy_sha256'][:16]}  chars {out['policy_chars']:,}")
     if out.get("schedule_path"):
@@ -133,7 +178,11 @@ def main(artifacts: str = "/data/tau2/artifacts_16384",
         print(f"  hash {out['schedule_hash']}  "
               f"{out['n_updates']}x{out['n_per_update']} = "
               f"{out['n_exposures']} exposures")
+    if out.get("tools_path"):
+        print(f"staged tools    -> {out['tools_path']}")
+        print(f"  hash {out['tools_hash']}  {out['n_tools']} schemas")
     print("\nReOPD:\n"
           f"  --policy-file {out['policy_path']}\n"
+          f"  --tools-file {out.get('tools_path')}\n"
           "continued SFT:\n"
           f"  --schedule {out.get('schedule_path')}")

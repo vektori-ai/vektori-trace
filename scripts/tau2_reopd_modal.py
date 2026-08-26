@@ -112,6 +112,7 @@ def train(
     temperature: float,
     policy_file: str | None,
     teacher_tokenizer: str,
+    tools_file: str | None = None,
 ) -> dict:
     import importlib.util
     import json
@@ -149,6 +150,8 @@ def train(
     ]
     if policy_file:
         argv += ["--policy-file", policy_file]
+    if tools_file:
+        argv += ["--tools-file", tools_file]
     if canary:
         argv += ["--canary", str(canary)]
     else:
@@ -234,6 +237,7 @@ def main(
     learning_rate: float = 1e-5,
     temperature: float = 1.0,
     policy_file: str = "",
+    tools_file: str = "/adapters/tau2/reopd/retail_tools.json",
     teacher_tokenizer: str = "deepseek-ai/DeepSeek-V4-Flash-0731",
 ):
     import json
@@ -268,7 +272,7 @@ def main(
 
     result = train.remote(api_base, model, rid, canary, n_updates,
                           n_per_update, learning_rate, temperature,
-                          policy_file, teacher_tokenizer)
+                          policy_file, teacher_tokenizer, tools_file)
     print(json.dumps({k: v for k, v in result.items()
                       if k != "stages"}, indent=2))
     for s in result.get("stages", []):
