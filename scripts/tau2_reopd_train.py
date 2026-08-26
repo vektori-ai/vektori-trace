@@ -704,9 +704,23 @@ def main() -> int:
 
     teacher_tok = load_tokenizer(a.teacher_tokenizer)
     pool = FireworksTeacherPool(model=a.teacher_model)
+    # `device` is explicit, never inferred. load_v0_for_training refuses a
+    # None device rather than silently landing the model on CPU, where the run
+    # trains correctly at a speed indistinguishable from a hang. This process
+    # is the Modal GPU container -- the vLLM endpoint is a different host and
+    # does not make this one GPU-resident -- so assert the GPU is really here
+    # instead of passing a string that only looks right.
+    import torch
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "no CUDA device in the training container: the replay update "
+            "cannot run here. The student endpoint being reachable is not "
+            "evidence of a local GPU -- it is a separate host."
+        )
     trainer = ReOPDTrainer(
         base_model=a.base_model, parent_adapter=a.parent,
         learning_rate=a.learning_rate, run_dir=run_dir,
+        device="cuda",
     )
     trainer.load(resume_from=run.update(start - 1).checkpoint_path
                  if start > 0 else None)

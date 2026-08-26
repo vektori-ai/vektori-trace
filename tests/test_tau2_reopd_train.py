@@ -337,3 +337,25 @@ def test_multi_update_run_requires_serving_volume_reload_url():
     src = open(REPO / "scripts" / "tau2_reopd_train.py").read()
     assert 'schedule["n_updates"] > 1 and not a.reload_url' in src
     assert 'default=os.environ.get("STUDENT_RELOAD_URL", "")' in src
+
+
+def test_modal_driver_places_training_model_on_cuda_explicitly():
+    src = open(REPO / "scripts" / "tau2_reopd_train.py").read()
+    call = src[src.index("trainer = ReOPDTrainer("):]
+    assert 'device="cuda"' in call.split(")", 1)[0]
+
+
+def test_the_driver_passes_an_explicit_device_to_the_trainer():
+    """load_v0_for_training refuses device=None rather than landing a model on
+    CPU, where the run trains at a speed indistinguishable from a hang. The
+    driver constructed ReOPDTrainer without device=, so every GPU canary died
+    after the endpoint gate and the paid parity check had already passed."""
+    import inspect
+
+    src = inspect.getsource(driver.main)
+    call = src[src.index("trainer = ReOPDTrainer("):]
+    call = call[:call.index(")")]
+    assert 'device="cuda"' in call, (
+        "ReOPDTrainer must be constructed with an explicit CUDA device; "
+        "ReplayTrainConfig.device defaults to None and the loader refuses it"
+    )
