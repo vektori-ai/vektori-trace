@@ -114,7 +114,7 @@ VLLM_ARGS = [
 ]
 
 
-def _model_info() -> dict:
+def _model_info(reserve: int = GENERATION_RESERVE) -> dict:
     """Token budget litellm advertises. Pinned, because the default starves it.
 
     `serve_model` clamps an unspecified budget to `out_cap = min(default,
@@ -125,8 +125,8 @@ def _model_info() -> dict:
     the split explicitly is what keeps the prompt budget at 14,336.
     """
     return {
-        "max_input_tokens": MAX_MODEL_LEN - GENERATION_RESERVE,
-        "max_output_tokens": GENERATION_RESERVE,
+        "max_input_tokens": MAX_MODEL_LEN - reserve,
+        "max_output_tokens": reserve,
         "input_cost_per_token": 0.0,
         "output_cost_per_token": 0.0,
     }
@@ -470,6 +470,13 @@ def main() -> int:
                          "adapters that are not {run-dir}/checkpoint-N -- "
                          "different runs, or ReOPD's update-NNN/checkpoint. "
                          "Mutually exclusive with --checkpoints.")
+    ap.add_argument("--generation-reserve", type=int, default=GENERATION_RESERVE,
+                    help="output-token cap per turn. Shares the window with the "
+                         "prompt: budget = max-model-len - reserve, so raising "
+                         "this shrinks prompt space (retail final-turn p90 is "
+                         "~11,942, so keep the budget above that). NOTE 2048 is "
+                         "what ReOPD trained under -- a larger value measures "
+                         "the policy under a setting it was not trained for.")
     ap.add_argument("--no-base", action="store_true",
                     help="skip the frozen A0 arm (it is the §7.1 baseline)")
     ap.add_argument("--gpu", default="L40S")
@@ -519,6 +526,20 @@ def main() -> int:
     task_ids, man_hash = _resolve_tasks(a.artifacts, a.partition)
     all_n = len(task_ids)
     task_ids = _subset(task_ids, a.partition, a.tasks, a.max_tasks)
+    # The window is shared: a bigger output cap is a smaller prompt budget.
+    # Retail final-turn prompts reach p90 ~11,942 (handoff §4.3), and a context
+    # refusal reaching tau2 is graded as a model failure rather than as infra --
+    # so a reserve that starves the prompt turns into fake losses.
+    _RETAIL_PROMPT_P90 = 11_942
+    if a.max_model_len - a.generation_reserve <= _RETAIL_PROMPT_P90:
+        raise SystemExit(
+            f"--generation-reserve {a.generation_reserve} leaves a prompt budget "
+            f"of {a.max_model_len - a.generation_reserve}, at or under the "
+            f"measured retail final-turn p90 of {_RETAIL_PROMPT_P90}. Episodes "
+            "would be refused for context and graded as model failures. Raise "
+            "--max-model-len too, or lower the reserve."
+        )
+
     if a.adapter:
         # Explicit paths win outright rather than merging with the template
         # arms: --checkpoints has a non-empty default, so a silent merge would
@@ -629,8 +650,8 @@ def main() -> int:
     print(f"tasks       {' '.join(task_ids)}")
     print(f"arms        {', '.join(arm_names)}")
     print(f"context     max_model_len={a.max_model_len}, "
-          f"prompt budget {a.max_model_len - GENERATION_RESERVE}, "
-          f"generation reserve {GENERATION_RESERVE}")
+          f"prompt budget {a.max_model_len - a.generation_reserve}, "
+          f"generation reserve {a.generation_reserve}")
     print(f"episodes    {len(arm_names)} arms x {len(task_ids)} tasks x "
           f"{a.num_trials} trials = {len(arm_names) * len(task_ids) * a.num_trials}")
 
@@ -663,7 +684,7 @@ def main() -> int:
         max_loras=max(1, len(adapters)),
         gpu=a.gpu,
         max_model_len=a.max_model_len,
-        model_info=_model_info(),
+        model_info=_model_info(a.generation_reserve),
         gpu_memory_utilization=0.90,
         extra_vllm_args=list(VLLM_ARGS),
     ) as served:
