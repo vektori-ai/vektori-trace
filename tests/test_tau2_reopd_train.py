@@ -148,9 +148,10 @@ def test_unreported_context_falls_back_to_a_real_probe(monkeypatch):
     import vektori_trace.tau2.reopd_sample as S
     monkeypatch.setattr(S, "post_json", poster)
     out = driver.verify_endpoint("http://x", "ck35")
-    assert out["probe_prompt_tokens"] == 12_880
-    assert len(sent["prompt"]) == 12_880
-    assert sent["max_tokens"] == driver.MAX_ACTION_TOKENS
+    assert out["probe_prompt_tokens"] == 14_927
+    assert len(sent["prompt"]) == 14_927
+    assert sent["max_tokens"] == 1
+    assert len(sent["prompt"]) + sent["max_tokens"] == 14_928
 
 
 def test_unreported_context_with_a_rejected_probe_is_refused(monkeypatch):
@@ -323,3 +324,16 @@ def test_update_0_needs_no_refresh_but_later_updates_do():
     # and the swap happens before anything is paid for
     assert src.index("refresh_serving_policy(args, idx") < src.index(
         "captures = sample_batch(")
+
+
+def test_driver_fingerprints_initial_policy_before_update_loop():
+    src = open(REPO / "scripts" / "tau2_reopd_train.py").read()
+    assert src.index("a.probe_logprobs = probe_logprobs(") < src.index(
+        'for idx in range(start, schedule["n_updates"])')
+    assert "a.initial_served_name = a.model" in src
+
+
+def test_multi_update_run_requires_serving_volume_reload_url():
+    src = open(REPO / "scripts" / "tau2_reopd_train.py").read()
+    assert 'schedule["n_updates"] > 1 and not a.reload_url' in src
+    assert 'default=os.environ.get("STUDENT_RELOAD_URL", "")' in src

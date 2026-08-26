@@ -206,7 +206,7 @@ def telemetry(run_dir: str | Path, row: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict:
+def verify_endpoint(api_base: str, model: str, *, timeout: float = 120.0) -> dict:
     """Refuse an endpoint that cannot serve this corpus.
 
     Reads the server's *reported* context rather than trusting the launch flag:
@@ -249,10 +249,16 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
             f"Relaunch with --max-model-len {REQUIRED_CONTEXT}."
         )
 
+    # Keep the same total length the run needs, but generate only one token.
+    # The previous gate asked the model to actually generate all 2,048 tokens;
+    # that tested decoding speed, not capacity, and timed out on a healthy
+    # endpoint. A 14,927-token prompt + one output token exercises the same
+    # 14,928-token context boundary and returns promptly.
+    probe_prompt_tokens = need - 1
     st, body2 = post_json(
         api_base.rstrip("/") + "/completions",
-        {"model": model, "prompt": [1] * LONGEST_PREFIX_TOKENS,
-         "max_tokens": MAX_ACTION_TOKENS, "temperature": 0.0}, timeout)
+        {"model": model, "prompt": [1] * probe_prompt_tokens,
+         "max_tokens": 1, "temperature": 0.0}, timeout)
     if st == 0:
         raise ReOPDSampleError(
             f"could not reach {api_base} to probe the serving window: "
@@ -262,7 +268,7 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
     if st != 200:
         raise ReOPDSampleError(
             f"endpoint advertises context {ctx} but rejected a realistic "
-            f"{LONGEST_PREFIX_TOKENS}-prompt + {MAX_ACTION_TOKENS}-completion "
+            f"{probe_prompt_tokens}-prompt + 1-token completion "
             f"probe (HTTP {st}): {str(body2)[:300]}. This is the shape the "
             f"longest C30 prefix sends. If the window looks large enough, the "
             f"advertised INPUT cap is the binding limit: serve.py gives input "
@@ -270,11 +276,11 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
             f"--max-model-len {REQUIRED_CONTEXT}."
         )
     log(f"endpoint ok: {model}, reported context {ctx}, and a "
-        f"{LONGEST_PREFIX_TOKENS}+{MAX_ACTION_TOKENS} probe was accepted")
+        f"{probe_prompt_tokens}+1 probe was accepted")
     return {"served_model": model,
             "max_model_len": None if ctx is None else int(ctx),
-            "probe_prompt_tokens": LONGEST_PREFIX_TOKENS,
-            "probe_max_tokens": MAX_ACTION_TOKENS,
+            "probe_prompt_tokens": probe_prompt_tokens,
+            "probe_max_tokens": 1,
             "models": served}
 
 
@@ -291,7 +297,7 @@ def refresh_serving_policy(args, idx: int, checkpoint_path, state) -> dict:
     """
     from vektori_trace.tau2.reopd_refresh import refresh_policy
 
-    name = f"{args.model}-u{idx - 1:03d}"
+    name = f"{args.initial_served_name}-u{idx - 1:03d}"
     rep = refresh_policy(
         args.api_base,
         new_name=name,
@@ -299,6 +305,7 @@ def refresh_serving_policy(args, idx: int, checkpoint_path, state) -> dict:
         probe_prompt_ids=args.probe_prompt_ids,
         previous_logprobs=getattr(args, "probe_logprobs", None),
         previous_name=getattr(args, "served_name", None),
+        reload_url=args.reload_url,
     )
     args.model = name
     args.served_name = name
@@ -542,6 +549,9 @@ def main() -> int:
                     help="CK35: the frozen A_warm both branches start from")
     ap.add_argument("--base-model", default="Qwen/Qwen3-4B")
     ap.add_argument("--api-base", default=os.environ.get("STUDENT_API_BASE", ""))
+    ap.add_argument("--reload-url", default=os.environ.get("STUDENT_RELOAD_URL", ""),
+                    help="serving-container control endpoint that reloads its "
+                         "Modal Volume before a newly committed adapter is loaded")
     ap.add_argument("--model", default="ck35")
     ap.add_argument("--teacher-model",
                     default="accounts/fireworks/models/deepseek-v4-flash-0731")
@@ -574,7 +584,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="plan and validate only: no endpoint, teacher or GPU")
     ap.add_argument("--canary", type=int, default=0,
-                    help="run ONE update with this many prefixes, then stop")
+                    help="run a small paid canary with this many prefixes/update")
+    ap.add_argument("--canary-updates", type=int, default=1,
+                    help="number of canary updates; use 2 to exercise refresh")
     ap.add_argument("--yes", action="store_true",
                     help="required for the full paid run")
     a = ap.parse_args()
@@ -607,7 +619,7 @@ def main() -> int:
 
     schedule = build_schedule(
         [p.prefix_id for p in prefixes],
-        n_updates=1 if a.canary else a.n_updates,
+        n_updates=a.canary_updates if a.canary else a.n_updates,
         n_per_update=a.canary or a.n_per_update,
     )
     log(f"schedule {describe(schedule)}")
@@ -655,6 +667,12 @@ def main() -> int:
         )
     if not a.api_base:
         raise SystemExit("--api-base is required (or set STUDENT_API_BASE)")
+    if schedule["n_updates"] > 1 and not a.reload_url:
+        raise SystemExit(
+            "--reload-url (or STUDENT_RELOAD_URL) is required for more than one "
+            "update; the serving container cannot see checkpoints committed by "
+            "the training container until its Modal Volume is reloaded"
+        )
 
     # --- verify before spending ------------------------------------------
     endpoint = verify_endpoint(a.api_base, a.model)
@@ -699,6 +717,15 @@ def main() -> int:
     # run does; truncated because a fingerprint needs a few tokens, not 12k.
     a.probe_prompt_ids = prefixes[0].prompt_token_ids[:256]
     a.served_name = a.model
+    a.initial_served_name = a.model
+    # Establish the behavior of CK35 before the first update, so the first
+    # refresh is verified against the policy it replaces rather than merely
+    # accepted because its name appeared in /models.
+    from vektori_trace.tau2.reopd_refresh import probe_logprobs
+    a.probe_logprobs = probe_logprobs(
+        a.api_base, a.model, a.probe_prompt_ids, timeout=120.0)
+    log(f"baseline fingerprint captured for {a.model} "
+        f"({len(a.probe_logprobs)} tokens)")
 
     for idx in range(start, schedule["n_updates"]):
         log(f"update {idx}/{schedule['n_updates'] - 1}")

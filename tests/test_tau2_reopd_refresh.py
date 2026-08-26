@@ -17,6 +17,7 @@ from vektori_trace.tau2.reopd_refresh import (
     load_adapter,
     probe_logprobs,
     refresh_policy,
+    reload_serving_volume,
     served_models,
 )
 
@@ -34,6 +35,8 @@ class FakeServer:
         self.unloaded = []
 
     def post(self, url, payload, timeout):
+        if url.endswith("/reload-volume"):
+            return 200, json.dumps({"ok": True, "seconds": 0.1})
         if url.endswith("/load_lora_adapter"):
             if not self.has_route:
                 return 404, "Not Found"
@@ -80,6 +83,22 @@ def test_refresh_loads_verifies_and_unloads(server):
     assert server.unloaded == ["ck35"]          # stale adapter released
 
 
+def test_refresh_reloads_volume_before_loading(server):
+    rep = refresh_policy(
+        "http://x", new_name="ck35-u000", new_path="/new/checkpoint",
+        probe_prompt_ids=[1, 2, 3], previous_logprobs=[-0.1, -0.2, -0.3],
+        previous_name="ck35", reload_url="http://control/reload-volume",
+    )
+    assert rep["volume_reload"]["ok"] is True
+
+
+def test_failed_volume_reload_is_fatal(monkeypatch):
+    import vektori_trace.tau2.reopd_refresh as R
+    monkeypatch.setattr(R, "_post", lambda *a, **k: (500, "busy volume"))
+    with pytest.raises(RefreshError, match="reload failed HTTP 500"):
+        reload_serving_volume("http://control/reload-volume")
+
+
 def test_first_refresh_needs_no_previous(server):
     rep = refresh_policy("http://x", new_name="ck35-u000",
                          new_path="/p", probe_prompt_ids=[1, 2, 3])
@@ -118,6 +137,24 @@ def test_missing_route_names_the_env_flag(server):
         load_adapter("http://x", "n", "/p")
 
 
+def test_failed_unload_is_not_reported_as_success(server, monkeypatch):
+    original = server.post
+
+    def fail_unload(url, payload, timeout):
+        if url.endswith("/unload_lora_adapter"):
+            return 500, "nope"
+        return original(url, payload, timeout)
+
+    import vektori_trace.tau2.reopd_refresh as R
+    monkeypatch.setattr(R, "_post", fail_unload)
+    with pytest.raises(RefreshError, match="unload_lora_adapter"):
+        refresh_policy(
+            "http://x", new_name="ck35-u000", new_path="/p",
+            probe_prompt_ids=[1, 2, 3],
+            previous_logprobs=[-0.1, -0.2, -0.3], previous_name="ck35",
+        )
+
+
 def test_probe_without_logprobs_is_fatal(server):
     server.lp["ck35"] = []
     with pytest.raises(RefreshError, match="no logprobs"):
@@ -144,6 +181,13 @@ def test_probe_uses_greedy_sampling(server):
 def test_serve_enables_runtime_lora_updating():
     src = open("vektori_trace/runtime/serve.py").read()
     assert '"VLLM_ALLOW_RUNTIME_LORA_UPDATING": "1"' in src
+
+
+def test_serve_exposes_volume_reload_control_plane():
+    src = open("vektori_trace/runtime/serve.py").read()
+    assert "def reload_volume(self)" in src
+    assert "vol.reload()" in src
+    assert "reload_volume_url=reload_url" in src
 
 
 def test_driver_refreshes_before_sampling_and_skips_update_0():
