@@ -77,10 +77,35 @@ def test_endpoint_serving_another_model_is_refused(monkeypatch):
         driver.verify_endpoint("http://x", "ck35")
 
 
-def test_endpoint_without_a_reported_context_is_refused(monkeypatch):
-    """Trusting the launch flag hides a --max-model-len typo."""
+def test_unreported_context_falls_back_to_a_real_probe(monkeypatch):
+    """vLLM does not expose a per-model context in every version, and a LoRA
+    entry inherits the base window rather than carrying its own. Refusing a
+    healthy endpoint over a missing metadata field is the wrong trade; probe
+    the thing that matters instead."""
     _models_response(monkeypatch, {"data": [{"id": "ck35"}]})
-    with pytest.raises(ReOPDSampleError, match="did not report a context"):
+    sent = {}
+
+    def poster(url, payload, timeout):
+        sent.update(payload)
+        return 200, {"choices": [{"text": "x"}]}
+
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json", poster)
+    out = driver.verify_endpoint("http://x", "ck35")
+    assert out["probe_tokens_accepted"] == 14_928
+    assert len(sent["prompt"]) == 14_928
+
+
+def test_unreported_context_with_a_rejected_probe_is_refused(monkeypatch):
+    """A server that cannot hold the longest prefix must still be caught."""
+    _models_response(monkeypatch, {"data": [{"id": "ck35"}]})
+
+    def poster(url, payload, timeout):
+        return 400, {"error": "maximum context length exceeded"}
+
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json", poster)
+    with pytest.raises(ReOPDSampleError, match="cannot serve this corpus"):
         driver.verify_endpoint("http://x", "ck35")
 
 

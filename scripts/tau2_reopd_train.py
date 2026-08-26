@@ -190,7 +190,7 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
     """
     import urllib.request
 
-    from vektori_trace.tau2.reopd_sample import ReOPDSampleError
+    from vektori_trace.tau2.reopd_sample import ReOPDSampleError, post_json
 
     url = api_base.rstrip("/") + "/models"
     with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -205,13 +205,35 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
         )
 
     entry = next(m for m in body["data"] if m.get("id") == model)
-    ctx = entry.get("max_model_len") or entry.get("context_length")
-    if ctx is None:
-        raise ReOPDSampleError(
-            f"endpoint did not report a context length for {model!r}; it cannot "
-            "be verified against the 14,928 tokens this corpus needs"
-        )
+    ctx = (entry.get("max_model_len") or entry.get("context_length")
+           or entry.get("max_context_length"))
     need = LONGEST_PREFIX_TOKENS + MAX_ACTION_TOKENS
+
+    if ctx is None:
+        # vLLM does not expose a per-model context in every version, and a LoRA
+        # entry inherits the base model's window rather than carrying its own.
+        # Rather than refuse a healthy endpoint over a missing metadata field,
+        # probe the thing that actually matters: does the server accept a prompt
+        # as long as the longest prefix this corpus will send?
+        probe = [1] * need
+        st, body2 = post_json(
+            api_base.rstrip("/") + "/completions",
+            {"model": model, "prompt": probe, "max_tokens": 1,
+             "temperature": 0.0}, timeout)
+        if st != 200:
+            raise ReOPDSampleError(
+                f"endpoint reports no context length AND rejected a "
+                f"{need}-token probe (HTTP {st}): {str(body2)[:200]}. The "
+                f"longest C30 prefix is {LONGEST_PREFIX_TOKENS} tokens and the "
+                f"action cap is {MAX_ACTION_TOKENS}, so this server cannot "
+                f"serve this corpus. Relaunch with --max-model-len "
+                f"{REQUIRED_CONTEXT}."
+            )
+        log(f"endpoint ok: {model}, context unreported but a {need}-token "
+            "prompt was accepted")
+        return {"served_model": model, "max_model_len": None,
+                "probe_tokens_accepted": need, "models": served}
+
     if int(ctx) < need:
         raise ReOPDSampleError(
             f"endpoint context {ctx} < {need} required "
