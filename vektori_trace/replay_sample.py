@@ -52,6 +52,27 @@ def token_bytes_from_ids(tokenizer: Any, token_ids: list[int]) -> list[bytes]:
     still containing a token the model did not sample as content — the same
     class of bug the Fireworks probe hit with a trailing EOS.
     """
+    # Fast ByteLevel tokenizers expose the *pre-decoder* vocabulary strings.
+    # Use those whenever possible.  Decoding one id at a time is not
+    # compositional when adjacent tokens split a UTF-8 code point: each call
+    # inserts U+FFFD even though decoding the complete sequence is lossless.
+    # Qwen uses ByteLevel BPE, so that old fallback could reject a perfectly
+    # valid vLLM capture after many successful ASCII-only samples.
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        from .vocab_bridge import _token_str_to_bytes
+
+        strings = tokenizer.convert_ids_to_tokens([int(t) for t in token_ids])
+        if isinstance(strings, str):
+            strings = [strings]
+        if len(strings) != len(token_ids) or any(s is None for s in strings):
+            raise CaptureAdaptError(
+                "tokenizer did not return one vocabulary token for every id"
+            )
+        return [_token_str_to_bytes(str(s)) for s in strings]
+
+    # Compatibility fallback for simple/non-fast tokenizers.  This is safe
+    # only for tokenizers whose single-id decode is compositional; callers
+    # still verify the joined result against the server's returned text.
     out: list[bytes] = []
     for tid in token_ids:
         piece = None

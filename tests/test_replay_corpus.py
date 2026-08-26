@@ -269,6 +269,22 @@ def test_token_bytes_reconstruct_the_action():
     assert b"".join(got) == b"abc"
 
 
+def test_token_bytes_survive_utf8_split_across_bytelevel_tokens():
+    """Single-id decode may be lossy even though the token sequence is not."""
+    class SplitUtf8Tokenizer:
+        def convert_ids_to_tokens(self, ids):
+            # ByteLevel's unicode alphabet for the UTF-8 bytes E2 82 AC (€).
+            return ["\u00e2", "\u0124", "\u00ac"]
+
+        def decode(self, ids, **kwargs):
+            # This is what independent decode calls commonly produce.
+            return "\ufffd"
+
+    got = token_bytes_from_ids(SplitUtf8Tokenizer(), [1, 2, 3])
+    assert got == [b"\xe2", b"\x82", b"\xac"]
+    assert b"".join(got).decode() == "\u20ac"
+
+
 def test_cap_hit_summary():
     tok = FakeTokenizer()
     ok = sampled_action_from_capture(
