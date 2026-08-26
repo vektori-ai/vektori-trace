@@ -218,3 +218,42 @@ def test_http_error_is_raised():
                      model="ck35", tokenizer=FakeTokenizer(),
                      policy_version="ck35", max_tokens=2048, temperature=0.7,
                      poster=poster)
+
+
+# --- transport failures are statuses, not exceptions ----------------------
+
+
+def test_post_json_reports_a_timeout_as_status_zero(monkeypatch):
+    """urlopen raises TimeoutError/URLError, neither of which is an HTTPError.
+
+    Callers branch on the returned status -- verify_endpoint's long-prompt probe
+    treats a non-200 as "this server is too short" -- so an uncaught transport
+    error propagated raw out of the gate instead of being reported. 0 is not a
+    real HTTP status, so it cannot be mistaken for a server-issued rejection.
+    """
+    import urllib.request
+
+    import vektori_trace.tau2.reopd_sample as S
+
+    def boom(*a, **k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    st, body = S.post_json("http://x/v1/completions", {"prompt": [1]}, 1.0)
+    assert st == 0
+    assert "TimeoutError" in body["error"]
+
+
+def test_post_json_reports_a_refused_connection_as_status_zero(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    import vektori_trace.tau2.reopd_sample as S
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    st, body = S.post_json("http://x/v1/completions", {"prompt": [1]}, 1.0)
+    assert st == 0
+    assert "URLError" in body["error"]

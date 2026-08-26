@@ -17,7 +17,13 @@ training beside it is not possible.
     # 1. endpoint, in its own tmux window
     .venv/bin/python scripts/serve_student.py --base-model Qwen/Qwen3-4B \\
         --adapter ck35=/adapters/tau2/runs/a_warm_20260825_003343/checkpoint-35 \\
-        --gpu L40S --max-model-len 20480 --write-env /data/tau2/ck35_env.sh
+        --gpu L40S --max-model-len 24576 --write-env /data/tau2/ck35_env.sh
+
+    24576, not 20480. serve.py splits the window into an advertised input and
+    output cap: out_cap = min(8192, L//2), in_cap = L - out_cap. At L=20480 that
+    advertises only 12,288 input tokens, which is BELOW the 12,880-token longest
+    C30 prefix -- the endpoint comes up healthy and then refuses the longest
+    prefixes. 24576 advertises 16,384 in / 8,192 out, clearing both.
 
     # 2. the canary, then the full run
     .venv/bin/modal run scripts/tau2_reopd_modal.py --canary 4 \\

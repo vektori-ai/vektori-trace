@@ -73,8 +73,33 @@ MAX_ACTION_TOKENS = 2048
 #: 14,928, so a 12,288-token server cannot serve this corpus and would drop
 #: tokens from the FRONT of the prompt, sampling a state the run cannot
 #: describe while every downstream assertion still passes.
-REQUIRED_CONTEXT = 16384
 LONGEST_PREFIX_TOKENS = 12_880
+
+
+def _required_context(prefix_tokens: int, action_tokens: int) -> int:
+    """The smallest --max-model-len that actually serves this corpus.
+
+    Not simply prefix+action. `runtime.serve` splits the window into advertised
+    caps -- out_cap = min(8192, L//2), in_cap = L - out_cap -- and litellm
+    honours in_cap, so the prompt is bounded by in_cap rather than by L. A
+    naive L = 14,928 advertises only 7,464 input tokens and refuses every long
+    prefix, which is the trap the old hardcoded 16,384 walked into: it looks
+    bigger than the 14,928 requirement while advertising 8,192 in.
+
+    Solve for the smallest L with in_cap >= prefix and L >= prefix + action,
+    then round up to a multiple of 1,024 so the number is a legible flag value.
+    """
+    need_total = prefix_tokens + action_tokens
+    L = need_total
+    while True:
+        out_cap = max(1, min(8192, L // 2))
+        if L - out_cap >= prefix_tokens and L >= need_total:
+            break
+        L += 1024
+    return ((L + 1023) // 1024) * 1024
+
+
+REQUIRED_CONTEXT = _required_context(LONGEST_PREFIX_TOKENS, MAX_ACTION_TOKENS)
 
 
 def log(msg: str) -> None:
@@ -209,39 +234,48 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
            or entry.get("max_context_length"))
     need = LONGEST_PREFIX_TOKENS + MAX_ACTION_TOKENS
 
-    if ctx is None:
-        # vLLM does not expose a per-model context in every version, and a LoRA
-        # entry inherits the base model's window rather than carrying its own.
-        # Rather than refuse a healthy endpoint over a missing metadata field,
-        # probe the thing that actually matters: does the server accept a prompt
-        # as long as the longest prefix this corpus will send?
-        probe = [1] * need
-        st, body2 = post_json(
-            api_base.rstrip("/") + "/completions",
-            {"model": model, "prompt": probe, "max_tokens": 1,
-             "temperature": 0.0}, timeout)
-        if st != 200:
-            raise ReOPDSampleError(
-                f"endpoint reports no context length AND rejected a "
-                f"{need}-token probe (HTTP {st}): {str(body2)[:200]}. The "
-                f"longest C30 prefix is {LONGEST_PREFIX_TOKENS} tokens and the "
-                f"action cap is {MAX_ACTION_TOKENS}, so this server cannot "
-                f"serve this corpus. Relaunch with --max-model-len "
-                f"{REQUIRED_CONTEXT}."
-            )
-        log(f"endpoint ok: {model}, context unreported but a {need}-token "
-            "prompt was accepted")
-        return {"served_model": model, "max_model_len": None,
-                "probe_tokens_accepted": need, "models": served}
-
-    if int(ctx) < need:
+    # A reported window is necessary but NOT sufficient, so it never short-
+    # circuits the probe. serve.py advertises a split input/output budget
+    # (out_cap = min(8192, L//2), in_cap = L - out_cap), and litellm honours
+    # in_cap. At --max-model-len 20480 the window looks ample at 20,480 while
+    # the advertised input cap is 12,288 -- below the 12,880-token longest C30
+    # prefix. The metadata check passes and the longest prefixes are then
+    # refused mid-run. Only sending a full-length prompt tests the path the
+    # corpus will actually use.
+    if ctx is not None and int(ctx) < need:
         raise ReOPDSampleError(
             f"endpoint context {ctx} < {need} required "
             f"({LONGEST_PREFIX_TOKENS} longest prefix + {MAX_ACTION_TOKENS} cap). "
             f"Relaunch with --max-model-len {REQUIRED_CONTEXT}."
         )
-    log(f"endpoint ok: {model}, context {ctx}")
-    return {"served_model": model, "max_model_len": int(ctx), "models": served}
+
+    st, body2 = post_json(
+        api_base.rstrip("/") + "/completions",
+        {"model": model, "prompt": [1] * LONGEST_PREFIX_TOKENS,
+         "max_tokens": MAX_ACTION_TOKENS, "temperature": 0.0}, timeout)
+    if st == 0:
+        raise ReOPDSampleError(
+            f"could not reach {api_base} to probe the serving window: "
+            f"{body2.get('error')}. Not treating an unreachable endpoint as a "
+            "short one -- fix the transport and rerun the gate."
+        )
+    if st != 200:
+        raise ReOPDSampleError(
+            f"endpoint advertises context {ctx} but rejected a realistic "
+            f"{LONGEST_PREFIX_TOKENS}-prompt + {MAX_ACTION_TOKENS}-completion "
+            f"probe (HTTP {st}): {str(body2)[:300]}. This is the shape the "
+            f"longest C30 prefix sends. If the window looks large enough, the "
+            f"advertised INPUT cap is the binding limit: serve.py gives input "
+            f"only max_model_len - min(8192, max_model_len//2). Relaunch with "
+            f"--max-model-len {REQUIRED_CONTEXT}."
+        )
+    log(f"endpoint ok: {model}, reported context {ctx}, and a "
+        f"{LONGEST_PREFIX_TOKENS}+{MAX_ACTION_TOKENS} probe was accepted")
+    return {"served_model": model,
+            "max_model_len": None if ctx is None else int(ctx),
+            "probe_prompt_tokens": LONGEST_PREFIX_TOKENS,
+            "probe_max_tokens": MAX_ACTION_TOKENS,
+            "models": served}
 
 
 def refresh_serving_policy(args, idx: int, checkpoint_path, state) -> dict:

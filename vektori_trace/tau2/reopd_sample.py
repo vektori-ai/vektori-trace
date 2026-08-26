@@ -60,6 +60,14 @@ def post_json(url: str, payload: dict, timeout: float) -> tuple[int, dict]:
             return e.code, json.loads(e.read().decode())
         except Exception:
             return e.code, {"error": str(e)}
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # A timeout or a refused connection is not an HTTPError, so without this
+        # it propagates raw. Callers that branch on the status code -- notably
+        # verify_endpoint's long-prompt probe -- would crash on a slow-but-
+        # healthy server instead of reporting a transport failure they can act
+        # on. 0 is not a real HTTP status, which is the point: it cannot be
+        # mistaken for a server-issued rejection.
+        return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
 def capture_fingerprint(

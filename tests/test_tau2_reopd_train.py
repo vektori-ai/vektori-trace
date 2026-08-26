@@ -54,17 +54,73 @@ def _models_response(monkeypatch, payload):
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: R())
 
 
+def _ok_poster(monkeypatch, sent=None):
+    def poster(url, payload, timeout):
+        if sent is not None:
+            sent.update(payload)
+        return 200, {"choices": [{"text": "x"}]}
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json", poster)
+
+
 def test_endpoint_with_enough_context_passes(monkeypatch):
     _models_response(monkeypatch, {"data": [
-        {"id": "ck35", "max_model_len": 16384}]})
+        {"id": "ck35", "max_model_len": 24576}]})
+    _ok_poster(monkeypatch)
     out = driver.verify_endpoint("http://x", "ck35")
-    assert out["max_model_len"] == 16384
+    assert out["max_model_len"] == 24576
+
+
+def test_required_context_clears_the_advertised_input_cap(monkeypatch):
+    """serve.py advertises in_cap = L - min(8192, L//2), and litellm honours
+    it, so the prompt is bounded by in_cap rather than by L. The old hardcoded
+    16,384 advertised only 8,192 input tokens -- below the 12,880 prefix -- so
+    relaunching as the error instructed would have failed the same way."""
+    L = driver.REQUIRED_CONTEXT
+    out_cap = min(8192, L // 2)
+    assert L - out_cap >= driver.LONGEST_PREFIX_TOKENS
+    assert L >= driver.LONGEST_PREFIX_TOKENS + driver.MAX_ACTION_TOKENS
+
+
+def test_a_big_window_with_a_short_input_cap_is_still_refused(monkeypatch):
+    """The 20480 regression: the window looks ample and the metadata check
+    passes, but the advertised input cap is 12,288 -- under the 12,880 prefix --
+    so the server rejects the longest prefixes at run time. The reported number
+    must never short-circuit the probe."""
+    _models_response(monkeypatch, {"data": [
+        {"id": "ck35", "max_model_len": 20480}]})
+
+    def poster(url, payload, timeout):
+        if len(payload["prompt"]) > 20480 - min(8192, 20480 // 2):
+            return 400, {"error": "maximum context length exceeded"}
+        return 200, {"choices": [{"text": "x"}]}
+
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json", poster)
+    with pytest.raises(ReOPDSampleError, match="INPUT cap"):
+        driver.verify_endpoint("http://x", "ck35")
+
+
+def test_an_unreachable_endpoint_is_not_reported_as_a_short_one(monkeypatch):
+    """post_json returns 0 for a transport failure. Reporting that as a
+    too-small context would send someone to relaunch a server that was fine."""
+    _models_response(monkeypatch, {"data": [
+        {"id": "ck35", "max_model_len": 24576}]})
+
+    def poster(url, payload, timeout):
+        return 0, {"error": "TimeoutError: timed out"}
+
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json", poster)
+    with pytest.raises(ReOPDSampleError, match="could not reach"):
+        driver.verify_endpoint("http://x", "ck35")
 
 
 def test_endpoint_too_short_is_refused(monkeypatch):
     """A 12288 server drops tokens from the FRONT, silently."""
     _models_response(monkeypatch, {"data": [
         {"id": "ck35", "max_model_len": 12288}]})
+    _ok_poster(monkeypatch)
     with pytest.raises(ReOPDSampleError, match="context 12288 < 14928"):
         driver.verify_endpoint("http://x", "ck35")
 
@@ -72,7 +128,7 @@ def test_endpoint_too_short_is_refused(monkeypatch):
 def test_endpoint_serving_another_model_is_refused(monkeypatch):
     """vLLM resolves an unknown name to the base; the adapter does nothing."""
     _models_response(monkeypatch, {"data": [
-        {"id": "Qwen/Qwen3-4B", "max_model_len": 16384}]})
+        {"id": "Qwen/Qwen3-4B", "max_model_len": 24576}]})
     with pytest.raises(ReOPDSampleError, match="does not advertise"):
         driver.verify_endpoint("http://x", "ck35")
 
@@ -92,8 +148,9 @@ def test_unreported_context_falls_back_to_a_real_probe(monkeypatch):
     import vektori_trace.tau2.reopd_sample as S
     monkeypatch.setattr(S, "post_json", poster)
     out = driver.verify_endpoint("http://x", "ck35")
-    assert out["probe_tokens_accepted"] == 14_928
-    assert len(sent["prompt"]) == 14_928
+    assert out["probe_prompt_tokens"] == 12_880
+    assert len(sent["prompt"]) == 12_880
+    assert sent["max_tokens"] == driver.MAX_ACTION_TOKENS
 
 
 def test_unreported_context_with_a_rejected_probe_is_refused(monkeypatch):
@@ -105,7 +162,7 @@ def test_unreported_context_with_a_rejected_probe_is_refused(monkeypatch):
 
     import vektori_trace.tau2.reopd_sample as S
     monkeypatch.setattr(S, "post_json", poster)
-    with pytest.raises(ReOPDSampleError, match="cannot serve this corpus"):
+    with pytest.raises(ReOPDSampleError, match="rejected a realistic"):
         driver.verify_endpoint("http://x", "ck35")
 
 
