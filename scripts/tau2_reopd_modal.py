@@ -71,11 +71,14 @@ hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=False)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
+        # Mirrors the SFT container, which builds. safetensors is deliberately
+        # unpinned: it arrives as a transformers dependency, and an explicit pin
+        # here was both wrong (0.7.1 does not exist -- versions jump 0.7.0 to
+        # 0.8.0) and unnecessary.
         "torch==2.13.0",
         "transformers==5.5.3",
         "peft==0.19.1",
         "accelerate==1.14.0",
-        "safetensors==0.7.1",
         "numpy<3",
         "requests",
     )
