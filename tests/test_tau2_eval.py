@@ -9,6 +9,7 @@ test or an unapproved GPU bill, and it is cheap to prove.
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -509,6 +510,12 @@ def runtime_env(monkeypatch, artifacts, tmp_path):
     # query. Its own behaviour is covered by the unit tests below.
     monkeypatch.setattr(_mod, "_assert_arms_differ_from_base",
                         lambda *_a, **_k: None)
+    # And the Volume check, for the same reason plus a sharper one: it makes a
+    # real Modal API call, so leaving it live makes this suite depend on
+    # credentials and network reachability. It passes in ~1s on a box with a
+    # token and hangs on one without. Its own behaviour is unit-tested below.
+    monkeypatch.setattr(_mod, "_verify_adapters_on_volume",
+                        lambda *_a, **_k: None)
     monkeypatch.setattr(_mod.time, "sleep", lambda _s: None)
     return {"artifacts": artifacts, "tau2_dir": str(tau2_dir)}
 
@@ -690,3 +697,62 @@ def test_a_probe_that_cannot_be_scored_is_refused(monkeypatch):
     with pytest.raises(SystemExit, match="no logprob"):
         _mod._assert_arms_differ_from_base(
             "http://x/v1", "Qwen3-4B", {"reopd": "Qwen3-4B-reopd"})
+
+
+# --- Volume adapter verification -----------------------------------------
+
+
+class _FakeVol:
+    def __init__(self, tree): self.tree = tree
+    def listdir(self, rel):
+        if rel not in self.tree:
+            raise FileNotFoundError("No such file or directory")
+        return [types.SimpleNamespace(path=f"{rel}/{n}") for n in self.tree[rel]]
+
+
+def _fake_volume(monkeypatch, tree):
+    import modal
+    monkeypatch.setattr(modal.Volume, "from_name",
+                        staticmethod(lambda *_a, **_k: _FakeVol(tree)))
+
+
+def test_volume_check_accepts_a_real_adapter(monkeypatch):
+    _fake_volume(monkeypatch, {"tau2/runs/r/checkpoint-1":
+                               ["adapter_model.safetensors", "adapter_config.json"]})
+    _mod._verify_adapters_on_volume(
+        {"warm": "/adapters/tau2/runs/r/checkpoint-1"})
+
+
+def test_volume_check_refuses_a_missing_directory(monkeypatch):
+    """A mistyped path must not reach vLLM, which resolves an unknown adapter
+    against the base model and evaluates A0 under another name."""
+    _fake_volume(monkeypatch, {})
+    with pytest.raises(SystemExit, match="cannot list"):
+        _mod._verify_adapters_on_volume(
+            {"bogus": "/adapters/tau2/runs/nope/checkpoint-1"})
+
+
+def test_volume_check_refuses_a_directory_without_weights(monkeypatch):
+    _fake_volume(monkeypatch, {"tau2/runs/r/checkpoint-1": ["adapter_config.json"]})
+    with pytest.raises(SystemExit, match="no adapter_model.safetensors"):
+        _mod._verify_adapters_on_volume(
+            {"warm": "/adapters/tau2/runs/r/checkpoint-1"})
+
+
+def test_volume_check_refuses_a_non_volume_path(monkeypatch):
+    _fake_volume(monkeypatch, {})
+    with pytest.raises(SystemExit, match="not a Volume path"):
+        _mod._verify_adapters_on_volume({"warm": "/tmp/somewhere/checkpoint-1"})
+
+
+def test_volume_check_falls_through_when_modal_is_unreachable(monkeypatch, capsys):
+    """A Modal outage should not block a launch: the served name is still
+    verified against /v1/models, and the logits probe still runs after boot."""
+    import modal
+
+    def boom(*_a, **_k):
+        raise RuntimeError("no token")
+
+    monkeypatch.setattr(modal.Volume, "from_name", staticmethod(boom))
+    _mod._verify_adapters_on_volume({"warm": "/adapters/tau2/runs/r/checkpoint-1"})
+    assert "WARNING" in capsys.readouterr().out
