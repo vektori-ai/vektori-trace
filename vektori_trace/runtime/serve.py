@@ -271,6 +271,16 @@ def serve_model(
                 # Emit engine stats every second so /metrics is actually live —
                 # scripts/vllm_monitor.py reads exactly these.
                 "VLLM_LOG_STATS_INTERVAL": "1",
+                # Lets a client POST /v1/load_lora_adapter to swap an adapter
+                # without restarting the server. Multi-update ReOPD needs the
+                # endpoint to serve update N's policy before sampling update
+                # N+1; restarting vLLM per update would add ~3 minutes x 32.
+                #
+                # vLLM documents this as unsafe for untrusted environments
+                # because it loads weights from a caller-supplied path. Here the
+                # only caller is the run's own driver and the path is a Modal
+                # volume, so the exposure is the same as the launch flags.
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "1",
             }
         )
     )

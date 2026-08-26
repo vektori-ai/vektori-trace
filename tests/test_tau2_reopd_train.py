@@ -231,10 +231,13 @@ def test_teacher_tokenizer_matches_the_served_teacher():
     assert "DeepSeek-V3" not in src
 
 
-def test_stale_serving_policy_is_refused_after_update_0():
-    """Update 0 is exempt -- CK35 is the current policy there. Update 1 is not."""
-    from vektori_trace.tau2.reopd_sample import ReOPDSampleError
-
-    driver.assert_serving_policy_matches("http://x", "ck35", "ck35", 0)   # ok
-    with pytest.raises(ReOPDSampleError, match="log pi_old"):
-        driver.assert_serving_policy_matches("http://x", "ck35", "ck35", 1)
+def test_update_0_needs_no_refresh_but_later_updates_do():
+    """CK35 *is* the policy at update 0, which keeps a one-update canary valid
+    against a static endpoint. Every later update must swap first, or log pi_old
+    comes from a policy that never sampled the action."""
+    src = open(REPO / "scripts" / "tau2_reopd_train.py").read()
+    assert 'if idx > 0 and not u.reached("SAMPLED")' in src
+    assert "refresh_serving_policy(args, idx" in src
+    # and the swap happens before anything is paid for
+    assert src.index("refresh_serving_policy(args, idx") < src.index(
+        "captures = sample_batch(")

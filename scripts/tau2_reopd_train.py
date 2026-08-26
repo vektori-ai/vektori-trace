@@ -222,33 +222,36 @@ def verify_endpoint(api_base: str, model: str, *, timeout: float = 30.0) -> dict
     return {"served_model": model, "max_model_len": int(ctx), "models": served}
 
 
-def assert_serving_policy_matches(
-    api_base: str, model: str, expect_adapter_hash: str | None, idx: int,
-) -> None:
-    """Refuse to sample update `idx` from a stale adapter.
+def refresh_serving_policy(args, idx: int, checkpoint_path, state) -> dict:
+    """Serve the checkpoint update `idx-1` produced, before sampling update idx.
 
-    ReOPD is on-policy in the action: `log pi_old` in the importance ratio must
-    come from the *current* policy. If the endpoint still serves CK35 while the
-    trainer has moved on, every ratio compares two different distributions --
-    finite loss, plausible metrics, wrong gradient, and no log would show it.
+    ReOPD is on-policy in the action: `log pi_old` must come from the policy
+    that sampled it. An endpoint still serving CK35 at update 7 makes every
+    importance ratio compare two different distributions, with a finite loss and
+    nothing in any log to show for it.
 
-    Update 0 is exempt: CK35 *is* the current policy there, which is why the
-    one-update canary is valid against a static endpoint.
+    Update 0 needs no refresh -- CK35 *is* the current policy there, which is
+    why a one-update canary is valid against a static endpoint.
     """
-    from vektori_trace.tau2.reopd_sample import ReOPDSampleError
+    from vektori_trace.tau2.reopd_refresh import refresh_policy
 
-    if idx == 0 or not expect_adapter_hash:
-        return
-    raise ReOPDSampleError(
-        f"update {idx} would sample from an endpoint still serving the update-"
-        f"{idx - 1} policy is unverified. vLLM cannot hot-swap a LoRA adapter "
-        "in place, so the serving side must be refreshed and re-verified "
-        "between updates. Implement --refresh-cmd, or run the arm one update "
-        "at a time, reloading the endpoint from each checkpoint.\n"
-        "This is a correctness stop, not a convenience one: sampling update "
-        f"{idx} from CK35 makes log pi_old the wrong distribution for every "
-        "action in the batch."
+    name = f"{args.model}-u{idx - 1:03d}"
+    rep = refresh_policy(
+        args.api_base,
+        new_name=name,
+        new_path=str(checkpoint_path),
+        probe_prompt_ids=args.probe_prompt_ids,
+        previous_logprobs=getattr(args, "probe_logprobs", None),
+        previous_name=getattr(args, "served_name", None),
     )
+    args.model = name
+    args.served_name = name
+    args.probe_logprobs = rep["probe_logprobs"]
+    log(f"  endpoint now serves {name} "
+        f"(probe delta {rep.get('max_logprob_delta', 'n/a')})")
+    telemetry(args.run_dir_resolved,
+              {"event": "refresh", "update": idx, **rep})
+    return rep
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +282,14 @@ def run_update(
 
     u = run.update(idx)
     u.validate()
-    # Before anything is sampled or paid for.
-    assert_serving_policy_matches(
-        args.api_base, args.model,
-        getattr(args, "served_adapter_hash", None), idx)
+
+    # Before anything is sampled or paid for: the endpoint must serve the
+    # policy this update is meant to sample from.
+    if idx > 0 and not u.reached("SAMPLED"):
+        prev = run.update(idx - 1)
+        prev.validate_checkpoint()
+        refresh_serving_policy(args, idx, prev.checkpoint_path, None)
+
     batch_ids = batch_for(schedule, idx)
     prefixes = [prefixes_by_id[pid] for pid in batch_ids]
 
@@ -620,12 +627,11 @@ def main() -> int:
                  if start > 0 else None)
 
     by_id = {p.prefix_id: p for p in prefixes}
-    if schedule["n_updates"] > 1:
-        # The serving side is CK35 and stays CK35: nothing here reloads vLLM.
-        # Rather than silently produce 31 off-policy updates, stop now.
-        log("NOTE a multi-update run needs the endpoint refreshed from each "
-            "checkpoint between updates; that is not implemented.")
-        setattr(a, "served_adapter_hash", "ck35")
+    # A fixed prompt whose greedy logprobs fingerprint the served policy. Taken
+    # from the first prefix's real ids so the probe exercises the same shape the
+    # run does; truncated because a fingerprint needs a few tokens, not 12k.
+    a.probe_prompt_ids = prefixes[0].prompt_token_ids[:256]
+    a.served_name = a.model
 
     for idx in range(start, schedule["n_updates"]):
         log(f"update {idx}/{schedule['n_updates'] - 1}")
