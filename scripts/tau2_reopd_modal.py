@@ -119,6 +119,8 @@ def train(
     policy_file: str | None,
     teacher_tokenizer: str,
     tools_file: str | None = None,
+    reload_url: str | None = None,
+    canary_updates: int = 1,
 ) -> dict:
     import importlib.util
     import json
@@ -158,6 +160,10 @@ def train(
         argv += ["--policy-file", policy_file]
     if tools_file:
         argv += ["--tools-file", tools_file]
+    if reload_url:
+        argv += ["--reload-url", reload_url]
+    if canary:
+        argv += ["--canary-updates", str(canary_updates)]
     if canary:
         argv += ["--canary", str(canary)]
     else:
@@ -244,6 +250,8 @@ def main(
     temperature: float = 1.0,
     policy_file: str = "",
     tools_file: str = "/adapters/tau2/reopd/retail_tools.json",
+    reload_url: str = "",
+    canary_updates: int = 1,
     teacher_tokenizer: str = "deepseek-ai/DeepSeek-V4-Flash-0731",
 ):
     import json
@@ -263,7 +271,7 @@ def main(
     rid = run_id or (
         f"{'canary' if canary else 'a_reopd'}_ck35_{time.strftime('%Y%m%d_%H%M%S')}"
     )
-    shape = f"{1 if canary else n_updates} updates x {canary or n_per_update} states"
+    shape = f"{canary_updates if canary else n_updates} updates x {canary or n_per_update} states"
     print(f"ReOPD: CK35 -> C30 ({shape})")
     print(f"  endpoint {api_base}")
     print(f"  output   {RUNS_IN_VOLUME}/{rid}")
@@ -275,10 +283,16 @@ def main(
             "Stage it on the volume and pass its remote path, e.g. "
             "/adapters/tau2/reopd/retail_policy.txt. Render parity verifies it."
         )
+    if (canary_updates if canary else n_updates) > 1 and not reload_url:
+        raise SystemExit(
+            "--reload-url is required for a multi-update run. Source the env "
+            "file written by the current serve_student.py first."
+        )
 
     result = train.remote(api_base, model, rid, canary, n_updates,
                           n_per_update, learning_rate, temperature,
-                          policy_file, teacher_tokenizer, tools_file)
+                          policy_file, teacher_tokenizer, tools_file,
+                          reload_url, canary_updates)
     print(json.dumps({k: v for k, v in result.items()
                       if k != "stages"}, indent=2))
     for s in result.get("stages", []):

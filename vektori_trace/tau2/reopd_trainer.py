@@ -44,6 +44,13 @@ class ReOPDTrainerError(RuntimeError):
     """The trainable model is not in the state the run requires."""
 
 
+def _canonical_lora_key(name: str) -> str:
+    """Normalize PEFT's live-vs-saved default-adapter name difference."""
+    return name.replace(".lora_A.default.", ".lora_A.").replace(
+        ".lora_B.default.", ".lora_B."
+    )
+
+
 class ReOPDTrainer:
     """CK35 + optimizer, carried across 32 updates."""
 
@@ -194,13 +201,24 @@ class ReOPDTrainer:
                 "trainable adapter and this run would be a no-op"
             )
 
+        canonical_live: dict[str, tuple[str, Any]] = {}
+        for name, tensor in live.items():
+            key = _canonical_lora_key(name)
+            if key in canonical_live:
+                raise CheckpointError(
+                    f"two live LoRA tensors canonicalize to {key!r}: "
+                    f"{canonical_live[key][0]!r} and {name!r}"
+                )
+            canonical_live[key] = (name, tensor)
+
         max_delta, matched = 0.0, 0
         for name, tensor in saved.items():
-            key = next((k for k in live if k.endswith(name.split(".", 1)[-1])), None)
-            if key is None:
+            pair = canonical_live.get(_canonical_lora_key(name))
+            if pair is None:
                 continue
+            _live_name, live_tensor = pair
             matched += 1
-            d = (live[key].detach().float().cpu() - tensor.float()).abs().max()
+            d = (live_tensor.detach().float().cpu() - tensor.float()).abs().max()
             max_delta = max(max_delta, float(d))
 
         if matched == 0:

@@ -117,10 +117,34 @@ def load_adapter(
     return {"name": name, "path": path, "status": status}
 
 
-def unload_adapter(api_base: str, name: str, *, timeout: float = 120.0) -> None:
-    """Best effort. A stale adapter left loaded costs memory, not correctness."""
-    _post(api_base.rstrip("/") + "/unload_lora_adapter",
-          {"lora_name": name}, timeout)
+def unload_adapter(api_base: str, name: str, *, timeout: float = 120.0) -> dict[str, Any]:
+    """Attempt to unload an old adapter and report the real result.
+
+    Failure is observable but not fatal: vLLM may already have evicted it from
+    its CPU LoRA cache, and the newly loaded adapter has already passed both
+    registration and behavioral verification. Resource cleanup must not turn a
+    correct policy swap into a failed training update.
+    """
+    status, raw = _post(api_base.rstrip("/") + "/unload_lora_adapter",
+                        {"lora_name": name}, timeout)
+    return {"name": name, "status": status,
+            "ok": status in (200, 201), "body": raw[:300]}
+
+
+def reload_serving_volume(url: str, *, timeout: float = 120.0) -> dict[str, Any]:
+    """Refresh the serving container's Modal Volume snapshot."""
+    status, raw = _post(url, {}, timeout)
+    if status not in (200, 201):
+        raise RefreshError(
+            f"serving-volume reload failed HTTP {status}: {raw[:300]}"
+        )
+    try:
+        body = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise RefreshError(f"serving-volume reload returned invalid JSON: {raw[:300]}") from exc
+    if body.get("ok") is not True:
+        raise RefreshError(f"serving-volume reload did not confirm success: {body}")
+    return body
 
 
 def refresh_policy(
@@ -131,6 +155,7 @@ def refresh_policy(
     probe_prompt_ids: list[int],
     previous_logprobs: list[float] | None = None,
     previous_name: str | None = None,
+    reload_url: str | None = None,
     timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Serve `new_path` as `new_name`, and prove the endpoint really swapped.
@@ -139,6 +164,9 @@ def refresh_policy(
     back as `previous_logprobs` on the next refresh -- so each update is checked
     against the one before it rather than against a fixed baseline.
     """
+    reload_report = None
+    if reload_url:
+        reload_report = reload_serving_volume(reload_url, timeout=timeout)
     load_adapter(api_base, new_name, new_path, timeout=timeout)
 
     # 1. the server admits to serving it
@@ -156,6 +184,8 @@ def refresh_policy(
         "name": new_name, "path": new_path,
         "probe_logprobs": lps, "n_probe_tokens": len(lps),
     }
+    if reload_report is not None:
+        report["volume_reload"] = reload_report
     if previous_logprobs:
         n = min(len(lps), len(previous_logprobs))
         delta = max(abs(a - b) for a, b in zip(lps[:n], previous_logprobs[:n]))
@@ -169,8 +199,7 @@ def refresh_policy(
             )
 
     if previous_name and previous_name != new_name:
-        unload_adapter(api_base, previous_name)
-        report["unloaded"] = previous_name
+        report["unload"] = unload_adapter(api_base, previous_name)
     return report
 
 
@@ -179,6 +208,7 @@ __all__ = [
     "load_adapter",
     "probe_logprobs",
     "refresh_policy",
+    "reload_serving_volume",
     "served_models",
     "unload_adapter",
 ]

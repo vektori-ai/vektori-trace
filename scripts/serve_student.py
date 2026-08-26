@@ -308,6 +308,7 @@ def main() -> int:
             return 3
 
         print(f"  STUDENT_API_BASE={served.api_base}")
+        print(f"  STUDENT_RELOAD_URL={served.reload_volume_url}")
         print(f"  model_name       {served.model_name}")
         print(f"  harbor model     {served.harbor_model}")
         if len(served.adapter_models) > 1:
@@ -325,6 +326,7 @@ def main() -> int:
                 fh.write(f"\nSTUDENT_API_BASE={served.api_base}\n")
                 fh.write(f"STUDENT_MODEL={served.model_name}\n")
                 fh.write(f"STUDENT_HARBOR_MODEL={served.harbor_model}\n")
+                fh.write(f"STUDENT_RELOAD_URL={served.reload_volume_url}\n")
             print(f"\nappended STUDENT_API_BASE/MODEL to {args.write_env}")
         if args.max_hours:
             print(f"auto-shutdown in {args.max_hours}h "

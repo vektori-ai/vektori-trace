@@ -84,6 +84,10 @@ class ServedModel:
     sample_gpu: Callable[[], dict[str, Any]] | None = field(
         default=None, repr=False, compare=False
     )
+    # Separate control-plane endpoint on the same serving container. ReOPD's
+    # trainer commits checkpoints from another container; Modal Volume mounts
+    # are snapshots and must be reloaded before vLLM can open the new path.
+    reload_volume_url: str | None = None
 
     @property
     def harbor_model(self) -> str:
@@ -339,6 +343,20 @@ def serve_model(
         def health(self) -> str:
             return "ok"
 
+        @modal.fastapi_endpoint(method="POST")
+        def reload_volume(self) -> dict[str, Any]:
+            """Make checkpoints committed by another container visible here.
+
+            This endpoint intentionally does only the filesystem synchronization;
+            the caller still asks vLLM to load the adapter and verifies both the
+            registered model name and its behavior afterwards.
+            """
+            import time as _t
+
+            started = _t.time()
+            vol.reload()
+            return {"ok": True, "seconds": round(_t.time() - started, 3)}
+
         @modal.method()
         def gpu_stats(self) -> dict[str, Any]:
             """One NVML sample of the card this container holds.
@@ -467,6 +485,16 @@ def serve_model(
             url = getattr(web, "web_url", None) or (
                 f"https://{_SERVE_APP_NAME}--openai-compat.modal.run"
             )
+        reload_web = server.reload_volume
+        reload_url = (reload_web.get_web_url()
+                      if hasattr(reload_web, "get_web_url") else None)
+        if not reload_url:
+            reload_url = getattr(reload_web, "web_url", None)
+        if not reload_url:
+            raise RuntimeError(
+                "Modal did not expose the serving-volume reload endpoint; "
+                "multi-update ReOPD cannot see newly committed checkpoints"
+            )
         served = ServedModel(
             api_base=url.rstrip("/") + "/v1",
             model_name=served_name,
@@ -478,6 +506,7 @@ def serve_model(
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             sample_gpu=lambda: server.gpu_stats.remote(),
+            reload_volume_url=reload_url,
         )
         yield served
 
@@ -489,6 +518,7 @@ def dump_serve_record(served: ServedModel) -> dict[str, Any]:
         "harbor_model": served.harbor_model,
         "base_model": served.base_model,
         "adapter_path": served.adapter_path,
+        "reload_volume_url": served.reload_volume_url,
         "gpu": served.gpu,
         "model_info": served.model_info,
         "volume": VOLUME_NAME,

@@ -81,6 +81,7 @@ def test_refresh_loads_verifies_and_unloads(server):
     assert rep["name"] == "ck35-u000"
     assert rep["max_logprob_delta"] > 0
     assert server.unloaded == ["ck35"]          # stale adapter released
+    assert rep["unload"]["ok"] is True
 
 
 def test_refresh_reloads_volume_before_loading(server):
@@ -137,7 +138,7 @@ def test_missing_route_names_the_env_flag(server):
         load_adapter("http://x", "n", "/p")
 
 
-def test_failed_unload_is_not_reported_as_success(server, monkeypatch):
+def test_failed_unload_is_recorded_without_invalidating_swap(server, monkeypatch):
     original = server.post
 
     def fail_unload(url, payload, timeout):
@@ -147,12 +148,13 @@ def test_failed_unload_is_not_reported_as_success(server, monkeypatch):
 
     import vektori_trace.tau2.reopd_refresh as R
     monkeypatch.setattr(R, "_post", fail_unload)
-    with pytest.raises(RefreshError, match="unload_lora_adapter"):
-        refresh_policy(
-            "http://x", new_name="ck35-u000", new_path="/p",
-            probe_prompt_ids=[1, 2, 3],
-            previous_logprobs=[-0.1, -0.2, -0.3], previous_name="ck35",
-        )
+    rep = refresh_policy(
+        "http://x", new_name="ck35-u000", new_path="/p",
+        probe_prompt_ids=[1, 2, 3],
+        previous_logprobs=[-0.1, -0.2, -0.3], previous_name="ck35",
+    )
+    assert rep["unload"] == {"name": "ck35", "status": 500,
+                              "ok": False, "body": "nope"}
 
 
 def test_probe_without_logprobs_is_fatal(server):

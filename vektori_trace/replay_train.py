@@ -567,6 +567,13 @@ def load_v0_for_training(cfg: ReplayTrainConfig):
     )
     model = PeftModel.from_pretrained(base, cfg.adapter_path, is_trainable=True)
 
+    # HF from_pretrained() returns evaluation-mode models. Gradient
+    # checkpointing is gated on `self.training`, so enter train mode before
+    # enabling and validating it; doing this only at the end makes the gate
+    # reject a healthy adapter (or, without the gate, silently retain all
+    # activations on the first backward pass).
+    model.train()
+
     if cfg.gradient_checkpointing:
         # Recompute hidden activations in the backward instead of storing all
         # 40 layers' worth — ~15.6 GiB at a 40k sequence. SFT trained this same
@@ -617,9 +624,6 @@ def load_v0_for_training(cfg: ReplayTrainConfig):
         raise ReplayTrainError(
             f"{cfg.adapter_path} loaded but exposes no trainable LoRA parameters"
         )
-    # Checkpointing is gated on `self.training`; from_pretrained does not
-    # guarantee it, and eval mode would silently cost ~53 GiB of activations.
-    model.train()
     return model
 
 
