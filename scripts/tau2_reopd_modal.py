@@ -9,7 +9,7 @@ student endpoint.
 Two GPUs are alive during a run, doing different jobs:
 
     L40S  serving ck35 under vLLM           (scripts/serve_student.py)
-    A100  running this: the optimizer step  (this file)
+    L40S  running this: the optimizer step  (this file)
 
 They cannot be the same card. vLLM claims its GPU's memory entirely, so
 training beside it is not possible.
@@ -44,6 +44,26 @@ CORPUS_IN_VOLUME = "corpora/b741bfceb1f3d027"
 PARENT_IN_VOLUME = "tau2/runs/a_warm_20260825_003343/checkpoint-35"
 RUNS_IN_VOLUME = "tau2/reopd"
 
+#: Two L40S, one serving and one training -- they cannot share a card, because
+#: vLLM claims its GPU's memory wholesale and leaves nothing for a training
+#: process beside it.
+#:
+#: L40S rather than an A100 for the training half, on the measured budget for
+#: Qwen3-4B + LoRA r=16:
+#:
+#:     base weights bf16      7.50 GiB
+#:     LoRA + grads + AdamW   0.43 GiB   (33M trainable, not 4B)
+#:     activations            6.34 GiB   (measured, matched SFT run)
+#:                           --------
+#:     SFT peak              14.26 GiB   of 44
+#:
+#: ReOPD adds the importance ratio's transient logits (~1.2 GiB at vocab 151k x
+#: 2048 action tokens), so ~15-16 GiB expected. Roughly 3x headroom. This is an
+#: estimate, not a measurement -- ReOPD has never run on this model. The canary
+#: reports torch_peak_gib, which turns it into a fact; if it OOMs the cost is
+#: one failed canary rather than a run.
+GPU = "L40S"
+
 app = modal.App("tau2-reopd")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
 hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=False)
@@ -71,7 +91,7 @@ image = (
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu=GPU,
     image=image,
     volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
     timeout=60 * 60 * 6,
