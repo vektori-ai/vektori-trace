@@ -422,7 +422,7 @@ def main() -> int:
         # Explicit paths win outright rather than merging with the template
         # arms: --checkpoints has a non-empty default, so a silent merge would
         # add three unrequested ck* arms to every explicit run and pay for them.
-        if a.checkpoints != _DEFAULT_CHECKPOINTS:
+        if tuple(a.checkpoints) != _DEFAULT_CHECKPOINTS:
             raise SystemExit(
                 "--adapter and --checkpoints are mutually exclusive; --adapter "
                 "already names every arm explicitly"
