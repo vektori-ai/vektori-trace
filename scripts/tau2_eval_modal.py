@@ -76,6 +76,10 @@ from run_replay_opd import require_endpoint_model  # noqa: E402
 
 BASE_MODEL = "Qwen/Qwen3-4B"
 
+#: Default --checkpoints. Named so --adapter can detect that the user left it
+#: alone; comparing against a literal in two places drifts.
+_DEFAULT_CHECKPOINTS = ("35", "70", "105")
+
 # The trained artifact (handoff §2). Checkpoints are subdirectories of the run.
 #
 # The prefix is `VOLUME_MOUNT` ("/adapters"), not "/vol": `_resolve_volume_adapter`
@@ -172,6 +176,47 @@ def _canonical_base_name() -> str:
     from vektori_trace.runtime.serve import _canonical_name
 
     return _canonical_name(BASE_MODEL)
+
+
+def _parse_adapter_args(specs: list[str]) -> dict[str, str]:
+    """`name=path` pairs -> {served_suffix: adapter_path}, order preserved.
+
+    `_arms` can only express `{run_dir}/checkpoint-{N}`, which reaches neither a
+    second run directory nor ReOPD's `update-031/checkpoint` (no `-N` suffix at
+    all). Forcing those through --run-dir/--checkpoints would need one
+    invocation per arm: three model loads instead of one, and three different
+    servers, so the arms would no longer be compared under identical conditions.
+
+    Names are served suffixes, so they must be distinct and URL-safe; vLLM
+    resolves an unknown model name against the *base* model, which is how a
+    typo becomes three silent A0 runs that still report numbers.
+    """
+    table: dict[str, str] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise SystemExit(
+                f"--adapter expects name=path, got {spec!r}"
+            )
+        name, _, path = spec.partition("=")
+        name, path = name.strip(), path.strip()
+        if not name or not path:
+            raise SystemExit(f"--adapter expects name=path, got {spec!r}")
+        if not all(c.isalnum() or c in "-_" for c in name):
+            raise SystemExit(
+                f"--adapter name {name!r} must be alphanumeric/-/_ : it becomes "
+                "a served model name"
+            )
+        if name in table:
+            raise SystemExit(
+                f"--adapter name {name!r} given twice; served names must be "
+                "distinct or one arm silently shadows the other"
+            )
+        if name.upper() == "A0":
+            raise SystemExit(
+                "--adapter name 'A0' is reserved for the unadapted base model"
+            )
+        table[name] = path
+    return table
 
 
 def _ck_order(suffixes) -> list[str]:
@@ -317,8 +362,13 @@ def main() -> int:
                          "order). Prefer --tasks when the ids matter.")
     ap.add_argument("--run-dir", default=DEFAULT_RUN,
                     help="Volume path of the A_warm run holding the checkpoints")
-    ap.add_argument("--checkpoints", nargs="*", default=["35", "70", "105"],
+    ap.add_argument("--checkpoints", nargs="*", default=list(_DEFAULT_CHECKPOINTS),
                     help="checkpoint numbers to grade; empty grades base only")
+    ap.add_argument("--adapter", action="append", default=[], metavar="NAME=PATH",
+                    help="explicit arm as name=path; repeatable. Use this for "
+                         "adapters that are not {run-dir}/checkpoint-N -- "
+                         "different runs, or ReOPD's update-NNN/checkpoint. "
+                         "Mutually exclusive with --checkpoints.")
     ap.add_argument("--no-base", action="store_true",
                     help="skip the frozen A0 arm (it is the §7.1 baseline)")
     ap.add_argument("--gpu", default="L40S")
@@ -368,9 +418,36 @@ def main() -> int:
     task_ids, man_hash = _resolve_tasks(a.artifacts, a.partition)
     all_n = len(task_ids)
     task_ids = _subset(task_ids, a.partition, a.tasks, a.max_tasks)
-    adapters = _arms(a.run_dir, a.checkpoints)
+    if a.adapter:
+        # Explicit paths win outright rather than merging with the template
+        # arms: --checkpoints has a non-empty default, so a silent merge would
+        # add three unrequested ck* arms to every explicit run and pay for them.
+        if a.checkpoints != _DEFAULT_CHECKPOINTS:
+            raise SystemExit(
+                "--adapter and --checkpoints are mutually exclusive; --adapter "
+                "already names every arm explicitly"
+            )
+        adapters = _parse_adapter_args(a.adapter)
+        arm_order = list(adapters)
+    else:
+        adapters = _arms(a.run_dir, a.checkpoints)
+        arm_order = _ck_order(adapters)
     if not adapters and a.no_base:
         raise SystemExit("nothing to evaluate: no checkpoints and --no-base")
+
+    # Fail before the GPU, not after. `_arms` never checked this: a wrong path
+    # reaches vLLM, which resolves an unknown adapter against the BASE model, so
+    # every arm silently becomes A0 and still reports plausible numbers. A
+    # dry-run cannot see the volume, so this is a real-run check only.
+    if not a.dry_run:
+        for name, path in adapters.items():
+            weights = Path(path) / "adapter_model.safetensors"
+            if not weights.exists():
+                raise SystemExit(
+                    f"arm {name!r}: no adapter weights at {weights}. Refusing "
+                    "to start: vLLM resolves a missing adapter against the base "
+                    "model, so this arm would silently be A0."
+                )
 
     prefix = a.save_prefix or f"tau2_eval_{a.partition.lower()}_{time.strftime('%Y%m%d_%H%M%S')}"
 
@@ -446,7 +523,7 @@ def main() -> int:
             "--log-level", "DEBUG",
         ]
 
-    arm_names = ([] if a.no_base else ["A0"]) + _ck_order(adapters)
+    arm_names = ([] if a.no_base else ["A0"]) + arm_order
     subset = "" if len(task_ids) == all_n else f" (subset of {all_n})"
     print(f"partition   {a.partition}: {len(task_ids)} tasks{subset}, "
           f"manifest_hash={man_hash}")
@@ -461,7 +538,7 @@ def main() -> int:
     if a.dry_run:
         print("\nwould serve:", BASE_MODEL, "on", a.gpu,
               "with", " ".join(VLLM_ARGS))
-        for suffix in _ck_order(adapters):
+        for suffix in arm_order:
             print(f"  lora {suffix:8s} {adapters[suffix]}")
         for arm in arm_names:
             # The served name is only knowable once the endpoint is up --
@@ -506,7 +583,7 @@ def main() -> int:
             # baseline that is actually a trained arm makes every delta wrong
             # in a direction nothing in the logs would show.
             served_for["A0"] = _canonical_base_name()
-        for suffix in _ck_order(adapters):
+        for suffix in arm_order:
             match = [n for n in served.adapter_models if n.endswith(f"-{suffix}")]
             if not match:
                 raise SystemExit(
