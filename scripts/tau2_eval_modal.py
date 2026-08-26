@@ -178,6 +178,56 @@ def _canonical_base_name() -> str:
     return _canonical_name(BASE_MODEL)
 
 
+def _verify_adapters_on_volume(adapters: dict[str, str]) -> None:
+    """Refuse an arm whose adapter weights are not in the Volume.
+
+    vLLM resolves an unknown adapter against the base model, so a mistyped path
+    does not error -- it evaluates A0 under another name and reports plausible
+    numbers. Checked here, before the GPU is allocated.
+
+    The Volume is not mounted on the launching machine, so this lists the Volume
+    over the Modal API rather than touching the local filesystem. If the client
+    or the Volume cannot be reached the check is skipped with a warning: a
+    launch should not be blocked by an unrelated Modal outage, and the served
+    name is still verified against /v1/models after boot.
+    """
+    from vektori_trace.runtime.modal_env import VOLUME_MOUNT
+
+    try:
+        import modal
+
+        from vektori_trace.runtime.modal_env import VOLUME_NAME
+
+        vol = modal.Volume.from_name(VOLUME_NAME)
+    except Exception as e:                       # noqa: BLE001 - see docstring
+        print(f"WARNING: cannot reach the Volume to verify adapters ({e}); "
+              "relying on the post-boot /v1/models check", flush=True)
+        return
+
+    for name, path in adapters.items():
+        if not path.startswith(VOLUME_MOUNT):
+            raise SystemExit(
+                f"arm {name!r}: {path!r} is not a Volume path (expected it to "
+                f"start with {VOLUME_MOUNT})"
+            )
+        rel = path[len(VOLUME_MOUNT):].lstrip("/")
+        try:
+            entries = {Path(e.path).name for e in vol.listdir(rel)}
+        except Exception as e:                   # noqa: BLE001
+            raise SystemExit(
+                f"arm {name!r}: cannot list {path} in the Volume ({e}). "
+                "Refusing to start: vLLM resolves a missing adapter against the "
+                "base model, so this arm would silently be A0."
+            ) from e
+        if "adapter_model.safetensors" not in entries:
+            raise SystemExit(
+                f"arm {name!r}: no adapter_model.safetensors under {path}. "
+                "Refusing to start: vLLM resolves a missing adapter against the "
+                "base model, so this arm would silently be A0."
+            )
+    print(f"adapters verified in the Volume: {', '.join(adapters)}", flush=True)
+
+
 def _parse_adapter_args(specs: list[str]) -> dict[str, str]:
     """`name=path` pairs -> {served_suffix: adapter_path}, order preserved.
 
@@ -437,17 +487,15 @@ def main() -> int:
 
     # Fail before the GPU, not after. `_arms` never checked this: a wrong path
     # reaches vLLM, which resolves an unknown adapter against the BASE model, so
-    # every arm silently becomes A0 and still reports plausible numbers. A
-    # dry-run cannot see the volume, so this is a real-run check only.
-    if not a.dry_run:
-        for name, path in adapters.items():
-            weights = Path(path) / "adapter_model.safetensors"
-            if not weights.exists():
-                raise SystemExit(
-                    f"arm {name!r}: no adapter weights at {weights}. Refusing "
-                    "to start: vLLM resolves a missing adapter against the base "
-                    "model, so this arm would silently be A0."
-                )
+    # every arm silently becomes A0 and still reports plausible numbers.
+    #
+    # These paths live in the Modal Volume, mounted at VOLUME_MOUNT inside the
+    # container -- they do NOT exist on the launching machine, so a local
+    # `Path.exists()` here rejects every valid arm. Ask the Volume instead.
+    # Skipped under --dry-run, which is meant to run anywhere, and skipped when
+    # the Modal client is unavailable rather than blocking a launch on it.
+    if not a.dry_run and adapters:
+        _verify_adapters_on_volume(adapters)
 
     prefix = a.save_prefix or f"tau2_eval_{a.partition.lower()}_{time.strftime('%Y%m%d_%H%M%S')}"
 
