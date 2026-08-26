@@ -504,6 +504,11 @@ def runtime_env(monkeypatch, artifacts, tmp_path):
 
     monkeypatch.setattr(_mod, "serve_model", _fake_serve)
     monkeypatch.setattr(_mod, "require_endpoint_model", lambda *_a, **_k: None)
+    # Same reason as the line above: these tests drive the arm-launch path
+    # against a fake endpoint, so the adapter-effect probe has nothing real to
+    # query. Its own behaviour is covered by the unit tests below.
+    monkeypatch.setattr(_mod, "_assert_arms_differ_from_base",
+                        lambda *_a, **_k: None)
     monkeypatch.setattr(_mod.time, "sleep", lambda _s: None)
     return {"artifacts": artifacts, "tau2_dir": str(tau2_dir)}
 
@@ -630,3 +635,58 @@ def test_heartbeat_reports_progress_while_an_arm_runs(runtime_env, monkeypatch,
     out = capsys.readouterr().out
     assert "elapsed, last progress" in out
     assert "kill at" in out, "the heartbeat should name the stall budget"
+
+
+# --- adapter-effect probe -------------------------------------------------
+
+
+def _probe_poster(monkeypatch, table):
+    """Fake /completions returning a per-model first-token logprob."""
+    import vektori_trace.tau2.reopd_sample as S
+
+    def poster(url, payload, timeout):
+        m = payload["model"]
+        if m not in table:
+            return 404, {"error": f"unknown model {m}"}
+        return 200, {"choices": [{"logprobs": {"token_logprobs": [table[m]]}}]}
+
+    monkeypatch.setattr(S, "post_json", poster)
+
+
+def test_an_arm_identical_to_the_base_is_refused(monkeypatch):
+    """The failure this exists for: the adapter is advertised but not applied.
+
+    vLLM can resolve an adapter to base weights, and a LoRA whose B tensors are
+    zero serves fine under its own name. Either way the arm IS A0, and the whole
+    experiment is a comparison against A0 -- so this must stop the run, not warn.
+    """
+    _probe_poster(monkeypatch, {"Qwen3-4B": -1.25, "Qwen3-4B-reopd": -1.25})
+    with pytest.raises(SystemExit, match="identical to the frozen base"):
+        _mod._assert_arms_differ_from_base(
+            "http://x/v1", "Qwen3-4B", {"reopd": "Qwen3-4B-reopd"})
+
+
+def test_an_applied_adapter_passes(monkeypatch):
+    _probe_poster(monkeypatch, {"Qwen3-4B": -1.25, "Qwen3-4B-reopd": -0.91})
+    _mod._assert_arms_differ_from_base(
+        "http://x/v1", "Qwen3-4B", {"reopd": "Qwen3-4B-reopd"})
+
+
+def test_two_arms_may_agree_with_each_other(monkeypatch):
+    """Arms share a CK35 parent, so agreeing with each other is legitimate.
+    Only agreement with A0 is disqualifying."""
+    _probe_poster(monkeypatch, {
+        "Qwen3-4B": -1.25, "Qwen3-4B-sft": -0.91, "Qwen3-4B-reopd": -0.91})
+    _mod._assert_arms_differ_from_base(
+        "http://x/v1", "Qwen3-4B",
+        {"sft": "Qwen3-4B-sft", "reopd": "Qwen3-4B-reopd"})
+
+
+def test_a_probe_that_cannot_be_scored_is_refused(monkeypatch):
+    """No logprob means the adapter's effect is unproven; that is not a pass."""
+    import vektori_trace.tau2.reopd_sample as S
+    monkeypatch.setattr(S, "post_json",
+                        lambda *_a, **_k: (200, {"choices": [{"logprobs": {}}]}))
+    with pytest.raises(SystemExit, match="no logprob"):
+        _mod._assert_arms_differ_from_base(
+            "http://x/v1", "Qwen3-4B", {"reopd": "Qwen3-4B-reopd"})

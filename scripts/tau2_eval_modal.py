@@ -178,6 +178,57 @@ def _canonical_base_name() -> str:
     return _canonical_name(BASE_MODEL)
 
 
+def _assert_arms_differ_from_base(
+    api_base: str, base_name: str, served_for: dict[str, str],
+    *, timeout: float = 120.0,
+) -> None:
+    """Refuse any arm whose logprobs are identical to the frozen base's.
+
+    Deterministic by construction: temperature 0, one token, the same prompt for
+    every arm, so the only thing that can move the number is the adapter. Two
+    arms may legitimately agree with each other -- they share a parent -- but an
+    adapter agreeing with A0 to the bit means it is not being applied.
+
+    Raises rather than warns. The whole experiment is a comparison against A0,
+    so an arm that IS A0 does not produce a weak result, it produces a false one.
+    """
+    from vektori_trace.tau2.reopd_sample import post_json
+
+    prompt = "Return the order status for order #W0000000."
+
+    def logprob(model: str) -> float:
+        st, body = post_json(
+            api_base.rstrip("/") + "/completions",
+            {"model": model, "prompt": prompt, "max_tokens": 1,
+             "temperature": 0.0, "logprobs": 0}, timeout)
+        if st != 200:
+            raise SystemExit(
+                f"adapter-effect probe failed for {model!r} (HTTP {st}): "
+                f"{str(body)[:200]}"
+            )
+        choice = (body.get("choices") or [{}])[0]
+        lps = (choice.get("logprobs") or {}).get("token_logprobs") or []
+        if not lps or lps[0] is None:
+            raise SystemExit(
+                f"adapter-effect probe for {model!r} returned no logprob; "
+                "cannot prove the adapter is applied"
+            )
+        return float(lps[0])
+
+    base_lp = logprob(base_name)
+    for arm, name in served_for.items():
+        lp = logprob(name)
+        if lp == base_lp:
+            raise SystemExit(
+                f"arm {arm!r} ({name}) produced logprob {lp!r}, identical to the "
+                f"frozen base {base_name!r}. The adapter is registered but not "
+                "changing the model's output -- evaluating it would measure A0 "
+                "under another name. Refusing to spend the run."
+            )
+        print(f"[serve] {arm:8s} adapter applied "
+              f"(logprob {lp:.6f} vs base {base_lp:.6f})", flush=True)
+
+
 def _verify_adapters_on_volume(adapters: dict[str, str]) -> None:
     """Refuse an arm whose adapter weights are not in the Volume.
 
@@ -643,6 +694,15 @@ def main() -> int:
         for arm, name in served_for.items():
             require_endpoint_model(served.api_base, name)
             print(f"[serve] {arm:8s} -> {name!r} advertised", flush=True)
+
+        # Advertised is not applied. /v1/models proves a name is registered; it
+        # does not prove the adapter changes the model's output. An adapter that
+        # loads but whose LoRA-B tensors are zero -- or that vLLM quietly
+        # resolves to base weights -- serves fine under its own name and grades
+        # as "the method changed nothing", with a full GPU bill behind it.
+        # Compare each arm's greedy logprobs against A0's on one fixed prompt.
+        _assert_arms_differ_from_base(
+            served.api_base, _canonical_base_name(), served_for)
 
         for arm, name in served_for.items():
             save_to = f"{prefix}_{arm.lower()}"
