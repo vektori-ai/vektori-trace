@@ -908,6 +908,89 @@ def classify_advantages(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def projection_report(run_id: str = "", update: int = 0) -> str:
+    """Offline acceptance report for the semantic projection. No API calls.
+
+    Runs `project_action` over every archived action and reports what would be
+    supervised, what would be excluded and why. This is the gate that must pass
+    before a single teacher token is re-purchased.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    from vektori_trace.tau2.live_projection import ProjectionError, project_action
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    if not runs:
+        return "no runs found"
+    run = runs[-1]
+    apath = os.path.join(run, f"update-{update:03d}", "actions.jsonl")
+    if not os.path.isfile(apath):
+        return f"no actions.jsonl at {apath}"
+
+    rows = [json.loads(l) for l in open(apath) if l.strip()]
+    n_ok = 0
+    failures = []
+    tot_tokens = tot_sup = 0
+    by_kind: dict = {}
+    by_reason: dict = {}
+    per_action = []
+
+    for r in rows:
+        stu = [base64.b64decode(x) for x in r["action_token_bytes_b64"]]
+        raw = b"".join(stu).decode("utf-8", "replace")
+        # Trailing specials are allowed by the capture path; strip for parsing.
+        for special in ("<|im_end|>", "<|endoftext|>"):
+            if raw.endswith(special):
+                raw = raw[: -len(special)]
+        try:
+            proj = project_action(raw, stu)
+        except ProjectionError as exc:
+            failures.append({"key": r["key"], "error": str(exc)[:200]})
+            continue
+        rep = proj.report()
+        # Invariant: nothing silently dropped.
+        assert rep["n_supervised"] + rep["n_excluded"] == len(stu), r["key"]
+        n_ok += 1
+        tot_tokens += len(stu)
+        tot_sup += rep["n_supervised"]
+        for k, v in rep["supervised_by_kind"].items():
+            by_kind[k] = by_kind.get(k, 0) + v
+        for k, v in rep["excluded_by_reason"].items():
+            by_reason[k] = by_reason.get(k, 0) + v
+        per_action.append((r["key"], rep["retained_fraction"],
+                           rep["has_reasoning"], rep["n_tool_calls"]))
+
+    out = [
+        f"run: {os.path.basename(run)}  update {update}",
+        f"actions: {len(rows)}   projected OK: {n_ok}   failed: {len(failures)}",
+        f"tokens: {tot_tokens}   supervised: {tot_sup}   "
+        f"retained: {round(tot_sup / tot_tokens, 4) if tot_tokens else 0}",
+        "",
+        "supervised by kind:  " + json.dumps(by_kind),
+        "excluded by reason:  " + json.dumps(by_reason),
+        "",
+        "ACCEPTANCE:",
+        f"  all actions project        : {n_ok == len(rows)}",
+        f"  zero markup supervised     : {'markup' not in by_kind}",
+        f"  zero tool-json supervised  : {'tool_json' not in by_kind}",
+        "",
+    ]
+    for key, frac, has_r, n_tc in per_action[:40]:
+        out.append(f"  {key:34s} retained={frac:.3f} reasoning={has_r} tools={n_tc}")
+    for f in failures[:10]:
+        out.append(f"  FAIL {f['key']}: {f['error']}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -920,6 +1003,7 @@ def main(
     show: bool = False,
     telemetry_only: bool = False,
     classify_only: bool = False,
+    projection_only: bool = False,
     classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
@@ -958,6 +1042,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if projection_only:
+        projection_report.remote(run_id, classify_update)
         return
 
     if classify_only:
