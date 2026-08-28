@@ -8,9 +8,21 @@ asked DeepSeek for its likelihood. The pinned reference forbids exactly that
     Both student_ids and teacher_ids should be the *response content only*
     (no chat template special tokens on either side).
 
-Upstream goes further and *translates* markers between families rather than
-passing one model's markup to the other (`_build_chat_template_mapping`, whose
-Qwen->DeepSeek branch names our case: ``<|im_end|>\\n -> <｜end▁of▁sentence｜>``).
+Upstream goes further and *translates* chat-template markers between families
+rather than passing one model's markup to the other
+(`_build_chat_template_mapping`). Its "already clean" note on the Qwen->DeepSeek
+branch means the replacement leaves no trailing newline -- NOT that the Qwen
+marker is safe to score unchanged.
+
+**Upstream stops at chat-template markers.** Verified against the vendored
+revision: it contains no occurrence of `tool_call`, `DSML` or `invoke name`,
+so it offers no Qwen-JSON -> DeepSeek-DSML conversion; the paper's experiments
+did not exercise a multi-turn tool protocol. The two defects therefore have
+different owners:
+
+    <|im_end|>                      -> upstream's template translation covers it
+    <tool_call>{JSON}</tool_call>   -> ours to project or exclude; nothing
+                                       upstream to reuse
 
 The measured cost of skipping that step, over the archived batch:
 
