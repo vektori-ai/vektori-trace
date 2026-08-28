@@ -257,7 +257,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reload-url", default=os.environ.get("STUDENT_RELOAD_URL", ""))
     p.add_argument("--student-model", required=True)
     p.add_argument("--adapter-hash", default="",
-                   help="hash of the parent adapter; recorded in every episode")
+                   help="DEPRECATED override. The parent hash is derived from "
+                        "--parent's weights; pass this only to pin a value when "
+                        "the parent is not readable from this process.")
 
     p.add_argument("--teacher-model",
                    default="accounts/fireworks/models/deepseek-v4-flash-0731")
@@ -329,6 +331,35 @@ def main() -> int:
     else:
         n_updates = a.n_updates
     a.run_dir = a.run_dir or f"runs/live-opd-{time.strftime('%Y%m%d-%H%M%S')}"
+
+    # Provenance is DERIVED, never an optional CLI string. `adapter_hash` is
+    # stamped onto every archived episode and is what `batch_report` checks a
+    # batch against; the 2026-08-28 two-update proof recorded "" for update 0
+    # because the wrapper never passed the flag, leaving that rollout's
+    # provenance blank while the checkpoint's own parent_policy_hash was
+    # correct. A hash that can be forgotten is not provenance.
+    if a.parent:
+        try:
+            from vektori_trace.tau2.reopd_checkpoint import adapter_hash
+            derived = adapter_hash(a.parent)
+        except Exception as exc:
+            raise SystemExit(
+                f"cannot derive the parent adapter hash from {a.parent}: {exc}. "
+                "Rollout provenance would be blank, so refusing to sample."
+            ) from exc
+        if a.adapter_hash and a.adapter_hash != derived:
+            raise SystemExit(
+                f"--adapter-hash {a.adapter_hash!r} disagrees with the weights "
+                f"at --parent ({derived!r}). One of them names a different "
+                "adapter than the run will actually sample from."
+            )
+        a.adapter_hash = derived
+        log(f"parent adapter {a.parent} -> {derived}")
+    elif not a.adapter_hash:
+        raise SystemExit(
+            "no --parent to derive the adapter hash from, and no explicit "
+            "--adapter-hash. Every episode would archive blank provenance."
+        )
 
     n_episodes = len(a.task_ids) * len(a.seeds)
     share = live_max_trace_share(n_episodes, headroom=a.share_headroom)

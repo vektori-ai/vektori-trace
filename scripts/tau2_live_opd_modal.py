@@ -239,6 +239,10 @@ def train(
     ]
     if reload_url:
         argv += ["--reload-url", reload_url]
+    # Deliberately NOT forwarded by default. The driver derives the parent
+    # hash from --parent's weights, which cannot be forgotten the way a flag
+    # can (update 0 of the 2026-08-28 proof archived "" for exactly that
+    # reason). An explicit value is still honoured as a cross-check.
     if adapter_hash:
         argv += ["--adapter-hash", adapter_hash]
     if allow_missing_reasoning:
@@ -465,7 +469,19 @@ def preflight(tau2_src: str = "") -> dict:
         return {"data_dir": root, "retail": "complete",
                 "user_simulator": "complete"}
 
+    def _parent_hash():
+        from vektori_trace.tau2.reopd_checkpoint import adapter_hash as _ah
+        got = _ah(parent)
+        if got != PARENT_ADAPTER_HASH:
+            raise ValueError(
+                f"parent adapter at {parent} hashes to {got}, but this file "
+                f"pins {PARENT_ADAPTER_HASH}. The run would train from a "
+                "different adapter than it claims."
+            )
+        return got
+
     check("tau2_domain_data", _domain_data)
+    check("parent_adapter_hash", _parent_hash)
     check("parent_adapter", _parent)
     check("tau2_importable", _tau2)
     check("retail_tools", _tools)
@@ -792,6 +808,106 @@ def show_telemetry(run_id: str = "") -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def classify_advantages(run_id: str = "", update: int = 0) -> str:
+    """Recompute per-token advantages and break them down BY TOKEN CLASS.
+
+    CPU only, no teacher call: it replays the exact alignment and chunk-
+    advantage math over the archived actions and paid scores, then attributes
+    every supervised token to markup / reasoning / tool-json / content.
+
+    This is what a global histogram cannot do. The 2026-08-28 proof reported a
+    single `-55.289` advantage and `</think>` negative in 27/31 turns; without
+    attribution there is no way to tell a structural-syntax penalty from a
+    genuine semantic one, and masking a class we have not measured throws away
+    real supervision alongside the spurious kind.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    from vektori_trace.align import align_by_bytes
+    from vektori_trace.chunk_opd import assign_chunk_advantages
+    from vektori_trace.tau2.live_token_classes import (
+        class_report, classify_action,
+    )
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    if not runs:
+        return "no runs found"
+    run = runs[-1]
+    u = os.path.join(run, f"update-{update:03d}")
+
+    actions = {}
+    for line in open(os.path.join(u, "actions.jsonl")):
+        if line.strip():
+            r = json.loads(line)
+            actions[r["key"]] = r
+    scores = {}
+    for line in open(os.path.join(u, "scores.jsonl")):
+        if line.strip():
+            r = json.loads(line)
+            scores[r["key"]] = r
+
+    per_token = []
+    n_actions = 0
+    skipped = []
+    for key, a in sorted(actions.items()):
+        sc = scores.get(key)
+        if sc is None:
+            skipped.append((key, "no score"))
+            continue
+        stu = [base64.b64decode(x) for x in a["action_token_bytes_b64"]]
+        tea = [base64.b64decode(x) for x in sc["teacher_token_bytes_b64"]]
+        try:
+            alignment = align_by_bytes(stu, tea)
+            advs, supervised, _stats = assign_chunk_advantages(
+                alignment,
+                [float(x) for x in a["behavior_logprobs"]],
+                [float(x) for x in sc["teacher_logprobs"]],
+            )
+        except Exception as exc:
+            skipped.append((key, f"{type(exc).__name__}: {exc}"[:120]))
+            continue
+        classes = classify_action(stu)
+        for i, (adv, sup) in enumerate(zip(advs, supervised)):
+            if not sup:
+                continue
+            tok = stu[i].decode("utf-8", "replace")
+            per_token.append((classes[i], float(adv), tok))
+        n_actions += 1
+
+    rep = class_report(per_token)
+    rep["n_actions"] = n_actions
+    rep["skipped"] = skipped[:10]
+
+    out = [f"run: {os.path.basename(run)}  update {update}",
+           f"actions analysed: {n_actions}",
+           f"supervised tokens: {rep['n_supervised_tokens']}",
+           f"markup share: {rep['markup_share']}", ""]
+    for cls, st in rep["by_class"].items():
+        out.append(
+            f"{cls:10s} n={st['n']:6d}  +{st['n_positive']:5d} "
+            f"-{st['n_negative']:5d}  mean={st['mean']:+.4f}  "
+            f"min={st['min']}  max={st['max']}"
+        )
+    out.append("")
+    for cls, st in rep["by_class"].items():
+        out.append(f"--- {cls} extremes ---")
+        for e in st["extremes"]:
+            out.append(f"   {e['advantage']:+10.4f}  {e['token']!r}")
+    if skipped:
+        out.append("")
+        out.append(f"skipped: {skipped[:5]}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -803,6 +919,8 @@ def main(
     preflight_only: bool = False,
     show: bool = False,
     telemetry_only: bool = False,
+    classify_only: bool = False,
+    classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
     diagnose_one: bool = False,
@@ -840,6 +958,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if classify_only:
+        classify_advantages.remote(run_id, classify_update)
         return
 
     if telemetry_only:
