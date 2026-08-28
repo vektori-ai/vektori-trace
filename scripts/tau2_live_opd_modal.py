@@ -727,6 +727,71 @@ def show_actions(run_id: str = "", update: int = 0, full: bool = False) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def show_telemetry(run_id: str = "") -> str:
+    """Print telemetry.jsonl and report.json for a run. CPU only."""
+    import glob
+    import json
+    import os
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    if not runs:
+        return "no runs found"
+    run = runs[-1]
+    out = [f"run: {os.path.basename(run)}", "", "=== files ==="]
+    for dp, dn, fn_ in os.walk(run):
+        if "turns" in dn:
+            dn.remove("turns")
+            out.append(f"  {os.path.relpath(os.path.join(dp,'turns'), run)}/ (dir)")
+        for f in fn_:
+            fp = os.path.join(dp, f)
+            out.append(f"  {os.path.relpath(fp, run)}  ({os.path.getsize(fp)}b)")
+
+    tel = os.path.join(run, "telemetry.jsonl")
+    out += ["", "=== telemetry.jsonl ==="]
+    if not os.path.isfile(tel):
+        out.append("  MISSING")
+    else:
+        for line in open(tel):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            r.pop("t", None); r.pop("iso", None); r.pop("probe_logprobs", None)
+            ev, st = r.get("event"), r.get("stage")
+            if ev == "stage" and st == "TRAINED":
+                out.append("[TRAINED] " + json.dumps(r, indent=1))
+            elif ev in ("live_batch", "refresh") or ev == "stage":
+                out.append(f"[{ev}/{st}] " + json.dumps(r)[:420])
+
+    rep = os.path.join(run, "update-000", "report.json")
+    out += ["", "=== report.json (update 0) ==="]
+    if not os.path.isfile(rep):
+        out.append("  MISSING")
+    else:
+        d = json.load(open(rep))
+        out.append("keys: " + str(sorted(d.keys())))
+        out.append("optimizer: " + json.dumps(d.get("optimizer"))[:600])
+        for k in ("global_supervised_tokens", "spread", "selection_policy",
+                  "realized_step_histogram"):
+            if k in d:
+                out.append(f"{k}: {json.dumps(d[k])[:300]}")
+        pas = d.get("per_action_stats") or []
+        advs = [s.get("mean_advantage") for s in pas
+                if isinstance(s, dict) and s.get("mean_advantage") is not None]
+        out.append(f"per_action_stats: {len(pas)}")
+        if advs:
+            sv = sorted(advs)
+            out.append(f"  mean_advantage min={min(advs):.6f} max={max(advs):.6f} "
+                       f"median={sv[len(sv)//2]:.6f} "
+                       f"n_distinct={len({round(a,6) for a in advs})}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -737,6 +802,7 @@ def main(
     n_updates: int = 5,
     preflight_only: bool = False,
     show: bool = False,
+    telemetry_only: bool = False,
     show_full: bool = False,
     show_update: int = 0,
     diagnose_one: bool = False,
@@ -774,6 +840,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if telemetry_only:
+        show_telemetry.remote(run_id)
         return
 
     if show or show_full:
