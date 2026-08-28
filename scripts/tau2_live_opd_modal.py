@@ -1916,6 +1916,93 @@ def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
     })
     return report
 
+
+@app.function(
+    # NO gpu=. The swap happens on the ALREADY-RUNNING serving card; this
+    # container only issues the load/verify calls.
+    image=image,
+    volumes={VOLUME_MOUNT: vol},
+    timeout=60 * 20,
+)
+def refresh_only(run_id: str = "", update: int = 0, api_base: str = "",
+                 reload_url: str = "", base_served_name: str = "",
+                 previous_served_name: str = "") -> dict:
+    """Stage 4: serve update `update-1`'s checkpoint before sampling `update`.
+
+    This is the step that makes the loop on-policy, and the one whose absence
+    is invisible: skip it and update k samples from update k-2's weights while
+    every marker, hash and loss still looks right. OPD is on-policy in the
+    action -- `log pi_old` must come from the policy that sampled it -- so a
+    stale endpoint makes every importance ratio compare two distributions that
+    never met, with a finite loss and nothing in the logs to show for it.
+
+    Verifies the swap by fingerprint rather than trusting the load call: the
+    probe logprobs must actually move.
+    """
+    import json
+    import os
+
+    from transformers import AutoTokenizer
+
+    from vektori_trace.tau2.live_train import refresh_live_policy
+    from vektori_trace.tau2.opd_stages import set_commit_fn
+    from vektori_trace.tau2.reopd_refresh import probe_logprobs
+    from vektori_trace.tau2.reopd_state import RunState
+
+    set_commit_fn(vol.commit)
+
+    if update <= 0:
+        raise ValueError(
+            "update 0 needs no refresh: the endpoint already serves the SFT "
+            "checkpoint it samples from"
+        )
+    if not api_base or not base_served_name:
+        raise ValueError("--api-base and --base-served-name are required")
+
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    with open(os.path.join(out, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    run = RunState(out, n_updates=int(manifest.get("n_updates", 1)))
+
+    prev = run.update(update - 1)
+    # The checkpoint must be complete BEFORE the endpoint is asked to serve it.
+    prev.validate_checkpoint()
+
+    tok = AutoTokenizer.from_pretrained(
+        manifest.get("student_tokenizer", "Qwen/Qwen3-4B"),
+        trust_remote_code=True)
+    probe_ids = tok("You are a retail agent.",
+                    add_special_tokens=False)["input_ids"][:256]
+
+    # Fingerprint the CURRENT policy first, so the swap is verified against the
+    # policy it replaces rather than accepted because a name appeared.
+    served_now = previous_served_name or base_served_name
+    before = probe_logprobs(api_base, served_now, probe_ids, timeout=300.0)
+
+    class _Args:
+        pass
+
+    args = _Args()
+    args.api_base = api_base
+    args.reload_url = reload_url
+    args.initial_served_name = base_served_name
+    args.served_name = served_now
+    args.student_model = served_now
+    args.probe_prompt_ids = probe_ids
+    args.probe_logprobs = before
+    args.adapter_hash = ""
+
+    rep = refresh_live_policy(args, update, prev.checkpoint_path, run_dir=out)
+    vol.commit()
+
+    return {
+        "update": update,
+        "served_name": args.student_model,
+        "adapter_hash": args.adapter_hash,
+        "max_logprob_delta": rep.get("max_logprob_delta"),
+        "checkpoint": str(prev.checkpoint_path),
+    }
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
     """Dump a run's manifest and stage markers verbatim. Read-only.
