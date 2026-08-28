@@ -627,6 +627,87 @@ def diagnose(
     return result
 
 
+@app.function(
+    # CPU only. Reads the archive off the volume and prints what Qwen sampled.
+    image=image,
+    volumes={VOLUME_MOUNT: vol},
+    timeout=60 * 10,
+)
+def show_actions(run_id: str = "", update: int = 0, full: bool = False) -> str:
+    """Print every sampled action, its reasoning and its observation."""
+    import glob
+    import json
+    import os
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    if run_id:
+        runs = [os.path.join(base, run_id)]
+    else:
+        runs = sorted(glob.glob(os.path.join(base, "*")), key=os.path.getmtime)
+    if not runs:
+        return "no runs on the volume yet"
+    run = runs[-1]
+    arch = os.path.join(run, f"update-{update:03d}", "live_archive")
+    if not os.path.isdir(arch):
+        return f"no live_archive at {arch}"
+
+    lim = 100000 if full else 500
+    out = [f"run: {os.path.basename(run)}", f"archive: {arch}", ""]
+
+    eps = os.path.join(arch, "episodes.jsonl")
+    if os.path.isfile(eps):
+        rows = [json.loads(x) for x in open(eps) if x.strip()]
+        last = {}
+        for r in rows:
+            last[r["episode_id"]] = r
+        for e in last.values():
+            out.append(
+                f"EPISODE {e['episode_id']}: status={e.get('status')} "
+                f"turns={e.get('num_turns')} failed={e.get('num_failed_turns')} "
+                f"reward={e.get('reward')} term={e.get('termination_reason')}"
+            )
+            if e.get("discard_reason"):
+                out.append(f"  discard_reason: {e['discard_reason']}")
+        out.append("")
+
+    for f in sorted(glob.glob(os.path.join(arch, "turns", "*.jsonl"))):
+        out.append("=" * 76)
+        out.append(f"TURNS: {os.path.basename(f)}")
+        out.append("=" * 76)
+        for line in open(f):
+            r = json.loads(line)
+            kind = r.get("kind")
+            if kind == "failed_turn":
+                out.append(f"\n--- turn {r.get('turn_index')} FAILED "
+                           f"[{r.get('failure_kind')}] ---")
+                out.append(f"    error: {str(r.get('error'))[:400]}")
+                out.append(f"    salvaged raw: {str(r.get('raw_text'))[:lim]!r}")
+                continue
+            if kind == "turn_observed":
+                obs = r.get("observation") or {}
+                txt = obs.get("content") or json.dumps(obs)
+                out.append(f"    ENV/USER -> {str(txt)[:300]}")
+                continue
+            c = r.get("capture") or {}
+            ids = c.get("sampled_token_ids") or []
+            lps = c.get("behavior_logprobs") or []
+            reasoning = c.get("reasoning") or ""
+            out.append(
+                f"\n--- turn {c.get('turn_index')} [{c.get('finish_reason')}] "
+                f"{len(ids)} tok / {len(lps)} logprobs "
+                f"{'OK' if len(ids) == len(lps) else 'MISMATCH!'} ---"
+            )
+            out.append(f"  REASONING ({len(reasoning)} chars): {reasoning[:lim]!r}")
+            out.append(f"  CONTENT  : {str(c.get('content'))[:lim]!r}")
+            for tc in (c.get("tool_calls") or []):
+                out.append(f"  TOOL_CALL: {json.dumps(tc)[:400]}")
+            if full:
+                out.append(f"  RAW      : {str(c.get('raw_text'))[:lim]!r}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -636,6 +717,9 @@ def main(
     seeds: str = "0",
     n_updates: int = 5,
     preflight_only: bool = False,
+    show: bool = False,
+    show_full: bool = False,
+    show_update: int = 0,
     diagnose_one: bool = False,
     diagnose_task: str = "57",
     diagnose_seed: int = 0,
@@ -671,6 +755,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if show or show_full:
+        show_actions.remote(run_id, show_update, show_full)
         return
 
     if diagnose_one:
