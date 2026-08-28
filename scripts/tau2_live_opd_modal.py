@@ -1228,6 +1228,260 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def show_markers(run_id: str = "", update: int = 0) -> str:
+    """Dump a run's manifest and stage markers verbatim. Read-only.
+
+    Exists so provenance can be audited from what is *on the volume* rather
+    than from the report of the function that wrote it.
+    """
+    import json
+    import os
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    run = os.path.join(base, run_id)
+    u = os.path.join(run, f"update-{update:03d}")
+    out = [f"run {run_id} update {update}", ""]
+    mf = os.path.join(run, "manifest.json")
+    if os.path.isfile(mf):
+        with open(mf) as fh:
+            out += ["=== manifest.json ===", json.dumps(json.load(fh),
+                                                        indent=1,
+                                                        sort_keys=True)]
+    for marker in (".PLANNED", ".SAMPLED", ".SCORED", ".TRAINED"):
+        p = os.path.join(u, marker)
+        out += ["", f"=== {marker} ==="]
+        if os.path.isfile(p):
+            with open(p) as fh:
+                out.append(json.dumps(json.load(fh), indent=1, sort_keys=True))
+        else:
+            out.append("(absent)")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def build_canary(source_run_id: str = "", canary_run_id: str = "",
+                 update: int = 0) -> str:
+    """Gate 4 -- a fresh SAMPLED-only run directory from immutable evidence.
+
+    The repaired scorer has never made a real teacher call, so the ~$0.04
+    re-score needs somewhere to run that is *not* the failed run. Resuming that
+    one would short-circuit the repair: its `.SCORED`/`.TRAINED` markers and its
+    31 contaminated score rows would be reused verbatim, the projected scorer
+    would never execute, and the run would report success having changed
+    nothing.
+
+    So this copies only what sampling produced and the teacher cannot influence:
+
+        actions.jsonl      the 31 archived generations (ids, bytes, logprobs)
+        rendered.json      the semantic histories the teacher will condition on
+        live_archive/      episodes, turns, events, Tau2 SimulationRuns
+        .PLANNED/.SAMPLED  the stage markers sampling legitimately reached
+
+    and refuses to copy scores, checkpoints, optimizer state or the
+    `SCORED`/`TRAINED` markers. The parent hash is read **fresh from the
+    adapter weights on the volume**, never from the source manifest -- update 0
+    archived `""` there, so trusting it would propagate the very blank this
+    gate exists to replace.
+
+    The stage markers are **reconstructed, not copied**, for the same reason.
+    The source `.PLANNED` and `.SAMPLED` both carry `"adapter_hash": ""`, so
+    copying them verbatim would leave the canary's lifecycle provenance
+    blank while its manifest claimed the real hash -- a contradiction between
+    two records of the same fact, and exactly the defect this gate exists to
+    remove. Everything the markers assert about *sampling* (plans, episode
+    ids, counts, policy version, generation-config and teacher-context hashes)
+    is preserved verbatim: that evidence is real and the teacher cannot
+    influence it. Only the empty provenance field is replaced.
+    """
+    import glob
+    import json
+    import os
+    import shutil
+
+    from vektori_trace.tau2.reopd_checkpoint import adapter_hash
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, source_run_id)] if source_run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    if not runs or not os.path.isdir(runs[-1]):
+        raise FileNotFoundError(f"no source run under {base}")
+    src_run = runs[-1]
+    src = os.path.join(src_run, f"update-{update:03d}")
+
+    # --- the parent, hashed fresh from its weights ------------------------
+    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+    got = adapter_hash(parent)
+    if got != PARENT_ADAPTER_HASH:
+        raise ValueError(
+            f"parent adapter at {parent} hashes to {got}, but this file pins "
+            f"{PARENT_ADAPTER_HASH}. The canary would train from a different "
+            "adapter than it claims."
+        )
+
+    name = canary_run_id or f"canary_rescore_{os.path.basename(src_run)}"
+    dst_run = os.path.join(base, name)
+    if os.path.exists(dst_run):
+        raise FileExistsError(
+            f"{dst_run} already exists; refusing to overwrite. Pass a new "
+            "--canary-run-id rather than resuming a directory whose history "
+            "is unknown."
+        )
+    dst = os.path.join(dst_run, f"update-{update:03d}")
+    os.makedirs(dst, exist_ok=True)
+
+    # --- copy ONLY the immutable sampling evidence ------------------------
+    copied = []
+    for fname in ("actions.jsonl", "rendered.json"):
+        s = os.path.join(src, fname)
+        if not os.path.isfile(s):
+            raise FileNotFoundError(f"source update is missing {fname}")
+        shutil.copy2(s, os.path.join(dst, fname))
+        copied.append(fname)
+    if os.path.isdir(os.path.join(src, "live_archive")):
+        shutil.copytree(os.path.join(src, "live_archive"),
+                        os.path.join(dst, "live_archive"))
+        copied.append("live_archive/")
+    # --- reconstruct the lifecycle markers with REAL provenance -----------
+    # Copying these verbatim is what the first build did wrong: both carry
+    # `adapter_hash: ""`. Preserve every sampling fact, replace only that.
+    source_markers = {}
+    rebuilt = {}
+    for marker in (".PLANNED", ".SAMPLED"):
+        s = os.path.join(src, marker)
+        if not os.path.isfile(s):
+            raise FileNotFoundError(
+                f"source update is missing {marker}; a canary cannot claim a "
+                "stage the evidence does not support"
+            )
+        with open(s) as fh:
+            payload = json.load(fh)
+        source_markers[marker] = {
+            "adapter_hash": payload.get("adapter_hash", None),
+            "policy_version": payload.get("policy_version"),
+            "gen_config_hash": payload.get("gen_config_hash"),
+        }
+        payload["adapter_hash"] = got
+        payload["parent_adapter_hash"] = got
+        payload["provenance"] = (
+            f"rebuilt for canary from {os.path.basename(src_run)} "
+            f"update {update}; adapter_hash restored from parent weights"
+        )
+        with open(os.path.join(dst, marker), "w") as fh:
+            json.dump(payload, fh, indent=1, sort_keys=True)
+        rebuilt[marker] = payload
+        copied.append(f"{marker} (rebuilt)")
+
+    # --- the manifest, with a REAL parent hash and full provenance --------
+    with open(os.path.join(src_run, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    manifest["adapter_hash"] = got
+    manifest["parent"] = "/" + PARENT_IN_VOLUME.lstrip("/")
+    manifest["parent_adapter_hash"] = got
+    manifest["mode"] = "canary-rescore"
+    manifest["n_updates"] = 1
+    manifest["source_run"] = os.path.basename(src_run)
+    manifest["source_update"] = update
+    manifest["derived_from"] = (
+        "SAMPLED-only evidence; scores, checkpoints and SCORED/TRAINED "
+        "markers deliberately not copied"
+    )
+    manifest["scoring"] = "semantic projection"
+    # What the source markers actually said, kept so the substitution is
+    # auditable rather than invisible. The blank is the defect being repaired.
+    manifest["source_marker_provenance"] = source_markers
+    manifest["marker_rebuild"] = (
+        "adapter_hash in .PLANNED/.SAMPLED was empty in the source and has "
+        f"been set to the freshly hashed parent weights ({got}); all sampling "
+        "fields preserved verbatim"
+    )
+    with open(os.path.join(dst_run, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=1, sort_keys=True)
+    for fname in ("retail_tools.json",):
+        s = os.path.join(src_run, fname)
+        if os.path.isfile(s):
+            shutil.copy2(s, os.path.join(dst_run, fname))
+
+    vol.commit()
+
+    # --- prove the thing that would silently ruin the re-score ------------
+    forbidden = [f for f in (".SCORED", ".TRAINED", "scores.jsonl",
+                             "checkpoint")
+                 if os.path.exists(os.path.join(dst, f))]
+    n_actions = sum(1 for l in open(os.path.join(dst, "actions.jsonl"))
+                    if l.strip())
+    with open(os.path.join(dst, "rendered.json")) as fh:
+        n_rendered = len(json.load(fh))
+
+    # --- the four records of the parent must agree, read back off disk ----
+    # Read from the written files rather than the in-memory values: the point
+    # is that what a later resume will *load* is consistent, not what this
+    # function believed it wrote.
+    with open(os.path.join(dst_run, "manifest.json")) as fh:
+        m_disk = json.load(fh)
+    with open(os.path.join(dst, ".PLANNED")) as fh:
+        p_disk = json.load(fh)
+    with open(os.path.join(dst, ".SAMPLED")) as fh:
+        s_disk = json.load(fh)
+    hashes = {
+        "parent weights (fresh)": got,
+        "manifest.adapter_hash": m_disk.get("adapter_hash"),
+        ".PLANNED.adapter_hash": p_disk.get("adapter_hash"),
+        ".SAMPLED.adapter_hash": s_disk.get("adapter_hash"),
+        "pinned constant": PARENT_ADAPTER_HASH,
+    }
+    disagree = {k: v for k, v in hashes.items() if v != PARENT_ADAPTER_HASH}
+
+    out = [
+        "GATE 4 -- fresh canary from immutable SAMPLED evidence",
+        "",
+        f"  source run      : {os.path.basename(src_run)} update {update}",
+        f"  canary run      : {name}",
+        f"  path            : {dst_run}",
+        "",
+        f"  parent          : {parent}",
+        f"  copied          : {', '.join(copied)}",
+        f"  actions         : {n_actions}",
+        f"  rendered        : {n_rendered} histories",
+        f"  forbidden found : {forbidden or 'none'}",
+        "",
+        "  PARENT PROVENANCE (all five must agree)",
+    ]
+    for k, v in hashes.items():
+        flag = "ok " if v == PARENT_ADAPTER_HASH else "BAD"
+        out.append(f"    [{flag}] {k:24s} {v!r}")
+    out += [
+        "",
+        "  source markers said (the defect being repaired):",
+    ]
+    for k, v in source_markers.items():
+        out.append(f"    {k:10s} adapter_hash={v['adapter_hash']!r}")
+    out += [
+        "",
+        f"  stage           : "
+        f"{'SAMPLED (ready to score)' if not forbidden and not disagree else 'CONTAMINATED'}",
+    ]
+    text = "\n".join(out)
+    print(text)
+    if forbidden:
+        raise RuntimeError(
+            f"canary carries {forbidden}; it would short-circuit the re-score"
+        )
+    if n_actions != n_rendered:
+        raise RuntimeError(
+            f"{n_actions} actions but {n_rendered} rendered histories"
+        )
+    if disagree:
+        raise RuntimeError(
+            f"parent provenance disagrees across records: {disagree}; the "
+            "canary would train from an adapter it cannot name consistently"
+        )
+    return text
+
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
 def predict_advantages(run_id: str = "", update: int = 0) -> str:
     """What the OLD advantages become once the projection's mask is applied.
@@ -1351,6 +1605,9 @@ def main(
     reconcile_only: bool = False,
     scoring_dryrun_only: bool = False,
     predict_only: bool = False,
+    build_canary_only: bool = False,
+    show_markers_only: bool = False,
+    canary_run_id: str = "",
     classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
@@ -1389,6 +1646,15 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if show_markers_only:
+        show_markers.remote(run_id, classify_update)
+        return
+
+    if build_canary_only:
+        print("build-canary: CPU only, no GPU, no teacher call")
+        build_canary.remote(run_id, canary_run_id, classify_update)
         return
 
     if predict_only:
