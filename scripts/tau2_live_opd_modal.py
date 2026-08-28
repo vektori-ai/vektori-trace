@@ -637,27 +637,50 @@ def diagnose(
     if not score:
         return result
 
-    # Step 4: prove REAL cross-tokenizer byte alignment on these exact bytes.
+    # Step 4: prove cross-tokenizer alignment through the SEMANTIC PROJECTION.
+    # Deliberately not `score_replay_batch`: that scores raw Qwen bytes, the
+    # path the 2026-08-28 update took, and no live code path may reach it.
+    import base64 as _b64
+
     from vektori_trace.providers.teacher.fireworks import FireworksTeacherPool
+    from vektori_trace.tau2.live_score import score_live_action
     from vektori_trace.tau2.live_train import load_live_update_inputs
     from vektori_trace.vocab_bridge import load_tokenizer
-    from vektori_trace.replay_score import score_replay_batch
 
     inputs = load_live_update_inputs(run.update(0),
                                      policy_version="diagnose-u000")
     teacher_tok = load_tokenizer(TEACHER_TOKENIZER)
     pool = FireworksTeacherPool(model=TEACHER_MODEL)
-    scored, ledger = score_replay_batch(
-        inputs.actions, inputs.rendered, teacher_tok, pool)
+
+    n_sup = n_exc = tin = 0
+    reasons: dict = {}
+    for row in inputs.capture_rows:
+        raw_a = _b64.b64decode(row["action_bytes_b64"]).decode("utf-8", "replace")
+        for sp in ("<|im_end|>", "<|endoftext|>"):
+            if raw_a.endswith(sp):
+                raw_a = raw_a[: -len(sp)]
+        sc = score_live_action(
+            key=row["key"], raw_text=raw_a,
+            student_token_bytes=[
+                _b64.b64decode(b) for b in row["action_token_bytes_b64"]
+            ],
+            semantic_history=inputs.rendered[row["prefix_id"]],
+            teacher_tokenizer=teacher_tok, pool=pool,
+        )
+        n_sup += sc.n_supervised
+        n_exc += len(sc.excluded)
+        tin += sc.n_prefix_tokens + sc.n_teacher_tokens
+        for r in sc.excluded.values():
+            reasons[r] = reasons.get(r, 0) + 1
     vol.commit()
-    tin = ledger.get("teacher_input_tokens", 0)
     result["scoring"] = {
-        "n_scored": len(scored),
+        "projection": "semantic",
+        "n_actions": len(inputs.capture_rows),
+        "n_supervised_tokens": n_sup,
+        "n_excluded_tokens": n_exc,
+        "excluded_by_reason": reasons,
         "teacher_input_tokens": tin,
         "est_cost_usd_uncached": round(tin * 0.22 / 1e6, 4),
-        "all_finite": all(
-            all(x == x and x not in (float("inf"), float("-inf")) for x in lps)
-            for _, lps in scored.values()),
     }
     return result
 
