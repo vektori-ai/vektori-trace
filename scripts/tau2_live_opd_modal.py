@@ -1095,6 +1095,116 @@ def reconcile_counts(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 30)
+def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
+    """Run the FULL projected scoring adapter offline. No teacher calls.
+
+    Step 6 of the repair: prove the scoring->training path works end to end on
+    every archived action before a single teacher token is re-purchased. The
+    teacher is a stub returning a constant, so what is exercised is the render,
+    the id extension, the per-payload alignment and the index mapping -- every
+    place a silent mismatch could hide.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    from vektori_trace.tau2.live_score import LiveScoreError, score_live_action
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    class _StubPool:
+        """Constant logprobs: this run must never bill the teacher."""
+
+        def __init__(self):
+            self.n_calls = 0
+            self.n_tokens = 0
+
+        def score_ids(self, prompt_ids, tokens):
+            self.n_calls += 1
+            self.n_tokens += len(tokens)
+            return [-0.5] * len(tokens)
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    run = runs[-1]
+    u = os.path.join(run, f"update-{update:03d}")
+    actions = [json.loads(l) for l in open(os.path.join(u, "actions.jsonl"))
+               if l.strip()]
+    rendered = json.loads(open(os.path.join(u, "rendered.json")).read())
+
+    tok = load_tokenizer(TEACHER_TOKENIZER)
+    pool = _StubPool()
+
+    n_ok = n_fail = 0
+    tot_tokens = tot_sup = 0
+    reasons: dict = {}
+    payload_skips: dict = {}
+    failures = []
+    per_action = []
+
+    for a in actions:
+        stu = [base64.b64decode(x) for x in a["action_token_bytes_b64"]]
+        raw = b"".join(stu).decode("utf-8", "replace")
+        for sp in ("<|im_end|>", "<|endoftext|>"):
+            if raw.endswith(sp):
+                raw = raw[: -len(sp)]
+        history = rendered.get(a["prefix_id"])
+        if history is None:
+            failures.append((a["key"], "no rendered history"))
+            n_fail += 1
+            continue
+        try:
+            sc = score_live_action(
+                key=a["key"], raw_text=raw, student_token_bytes=stu,
+                semantic_history=history, teacher_tokenizer=tok, pool=pool,
+            )
+        except LiveScoreError as exc:
+            failures.append((a["key"], f"{exc}"[:160]))
+            n_fail += 1
+            continue
+        n_ok += 1
+        tot_tokens += len(stu)
+        tot_sup += sc.n_supervised
+        # Invariant: nothing silently dropped.
+        covered = set(sc.teacher_logprob_by_index) | set(sc.excluded)
+        if covered != set(range(len(stu))):
+            failures.append((a["key"], "token accounting incomplete"))
+        for r in sc.excluded.values():
+            reasons[r] = reasons.get(r, 0) + 1
+        for kind, info in sc.payload_report.items():
+            if isinstance(info, dict) and "skipped" in info:
+                k = f"{kind}: {info['skipped']}"
+                payload_skips[k] = payload_skips.get(k, 0) + 1
+        per_action.append((a["key"], sc.n_supervised, len(stu)))
+
+    out = [
+        f"run {os.path.basename(run)} update {update}",
+        f"actions: {len(actions)}   scored OK: {n_ok}   failed: {n_fail}",
+        f"teacher STUB calls: {pool.n_calls}  (tokens {pool.n_tokens}) -- $0",
+        f"student tokens: {tot_tokens}   supervised: {tot_sup}   "
+        f"retained: {round(tot_sup/tot_tokens, 4) if tot_tokens else 0}",
+        "",
+        "exclusion reasons: " + json.dumps(reasons),
+        "payload skips    : " + json.dumps(payload_skips),
+        "",
+        "ACCEPTANCE:",
+        f"  all actions scored          : {n_fail == 0}",
+        f"  token accounting complete   : {not any('accounting' in f[1] for f in failures)}",
+        f"  some supervision retained   : {tot_sup > 0}",
+        "",
+    ]
+    for key, sup, tot in per_action[:40]:
+        out.append(f"  {key:34s} {sup:4d}/{tot:4d} = {sup/tot:.3f}")
+    for f in failures[:12]:
+        out.append(f"  FAIL {f[0]}: {f[1]}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -1109,6 +1219,7 @@ def main(
     classify_only: bool = False,
     projection_only: bool = False,
     reconcile_only: bool = False,
+    scoring_dryrun_only: bool = False,
     classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
@@ -1147,6 +1258,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if scoring_dryrun_only:
+        scoring_dryrun.remote(run_id, classify_update)
         return
 
     if reconcile_only:
