@@ -2143,6 +2143,58 @@ def pilot_status(run_id: str = "") -> dict:
     print("PILOT_STATUS_JSON=" + json.dumps(result, separators=(",", ":")))
     return result
 
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def stage_manifest(run_id: str = "", manifest_json: str = "") -> dict:
+    """Create the run directory and freeze its manifest. No GPU, no teacher.
+
+    Refuses to overwrite an existing manifest: the preregistration is the
+    record of what the run intended, and silently replacing it would make the
+    schedule unfalsifiable after the fact.
+    """
+    import hashlib
+    import json
+    import os
+
+    if not run_id or not manifest_json:
+        raise ValueError("--run-id and --manifest-json are required")
+
+    manifest = json.loads(manifest_json)
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    path = os.path.join(out, "manifest.json")
+    if os.path.exists(path):
+        with open(path) as fh:
+            existing = json.load(fh)
+        if existing.get("plan_hash") != manifest.get("plan_hash"):
+            raise FileExistsError(
+                f"{path} already exists with plan_hash "
+                f"{existing.get('plan_hash')}, not {manifest.get('plan_hash')}. "
+                "Refusing to overwrite a frozen preregistration; use a new "
+                "run id."
+            )
+        print(f"manifest already staged (plan {existing.get('plan_hash')})")
+        return {"run_id": run_id, "staged": False,
+                "plan_hash": existing.get("plan_hash")}
+
+    # The plan must hash to what it claims before anything samples from it.
+    actual = hashlib.sha256(
+        json.dumps(manifest["plans_by_update"], sort_keys=True).encode()
+    ).hexdigest()[:16]
+    if actual != manifest.get("plan_hash"):
+        raise ValueError(
+            f"plan_hash mismatch: manifest says {manifest.get('plan_hash')}, "
+            f"content hashes to {actual}"
+        )
+
+    os.makedirs(out, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(manifest, fh, indent=1, sort_keys=True)
+    vol.commit()
+    print(f"staged {path} (plan {actual}, "
+          f"{manifest.get('n_planned_episodes')} episodes)")
+    return {"run_id": run_id, "staged": True, "plan_hash": actual,
+            "path": path}
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
     """Dump a run's manifest and stage markers verbatim. Read-only.
