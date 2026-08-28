@@ -72,18 +72,36 @@ class OwnedApps:
             self.path.write_text(json.dumps({"app_ids": self.ids}, indent=1))
 
     def stop_all(self) -> None:
+        """Stop owned apps, and KEEP any id whose stop did not succeed.
+
+        Clearing the list unconditionally would discard the only handle to an
+        endpoint that is still billing. A failed teardown must stay visible --
+        in the file and in the log -- so it can be finished by hand.
+        """
+        still: list[str] = []
         for app_id in list(self.ids):
             log(f"teardown: stopping {app_id}")
             try:
-                subprocess.run(
+                p = subprocess.run(
                     [str(REPO / ".venv/bin/modal"), "app", "stop", app_id, "-y"],
-                    timeout=180, capture_output=True,
+                    timeout=180, capture_output=True, text=True,
                 )
+                out = (p.stdout or "") + (p.stderr or "")
+                if p.returncode != 0 and "already stopped" not in out.lower():
+                    log(f"  WARNING stop returned {p.returncode} for {app_id}; "
+                        "KEEPING the id -- it may still be billing")
+                    still.append(app_id)
+                else:
+                    log(f"  stopped {app_id}")
             except Exception as exc:  # noqa: BLE001
-                log(f"  WARNING could not stop {app_id}: {exc}")
-        self.ids = []
-        if self.path.exists():
-            self.path.write_text(json.dumps({"app_ids": []}, indent=1))
+                log(f"  WARNING could not stop {app_id}: {exc}; KEEPING the id")
+                still.append(app_id)
+        self.ids = still
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"app_ids": still}, indent=1))
+        if still:
+            log(f"!! {len(still)} app id(s) NOT confirmed stopped: {still}")
+            log(f"!! check `modal app list` and stop them by hand")
 
 
 # --- modal dispatch --------------------------------------------------------
@@ -103,53 +121,186 @@ def modal_run(fn: str, args: list[str], *, log_path: Path,
     return p.returncode
 
 
-def stage_done(run_dir: Path, update: int, marker: str) -> bool:
-    return (run_dir / f"update-{update:03d}" / marker).exists()
+def fetch_status(run_id: str, state_dir: Path) -> dict:
+    """Stage markers from the VOLUME, not from a local path that cannot exist.
+
+    `/adapters` lives inside Modal containers. Testing it from the box always
+    reports "absent", so a resumed orchestrator would conclude nothing had run
+    and resample updates it already holds -- paying twice and overwriting
+    evidence.
+    """
+    out = state_dir / "status.json"
+    cmd = [str(REPO / ".venv/bin/modal"), "run",
+           f"{MODAL_SCRIPT}::pilot_status", "--run-id", run_id]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if p.returncode != 0:
+        raise SystemExit(
+            f"cannot read pilot status from the volume:\n{p.stdout[-2000:]}\n"
+            f"{p.stderr[-2000:]}"
+        )
+    # Parse ONLY the sentinel line. Scanning from the first "{" to the last
+    # "}" silently mis-parses as soon as anything else prints an object.
+    line = next((ln for ln in reversed(p.stdout.splitlines())
+                 if ln.startswith("PILOT_STATUS_JSON=")), None)
+    if line is None:
+        raise SystemExit(
+            f"pilot_status printed no PILOT_STATUS_JSON line:\n"
+            f"{p.stdout[-2000:]}"
+        )
+    status = json.loads(line[len("PILOT_STATUS_JSON="):])
+    out.write_text(json.dumps(status, indent=1))
+    return status
 
 
-def read_marker(run_dir: Path, update: int, marker: str) -> dict:
-    p = run_dir / f"update-{update:03d}" / marker
-    if not p.exists():
-        return {}
+#: L40S, https://modal.com/pricing. Used only for the running estimate the
+#: ceiling is checked against -- it is not a bill.
+GPU_USD_PER_HOUR = 1.95
+#: DeepSeek V4 Flash input, per million tokens.
+TEACHER_USD_PER_MTOK = 0.22
+
+
+class Ledger:
+    """A running cost estimate, and the hard stop that uses it.
+
+    Nobody is watching an unattended run, so the update-5 judgement call has to
+    be a rule the process can apply itself. Wall-clock endpoint uptime is the
+    dominant term and the one that runs away when a stage hangs.
+
+    These are ESTIMATES from measured rates, not billing data. The ceiling is
+    deliberately conservative for that reason.
+    """
+
+    def __init__(self, path: Path, *, max_usd: float, max_hours: float) -> None:
+        self.path = path
+        self.max_usd = max_usd
+        self.max_hours = max_hours
+        self.started = time.time()
+        self.teacher_tokens = 0
+        self.updates_done = 0
+        if path.exists():
+            try:
+                d = json.loads(path.read_text())
+                self.started = d.get("started", self.started)
+                self.teacher_tokens = d.get("teacher_tokens", 0)
+                self.updates_done = d.get("updates_done", 0)
+            except (OSError, ValueError):
+                pass
+
+    @property
+    def hours(self) -> float:
+        return (time.time() - self.started) / 3600.0
+
+    def estimate_usd(self) -> float:
+        # One serving card up for the whole run, plus ~2 min of training GPU
+        # per completed update, plus the teacher.
+        serving = self.hours * GPU_USD_PER_HOUR
+        training = self.updates_done * (2.0 / 60.0) * GPU_USD_PER_HOUR
+        teacher = self.teacher_tokens * TEACHER_USD_PER_MTOK / 1e6
+        return serving + training + teacher
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({
+            "started": self.started,
+            "hours": round(self.hours, 3),
+            "updates_done": self.updates_done,
+            "teacher_tokens": self.teacher_tokens,
+            "estimate_usd": round(self.estimate_usd(), 2),
+            "max_usd": self.max_usd,
+            "max_hours": self.max_hours,
+        }, indent=1))
+
+    def check(self) -> str | None:
+        """The reason to stop, or None. Checked before each paid stage."""
+        if self.hours >= self.max_hours:
+            return (f"time ceiling: {self.hours:.2f}h >= {self.max_hours}h")
+        est = self.estimate_usd()
+        if est >= self.max_usd:
+            return (f"budget ceiling: estimated ${est:.2f} >= "
+                    f"${self.max_usd:.2f}")
+        return None
+
+
+def probe_now(api_base: str, model: str, probe_ids: list[int]) -> list[float]:
+    sys.path.insert(0, str(REPO))
+    from vektori_trace.tau2.reopd_refresh import probe_logprobs
+    return probe_logprobs(api_base, model, probe_ids, timeout=300.0)
+
+
+def refresh_already_done(a, state_dir: Path, idx: int, expected_name: str,
+                         expected_hash: str) -> bool:
+    """Is the endpoint ALREADY serving update idx-1's weights?
+
+    A name check is not enough: vLLM will happily advertise
+    `...-u000` while serving whatever was loaded under that name, and after an
+    endpoint restart the name may be absent entirely. So this compares the live
+    probe logprobs against the ones the refresh recorded when it verified the
+    swap -- weights, not labels.
+
+    Returns False on any doubt, because re-refreshing is cheap and sampling
+    from a stale policy is not.
+    """
+    rec_path = state_dir / f"refresh-{idx:03d}.json"
+    if not rec_path.exists():
+        return False
     try:
-        return json.loads(p.read_text())
+        rec = json.loads(rec_path.read_text())
     except (OSError, ValueError):
-        return {}
+        return False
+    if rec.get("adapter_hash") != expected_hash:
+        return False
+    probe_ids = rec.get("probe_ids")
+    recorded = rec.get("probe_logprobs")
+    if not probe_ids or not recorded:
+        return False
+    try:
+        live = probe_now(a.api_base, expected_name, probe_ids)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  probe failed ({exc}); will refresh rather than assume")
+        return False
+    if len(live) != len(recorded):
+        return False
+    drift = max(abs(x - y) for x, y in zip(live, recorded))
+    if drift > 1e-6:
+        log(f"  endpoint logprobs drifted {drift:.3g} from the recorded "
+            "refresh; treating the served policy as unverified")
+        return False
+    log(f"  endpoint already serves {expected_name} "
+        f"(adapter {expected_hash}, probe matches to {drift:.3g})")
+    return True
 
 
-def preflight_checkpoint(run_dir: Path, update: int) -> None:
-    """Refuse to dispatch a training GPU that is going to fail on arrival.
+def update_row(status: dict, idx: int) -> dict:
+    for row in status.get("updates", []):
+        if row.get("update") == idx:
+            return row
+    return {}
 
-    Update k>0 must resume update k-1's optimizer, so a missing `optimizer.pt`
-    is fatal -- but discovering that inside the GPU container costs a card
-    allocation and a model load to learn something a stat() answers for free.
-    Fresh Adam every update would also be silently WRONG rather than an error,
+
+def preflight_checkpoint(status: dict, update: int) -> None:
+    """Refuse to dispatch a training GPU that will fail on arrival.
+
+    Update k>0 resumes update k-1's optimizer, so a missing `optimizer.pt` is
+    fatal -- and discovering that inside the GPU container costs a card
+    allocation and a model load to learn something the status call already
+    answered. Fresh Adam would also be silently WRONG rather than an error,
     which is why this refuses instead of falling back.
     """
     if update == 0:
         return
-    cp = run_dir / f"update-{update - 1:03d}" / "checkpoint"
-    required = ("optimizer.pt", "state.json", "adapter_config.json")
-    missing = [f for f in required if not (cp / f).exists()]
-    if missing:
+    prev = update_row(status, update - 1)
+    if not prev.get("trained"):
         raise SystemExit(
-            f"update {update} cannot train: {cp} is missing {missing}. "
-            "Update k>0 resumes update k-1's optimizer, scheduler and RNG; "
-            "training with a fresh optimizer would change the recipe at every "
-            "update while every reported metric looked normal. Refusing before "
+            f"update {update} cannot train: update {update - 1} is not TRAINED"
+        )
+    if not prev.get("checkpoint_complete"):
+        raise SystemExit(
+            f"update {update} cannot train: update {update - 1}'s checkpoint "
+            "is missing optimizer.pt/state.json/adapter_config.json. Training "
+            "with a fresh optimizer would change the recipe at every update "
+            "while every reported metric looked normal. Refusing before "
             "allocating a GPU."
         )
-
-
-def served_adapter_hash(api_base: str, name: str, timeout: float = 60.0
-                        ) -> str | None:
-    """Which adapter the endpoint currently serves under `name`, if any."""
-    sys.path.insert(0, str(REPO))
-    try:
-        from vektori_trace.tau2.reopd_refresh import served_models
-        return name if name in served_models(api_base, timeout=timeout) else None
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def main() -> int:
@@ -157,7 +308,9 @@ def main() -> int:
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--n-updates", type=int, required=True)
     ap.add_argument("--api-base", required=True)
-    ap.add_argument("--reload-url", default="")
+    ap.add_argument("--reload-url", default="",
+                    help="REQUIRED: serving-volume reload url. Without it the "
+                         "endpoint may never see the new checkpoint.")
     ap.add_argument("--student-model", required=True,
                     help="served adapter name for update 0")
     ap.add_argument("--serve-app-id", default="",
@@ -169,14 +322,18 @@ def main() -> int:
                     help="take ownership of --serve-app-id, so teardown stops "
                          "it. Pass this only when the endpoint exists solely "
                          "for this pilot.")
-    ap.add_argument("--run-dir", default="",
-                    help="the pilot's run directory, readable from here, so "
-                         "stage markers can be inspected without dispatching")
     ap.add_argument("--parent-adapter-hash", default="3869b147ab7ce5d2",
                     help="hash of the untouched parent update 0 samples from")
     ap.add_argument("--state-dir", default="",
                     help="where owned app ids and stage logs live")
     ap.add_argument("--start-at", type=int, default=0)
+    ap.add_argument("--max-usd", type=float, default=30.0,
+                    help="hard stop when the ESTIMATED spend reaches this. "
+                         "Checked before every paid stage, so an unattended "
+                         "run cannot spend past it.")
+    ap.add_argument("--max-hours", type=float, default=7.0,
+                    help="hard stop on wall clock. A hung stage otherwise "
+                         "bills a serving card indefinitely.")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the stage plan and exit; dispatches nothing")
     a = ap.parse_args()
@@ -210,17 +367,35 @@ def main() -> int:
         log("nothing dispatched, no GPU, no teacher call")
         return 0
 
+    ledger = Ledger(state_dir / "ledger.json",
+                    max_usd=a.max_usd, max_hours=a.max_hours)
+    ledger.save()
+    log(f"budget: hard stop at ${a.max_usd:.2f} estimated or "
+        f"{a.max_hours}h wall clock "
+        f"(already {ledger.hours:.2f}h, ~${ledger.estimate_usd():.2f})")
+
     log(f"pilot {a.run_id}: updates {a.start_at}..{a.n_updates - 1}")
     log(f"  state dir : {state_dir}")
     log(f"  endpoint  : {a.api_base}")
 
-    run_dir = Path(a.run_dir) if a.run_dir else None
-    if run_dir is None or not run_dir.exists():
+    if not a.reload_url:
         raise SystemExit(
-            "--run-dir must point at the pilot's run directory (the same path "
-            "the Modal volume exposes), so stage markers can be read WITHOUT "
-            "dispatching a container to ask"
+            "--reload-url is required. Without a serving-volume reload the "
+            "endpoint may never see the newly committed checkpoint, so update "
+            "k+1 would resample update k-1's policy while every marker, hash "
+            "and loss still looked correct -- the on-policy claim would be "
+            "false with nothing in the logs to show it."
         )
+
+    status = fetch_status(a.run_id, state_dir)
+    if not status.get("exists"):
+        raise SystemExit(
+            f"no run {a.run_id} on the volume. Freeze a manifest with "
+            "scripts/tau2_pilot_manifest.py and stage it first."
+        )
+    log(f"status: {len(status.get('trained_updates', []))}/"
+        f"{status.get('n_updates')} updates trained, "
+        f"next={status.get('next_update')}, plan={status.get('plan_hash')}")
 
     # Endpoint recovery: after an orchestrator restart the served policy is
     # whatever the last completed refresh left. Derive it from the markers
@@ -243,7 +418,14 @@ def main() -> int:
     for idx in range(a.start_at, a.n_updates):
         log(f"=== update {idx} ===")
         stage_log = state_dir / f"update-{idx:03d}.log"
-        trained = stage_done(run_dir, idx, ".TRAINED")
+        stop = ledger.check()
+        if stop is not None:
+            log(f"STOPPING before update {idx}: {stop}")
+            log("artifacts are intact; resume with a raised ceiling if that is "
+                "the deliberate choice")
+            return 2
+        row = update_row(status, idx)
+        trained = bool(row.get("trained"))
 
         # --- 0. REFRESH (serving GPU, already up) -------------------------
         # Serve update k-1's checkpoint BEFORE sampling update k. Skipping this
@@ -253,11 +435,18 @@ def main() -> int:
         #
         # Skipped when this update is already SAMPLED: its episodes exist and
         # re-pointing the endpoint now would serve a policy nothing here needs.
-        need_rollout = not stage_done(run_dir, idx, ".SAMPLED")
+        need_rollout = not row.get("sampled")
         if idx > 0 and need_rollout:
             expected = f"{a.student_model}-u{idx - 1:03d}"
-            if served_adapter_hash(a.api_base, expected) == expected:
-                log(f"endpoint already serves {expected}; refresh skipped")
+            expected_hash = update_row(status, idx - 1).get(
+                "trained_adapter_hash", "")
+            if not expected_hash:
+                raise SystemExit(
+                    f"update {idx - 1} reports no trained adapter_hash; the "
+                    "endpoint cannot be verified against the weights it should "
+                    "now serve"
+                )
+            if refresh_already_done(a, state_dir, idx, expected, expected_hash):
                 served_name = expected
                 _record_served(served_name)
             else:
@@ -275,6 +464,28 @@ def main() -> int:
                     return rc
                 served_name = expected  # refresh_live_policy's naming
                 _record_served(served_name)
+                # Record the verified fingerprint so a resumed run can tell
+                # "already serving this" from "serving something else under
+                # the same name".
+                try:
+                    sys.path.insert(0, str(REPO))
+                    from transformers import AutoTokenizer
+                    tok = AutoTokenizer.from_pretrained(
+                        "Qwen/Qwen3-4B", trust_remote_code=True)
+                    pids = tok("You are a retail agent.",
+                               add_special_tokens=False)["input_ids"][:256]
+                    (state_dir / f"refresh-{idx:03d}.json").write_text(
+                        json.dumps({
+                            "update": idx, "served_name": served_name,
+                            "adapter_hash": expected_hash,
+                            "probe_ids": pids,
+                            "probe_logprobs": probe_now(
+                                a.api_base, served_name, pids),
+                            "at": time.strftime("%F %T"),
+                        }, indent=1))
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  WARNING could not record refresh fingerprint: "
+                        f"{exc} (a resume will simply refresh again)")
                 log(f"endpoint now serves {served_name}")
 
         # --- 1. ROLLOUT (serving GPU) -------------------------------------
@@ -283,10 +494,11 @@ def main() -> int:
             # actually being served. Update 0 is the frozen parent; later
             # updates are update k-1's child, read off its checkpoint state.
             if idx == 0:
-                expect_hash = a.parent_adapter_hash
+                expect_hash = status.get("parent_adapter_hash") or \
+                    a.parent_adapter_hash
             else:
-                st = read_marker(run_dir, idx - 1, "checkpoint/state.json")
-                expect_hash = st.get("adapter_hash", "")
+                expect_hash = update_row(status, idx - 1).get(
+                    "trained_adapter_hash", "")
             if not expect_hash:
                 raise SystemExit(
                     f"cannot determine the adapter hash update {idx} will "
@@ -307,7 +519,7 @@ def main() -> int:
             log(f"update {idx} already SAMPLED; not resampling")
 
         # --- 2. SCORE (CPU + DeepSeek, no GPU) ----------------------------
-        if not stage_done(run_dir, idx, ".SCORED"):
+        if not row.get("scored"):
             rc = modal_run("rescore", [
                 "--run-id", a.run_id, "--update", str(idx),
             ], log_path=stage_log)
@@ -323,7 +535,7 @@ def main() -> int:
         if not trained:
             # Everything checkable is checked before this line: this is the
             # first stage that allocates a card.
-            preflight_checkpoint(run_dir, idx)
+            preflight_checkpoint(status, idx)
             rc = modal_run("one_step", [
                 "--run-id", a.run_id, "--update", str(idx),
             ], log_path=stage_log)
@@ -334,7 +546,13 @@ def main() -> int:
         else:
             log(f"update {idx} already TRAINED; not retraining")
 
-        log(f"update {idx} complete")
+        status = fetch_status(a.run_id, state_dir)
+        ledger.updates_done = len([u for u in status.get("updates", [])
+                                   if u.get("trained")])
+        ledger.save()
+        log(f"update {idx} complete "
+            f"({ledger.hours:.2f}h, ~${ledger.estimate_usd():.2f} of "
+            f"${a.max_usd:.2f})")
 
     log("pilot complete")
     return 0

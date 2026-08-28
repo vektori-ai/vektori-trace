@@ -1795,7 +1795,6 @@ def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
     The roster, seeds and generation settings come from the FROZEN manifest,
     not from CLI arguments, so a preregistered run cannot drift by a typo.
     """
-    import importlib.util
     import json
     import os
     import sys
@@ -1852,22 +1851,73 @@ def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
             "stamped with it, and batch_report checks the batch against it"
         )
 
-    # Roster from the FROZEN manifest, never from CLI arguments.
-    tasks = [str(t) for t in manifest["task_ids"]]
-    seed_list = [int(s) for s in manifest["seeds"]]
-
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         manifest.get("student_tokenizer", "Qwen/Qwen3-4B"),
         trust_remote_code=True)
-    # Reuse the driver's planning rather than reimplementing it: the episode id
-    # convention and the task x seed cross are the balance mechanism this run
-    # preregisters, and a second copy would be free to drift from it.
-    spec = importlib.util.spec_from_file_location(
-        "tau2_live_opd_train", "/root/scripts/tau2_live_opd_train.py")
-    drv = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(drv)
-    plans = drv.plan_update(update, tasks, seed_list)
+
+    # Episodes come from the FROZEN plan, not a task x seed cross recomputed
+    # here. `plan_update` crosses the same tasks and seeds at every update --
+    # only the episode id carries the update index -- so a 10x8 run would
+    # sample the same 8 scenarios ten times and call it 80 episodes.
+    # `plans_by_update` names all 80 distinct (task, seed) pairs before update
+    # 0 runs, which is what makes the schedule auditable afterwards.
+    from vektori_trace.tau2.live_rollout import EpisodePlan
+
+    by_update = manifest.get("plans_by_update")
+    if not by_update:
+        raise ValueError(
+            "manifest has no plans_by_update: this run's episode schedule was "
+            "never frozen, so what it sampled cannot be checked against what "
+            "it intended. Build it with scripts/tau2_pilot_manifest.py."
+        )
+    if update >= len(by_update):
+        raise ValueError(
+            f"update {update} is outside the frozen plan "
+            f"({len(by_update)} updates)"
+        )
+    # The plan must be the one that was frozen. A manifest edited after
+    # generation -- a task swapped, a seed nudged -- would silently change the
+    # experiment while every downstream check still passed.
+    import hashlib as _hashlib
+
+    recorded = manifest.get("plan_hash")
+    actual = _hashlib.sha256(
+        json.dumps(by_update, sort_keys=True).encode()).hexdigest()[:16]
+    if recorded and recorded != actual:
+        raise ValueError(
+            f"plans_by_update hashes to {actual} but the manifest records "
+            f"{recorded}: the schedule was modified after it was frozen. "
+            "Refusing to sample a plan that is not the preregistered one."
+        )
+
+    block = by_update[update]
+    expected_n = int(manifest.get("episodes_per_update", len(block)))
+    if len(block) != expected_n:
+        raise ValueError(
+            f"update {update} has {len(block)} planned episodes, expected "
+            f"{expected_n}"
+        )
+    ids = [p["episode_id"] for p in block]
+    pairs = [(str(p["task_id"]), int(p["seed"])) for p in block]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"update {update} has duplicate episode ids")
+    if len(set(pairs)) != len(pairs):
+        raise ValueError(f"update {update} has duplicate (task, seed) pairs")
+    pool = {str(t) for t in manifest.get("task_ids", [])}
+    stray = sorted({t for t, _ in pairs} - pool) if pool else []
+    if stray:
+        raise ValueError(
+            f"update {update} plans tasks outside the frozen pool: {stray}"
+        )
+
+    plans = [
+        EpisodePlan(episode_id=p["episode_id"], task_id=str(p["task_id"]),
+                    seed=int(p["seed"]))
+        for p in block
+    ]
+    log(f"frozen plan for update {update} (plan_hash {actual}): "
+        + ", ".join(f"{p.task_id}/s{p.seed}" for p in plans))
 
     settings = RolloutSettings(
         domain=manifest.get("domain", "retail"),
@@ -2002,6 +2052,92 @@ def refresh_only(run_id: str = "", update: int = 0, api_base: str = "",
         "max_logprob_delta": rep.get("max_logprob_delta"),
         "checkpoint": str(prev.checkpoint_path),
     }
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def pilot_status(run_id: str = "") -> dict:
+    """Which stages are done, per update, read from the volume itself.
+
+    The orchestrator runs on the box, which cannot see `/adapters` -- that path
+    exists inside Modal containers. Without this it would test local paths that
+    are always absent, conclude every stage is unfinished, and resample an
+    update it already has.
+
+    Also reports whether each checkpoint carries `optimizer.pt`, so the caller
+    can refuse to dispatch a training GPU that is going to fail on arrival:
+    update k>0 resumes update k-1's Adam state, and a fresh optimizer would be
+    silently WRONG rather than an error.
+    """
+    import json
+    import os
+
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    if not os.path.isdir(out):
+        return {"run_id": run_id, "exists": False, "updates": []}
+
+    with open(os.path.join(out, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    n = int(manifest.get("n_updates", 1))
+
+    updates = []
+    for i in range(n):
+        u = os.path.join(out, f"update-{i:03d}")
+        cp = os.path.join(u, "checkpoint")
+
+        def _marker(name):
+            p = os.path.join(u, name)
+            if not os.path.isfile(p):
+                return None
+            try:
+                with open(p) as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                return {}
+
+        sampled = _marker(".SAMPLED")
+        trained = _marker(".TRAINED")
+        n_scores = 0
+        sp = os.path.join(u, "scores.jsonl")
+        if os.path.isfile(sp):
+            with open(sp) as fh:
+                n_scores = sum(1 for line in fh if line.strip())
+
+        updates.append({
+            "update": i,
+            "planned": os.path.isfile(os.path.join(u, ".PLANNED")),
+            "sampled": sampled is not None,
+            "scored": _marker(".SCORED") is not None,
+            "trained": trained is not None,
+            "n_scores": n_scores,
+            "sampled_adapter_hash": (sampled or {}).get("adapter_hash"),
+            "sampled_policy_version": (sampled or {}).get("policy_version"),
+            "n_actions": (sampled or {}).get("actions"),
+            "trained_adapter_hash": (trained or {}).get("adapter_hash"),
+            # What `preflight_checkpoint` needs, without a GPU to ask.
+            "checkpoint_complete": all(
+                os.path.isfile(os.path.join(cp, f))
+                for f in ("optimizer.pt", "state.json", "adapter_config.json")
+            ),
+        })
+
+    done = [u["update"] for u in updates if u["trained"]]
+    nxt = next((u["update"] for u in updates if not u["trained"]), n)
+    result = {
+        "run_id": run_id,
+        "exists": True,
+        "n_updates": n,
+        "plan_hash": manifest.get("plan_hash"),
+        "parent_adapter_hash": manifest.get("adapter_hash"),
+        "trained_updates": done,
+        "next_update": nxt,
+        "complete": len(done) == n,
+        "updates": updates,
+    }
+    # A sentinel line, not pretty-printed JSON: the orchestrator parses this
+    # exact prefix. Scanning for the first "{" through the last "}" breaks the
+    # moment Modal or a library prints any other object.
+    print("PILOT_STATUS_JSON=" + json.dumps(result, separators=(",", ":")))
+    return result
 
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
