@@ -83,3 +83,27 @@ def test_report_states_retained_fraction_and_reasons():
     assert rep["supervised_by_kind"] == {"reasoning": 1, "content": 1}
     assert rep["excluded_by_reason"][EXCLUDE_TOOL] == 3
     assert 0.0 < rep["retained_fraction"] < 1.0
+
+
+def test_content_repeated_inside_reasoning_maps_to_the_real_content():
+    """A model that previews its answer inside the reasoning must not have the
+    content payload captured by the earlier occurrence."""
+    raw = "<think>I will say: Here you go.</think>Here you go."
+    toks = _toks("<think>", "I will say: Here you go.", "</think>", "Here you go.")
+    p = project_action(raw, toks)
+    # Token 3 is the REAL content; token 1 is reasoning.
+    assert p.supervised[1] == "reasoning"
+    assert p.supervised[3] == "content"
+
+
+def test_ambiguous_repeated_content_is_refused():
+    """Two identical candidate spans after the reasoning: the mapping is not
+    determined by the bytes, so it is refused rather than guessed."""
+    raw = "<think>why</think>ok ok"
+    toks = _toks("<think>", "why", "</think>", "ok", " ok")
+    import pytest as _pytest
+    from vektori_trace.tau2.live_agent import split_generation
+    reasoning, content, _ = split_generation(raw)
+    if content is not None and raw.encode().count(content.encode()) > 1:
+        with _pytest.raises(ProjectionError, match="occurs more than once"):
+            project_action(raw, toks)

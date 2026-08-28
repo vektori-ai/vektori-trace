@@ -149,18 +149,34 @@ def _find_payload_spans(raw: str, reasoning: str | None, content: str | None) ->
     spans: list[PayloadSpan] = []
     raw_b = raw.encode("utf-8")
 
+    # Search *after* the reasoning block for content, so a content string that
+    # also appears inside the reasoning cannot capture the wrong bytes. A model
+    # that reasons "I will say: Here you go." and then says "Here you go."
+    # would otherwise map the content payload onto the reasoning occurrence --
+    # silently, with every downstream assertion still passing.
+    search_from = 0
     for kind, text in (("reasoning", reasoning), ("content", content)):
         if not text or not text.strip():
             continue
         payload = text.encode("utf-8")
-        idx = raw_b.find(payload)
+        idx = raw_b.find(payload, search_from)
         if idx < 0:
             raise ProjectionError(
-                f"{kind} payload is not a literal substring of the raw action; "
-                "there is no byte correspondence to transfer a teacher score "
-                "across, and a fuzzy match would be a guess"
+                f"{kind} payload is not a literal substring of the raw action "
+                f"at or after byte {search_from}; there is no byte "
+                "correspondence to transfer a teacher score across, and a "
+                "fuzzy match would be a guess"
+            )
+        # Ambiguity is refused rather than resolved by position: two identical
+        # candidate spans mean the mapping is not determined by the bytes.
+        if raw_b.find(payload, idx + 1) >= 0 and kind == "content":
+            raise ProjectionError(
+                f"{kind} payload occurs more than once at or after byte "
+                f"{search_from}; the byte range that carries the teacher score "
+                "is ambiguous, and picking one would be a guess"
             )
         spans.append(PayloadSpan(kind, idx, idx + len(payload)))
+        search_from = idx + len(payload)
     return spans
 
 
