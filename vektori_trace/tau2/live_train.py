@@ -39,9 +39,8 @@ from vektori_trace.tau2.live_turns import (
 )
 from vektori_trace.tau2.opd_stages import (
     commit_scores,
+    gpu_snapshot,
     log,
-    run_score_stage,
-    run_train_stage,
     telemetry,
 )
 from vektori_trace.tau2.reopd_state import RunState, UpdateDir, read_jsonl
@@ -223,25 +222,21 @@ def train_live_update(
 
     by_key = {r["key"]: r for r in inputs.capture_rows}
 
-    def _provenance(scored_action: Any) -> dict[str, Any]:
-        row = by_key.get(getattr(scored_action, "key", None))
-        if row is None:
-            raise LiveTurnError(
-                f"scored action {getattr(scored_action, 'key', None)!r} is not "
-                "in this batch; refusing to write provenance for a foreign score"
-            )
-        return score_row_provenance(scored_action, row)
-
-    result = run_score_stage(
+    # --- SCORED, through the semantic projection ---------------------------
+    # NOT `score_replay_batch`. That scorer asks DeepSeek for the likelihood of
+    # the raw Qwen action bytes, which for a reasoning-inclusive live action
+    # includes control markup the teacher never emits -- measured at -55 per
+    # `<tool_call>` on 2026-08-28, and forbidden by the pinned reference
+    # (`response content only, no chat template special tokens`).
+    result = run_projected_score_stage(
         update,
-        inputs.actions,
-        inputs.rendered,
+        inputs,
         teacher_tok=teacher_tok,
         pool=pool,
         run_dir=run_dir,
         paid=paid,
         drop_keys=stale,
-        provenance=_provenance,
+        by_key=by_key,
     )
 
     log(
@@ -259,22 +254,227 @@ def train_live_update(
             "episode_ids": inputs.episode_ids,
             "max_trace_share": inputs.max_trace_share,
             "n_stale_scores_dropped": len(stale),
+            "n_supervised_tokens": sum(
+                sc.n_supervised for sc in result.projected.values()
+            ),
+            "scoring": "semantic projection",
         },
     )
 
-    return run_train_stage(
+    return run_projected_train_stage(
         update,
-        inputs.prefixes,
-        inputs.actions,
-        result.scored,
+        inputs,
+        result.projected,
         trainer,
         run_dir=run_dir,
         policy_version=policy_version,
-        max_new_tokens=max_new_tokens,
         max_trace_share=inputs.max_trace_share,
-        selection_policy=SELECTION_POLICY,
-        n_samples_per_prefix=1,
     )
+
+
+@dataclass
+class ProjectedScoreResult:
+    """What the projected SCORED stage produced."""
+
+    projected: dict[str, Any]
+    n_newly_scored: int
+    n_reused: int
+    teacher_input_tokens: int
+    seconds: float
+
+
+def run_projected_score_stage(
+    update: UpdateDir,
+    inputs: LiveUpdateInputs,
+    *,
+    teacher_tok: Any,
+    pool: Any,
+    run_dir: str | Path,
+    paid: dict[str, Any],
+    drop_keys: set[str] | None = None,
+    by_key: dict[str, Any] | None = None,
+) -> ProjectedScoreResult:
+    """Score every live turn through its DeepSeek-native semantic equivalent.
+
+    Persists one row per action carrying the per-student-token teacher credit
+    and the exclusion mask, so a resume reloads the *projected* representation
+    rather than re-deriving it from raw bytes -- which is what re-introduced
+    the contamination in the first place.
+    """
+    import base64
+    import json as _json
+    import time as _time
+
+    from vektori_trace.tau2.live_score import score_live_action
+    from vektori_trace.tau2.reopd_state import append_jsonl, read_jsonl
+
+    drop = set(drop_keys or ())
+    by_key = by_key or {}
+    rows_on_disk = {
+        r["key"]: r for r in read_jsonl(update.scores_path)
+        if r.get("key") and r.get("projection") == "semantic"
+    }
+
+    projected: dict[str, Any] = {}
+    n_new = n_reused = 0
+    t0 = _time.time()
+
+    from vektori_trace.tau2.live_score import ProjectedScore
+
+    for row, action in zip(inputs.capture_rows, inputs.actions):
+        key = row["key"]
+        cached = rows_on_disk.get(key)
+        if cached is not None and key not in drop:
+            projected[key] = ProjectedScore(
+                key=key,
+                teacher_logprob_by_index={
+                    int(k): float(v)
+                    for k, v in cached["teacher_logprob_by_index"].items()
+                },
+                excluded={int(k): v for k, v in cached["excluded"].items()},
+                n_prefix_tokens=int(cached.get("n_prefix_tokens", 0)),
+                n_teacher_tokens=int(cached.get("n_teacher_tokens", 0)),
+                payload_report=cached.get("payloads", {}),
+            )
+            n_reused += 1
+            continue
+
+        raw = base64.b64decode(row["action_bytes_b64"]).decode("utf-8", "replace")
+        for special in ("<|im_end|>", "<|endoftext|>"):
+            if raw.endswith(special):
+                raw = raw[: -len(special)]
+        history = inputs.rendered[row["prefix_id"]]
+        sc = score_live_action(
+            key=key,
+            raw_text=raw,
+            student_token_bytes=[
+                base64.b64decode(b) for b in row["action_token_bytes_b64"]
+            ],
+            semantic_history=history,
+            teacher_tokenizer=teacher_tok,
+            pool=pool,
+        )
+        projected[key] = sc
+        n_new += 1
+        # Persist immediately: every teacher call is billed.
+        out = {
+            "key": key,
+            "projection": "semantic",
+            "teacher_logprob_by_index": {
+                str(k): v for k, v in sc.teacher_logprob_by_index.items()
+            },
+            "excluded": {str(k): v for k, v in sc.excluded.items()},
+            "n_prefix_tokens": sc.n_prefix_tokens,
+            "n_teacher_tokens": sc.n_teacher_tokens,
+            "payloads": sc.payload_report,
+        }
+        src = by_key.get(key)
+        if src is not None:
+            out["fingerprint"] = src.get("score_fingerprint")
+            out["semantic_history_hash"] = src.get("semantic_history_hash")
+            out["teacher_context_hash"] = src.get("teacher_context_hash")
+            out["policy_version"] = src.get("policy_version")
+        append_jsonl(update.scores_path, out)
+        commit_scores("projected score")
+
+    seconds = round(_time.time() - t0, 1)
+    tin = sum(sc.n_prefix_tokens + sc.n_teacher_tokens
+              for sc in projected.values())
+    if not update.reached("SCORED"):
+        update.mark("SCORED", {
+            "n_scores": len(projected), "seconds": seconds,
+            "teacher_input_tokens": tin, "projection": "semantic",
+        })
+        commit_scores("scored marker")
+    log(f"  scored {n_new} new / {n_reused} reused in {seconds}s "
+        f"(semantic projection; ~{tin:,} teacher input tokens)")
+    telemetry(run_dir, {
+        "event": "stage", "stage": "SCORED", "update": update.index,
+        "seconds": seconds, "n_scores": len(projected),
+        "teacher_input_tokens": tin, "projection": "semantic",
+        "est_cost_usd_uncached": round(tin * 0.22 / 1e6, 4),
+    })
+    return ProjectedScoreResult(projected, n_new, n_reused, tin, seconds)
+
+
+def run_projected_train_stage(
+    update: UpdateDir,
+    inputs: LiveUpdateInputs,
+    projected: dict[str, Any],
+    trainer: Any,
+    *,
+    run_dir: str | Path,
+    policy_version: str,
+    max_trace_share: float,
+    clamp: float | None = None,
+) -> dict[str, Any]:
+    """One optimizer step over the projected batch.
+
+    Does NOT call `run_replay_chunk_opd`: that re-aligns raw student bytes
+    against teacher bytes, which for a projected score would undo the
+    projection. `build_projected_batch` consumes the already-aligned per-token
+    credit instead.
+    """
+    import json as _json
+    import time as _time
+
+    from vektori_trace.tau2.live_batch import build_projected_batch
+    from vektori_trace.tau2.reopd_state import atomic_write_json
+
+    if update.reached("TRAINED"):
+        log("  already trained; skipping")
+        return _json.loads((update.checkpoint_path / "state.json").read_text())
+
+    t0 = _time.time()
+    # Task share is derived from the batch, exactly as the trace share is. A
+    # live update rolls out a fixed task set, so a 4-episode single-task batch
+    # legitimately has share 1.0; inheriting the replay default of 0.5 would
+    # reject it for a concentration the schedule chose on purpose.
+    n_tasks = len({p.task for p in inputs.prefixes})
+    max_task_share = min(1.0, (1.0 / n_tasks) * 1.5) if n_tasks else 1.0
+    batch = build_projected_batch(
+        inputs.prefixes, inputs.actions, projected,
+        policy_version=policy_version,
+        max_task_share=max_task_share,
+        max_trace_share=max_trace_share,
+        clamp=clamp,
+    )
+    opt = trainer.step(batch)
+    train_s = round(_time.time() - t0, 1)
+    gpu = gpu_snapshot()
+
+    report = {
+        "policy_version": policy_version,
+        "selection_policy": SELECTION_POLICY,
+        "projection": "semantic",
+        "global_supervised_tokens": batch.global_supervised_tokens,
+        "n_actions": len(batch.keys),
+        "spread": batch.spread_report,
+        "optimizer": opt,
+    }
+    atomic_write_json(update.report_path, report)
+    telemetry(run_dir, {
+        "event": "stage", "stage": "TRAINED", "update": update.index,
+        "seconds": train_s, "loss": (opt or {}).get("loss"),
+        "grad_norm": (opt or {}).get("grad_norm"),
+        "supervised_tokens": batch.global_supervised_tokens,
+        "projection": "semantic", **gpu,
+    })
+
+    state = trainer.checkpoint(
+        update.checkpoint_path, update_index=update.index,
+        policy_version=policy_version,
+    )
+    commit_scores("checkpoint")
+    update.mark("TRAINED", {
+        "loss": (opt or {}).get("loss"), "seconds": train_s,
+        "adapter_hash": state.get("adapter_hash"),
+    })
+    commit_scores("trained marker")
+    log(f"  trained in {train_s}s; loss={(opt or {}).get('loss')} "
+        f"adapter={state.get('adapter_hash')} "
+        f"supervised={batch.global_supervised_tokens}")
+    return state
 
 
 def refresh_live_policy(

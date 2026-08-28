@@ -247,122 +247,6 @@ def _fake_chunk_opd(monkeypatch, captured):
         captured["n_prefixes"] = len(prefixes)
         step({"n": len(actions)})
         return {"optimizer": {"loss": 0.5}, "global_supervised_tokens": 4}
-
-    monkeypatch.setattr(ro, "run_replay_chunk_opd", fake)
-
-
-def test_train_scores_then_steps_and_checkpoints(tmp_path, monkeypatch):
-    pairs = [_row("ep-1", 0), _row("ep-1", 1), _row("ep-2", 0), _row("ep-3", 0)]
-    u = _sampled_update(tmp_path, pairs)
-    run = RunState(tmp_path, n_updates=1)
-
-    seen, kw = [], {}
-    _fake_score(monkeypatch, seen)
-    _fake_chunk_opd(monkeypatch, kw)
-
-    inputs = load_live_update_inputs(u, policy_version="live-u000")
-    trainer = _Trainer()
-    state = train_live_update(
-        u, inputs, run, teacher_tok=object(), pool=_Pool(), trainer=trainer,
-        run_dir=tmp_path, policy_version="live-u000", max_new_tokens=4096,
-    )
-
-    assert len(seen) == 4
-    assert len(trainer.steps) == 1
-    assert state["adapter_hash"] == "adapter-next"
-    assert u.reached("TRAINED")
-    # The batch-derived share reached the loss, not the replay default.
-    assert kw["max_trace_share"] == pytest.approx(0.5)
-    assert kw["selection_policy"] == "tau2-live-episode-balanced"
-    assert kw["n_samples_per_prefix"] == 1
-
-    # Every persisted score carries the binding RunState.validate() checks.
-    scores = read_jsonl(u.scores_path)
-    assert len(scores) == 4
-    by_key = {r["key"]: r for r in scores}
-    for row in inputs.capture_rows:
-        assert by_key[row["key"]]["fingerprint"] == row["score_fingerprint"]
-        assert by_key[row["key"]]["semantic_history_hash"] == (
-            row["semantic_history_hash"]
-        )
-    # And the update validates as a whole -- the resume-time backstop.
-    u.validate()
-
-
-def test_train_reuses_paid_scores_but_drops_stale_ones(tmp_path, monkeypatch):
-    """A live turn key can recur inside one update after a discard-and-
-    resample, where identical action bytes follow a *different* history. That
-    paid score was bought for a trajectory that no longer exists."""
-    fresh, fresh_hist = _row("ep-1", 0)
-    keep, keep_hist = _row("ep-2", 0)
-    u = _sampled_update(tmp_path, [(fresh, fresh_hist), (keep, keep_hist)])
-    run = RunState(tmp_path, n_updates=1)
-
-    # One cached score matches its history; one was bought under another.
-    atomic_write_jsonl(u.scores_path, [
-        {
-            "key": keep["key"],
-            "teacher_token_bytes_b64": [base64.b64encode(b"A").decode()],
-            "teacher_logprobs": [-0.1],
-            "n_prefix_tokens": 3,
-            "n_trailing_dropped": 0,
-            "fingerprint": keep["score_fingerprint"],
-            "semantic_history_hash": keep["semantic_history_hash"],
-        },
-        {
-            "key": fresh["key"],
-            "teacher_token_bytes_b64": [base64.b64encode(b"A").decode()],
-            "teacher_logprobs": [-0.1],
-            "n_prefix_tokens": 3,
-            "n_trailing_dropped": 0,
-            "fingerprint": "stale",
-            "semantic_history_hash": "a-history-that-no-longer-exists",
-        },
-    ])
-
-    seen, kw = [], {}
-    _fake_score(monkeypatch, seen)
-    _fake_chunk_opd(monkeypatch, kw)
-
-    inputs = load_live_update_inputs(u, policy_version="live-u000")
-    train_live_update(
-        u, inputs, run, teacher_tok=object(), pool=_Pool(), trainer=_Trainer(),
-        run_dir=tmp_path, policy_version="live-u000", max_new_tokens=4096,
-    )
-
-    # The stale one was re-bought; the provable one was reused. Paying twice is
-    # the cheap failure.
-    assert seen == [fresh["key"]]
-    rows = {r["key"]: r for r in read_jsonl(u.scores_path)}
-    assert rows[fresh["key"]]["fingerprint"] == fresh["score_fingerprint"]
-    assert rows[fresh["key"]]["semantic_history_hash"] == (
-        fresh["semantic_history_hash"]
-    )
-
-
-def test_train_is_idempotent_across_a_resume(tmp_path, monkeypatch):
-    """The optimizer step is the one stage that must never run twice for one
-    batch: a second step would double this update's contribution."""
-    u = _sampled_update(tmp_path, [_row("ep-1", 0), _row("ep-2", 0)])
-    run = RunState(tmp_path, n_updates=1)
-    seen, kw = [], {}
-    _fake_score(monkeypatch, seen)
-    _fake_chunk_opd(monkeypatch, kw)
-
-    inputs = load_live_update_inputs(u, policy_version="live-u000")
-    trainer = _Trainer()
-    for _ in range(2):
-        train_live_update(
-            u, inputs, run, teacher_tok=object(), pool=_Pool(),
-            trainer=trainer, run_dir=tmp_path, policy_version="live-u000",
-            max_new_tokens=4096,
-        )
-    assert len(trainer.steps) == 1
-
-
-# --- adapter-hash propagation ----------------------------------------------
-
-
 def _checkpoint(path, adapter_hash="adapter-u000"):
     path.mkdir(parents=True, exist_ok=True)
     (path / "state.json").write_text(json.dumps({
@@ -432,3 +316,12 @@ def test_refresh_refuses_an_unreadable_checkpoint(tmp_path, monkeypatch):
     _patch_refresh(monkeypatch)
     with pytest.raises(LiveTrainError, match="cannot read"):
         refresh_live_policy(_Args(), 1, tmp_path / "nope", run_dir=tmp_path)
+
+
+# The three tests that previously lived here drove `run_score_stage` ->
+# `score_replay_batch`, the raw-action route. `train_live_update` no longer
+# takes it: live scoring goes through the semantic projection, so mocking the
+# replay scorer exercised a path production cannot reach. Equivalent coverage
+# -- scoring, persistence, resume-without-rescoring, and the guarantee that
+# `score_replay_batch` is never called -- is in `test_live_train_projected.py`,
+# driven through the real `train_live_update`.
