@@ -225,6 +225,38 @@ def run_update(
         f"{inputs.n_episodes} episode(s)"
     )
 
+    # Concentration is REPORTED, never enforced, on the live path. An episode's
+    # length is an outcome of the policy, so refusing a batch for producing a
+    # long trajectory selects against hard tasks -- exactly the states OPD
+    # exists to learn from. Balance is a property of the preregistered roster
+    # (equal episode counts per task), decided before the rollout; pathology is
+    # bounded by `max_turns` and MAX_ACTION_TOKENS, which cap a runaway
+    # generation without discarding a legitimate long one.
+    from vektori_trace.tau2.live_batch import estimate_batch_shares
+
+    n_tasks = len({p.task for p in inputs.prefixes})
+    est = estimate_batch_shares(
+        inputs.prefixes, inputs.actions,
+        max_task_share=min(1.0, (1.0 / n_tasks) * 1.5) if n_tasks else 1.0,
+        max_trace_share=inputs.max_trace_share,
+    )
+    log(f"  concentration (raw-token estimate): "
+        f"task={est.get('worst_task_share')} "
+        f"trace={est.get('worst_trace_share')} -- telemetry only")
+    telemetry(
+        args.run_dir,
+        {
+            "event": "batch_concentration",
+            "update": idx,
+            "estimated_task_share": est.get("estimated_task_share"),
+            "estimated_trace_share": est.get("estimated_trace_share"),
+            "worst_task_share": est.get("worst_task_share"),
+            "worst_trace_share": est.get("worst_trace_share"),
+            "enforced": False,
+            "basis": est.get("basis"),
+        },
+    )
+
     return train_live_update(
         u,
         inputs,

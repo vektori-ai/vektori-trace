@@ -1495,7 +1495,7 @@ def rescore(run_id: str = "", update: int = 0,
     max_containers=1,
 )
 def one_step(run_id: str = "", update: int = 0,
-             learning_rate: float = 1e-5) -> str:
+             learning_rate: float = 1e-5, parent_override: str = "") -> str:
     """Exactly one optimizer step from cached scores. No rollout, no teacher.
 
     The `train` driver cannot do this: its loop samples fresh episodes before
@@ -1540,20 +1540,32 @@ def one_step(run_id: str = "", update: int = 0,
             "twice from one parent"
         )
 
+    # The parent is whatever SAMPLED this batch, read off the manifest and then
+    # confirmed against the weights on disk. Pinning it to the SFT adapter
+    # would be wrong for an ITERATED update: update 2 was sampled from update
+    # 1's child, and training it onto A_sft_new would silently discard the
+    # first step while every hash in the report still looked plausible.
     with open(os.path.join(out, "manifest.json")) as fh:
         manifest = json.load(fh)
-    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+    claimed = manifest.get("adapter_hash")
+    if not claimed:
+        raise ValueError(
+            f"{run_id} manifest records no adapter_hash; the batch cannot name "
+            "the policy that sampled it, so its parent cannot be verified"
+        )
+    parent = parent_override or os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
     parent_hash = adapter_hash(parent)
-    if parent_hash != PARENT_ADAPTER_HASH:
+    if parent_hash != claimed:
         raise ValueError(
-            f"parent hashes to {parent_hash}, not the pinned "
-            f"{PARENT_ADAPTER_HASH}"
+            f"the adapter at {parent} hashes to {parent_hash}, but "
+            f"{run_id} was sampled from {claimed}. Training this batch onto a "
+            "different adapter than the one that generated it breaks the "
+            "on-policy assumption: every importance ratio would compare two "
+            "distributions that never met. Pass --parent-override pointing at "
+            f"the checkpoint whose weights hash to {claimed}."
         )
-    if manifest.get("adapter_hash") != PARENT_ADAPTER_HASH:
-        raise ValueError(
-            f"{run_id} manifest parent {manifest.get('adapter_hash')!r} is not "
-            "the untouched parent"
-        )
+    print(f"parent: {parent}\n  hash {parent_hash} (matches the sampling "
+          "policy recorded in the manifest)")
 
     policy_version = manifest.get("policy_version") or "live-u000"
     inputs = load_live_update_inputs(u, policy_version=policy_version)
@@ -1633,6 +1645,76 @@ def one_step(run_id: str = "", update: int = 0,
         raise RuntimeError(
             "child adapter hash equals the parent: the step changed nothing"
         )
+    return text
+
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def token_shares(run_id: str = "", update: int = 0) -> str:
+    """True per-task gradient share: supervised TOKENS, not turn counts.
+
+    A turn share answers "how many turns did this task contribute"; the loss is
+    normalised by supervised tokens, so that is the number that decides
+    influence. They are not the same when turns differ in length, which for
+    heterogeneous Tau2 conversations is always.
+    """
+    import json
+    import os
+
+    u = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id,
+                     f"update-{update:03d}")
+    acts = [json.loads(l) for l in open(os.path.join(u, "actions.jsonl"))
+            if l.strip()]
+    scores = {}
+    for l in open(os.path.join(u, "scores.jsonl")):
+        if l.strip():
+            r = json.loads(l)
+            scores[r["key"]] = r
+
+    turns, raw, sup, adv = {}, {}, {}, {}
+    t_raw = t_sup = 0
+    t_adv = 0.0
+    for a in acts:
+        t = a["task_id"]
+        sc = scores.get(a["key"], {})
+        tl = sc.get("teacher_logprob_by_index", {}) or {}
+        ntok = len(a["action_token_ids"])
+        beh = list(a["behavior_logprobs"])
+        mag = 0.0
+        for idx, tv in tl.items():
+            i = int(idx)
+            if i >= len(beh):
+                continue
+            ls = float(beh[i])
+            if abs(ls) < 1e-8:
+                continue
+            mag += abs((float(tv) / ls - 1.0) * ls)
+        turns[t] = turns.get(t, 0) + 1
+        raw[t] = raw.get(t, 0) + ntok
+        sup[t] = sup.get(t, 0) + len(tl)
+        adv[t] = adv.get(t, 0.0) + mag
+        t_raw += ntok
+        t_sup += len(tl)
+        t_adv += mag
+
+    n = len(acts)
+    out = [f"TRUE SHARES -- {run_id} update {update}", "",
+           f"  turns {n}   raw tokens {t_raw:,}   supervised {t_sup:,}", "",
+           f"  {'task':<6}{'turns':>7}{'turn%':>9}{'sup_tok':>10}{'SUP%':>9}"
+           f"{'|adv|%':>9}"]
+    for t in sorted(turns):
+        out.append(
+            f"  {t:<6}{turns[t]:>7}{100 * turns[t] / n:>8.1f}%"
+            f"{sup[t]:>10,}{100 * sup[t] / max(1, t_sup):>8.1f}%"
+            f"{100 * adv[t] / max(1e-9, t_adv):>8.1f}%")
+    out += ["",
+            f"  worst by TURNS      : {max(turns.values()) / n:.4f}",
+            f"  worst by SUP TOKENS : "
+            f"{max(sup.values()) / max(1, t_sup):.4f}   <- gradient share",
+            f"  worst by |advantage|: "
+            f"{max(adv.values()) / max(1e-9, t_adv):.4f}   <- influence"]
+    text = "\n".join(out)
+    print(text)
     return text
 
 
@@ -2015,6 +2097,7 @@ def main(
     predict_only: bool = False,
     build_canary_only: bool = False,
     show_markers_only: bool = False,
+    token_shares_only: bool = False,
     rescore_only: bool = False,
     one_step_only: bool = False,
     parent_override: str = "",
@@ -2060,6 +2143,10 @@ def main(
         print("preflight OK")
         return
 
+    if token_shares_only:
+        token_shares.remote(run_id, classify_update)
+        return
+
     if show_markers_only:
         show_markers.remote(run_id, classify_update)
         return
@@ -2067,7 +2154,8 @@ def main(
     if one_step_only:
         print(f"one-step: TRAINING GPU on {run_id!r} update {classify_update}")
         print("  cached scores only, no teacher pool, no rollout, no endpoint")
-        one_step.remote(run_id, classify_update, learning_rate)
+        one_step.remote(run_id, classify_update, learning_rate,
+                        parent_override)
         return
 
     if rescore_only:

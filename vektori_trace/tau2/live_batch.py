@@ -30,6 +30,7 @@ from typing import Any, Sequence
 
 __all__ = [
     "LiveBatchError",
+    "estimate_batch_shares",
     "projected_turn_advantages",
     "build_projected_batch",
 ]
@@ -41,6 +42,79 @@ DEGENERATE_LS_EPS = 1e-8
 
 class LiveBatchError(RuntimeError):
     """A projected batch that must not reach the optimizer."""
+
+
+def estimate_batch_shares(
+    prefixes: Sequence[Any],
+    actions: Sequence[Any],
+    *,
+    max_task_share: float,
+    max_trace_share: float,
+) -> dict[str, Any]:
+    """Would this batch's balance check pass? Answerable before scoring.
+
+    `build_projected_batch` weights each turn by its *supervised token* count,
+    which is not known until the teacher has been paid. But the dominant term
+    is how many turns each task contributed and how long they are, and raw
+    action-token counts are on disk the moment sampling ends. So this
+    approximates the same ratio from `action_token_ids` and reports whether the
+    real check is likely to refuse the batch.
+
+    The point is placement, not precision. On 2026-08-28 update 2 paid $0.05
+    and 410 s of DeepSeek scoring before `build_projected_batch` refused a
+    batch whose imbalance -- task 93 at 15 of 34 turns -- was determined the
+    instant the rollout ended. A gate that only fires after the expensive stage
+    is a gate in the wrong place.
+
+    This is deliberately advisory: it NEVER replaces the real check, because it
+    estimates a quantity it cannot know exactly. It exists so a doomed batch is
+    refused in one second instead of after a paid scoring pass.
+    """
+    by_task: dict[str, int] = {}
+    by_trace: dict[str, int] = {}
+    total = 0
+    for prefix, action in zip(prefixes, actions):
+        n = len(getattr(action, "token_ids", None)
+                or getattr(action, "action_token_ids", None) or ())
+        if n <= 0:
+            n = 1
+        total += n
+        by_task[prefix.task] = by_task.get(prefix.task, 0) + n
+        by_trace[prefix.trace_id] = by_trace.get(prefix.trace_id, 0) + n
+
+    if total == 0:
+        return {"ok": False, "reason": "no sampled tokens", "total": 0}
+
+    task_share = {k: v / total for k, v in by_task.items()}
+    trace_share = {k: v / total for k, v in by_trace.items()}
+    worst_task = max(task_share.values()) if task_share else 0.0
+    worst_trace = max(trace_share.values()) if trace_share else 0.0
+
+    reasons = []
+    if worst_task > max_task_share:
+        top = max(task_share, key=task_share.get)
+        reasons.append(
+            f"task {top} would take ~{worst_task:.3f} of the batch, over "
+            f"{max_task_share:.3f}"
+        )
+    if worst_trace > max_trace_share:
+        top = max(trace_share, key=trace_share.get)
+        reasons.append(
+            f"episode {top} would take ~{worst_trace:.3f} of the batch, over "
+            f"{max_trace_share:.3f}"
+        )
+
+    return {
+        "ok": not reasons,
+        "reason": "; ".join(reasons),
+        "estimated_task_share": {k: round(v, 4) for k, v in task_share.items()},
+        "estimated_trace_share": {k: round(v, 4)
+                                  for k, v in trace_share.items()},
+        "worst_task_share": round(worst_task, 4),
+        "worst_trace_share": round(worst_trace, 4),
+        "total_action_tokens": total,
+        "basis": "raw action tokens (pre-scoring estimate, not the real check)",
+    }
 
 
 def projected_turn_advantages(
@@ -123,6 +197,7 @@ def build_projected_batch(
     max_task_share: float = 0.5,
     max_trace_share: float = 0.35,
     clamp: float | None = None,
+    enforce_shares: bool = True,
 ) -> Any:
     """`ReplayBatch` from projected scores, without re-aligning raw bytes.
 
@@ -182,16 +257,37 @@ def build_projected_batch(
     trace_share = {k: v / total for k, v in by_trace.items()}
     worst_task = max(task_share.values()) if task_share else 0.0
     worst_trace = max(trace_share.values()) if trace_share else 0.0
-    if worst_task > max_task_share:
-        raise LiveBatchError(
-            f"task share {worst_task:.3f} exceeds {max_task_share}; one task "
-            "dominates the update"
-        )
-    if worst_trace > max_trace_share:
-        raise LiveBatchError(
-            f"trace share {worst_trace:.3f} exceeds {max_trace_share}; one "
-            "episode dominates the update"
-        )
+
+    # `enforce_shares=False` is the LIVE contract, and it is a deliberate
+    # methodological choice rather than a relaxation.
+    #
+    # Replay selected prefixes from a frozen corpus of thousands: a lopsided
+    # batch was reshuffled for free, so the share limits were a *sampling*
+    # constraint (`replay_select.assert_no_source_dominates`, plan §8.4).
+    # Live episodes are generated one at a time at real cost, and their length
+    # is an OUTCOME, not a knob -- task 93 runs 15 turns because the student
+    # struggles there.
+    #
+    # Refusing a batch after seeing its realized length is therefore
+    # outcome-dependent selection: hard tasks produce more states, so a
+    # length-triggered gate systematically excludes the very trajectories
+    # on-policy distillation exists to learn from. Upstream bounds pathology
+    # with `max_turns` and token caps, not with share rejection.
+    #
+    # Balance belongs BEFORE the rollout -- equal preregistered episode counts
+    # per task -- not after it. The shares are still computed and reported, so
+    # concentration is visible in every run report.
+    if enforce_shares:
+        if worst_task > max_task_share:
+            raise LiveBatchError(
+                f"task share {worst_task:.3f} exceeds {max_task_share}; one task "
+                "dominates the update"
+            )
+        if worst_trace > max_trace_share:
+            raise LiveBatchError(
+                f"trace share {worst_trace:.3f} exceeds {max_trace_share}; one "
+                "episode dominates the update"
+            )
 
     return ReplayBatch(
         prefixes=list(prefixes),

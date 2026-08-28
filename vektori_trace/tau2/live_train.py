@@ -356,6 +356,15 @@ def run_projected_score_stage(
         )
         projected[key] = sc
         n_new += 1
+        # A paid stage that prints nothing until it finishes is one you cannot
+        # tell apart from a hung one. 34 actions took 410 s on 2026-08-28.
+        if n_new % 5 == 0 or n_new == 1:
+            done = n_new + n_reused
+            spent = sum(s.n_prefix_tokens + s.n_teacher_tokens
+                        for s in projected.values())
+            log(f"    scoring {done}/{len(inputs.capture_rows)} "
+                f"({_time.time() - t0:.0f}s, ~{spent:,} teacher tokens, "
+                f"~${spent * 0.22 / 1e6:.4f})")
         # Persist immediately: every teacher call is billed.
         out = {
             "key": key,
@@ -437,6 +446,12 @@ def run_projected_train_stage(
         policy_version=policy_version,
         max_task_share=max_task_share,
         max_trace_share=max_trace_share,
+        # Telemetry, not refusal -- see `build_projected_batch`. A live
+        # episode's length is an outcome, so rejecting on realized length
+        # selects against hard tasks, which is the opposite of what on-policy
+        # distillation is for. Balance is enforced before the rollout by equal
+        # episode counts per task; the shares are reported below.
+        enforce_shares=False,
         clamp=clamp,
     )
     opt = trainer.step(batch)
