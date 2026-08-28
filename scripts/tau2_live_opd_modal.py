@@ -1303,32 +1303,18 @@ def rescore(run_id: str = "", update: int = 0,
 
     with open(os.path.join(out, "manifest.json")) as fh:
         manifest = json.load(fh)
-    # Validate against THIS update's own sampling policy, not the frozen SFT
-    # parent: update k>0 is sampled from update k-1's child, so pinning
-    # PARENT_ADAPTER_HASH here would reject every iterative update. The
-    # `.SAMPLED` marker records what actually generated these actions.
-    sampled_marker = u.marker("SAMPLED")
-    sampled_hash = None
-    if sampled_marker.exists():
-        try:
-            sampled_hash = json.loads(sampled_marker.read_text()).get(
-                "adapter_hash")
-        except (OSError, ValueError):
-            sampled_hash = None
-    if not sampled_hash:
-        raise ValueError(
-            f"{run_id} update {update} has no adapter_hash in .SAMPLED; the "
-            "batch cannot name the policy that generated it, so the scores "
-            "could not be bound to a provenance"
-        )
-    if update == 0 and sampled_hash != PARENT_ADAPTER_HASH:
-        raise ValueError(
-            f"update 0 was sampled from {sampled_hash!r}, not the untouched "
-            f"parent {PARENT_ADAPTER_HASH}; a clean pilot must start there"
-        )
-    print(f"scoring update {update}, sampled from {sampled_hash}")
+    # Identity comes from THIS update's .SAMPLED marker, never the run
+    # manifest -- the manifest names the run's initial parent, which for
+    # update k>0 is the wrong adapter and the wrong policy version.
+    from vektori_trace.tau2.live_train import sampled_identity
 
-    policy_version = manifest.get("policy_version") or "live-u000"
+    ident = sampled_identity(
+        u, expect_adapter_hash=PARENT_ADAPTER_HASH if update == 0 else None)
+    sampled_hash = ident["adapter_hash"]
+    print(f"scoring update {update}, sampled from {sampled_hash} "
+          f"(policy {ident['policy_version']})")
+
+    policy_version = ident["policy_version"]
     inputs = load_live_update_inputs(u, policy_version=policy_version)
     teacher_tok = load_tokenizer(TEACHER_TOKENIZER)
     pool = FireworksTeacherPool(model=TEACHER_MODEL)
@@ -1564,34 +1550,40 @@ def one_step(run_id: str = "", update: int = 0,
             "twice from one parent"
         )
 
-    # The parent is whatever SAMPLED this batch, read off the manifest and then
-    # confirmed against the weights on disk. Pinning it to the SFT adapter
-    # would be wrong for an ITERATED update: update 2 was sampled from update
-    # 1's child, and training it onto A_sft_new would silently discard the
-    # first step while every hash in the report still looked plausible.
+    # Identity from THIS update's .SAMPLED marker, never the run manifest:
+    # the manifest names the run's INITIAL parent, so for update k>0 it holds
+    # both the wrong adapter hash and the wrong policy version. Reading it
+    # there would reject update k-1's correct checkpoint for "disagreeing"
+    # with the SFT hash, or load the actions under a version they were never
+    # sampled with -- and both read as a provenance check passing.
+    from vektori_trace.tau2.live_train import sampled_identity
+
     with open(os.path.join(out, "manifest.json")) as fh:
         manifest = json.load(fh)
-    claimed = manifest.get("adapter_hash")
-    if not claimed:
-        raise ValueError(
-            f"{run_id} manifest records no adapter_hash; the batch cannot name "
-            "the policy that sampled it, so its parent cannot be verified"
-        )
-    parent = parent_override or os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+
+    # Lineage: update 0 must come from the untouched parent; update k>0 must
+    # come from exactly update k-1's checkpoint.
+    expect = PARENT_ADAPTER_HASH if update == 0 else adapter_hash(
+        run.update(update - 1).checkpoint_path)
+    ident = sampled_identity(u, expect_adapter_hash=expect)
+    claimed = ident["adapter_hash"]
+
+    parent = parent_override or (
+        os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME) if update == 0
+        else str(run.update(update - 1).checkpoint_path))
     parent_hash = adapter_hash(parent)
     if parent_hash != claimed:
         raise ValueError(
             f"the adapter at {parent} hashes to {parent_hash}, but "
-            f"{run_id} was sampled from {claimed}. Training this batch onto a "
-            "different adapter than the one that generated it breaks the "
-            "on-policy assumption: every importance ratio would compare two "
-            "distributions that never met. Pass --parent-override pointing at "
-            f"the checkpoint whose weights hash to {claimed}."
+            f"update {update} was sampled from {claimed}. Training a batch "
+            "onto an adapter that did not generate it breaks the on-policy "
+            "assumption: every importance ratio would compare two "
+            "distributions that never met."
         )
-    print(f"parent: {parent}\n  hash {parent_hash} (matches the sampling "
-          "policy recorded in the manifest)")
+    print(f"parent: {parent}\n  hash {parent_hash} == .SAMPLED adapter_hash "
+          f"(policy {ident['policy_version']})")
 
-    policy_version = manifest.get("policy_version") or "live-u000"
+    policy_version = ident["policy_version"]
     inputs = load_live_update_inputs(u, policy_version=policy_version)
 
     # --- rehydrate the PAID scores. No pool exists in this container. ------
@@ -1778,6 +1770,151 @@ def token_shares(run_id: str = "", update: int = 0) -> str:
     print(text)
     return text
 
+
+
+@app.function(
+    # NO gpu=. Rollout drives the SERVING endpoint over HTTP -- the generation
+    # happens on that card, not in this container. The monolithic `train`
+    # allocated a training GPU here and then held it through scoring too,
+    # which over a 10-update run is hours of an idle card.
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 90,
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
+)
+def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
+                 student_model: str = "", adapter_hash_expect: str = "",
+                 tau2_src: str = "",
+                 allow_missing_reasoning: bool = False) -> dict:
+    """Stage 1: sample one update's episodes, stop at SAMPLED.
+
+    No teacher pool, no trainer, no GPU. Every turn is archived the moment it
+    lands, so a crash costs at most the episode in flight -- and nothing has
+    been paid to DeepSeek yet, which is why this stage runs before scoring.
+
+    The roster, seeds and generation settings come from the FROZEN manifest,
+    not from CLI arguments, so a preregistered run cannot drift by a typo.
+    """
+    import importlib.util
+    import json
+    import os
+    import sys
+    import time
+
+    sys.path.insert(0, "/root")
+    if tau2_src:
+        sys.path.insert(0, tau2_src)
+
+    from vektori_trace.tau2.live_rollout import (
+        RolloutSettings, Tau2EpisodeRunner, capture_live_update,
+    )
+    from vektori_trace.tau2.opd_stages import log, set_commit_fn, telemetry
+    from vektori_trace.tau2.reopd_refresh import served_models
+    from vektori_trace.tau2.reopd_state import RunState
+
+    set_commit_fn(vol.commit)
+
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    with open(os.path.join(out, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    run = RunState(out, n_updates=int(manifest.get("n_updates", 1)))
+    u = run.update(update)
+    u.validate()
+
+    # Idempotent: a resumed pilot must never resample an update it already has.
+    # The archived turns ARE the recovery mechanism.
+    if u.reached("SAMPLED"):
+        rep = json.loads(u.report_path.read_text())
+        log(f"update {update} already SAMPLED "
+            f"({rep.get('trainable_turns')} turns); nothing resampled")
+        return rep
+
+    if not api_base or not student_model:
+        raise ValueError("--api-base and --student-model are required")
+
+    # The endpoint must already serve the policy this update samples from.
+    # vLLM resolves an unknown adapter name against the base model, so without
+    # this the run would sample the BASE weights and report success.
+    advertised = served_models(api_base, timeout=30.0)
+    if student_model not in advertised:
+        raise ValueError(
+            f"endpoint does not advertise {student_model!r}; it serves "
+            f"{advertised}. An unknown name silently resolves to the base "
+            "model, so the adapter would do nothing."
+        )
+
+    # Provenance comes from the caller, which read it off the checkpoint that
+    # is actually being served. A blank here is what made update 0 of the
+    # 2026-08-28 proof unverifiable.
+    if not adapter_hash_expect:
+        raise ValueError(
+            "--adapter-hash-expect is required: every archived episode is "
+            "stamped with it, and batch_report checks the batch against it"
+        )
+
+    # Roster from the FROZEN manifest, never from CLI arguments.
+    tasks = [str(t) for t in manifest["task_ids"]]
+    seed_list = [int(s) for s in manifest["seeds"]]
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        manifest.get("student_tokenizer", "Qwen/Qwen3-4B"),
+        trust_remote_code=True)
+    # Reuse the driver's planning rather than reimplementing it: the episode id
+    # convention and the task x seed cross are the balance mechanism this run
+    # preregisters, and a second copy would be free to drift from it.
+    spec = importlib.util.spec_from_file_location(
+        "tau2_live_opd_train", "/root/scripts/tau2_live_opd_train.py")
+    drv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(drv)
+    plans = drv.plan_update(update, tasks, seed_list)
+
+    settings = RolloutSettings(
+        domain=manifest.get("domain", "retail"),
+        student_model=student_model,
+        api_base=api_base,
+        policy_version=f"live-u{update:03d}",
+        adapter_hash=adapter_hash_expect,
+        gen_config_hash=manifest.get("gen_config_hash", ""),
+        max_tokens=int(manifest.get("max_action_tokens", 4096)),
+        max_input_tokens=int(manifest.get("max_input_tokens", 16384)),
+        temperature=float(manifest.get("temperature", 1.0)),
+        timeout=600.0,
+        max_steps=int(manifest.get("max_turns", 100)),
+        max_errors=10,
+        user="user_simulator",
+        user_model=manifest.get("user_model", USER_MODEL),
+        user_model_args={},
+        require_reasoning=not allow_missing_reasoning,
+    )
+
+    t0 = time.time()
+    log(f"rolling out {len(plans)} episode(s) on {student_model} "
+        f"(adapter {adapter_hash_expect}, policy live-u{update:03d})")
+    report = capture_live_update(
+        u, plans,
+        settings=settings,
+        teacher_context={
+            "model": manifest.get("teacher_model", TEACHER_MODEL),
+            "tokenizer": manifest.get("teacher_tokenizer", TEACHER_TOKENIZER),
+            "renderer": manifest.get("teacher_renderer", "deepseek-v4-native"),
+        },
+        runner=Tau2EpisodeRunner(settings, tokenizer),
+    )
+    secs = round(time.time() - t0, 1)
+    vol.commit()
+
+    log(f"rollout took {secs}s: {report.get('trainable')} episodes, "
+        f"{report.get('trainable_turns')} turns, {report.get('failed')} "
+        f"failed, {report.get('discarded')} discarded")
+    telemetry(out, {
+        "event": "stage", "stage": "SAMPLED", "update": update,
+        "seconds": secs, "n_episodes": report.get("trainable"),
+        "n_turns": report.get("trainable_turns"),
+        "failed": report.get("failed"), "discarded": report.get("discarded"),
+        "adapter_hash": adapter_hash_expect,
+    })
+    return report
 
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:

@@ -62,6 +62,71 @@ class LiveTrainError(RuntimeError):
     """A live update that must not reach the optimizer."""
 
 
+def sampled_identity(update: Any, *, expect_adapter_hash: str | None = None
+                     ) -> dict[str, Any]:
+    """Who sampled THIS update, read from its own `.SAMPLED` marker.
+
+    The run manifest describes the run's *initial* parent. For update k>0 that
+    is the wrong answer to both questions a downstream stage asks -- which
+    adapter generated these actions, and what policy version is stamped on
+    them. Reading the manifest there either rejects the correct previous
+    checkpoint for "disagreeing" with the SFT hash, or loads the actions under
+    a policy version they were never sampled with. Both look like provenance
+    checks passing.
+
+    So every stage after sampling derives identity from the marker the
+    sampling stage wrote, and `expect_adapter_hash` lets the caller assert the
+    specific lineage it requires: `A_sft_new` for update 0, update k-1's
+    checkpoint hash otherwise.
+    """
+    import json as _json
+
+    marker = update.marker("SAMPLED")
+    if not marker.exists():
+        raise LiveTrainError(
+            f"update {update.index} has no .SAMPLED marker; nothing downstream "
+            "can name the policy that generated its actions"
+        )
+    try:
+        payload = _json.loads(marker.read_text())
+    except (OSError, ValueError) as exc:
+        raise LiveTrainError(
+            f"update {update.index}: .SAMPLED is unreadable ({exc}); its "
+            "provenance cannot be verified"
+        ) from exc
+
+    adapter = payload.get("adapter_hash")
+    policy = payload.get("policy_version")
+    if not adapter:
+        raise LiveTrainError(
+            f"update {update.index}: .SAMPLED records no adapter_hash. The "
+            "batch cannot name the policy that sampled it -- the exact blank "
+            "that made update 0 of the 2026-08-28 proof unverifiable."
+        )
+    if not policy:
+        raise LiveTrainError(
+            f"update {update.index}: .SAMPLED records no policy_version; the "
+            "actions cannot be loaded under the version they were sampled with"
+        )
+    if expect_adapter_hash is not None and adapter != expect_adapter_hash:
+        raise LiveTrainError(
+            f"update {update.index} was sampled from {adapter!r}, but this "
+            f"stage requires {expect_adapter_hash!r}. Training a batch onto an "
+            "adapter that did not generate it breaks the on-policy assumption: "
+            "every importance ratio would compare two distributions that never "
+            "met, with a finite loss and nothing in the logs to show for it."
+        )
+
+    return {
+        "adapter_hash": adapter,
+        "policy_version": policy,
+        "n_actions": payload.get("actions"),
+        "n_episodes": payload.get("episodes"),
+        "gen_config_hash": payload.get("gen_config_hash"),
+        "teacher_context_hash": payload.get("teacher_context_hash"),
+    }
+
+
 def live_max_trace_share(n_episodes: int, *, headroom: float = 1.5) -> float:
     """The trace-share limit a live batch of `n_episodes` can actually satisfy.
 

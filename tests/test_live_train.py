@@ -325,3 +325,67 @@ def test_refresh_refuses_an_unreadable_checkpoint(tmp_path, monkeypatch):
 # -- scoring, persistence, resume-without-rescoring, and the guarantee that
 # `score_replay_batch` is never called -- is in `test_live_train_projected.py`,
 # driven through the real `train_live_update`.
+
+
+# --- per-update identity: the manifest is NOT the answer for update k>0 -----
+
+
+def _mark_sampled(tmp_path, idx, *, adapter, policy, actions=4, episodes=2):
+    from vektori_trace.tau2.reopd_state import UpdateDir
+
+    u = UpdateDir(tmp_path, idx)
+    u.path.mkdir(parents=True, exist_ok=True)
+    u.mark("PLANNED", {})
+    u.mark("SAMPLED", {
+        "adapter_hash": adapter, "policy_version": policy,
+        "actions": actions, "episodes": episodes, "stage": "SAMPLED",
+    })
+    return u
+
+
+def test_sampled_identity_reads_the_update_not_the_run(tmp_path):
+    """Update 1's identity is update 1's, even when the run began elsewhere."""
+    from vektori_trace.tau2.live_train import sampled_identity
+
+    u1 = _mark_sampled(tmp_path, 1, adapter="child-of-u0", policy="live-u001")
+    ident = sampled_identity(u1)
+    assert ident["adapter_hash"] == "child-of-u0"
+    assert ident["policy_version"] == "live-u001"
+
+
+def test_sampled_identity_enforces_the_expected_lineage(tmp_path):
+    from vektori_trace.tau2.live_train import LiveTrainError, sampled_identity
+
+    u1 = _mark_sampled(tmp_path, 1, adapter="child-of-u0", policy="live-u001")
+    # Correct lineage passes.
+    sampled_identity(u1, expect_adapter_hash="child-of-u0")
+    # The SFT parent -- what a manifest read would have supplied -- does not.
+    with pytest.raises(LiveTrainError, match="was sampled from"):
+        sampled_identity(u1, expect_adapter_hash="3869b147ab7ce5d2")
+
+
+def test_sampled_identity_refuses_a_blank_adapter_hash(tmp_path):
+    """The exact blank that made update 0 of the 2026-08-28 proof unverifiable."""
+    from vektori_trace.tau2.live_train import LiveTrainError, sampled_identity
+
+    u = _mark_sampled(tmp_path, 0, adapter="", policy="live-u000")
+    with pytest.raises(LiveTrainError, match="no adapter_hash"):
+        sampled_identity(u)
+
+
+def test_sampled_identity_refuses_a_missing_policy_version(tmp_path):
+    from vektori_trace.tau2.live_train import LiveTrainError, sampled_identity
+
+    u = _mark_sampled(tmp_path, 0, adapter="a-hash", policy="")
+    with pytest.raises(LiveTrainError, match="no policy_version"):
+        sampled_identity(u)
+
+
+def test_sampled_identity_refuses_an_unsampled_update(tmp_path):
+    from vektori_trace.tau2.live_train import LiveTrainError, sampled_identity
+    from vektori_trace.tau2.reopd_state import UpdateDir
+
+    u = UpdateDir(tmp_path, 3)
+    u.path.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(LiveTrainError, match="no .SAMPLED marker"):
+        sampled_identity(u)
