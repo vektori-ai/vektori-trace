@@ -1,161 +1,196 @@
-# Pilot handoff — live OPD 10×8
+# Pilot handoff — live OPD, halted before restart
 
-Branch `feat/tau2-live-opd` · HEAD `8bcb047` · 2026-08-29 ~04:50 IST
+Branch `feat/tau2-live-opd` · HEAD `fcad207` · written 2026-08-29 ~05:15 IST
+
+**Authority:** `docs/TAU2-OPD-DEEP-DIVE.md` § "Pilot incident" is the record of
+what the pilot established and what must be fixed. This file is the operational
+companion: current state, teardown, and what was verified first-hand versus
+what is assumed. Where the two disagree, the deep dive wins.
 
 ---
 
-## 0. TEARDOWN FIRST — read this before anything else
-
-**A running pilot means two Modal GPUs are billing.** Before ending any
-session, and immediately on any failure:
+## 0. TEARDOWN — check before ending any session
 
 ```bash
 cd /data/vektori-trace && .venv/bin/modal app list | grep ephemeral
-# every row with Tasks>=1 is billing. Expect ZERO when the run is done.
-.venv/bin/modal app stop <app-id> -y        # -y is MANDATORY; silent no-op without it
-cat /data/tau2/pilot-state/owned_apps.json  # non-empty => a stop FAILED, do it by hand
+# any row with Tasks>=1 is billing. Expect ZERO.
+.venv/bin/modal app stop <app-id> -y          # -y MANDATORY, silent no-op without it
+cat /data/tau2/pilot-state/owned_apps.json    # non-empty => a stop FAILED, do it by hand
 ```
 
-Check from **both** the box and locally — separate Modal clients, and one can
-show a stale view. Re-check after ~60 s: an app can report `stopped` while its
-container drains.
+Check from **both** the box and locally — separate Modal clients. Re-check after
+~60 s; an app can report `stopped` while its container drains.
 
-The orchestrator stops the endpoint it owns on every exit path, and *keeps* any
-id whose stop failed rather than forgetting it. Do not rely on that alone.
+**State at time of writing: 0 ephemeral apps, no tmux sessions, nothing
+billing.** Verified from both clients.
 
 ---
 
-## 1. What is running right now
+## 1. Where things stand
+
+**The pilot is halted and must not restart** until the gates in the deep dive
+pass. Update 0 failed during rollout. **No teacher call and no optimizer step
+ever ran**, so no trained artifact is contaminated.
 
 | | |
 | --- | --- |
-| run id | `pilot_10x8_20260829` |
-| plan hash | `aa9251ccb6d566fa` (80 distinct C30 pairs) |
-| parent | `3869b147ab7ce5d2` — untouched `A_sft_new` |
-| host | EC2 `i-0a348ff3d7be9769a`, **SSM only**, tmux `serve` + `pilot` |
-| state dir | `/data/tau2/pilot-state` |
-| endpoint app | `ap-Te8Ouvb9zU3GQ3Em94ZcT6` (serving L40S, owned by the pilot) |
-| started | 23:08 UTC 2026-08-28 |
-| ceilings | `--max-usd 30`, `--max-hours 7` |
-| spend so far tonight | ~$3.40 total (mechanism proof ~$2.75 + pilot so far) |
+| run id | `pilot_10x8_20260829` (failed, keep as evidence) |
+| plan hash | `aa9251ccb6d566fa` — 80 distinct C30 `(task, seed)` pairs |
+| parent | `3869b147ab7ce5d2`, untouched `A_sft_new` |
+| stage reached | `.PLANNED` only; `.SAMPLED` absent |
+| spend tonight | **~$3.60** total (mechanism proof ~$2.75 + failed pilot ~$0.85) |
+| host | EC2 `i-0a348ff3d7be9769a`, **SSM only**; state in `/data/tau2/pilot-state` |
 
-Expected: 10 updates × 8 episodes ≈ 4–5.5 h, **$14–22**.
-
-### Watch it
-
-```bash
-tail -f /data/tau2/pilot-state/pilot_run.log      # stage transitions
-tail -f /data/tau2/pilot-state/update-000.log     # per-update detail
-cat    /data/tau2/pilot-state/ledger.json         # hours / estimated spend
-tmux attach -t pilot                              # Ctrl-B D detaches WITHOUT killing
-```
-
-`pilot_env.sh` appears only when the endpoint genuinely serves — it is the
-readiness signal, not the log.
+Do not delete or edit the failed archive. Restart is a **new run id** carrying
+the same 80 pairs and plan hash, per the deep dive.
 
 ---
 
-## 2. The experiment
+## 2. Update 0, exactly as archived
 
-**10 updates × 8 episodes = 80 distinct C30 `(task, seed)` pairs**, frozen in
-`docs/prereg/pilot_10x8_20260829.manifest.json` *before* update 0 ran.
+| episode | status | turns | outcome |
+| --- | --- | ---: | --- |
+| task 95 / seed 1 | sampled | 10 | reward 1.0 |
+| task 71 / seed 1 | sampled | 9 | reward 1.0 |
+| task 53 / seed 2 | sampled | 8 | reward 1.0 |
+| task 108 / seed 1 | sampled | 8 | reward 1.0 |
+| task 44 / seed 1 | failed | 3 | unclosed `<think>` |
+| task 68 / seed 0 | failed | 3 | unclosed `<think>` |
+| task 76 / seed 0 | failed | 2 | unclosed `<think>` |
+| task 109 / seed 0 | discarded | 1 | HTTP 408 |
 
-Per update: `refresh → rollout → score → train`, each its own Modal function so
-the training GPU is allocated for ~2 min instead of held through everything.
+**Read the denominators the way the deep dive states them**, not the way I first
+reported them: 3/7 non-infrastructure *episodes* (42.9%), but only 3 of ~43
+generated *turns* (~7%). I conflated those two rates earlier; the turn rate is
+the one that describes how often the parser is wrong.
 
-- **C30** (train): 30 tasks, seeds 0/1/2. No pair reused; no task repeated
-  within an update.
-- **S16** (held out, 16 tasks incl. `56`): `0,1,21,30,32,38,43,56,57,59,73,75,84,92,93,110`.
-  Inspected **once**, after update 9. Looking earlier converts it into a
-  checkpoint-selection set and destroys the comparison.
-- **F38**: sealed.
-- Loss: **token-mean over one global supervised-token denominator**, unchanged
-  from the mechanism proof. Do not change it mid-run.
-
-**The engineering proof (`b6c160fcf9792e92`, `01a95c2368661cd7`) trained on
-57/73/75/93, which are S16.** Fine for a mechanism test, fatal for this one —
-which is why the pilot restarts from the untouched parent and those two
-checkpoints are evidence only, never pilot lineage.
-
----
-
-## 3. Resuming after a crash
-
-Retries are **stage-local**. Never delete an update directory; the artifacts
-are the recovery mechanism.
-
-```bash
-cd /data/vektori-trace
-.venv/bin/python scripts/tau2_pilot_orchestrate.py \
-  --run-id pilot_10x8_20260829 --n-updates 10 \
-  --api-base "$STUDENT_API_BASE" --reload-url "$STUDENT_RELOAD_URL" \
-  --student-model "$STUDENT_MODEL" \
-  --serve-app-id <fresh id> --own-endpoint \
-  --state-dir /data/tau2/pilot-state --max-usd 30 --max-hours 7
-```
-
-It reads stage markers off the **volume** (`pilot_status`), so it resamples
-nothing and re-buys no scores. `--start-at N` only if you must force it.
-
-If the endpoint died, start a new one first and pass its **fresh** app id —
-`pilot_app_id.txt` can hold a stale value from an aborted attempt.
+`4/4 completed episodes scored reward 1.0` is a **conditional** result on the
+episodes that finished — not a batch success rate.
 
 ---
 
-## 4. Bugs found tonight — each was invisible in the logs
+## 3. Verified first-hand (I ran these)
 
-| bug | why it mattered |
-| --- | --- |
-| **Fabricated endpoint URL** (`8bcb047`) | `get_web_url()` lives on the class's Function, not the instance's bound method; the fallback *invented* a URL missing the workspace prefix, class segment and `-dev` suffix. Every request 404s while vLLM reports healthy — reads as a model failure. Now raises instead of guessing. |
-| **Fresh Adam every update** (`26d2ed3`) | `one_step` hardcoded `resume_from=None`, so chaining via `--parent-override` gave correct weights and a reset optimizer. Ten "iterative" updates would be ten independent first steps. `max_param_delta` reads 1e-5 either way. |
-| **Identity from the run manifest** (`221daf9`) | The manifest names the run's *initial* parent, so update k>0 got the wrong adapter hash and policy version. Now from each update's own `.SAMPLED`. |
-| **Same 8 scenarios ×10** (`c7a8fda`) | `plan_update` crosses the same tasks/seeds every update; only the episode id carried the index. Was data reuse dressed as 80 episodes. |
-| **Missing `--tool-call-parser`** (`b5b777c`) | vLLM 400s on *any* request carrying `tools`. `/models`, `/health` and plain completions all look fine until the first tool turn. |
-| **Share gate unsatisfiable** (`324da9b`) | `1.5/n` tightens as fast as added episodes dilute; refused every batch size 4–16 when one task runs long. Now telemetry — rejecting on realized length selects against hard tasks, which is what OPD exists to learn from. |
+- **Raw generations of all three failures**, read off the volume via
+  `inspect_failed_turns`. Each: one `<think>`, zero `</think>`, 288–1,347 tokens
+  of coherent reasoning, one or more valid `<tool_call>` blocks, and
+  `finish_reason: stop`. So "dropped reasoning" and "truncated" are both false.
+- **The prompt does not pre-open `<think>`** — `apply_chat_template(...,
+  enable_thinking=True)` ends at `<|im_start|>assistant\n`. The model emits both
+  delimiters itself.
+- **SFT masked the wrapper.** `dataset.py` defines
+  `THINK_WRAPPER_TEXT = "<think>\n\n</think>\n\n"` and `mask_think_wrapper=True`
+  keeps those four tokens out of the loss — the closing tag was context, never a
+  supervised target.
+- **The N:1 advantage defect**, by reading both implementations:
+  `chunk_opd.assign_chunk_advantages` sums `L_S` over the chunk;
+  `live_batch.projected_turn_advantages` uses one token's `L_S` against the
+  chunk's `L_T`. Worked example — 3 student tokens each `log p = -1.0`, teacher
+  agrees exactly (`L_T = L_S = -3.0`): reference gives `A_i = 0`, live gives
+  **`A_i = -2.0`**. A strong wrong-direction advantage where the models agree.
+- **Endpoint URL fabrication** (fixed, `8bcb047`): `get_web_url()` lives on the
+  class's Function, not the instance's bound method; the fallback invented a URL
+  missing the workspace prefix, class segment and `-dev` suffix, so every
+  request 404'd while vLLM logged `UP in 183s`.
+- **Teardown works.** The orchestrator stopped its endpoint on failure both
+  times; `owned_apps.json` came back empty.
 
----
+## 3b. NOT verified — do not repeat these as facts
 
-## 5. Facts worth not re-deriving
-
-- **~8.0 turns/episode**, measured over 10 real episodes. The docs' "~13" was an
-  estimate. So 10×8 ≈ **640 actions**, near ReOPD's 512 — 5×8 would have been
-  ~320, well short.
-- **Task 93 took 46.2% of supervised tokens** in one engineering update. That is
-  the gradient share; **turn share (44.1%) is a different and worse proxy** —
-  task 57 was 14.7% of turns but 24.5% of gradient.
-- Tinker sums token losses (`loss:sum`) and bounds length with `max_turns`,
-  **not** share rejection. Our global token-mean has the same relative
-  weighting; the denominator changes scale, not which task dominates.
-- vLLM serves adapters **prefixed**: `a-sft-new` → `Qwen3-4B-a-sft-new`. An
-  unknown name silently resolves to the base model.
-- `serve_student.py` fires a real completion before declaring itself up. That
-  smoke test caught the URL bug before the pilot could roll out against a 404.
-
----
-
-## 6. When the run finishes
-
-1. **Verify teardown** (§0). Zero ephemeral apps, from both clients, twice.
-2. **Terminal refresh** — the loop exits after update 9 trains without serving
-   that checkpoint. Run `refresh_only --update 10` before evaluating, then the
-   format probes.
-3. **Paired S16 evaluation** — untouched parent vs update 9, same 16 tasks,
-   same 2 seeds, same generation settings, both adapters on one instance.
-   Report paired per-episode outcomes and discordant-pair counts, not a
-   difference of aggregates. A non-significant result is **inconclusive**, not
-   "no effect" — with ~32 paired episodes only a decisive imbalance will show.
-4. Do **not** infer efficacy from training telemetry. Healthy gradients prove
-   the mechanism runs, nothing more.
-
----
-
-## 7. Open
-
-- **Cumulative Modal spend** never pulled from modal.com. The $30 ceiling is
+- **Whether the 4 successful episodes closed their think tags.** Never checked.
+  If some turns close and some do not, the form is stochastic; if the successes
+  never opened `<think>` at all, the story is different again. This is free to
+  check from the archive and has not been done.
+- **Whether SFT masking *causes* the unclosed form.** Plausible and consistent,
+  but it is a hypothesis. The deep dive says so; I stated it more firmly than
+  the evidence supports at one point.
+- **Whether the HTTP 408 is random.** Needs correlation with request duration
+  and client/server timeouts before being called infrastructure noise.
+- **Cumulative Modal spend.** Never pulled from modal.com. The $30 ceiling is
   per-run and cannot see the account total.
-- **Grok's box-side monitors** — read-only pollers to be committed under
-  `scripts/`. `scripts/pilot_watch.sh` currently hardcodes a laptop scratchpad
-  path and is **useless on the box**: fix or delete it.
-- Alerting on bare `refus`/`Error` false-positives constantly — Tau2 retail
-  dialogue is full of "refund", "return", "refusal". Match orchestrator strings
-  (`STOPPING`, `failed (rc=`, `!!`, `Traceback`) in `pilot_run.log` only.
+- **The earlier claim that one OPD update broke `</think>`** (in the older
+  handoff) is an unproven causal hypothesis. The untouched parent produces the
+  same form.
+
+---
+
+## 4. Restart gates
+
+See `docs/TAU2-OPD-DEEP-DIVE.md` § "Mandatory restart gates" — eight items.
+The two that block everything:
+
+1. **N:1 / M:N advantages must match `chunk_opd.py` exactly.** Carry aligned
+   chunk membership through projected scoring rather than collapsing to
+   per-index. Add the regression test where equal aggregate likelihoods produce
+   zero advantage for every token in the chunk. Until this passes, a finite loss
+   and a healthy gradient norm are **not** evidence the update direction is
+   right.
+2. **Parser parity with pinned vLLM.** Port the narrow upstream behavior
+   (vLLM `92762ed`): first valid `<tool_call>` opening is the implicit end of an
+   unclosed `<think>`; spans stay disjoint; invent no bytes; refuse the
+   ambiguous cases. Not a general "reasoning to end of generation" rule — that
+   would sweep the tool calls into the reasoning payload.
+
+The root cause of the parser drift is worth keeping in mind: live capture posts
+pre-tokenized ids to `/completions`, so vLLM's `qwen3` and `hermes` parsers
+never run. `split_generation()` is a client-side reimplementation that fell
+behind upstream.
+
+---
+
+## 5. Operational facts worth not re-deriving
+
+- vLLM serves adapters **prefixed**: `a-sft-new` → `Qwen3-4B-a-sft-new`. An
+  unknown name silently resolves to the base model. This cost one launch.
+- `serve_student.py` writes `pilot_env.sh` only after a real completion
+  succeeds. That smoke test is the readiness signal, not the log line.
+- `--tool-call-parser hermes` is required or vLLM 400s on any request carrying
+  `tools`; `/models`, `/health` and plain completions all look fine until the
+  first tool turn.
+- **~8 turns/episode**, measured. The proposal's "~13" was an estimate. 10×8 is
+  therefore ~640 actions.
+- Failed and discarded episodes are **terminal**. A resume reloads them, refuses
+  to resample, and fails the same 8/8 check. `--start-at 0` does not force
+  resampling.
+- The alerting substrings `refus` and `Error` false-positive constantly on
+  `update-NNN.log` — it is retail dialogue full of "refund", "return",
+  "refusal". Match orchestrator strings (`STOPPING`, `failed (rc=`, `!!`,
+  `Traceback`) in `pilot_run.log` only.
+- `scripts/pilot_watch.sh` hardcodes a laptop scratchpad path and is **useless
+  on the box**. Fix or delete it.
+
+---
+
+## 6. Commits this session
+
+| commit | what |
+| --- | --- |
+| `6047ccd` | gate 4 — canary from SAMPLED-only evidence |
+| `7409099` | `--rescore-only` — paid scoring, no optimizer step |
+| `cf54d32` | `--one-step-only` — one step from cached scores |
+| `b5b777c` | `--tool-call-parser`, or every tool turn is a 400 |
+| `115c151` | `--parent-override`, or update 2 retrains from the SFT adapter |
+| `324da9b` | live share limits are telemetry, not refusal |
+| `26d2ed3` | `one_step` must resume Adam, not just the weights |
+| `221daf9` | per-update identity + `rollout_only` |
+| `47bb680` | pilot orchestrator, resume and scoped teardown |
+| `c7a8fda` | freeze 80 distinct C30 plans before update 0 |
+| `ea01216` | rehearsal, ledger fixes, frozen preregistration |
+| `1a568d6` | `stage_manifest` |
+| `8bcb047` | never fabricate the endpoint URL |
+| `fcad207` | `inspect_failed_turns` — read raw bytes before diagnosing |
+
+Full suite at `ea01216`: **1,982 passed, 2 skipped, 0 failed**.
+
+---
+
+## 7. The two-update mechanism proof is now suspect
+
+`b6c160fcf9792e92` and `01a95c2368661cd7` were trained through the same
+projected path that carries the N:1 defect, so **their loss and gradient
+numbers were computed with inflated ratios**. Treat those runs as evidence that
+the *plumbing* executes end to end, not as evidence about the update direction.
+
+They also trained on tasks 57/73/75/93, which are **S16** — fine for a mechanism
+test, disqualifying for the pilot lineage. The pilot restarts from the untouched
+parent and those two checkpoints are never in it.

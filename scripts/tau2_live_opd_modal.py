@@ -2229,23 +2229,27 @@ def inspect_failed_turns(run_id: str = "", update: int = 0) -> str:
                 continue
             r = json.loads(line)
             # A FailedTurn row carries an error; a capture row does not.
-            err = r.get("error") or r.get("failure") or r.get("reason")
-            if not err:
+            if r.get("kind") != "failed_turn":
                 continue
+            err = f"{r.get('failure_kind')}: {r.get('failure_detail')}"
             n_fail += 1
-            raw = r.get("raw_text") or r.get("text") or ""
-            if not raw:
-                b64 = r.get("raw_sampled_bytes_b64") or r.get("action_bytes_b64")
-                if b64:
-                    raw = base64.b64decode(b64).decode("utf-8", "replace")
+            raw = r.get("raw_text") or ""
+            if not raw and r.get("raw_bytes_hex"):
+                raw = bytes.fromhex(r["raw_bytes_hex"]).decode("utf-8", "replace")
             out += [
                 f"── {ep} turn {r.get('turn_index')} ──",
                 f"   error       : {str(err)[:150]}",
                 f"   finish      : {r.get('finish_reason')}",
-                f"   n_tokens    : {len(r.get('sampled_token_ids') or r.get('action_token_ids') or [])}",
+                f"   n_tokens    : {len(r.get('sampled_token_ids') or [])}",
+                f"   raw_len     : {len(raw)}",
                 f"   has '<think>' : {'<think>' in raw}",
                 f"   has '</think>': {'</think>' in raw}",
-                f"   raw[:600]   : {raw[:600]!r}",
+                f"   n '<think>' : {raw.count('<think>')}",
+                f"   n '</think>': {raw.count('</think>')}",
+                f"   n tool_call : {raw.count('<tool_call>')}",
+                f"   first 120   : {raw[:120]!r}",
+                f"   last 120    : {raw[-120:]!r}",
+                f"   prompt_tail : {(r.get('request_payload') or {}).get('prompt_tail','')!r}",
                 "",
             ]
     if not n_fail:
