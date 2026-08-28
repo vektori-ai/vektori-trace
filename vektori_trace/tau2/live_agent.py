@@ -71,8 +71,9 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..replay_sample import token_bytes_from_ids
 
@@ -487,10 +488,14 @@ class CapturingLLMAgent:
         max_input_tokens: int,
         temperature: float = 0.0,
         timeout: float = 600.0,
-        llm_args: Optional[dict] = None,
-        on_capture: Optional[Callable[[TurnCapture], None]] = None,
-        on_failure: Optional[Callable[..., None]] = None,
-        poster: Optional[Callable[..., tuple[int, dict]]] = None,
+        llm_args: dict | None = None,
+        on_capture: Callable[[TurnCapture], None] | None = None,
+        on_turn: (
+            Callable[[TurnCapture, list[dict[str, Any]], dict[str, Any]], None]
+            | None
+        ) = None,
+        on_failure: Callable[..., None] | None = None,
+        poster: Callable[..., tuple[int, dict]] | None = None,
     ) -> None:
         from tau2.agent.llm_agent import LLMAgent  # imported lazily; see above
 
@@ -513,6 +518,10 @@ class CapturingLLMAgent:
         self.timeout = timeout
         self._post = poster or post_json
         self._on_capture = on_capture
+        # Higher-level archive hook. `on_capture` predates the live episode
+        # archive and intentionally remains compatible; this hook additionally
+        # carries the semantic pre-action history and parsed Tau2 message.
+        self._on_turn = on_turn
         # Called with the raw response body before a `build_capture` failure
         # propagates. The generation was paid for; its ids and behaviour
         # logprobs exist only in that body and are gone once it is discarded.
@@ -549,6 +558,14 @@ class CapturingLLMAgent:
         self.episode_id = episode_id
         self.task_id = task_id
         self.turn_index = 0
+
+    def set_seed(self, seed: int) -> None:
+        """Delegate the method Tau2's orchestrator calls at initialization."""
+        self._inner.set_seed(seed)
+
+    def is_stop(self, message: Any) -> bool:
+        """Delegate Tau2's agent-stop predicate."""
+        return self._inner.is_stop(message)
 
     # -- the one method that differs ---------------------------------------
 
@@ -634,15 +651,7 @@ class CapturingLLMAgent:
                     error=exc,
                 )
             raise
-        self.captures.append(cap)
-        if self._on_capture is not None:
-            # Persist as it lands. A crash on turn 6 must not discard the
-            # GPU-generated turns before it -- their behaviour logprobs cannot
-            # be recreated.
-            self._on_capture(cap)
-        self.turn_index += 1
-
-        return AssistantMessage(
+        assistant_message = AssistantMessage(
             role="assistant",
             content=cap.content,
             tool_calls=[
@@ -657,6 +666,17 @@ class CapturingLLMAgent:
             usage=cap.usage,
             raw_data={"live_capture": True, "finish_reason": cap.finish_reason},
         )
+        self.captures.append(cap)
+        if self._on_capture is not None:
+            # Persist as it lands. A crash on turn 6 must not discard the
+            # GPU-generated turns before it -- their behaviour logprobs cannot
+            # be recreated.
+            self._on_capture(cap)
+        if self._on_turn is not None:
+            parsed = assistant_message.model_dump(mode="json")
+            self._on_turn(cap, canonical, parsed)
+        self.turn_index += 1
+        return assistant_message
 
 
 __all__ = [

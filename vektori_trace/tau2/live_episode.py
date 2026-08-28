@@ -709,6 +709,16 @@ class EpisodeArchive:
         ]
         for e in missing:
             problems.append(f"{e}: no episode record")
+        for e in failed:
+            problems.append(
+                f"{e}: failed ({episodes[e].get('discard_reason')}) -- the "
+                "planned batch contains a policy/capture failure"
+            )
+        for e in discarded:
+            problems.append(
+                f"{e}: discarded ({episodes[e].get('discard_reason')}) -- the "
+                "planned batch contains an infrastructure loss"
+            )
 
         versions = {
             episodes[e]["policy_version"] for e in episode_ids if e in episodes
