@@ -2195,6 +2195,65 @@ def stage_manifest(run_id: str = "", manifest_json: str = "") -> dict:
     return {"run_id": run_id, "staged": True, "plan_hash": actual,
             "path": path}
 
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
+def inspect_failed_turns(run_id: str = "", update: int = 0) -> str:
+    """Why did a capture fail? Read the RAW bytes, do not infer.
+
+    "No non-empty <think> span" is a statement about the PARSER, not about the
+    model. It is consistent with at least three different things: the model
+    really answered directly, it reasoned in a form `split_generation` does not
+    recognise (malformed or absent tags, a different marker), or something
+    stripped the span server-side. Those have different fixes, and guessing
+    between them costs a rollout.
+
+    So this prints the first 600 raw characters of every failed generation.
+    No GPU, no teacher, no rollout.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    root = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id,
+                        f"update-{update:03d}", "live_archive", "turns")
+    if not os.path.isdir(root):
+        return f"no turns archive at {root}"
+
+    out = [f"RAW FAILED GENERATIONS -- {run_id} update {update}", ""]
+    n_fail = 0
+    for path in sorted(glob.glob(os.path.join(root, "*.jsonl"))):
+        ep = os.path.basename(path)[:-6]
+        for line in open(path):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            # A FailedTurn row carries an error; a capture row does not.
+            err = r.get("error") or r.get("failure") or r.get("reason")
+            if not err:
+                continue
+            n_fail += 1
+            raw = r.get("raw_text") or r.get("text") or ""
+            if not raw:
+                b64 = r.get("raw_sampled_bytes_b64") or r.get("action_bytes_b64")
+                if b64:
+                    raw = base64.b64decode(b64).decode("utf-8", "replace")
+            out += [
+                f"── {ep} turn {r.get('turn_index')} ──",
+                f"   error       : {str(err)[:150]}",
+                f"   finish      : {r.get('finish_reason')}",
+                f"   n_tokens    : {len(r.get('sampled_token_ids') or r.get('action_token_ids') or [])}",
+                f"   has '<think>' : {'<think>' in raw}",
+                f"   has '</think>': {'</think>' in raw}",
+                f"   raw[:600]   : {raw[:600]!r}",
+                "",
+            ]
+    if not n_fail:
+        out.append("no failed-turn rows found (they may not carry an error key)")
+    text = "\n".join(out)
+    print(text)
+    return text
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
     """Dump a run's manifest and stage markers verbatim. Read-only.
