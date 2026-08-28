@@ -1113,3 +1113,24 @@
 {"logged_at": 1787952340.7256663, "error": "ConflictError: function fu-9kbSxA7mJFjbzIVH6kT57V is stopped"}
 {"logged_at": 1787952346.3560226, "error": "ConflictError: function fu-9kbSxA7mJFjbzIVH6kT57V is stopped"}
 {"logged_at": 1787952351.6836216, "error": "ConflictError: function fu-9kbSxA7mJFjbzIVH6kT57V is stopped"}
+{"logged_at": 1787957335.4655943, "sampled_at": 1787957335.6088915, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 42, "power_w": 79.609, "sm_clock_mhz": 2520}
+{"logged_at": 1787957341.0633893, "sampled_at": 1787957341.228673, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 42, "power_w": 79.707, "sm_clock_mhz": 2520}
+{"logged_at": 1787957346.6955907, "sampled_at": 1787957346.8898458, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 42, "power_w": 79.779, "sm_clock_mhz": 2520}
+{"logged_at": 1787957352.327049, "sampled_at": 1787957352.5083976, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.308, "sm_clock_mhz": 2520}
+{"logged_at": 1787957358.1715295, "sampled_at": 1787957358.326468, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.653, "sm_clock_mhz": 2520}
+{"logged_at": 1787957363.79605, "sampled_at": 1787957363.9668698, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.086, "sm_clock_mhz": 2520}
+{"logged_at": 1787957369.4304757, "sampled_at": 1787957369.6068218, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.281, "sm_clock_mhz": 2520}
+{"logged_at": 1787957375.0601683, "sampled_at": 1787957375.2299616, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 78.73, "sm_clock_mhz": 2520}
+{"logged_at": 1787957380.7957146, "sampled_at": 1787957380.9721804, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 80.046, "sm_clock_mhz": 2520}
+{"logged_at": 1787957386.426537, "sampled_at": 1787957386.607045, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.551, "sm_clock_mhz": 2520}
+{"logged_at": 1787957392.0596344, "sampled_at": 1787957392.2482858, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.653, "sm_clock_mhz": 2520}
+{"logged_at": 1787957397.9097593, "sampled_at": 1787957398.065966, "gpu_name": "NVIDIA L40S", "gpu_util_pct": 0, "mem_util_pct": 0, "mem_used_mib": 42056, "mem_total_mib": 46068, "temperature_c": 41, "power_w": 79.253, "sm_clock_mhz": 2520}
+{"logged_at": 1787957403.8433478, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957409.1624808, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957414.4855473, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957419.8383389, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957425.2656953, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957430.6176019, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957435.8973653, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957441.2128677, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}
+{"logged_at": 1787957446.536524, "error": "ConflictError: function fu-HPR3NF7TMfZxNO0fXVOHIz is stopped"}

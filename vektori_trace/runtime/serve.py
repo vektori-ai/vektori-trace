@@ -480,16 +480,55 @@ def serve_model(
         server = VllmServer()
         _ = server.health.remote()
         web = server.openai_compat
-        url = web.get_web_url() if hasattr(web, "get_web_url") else None
+        # Ask the CLASS's method, not the instance's bound one. `server` is an
+        # instantiated Cls, and on modal 1.5.3 `server.openai_compat` does not
+        # carry `get_web_url()` -- the `hasattr` guard below then silently
+        # falls through. `VllmServer.openai_compat` is the Function that owns
+        # the URL. This is what made the old fallback fire on every start.
+        url = None
+        for candidate in (getattr(VllmServer, "openai_compat", None), web):
+            if candidate is None:
+                continue
+            getter = getattr(candidate, "get_web_url", None)
+            if callable(getter):
+                try:
+                    url = getter()
+                except Exception:  # noqa: BLE001
+                    url = None
+            if not url:
+                url = getattr(candidate, "web_url", None)
+            if url:
+                break
         if not url:
-            url = getattr(web, "web_url", None) or (
-                f"https://{_SERVE_APP_NAME}--openai-compat.modal.run"
+            # NEVER fabricate this. The old fallback built
+            # `https://{app_name}--openai-compat.modal.run`, which is missing
+            # the workspace prefix, the class segment and the `-dev` suffix an
+            # ephemeral app carries -- so it resolves to nothing and every
+            # request returns `404 modal-http: invalid function call`. vLLM
+            # loads fine, the container is healthy, and the only broken thing
+            # is the address, which makes it look like a model failure.
+            # Observed 2026-08-28: two consecutive endpoint starts reported
+            # "UP in 183s" and then failed their smoke completion.
+            raise RuntimeError(
+                "Modal did not expose a web URL for the OpenAI-compatible "
+                "endpoint. Refusing to guess one: a fabricated URL 404s on "
+                "every request while the server itself looks healthy."
             )
-        reload_web = server.reload_volume
-        reload_url = (reload_web.get_web_url()
-                      if hasattr(reload_web, "get_web_url") else None)
-        if not reload_url:
-            reload_url = getattr(reload_web, "web_url", None)
+        reload_url = None
+        for candidate in (getattr(VllmServer, "reload_volume", None),
+                          server.reload_volume):
+            if candidate is None:
+                continue
+            getter = getattr(candidate, "get_web_url", None)
+            if callable(getter):
+                try:
+                    reload_url = getter()
+                except Exception:  # noqa: BLE001
+                    reload_url = None
+            if not reload_url:
+                reload_url = getattr(candidate, "web_url", None)
+            if reload_url:
+                break
         if not reload_url:
             raise RuntimeError(
                 "Modal did not expose the serving-volume reload endpoint; "
