@@ -166,6 +166,7 @@ def train(
     adapter_hash: str,
     allow_missing_reasoning: bool,
     max_input_tokens: int,
+    parent_override: str = "",
 ) -> dict:
     import importlib.util
     import json
@@ -178,8 +179,16 @@ def train(
     if tau2_src:
         sys.path.insert(0, tau2_src)
 
-    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+    # Default: the frozen A_sft_new parent. `parent_override` exists for an
+    # ITERATED update -- update 2 must train from update 1's child, not from
+    # the SFT adapter again, or it is a second first-step wearing the name of
+    # an iteration: fresh on-policy data trained onto the wrong base, with a
+    # loss curve and a checkpoint that both look entirely normal.
+    parent = (parent_override if parent_override
+              else os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME))
     out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    print(f"parent adapter: {parent}"
+          f"{' (OVERRIDE)' if parent_override else ' (pinned A_sft_new)'}")
 
     for name in ("adapter_config.json",):
         if not os.path.isfile(os.path.join(parent, name)):
@@ -2008,6 +2017,7 @@ def main(
     show_markers_only: bool = False,
     rescore_only: bool = False,
     one_step_only: bool = False,
+    parent_override: str = "",
     clamp_preview: float = 0.0,
     canary_run_id: str = "",
     classify_update: int = 0,
@@ -2159,6 +2169,7 @@ def main(
         api_base, student_model, rid, task_ids, seeds, n, mode,
         learning_rate, temperature, tools_file, tau2_src, reload_url,
         user_model, adapter_hash, allow_missing_reasoning, max_input_tokens,
+        parent_override,
     )
     print(json.dumps(
         {k: v for k, v in result.items() if k not in ("stages", "refreshes")},
