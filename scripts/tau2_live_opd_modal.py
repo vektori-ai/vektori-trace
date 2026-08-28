@@ -1205,6 +1205,113 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def predict_advantages(run_id: str = "", update: int = 0) -> str:
+    """What the OLD advantages become once the projection's mask is applied.
+
+    Free preview, no teacher call: it takes the advantages already paid for in
+    the archived run and reports them under the NEW eligibility rules -- which
+    tokens keep credit, which lose it, and what happens to the tails.
+
+    This is a *lower bound* on the improvement, not the post-fix distribution:
+    the surviving numbers were still computed against a chat-mode prefix and
+    raw-byte alignment. What it does show exactly is the damage the mask
+    removes -- the -55 tool markup and the -27 EOS.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    from vektori_trace.align import align_by_bytes
+    from vektori_trace.chunk_opd import assign_chunk_advantages
+    from vektori_trace.tau2.live_projection import project_action
+    from vektori_trace.tau2.live_token_classes import classify_action
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    run = runs[-1]
+    u = os.path.join(run, f"update-{update:03d}")
+    actions = {json.loads(l)["key"]: json.loads(l)
+               for l in open(os.path.join(u, "actions.jsonl")) if l.strip()}
+    scores = {json.loads(l)["key"]: json.loads(l)
+              for l in open(os.path.join(u, "scores.jsonl")) if l.strip()}
+
+    kept: list = []
+    dropped: list = []
+    kept_by_cls: dict = {}
+    drop_by_cls: dict = {}
+    drop_extremes: list = []
+
+    for key, a in sorted(actions.items()):
+        sc = scores.get(key)
+        if sc is None:
+            continue
+        stu = [base64.b64decode(x) for x in a["action_token_bytes_b64"]]
+        tea = [base64.b64decode(x) for x in sc["teacher_token_bytes_b64"]]
+        advs, sup, _st = assign_chunk_advantages(
+            align_by_bytes(stu, tea),
+            [float(x) for x in a["behavior_logprobs"]],
+            [float(x) for x in sc["teacher_logprobs"]],
+        )
+        raw = b"".join(stu).decode("utf-8", "replace")
+        trimmed = raw
+        for spc in ("<|im_end|>", "<|endoftext|>"):
+            if trimmed.endswith(spc):
+                trimmed = trimmed[: -len(spc)]
+        proj = project_action(trimmed, stu)
+        cls = classify_action(stu)
+        for i, (adv, s) in enumerate(zip(advs, sup)):
+            if not s:
+                continue
+            if i in proj.supervised:
+                kept.append(float(adv))
+                kept_by_cls.setdefault(cls[i], []).append(float(adv))
+            else:
+                dropped.append(float(adv))
+                drop_by_cls.setdefault(cls[i], []).append(float(adv))
+                drop_extremes.append((float(adv),
+                                      stu[i].decode("utf-8", "replace")))
+
+    def stats(xs):
+        if not xs:
+            return "none"
+        xs2 = sorted(xs)
+        pos = sum(1 for x in xs if x > 0)
+        return (f"n={len(xs):6d} +{pos:5d} -{len(xs)-pos:5d} "
+                f"mean={sum(xs)/len(xs):+.4f} min={xs2[0]:+.3f} "
+                f"max={xs2[-1]:+.3f} p1={xs2[len(xs2)//100]:+.3f}")
+
+    drop_extremes.sort()
+    out = [
+        f"run {os.path.basename(run)} update {update}",
+        "",
+        "BEFORE (everything the old update trained on):",
+        f"  {stats(kept + dropped)}",
+        "",
+        "AFTER the projection mask:",
+        f"  KEPT    {stats(kept)}",
+        f"  DROPPED {stats(dropped)}",
+        "",
+        "kept, by class:",
+    ]
+    for c, xs in sorted(kept_by_cls.items()):
+        out.append(f"  {c:10s} {stats(xs)}")
+    out.append("")
+    out.append("dropped, by class:")
+    for c, xs in sorted(drop_by_cls.items()):
+        out.append(f"  {c:10s} {stats(xs)}")
+    out.append("")
+    out.append("worst advantages the mask REMOVES:")
+    for adv, t in drop_extremes[:12]:
+        out.append(f"  {adv:+10.3f}  {t!r}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -1220,6 +1327,7 @@ def main(
     projection_only: bool = False,
     reconcile_only: bool = False,
     scoring_dryrun_only: bool = False,
+    predict_only: bool = False,
     classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
@@ -1258,6 +1366,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if predict_only:
+        predict_advantages.remote(run_id, classify_update)
         return
 
     if scoring_dryrun_only:
