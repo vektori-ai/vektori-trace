@@ -991,6 +991,110 @@ def projection_report(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def reconcile_counts(run_id: str = "", update: int = 0) -> str:
+    """Account for EVERY token, three ways. No API calls.
+
+    Three numbers were reported for the same batch and did not agree:
+
+        14,178  optimizer `supervised_tokens`   (chunk_opd, post-alignment)
+        14,206  projection `tokens`             (raw archived token count)
+           711  classifier markup+tool_json     vs 789 projection exclusions
+
+    A 28-token and a 78-token gap, unexplained, is exactly the kind of drift
+    that makes a later result unfalsifiable. This reconciles them token by
+    token: sentinel (over-long chunk / unaligned tail), trailing special, and
+    class-by-class agreement between the two accountings.
+    """
+    import base64
+    import glob
+    import json
+    import os
+
+    from vektori_trace.align import align_by_bytes
+    from vektori_trace.chunk_opd import assign_chunk_advantages
+    from vektori_trace.tau2.live_projection import project_action
+    from vektori_trace.tau2.live_token_classes import classify_action
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    runs = ([os.path.join(base, run_id)] if run_id
+            else sorted(glob.glob(os.path.join(base, "two_update_proof_*")),
+                        key=os.path.getmtime))
+    run = runs[-1]
+    u = os.path.join(run, f"update-{update:03d}")
+    actions = {json.loads(l)["key"]: json.loads(l)
+               for l in open(os.path.join(u, "actions.jsonl")) if l.strip()}
+    scores = {json.loads(l)["key"]: json.loads(l)
+              for l in open(os.path.join(u, "scores.jsonl")) if l.strip()}
+
+    tot_raw = tot_chunk_sup = tot_sentinel = 0
+    tot_trailing = 0
+    proj_sup = proj_exc = 0
+    # cross-tab: chunk-supervised x projection-decision
+    cross: dict = {}
+    cls_counts: dict = {}
+
+    for key, a in sorted(actions.items()):
+        stu = [base64.b64decode(x) for x in a["action_token_bytes_b64"]]
+        sc = scores[key]
+        tea = [base64.b64decode(x) for x in sc["teacher_token_bytes_b64"]]
+        tot_raw += len(stu)
+
+        alignment = align_by_bytes(stu, tea)
+        _advs, supervised, stats = assign_chunk_advantages(
+            alignment,
+            [float(x) for x in a["behavior_logprobs"]],
+            [float(x) for x in sc["teacher_logprobs"]],
+        )
+        tot_chunk_sup += sum(1 for x in supervised if x)
+        tot_sentinel += stats.n_sentinel_tokens
+
+        raw = b"".join(stu).decode("utf-8", "replace")
+        trimmed = raw
+        for special in ("<|im_end|>", "<|endoftext|>"):
+            if trimmed.endswith(special):
+                trimmed = trimmed[: -len(special)]
+                tot_trailing += 1
+        proj = project_action(trimmed, stu)
+        proj_sup += proj.n_supervised
+        proj_exc += proj.n_excluded
+
+        classes = classify_action(stu)
+        for i in range(len(stu)):
+            in_chunk = bool(supervised[i])
+            in_proj = i in proj.supervised
+            cross[(in_chunk, in_proj)] = cross.get((in_chunk, in_proj), 0) + 1
+            if in_chunk and not in_proj:
+                cls_counts[classes[i]] = cls_counts.get(classes[i], 0) + 1
+
+    out = [
+        f"run {os.path.basename(run)} update {update}",
+        "",
+        "TOKEN ACCOUNTING",
+        f"  raw archived student tokens        : {tot_raw}",
+        f"  chunk_opd supervised (optimizer)   : {tot_chunk_sup}",
+        f"  chunk_opd sentinel (unsupervised)  : {tot_sentinel}",
+        f"  raw - supervised - sentinel        : "
+        f"{tot_raw - tot_chunk_sup - tot_sentinel}",
+        f"  actions with a trailing special    : {tot_trailing}",
+        "",
+        "PROJECTION",
+        f"  supervised : {proj_sup}",
+        f"  excluded   : {proj_exc}",
+        f"  sum        : {proj_sup + proj_exc}  (must equal raw {tot_raw})",
+        "",
+        "CROSS-TAB  (chunk_supervised, projection_supervised) -> n",
+    ]
+    for k in sorted(cross, key=lambda t: (not t[0], not t[1])):
+        out.append(f"  chunk={k[0]!s:5s} proj={k[1]!s:5s} : {cross[k]}")
+    out += ["", "TOKENS THE PROJECTION REMOVES FROM SUPERVISION, by class:"]
+    for k, v in sorted(cls_counts.items(), key=lambda kv: -kv[1]):
+        out.append(f"  {k:12s} {v}")
+    text = "\n".join(out)
+    print(text)
+    return text
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -1004,6 +1108,7 @@ def main(
     telemetry_only: bool = False,
     classify_only: bool = False,
     projection_only: bool = False,
+    reconcile_only: bool = False,
     classify_update: int = 0,
     show_full: bool = False,
     show_update: int = 0,
@@ -1042,6 +1147,10 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if reconcile_only:
+        reconcile_counts.remote(run_id, classify_update)
         return
 
     if projection_only:
