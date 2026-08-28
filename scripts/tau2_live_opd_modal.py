@@ -2095,6 +2095,7 @@ def pilot_status(run_id: str = "") -> dict:
                 return {}
 
         sampled = _marker(".SAMPLED")
+        scored = _marker(".SCORED")
         trained = _marker(".TRAINED")
         n_scores = 0
         sp = os.path.join(u, "scores.jsonl")
@@ -2106,7 +2107,10 @@ def pilot_status(run_id: str = "") -> dict:
             "update": i,
             "planned": os.path.isfile(os.path.join(u, ".PLANNED")),
             "sampled": sampled is not None,
-            "scored": _marker(".SCORED") is not None,
+            "scored": scored is not None,
+            # What the ledger values DeepSeek spend from. Without it the
+            # teacher contributes $0 to the running estimate.
+            "teacher_input_tokens": (scored or {}).get("teacher_input_tokens"),
             "trained": trained is not None,
             "n_scores": n_scores,
             "sampled_adapter_hash": (sampled or {}).get("adapter_hash"),

@@ -106,8 +106,14 @@ class OwnedApps:
 
 # --- modal dispatch --------------------------------------------------------
 
+#: A stage that hangs bills a serving card until it is killed. Two hours was
+#: long enough to overshoot the wall-clock ceiling by itself; the longest real
+#: stage measured is a ~15 min rollout.
+STAGE_TIMEOUT_S = 45 * 60
+
+
 def modal_run(fn: str, args: list[str], *, log_path: Path,
-              timeout: int = 7200) -> int:
+              timeout: int = STAGE_TIMEOUT_S) -> int:
     """Invoke one Modal function, streaming to a per-stage log."""
     cmd = [str(REPO / ".venv/bin/modal"), "run",
            f"{MODAL_SCRIPT}::{fn}", *args]
@@ -190,6 +196,21 @@ class Ledger:
     def hours(self) -> float:
         return (time.time() - self.started) / 3600.0
 
+    def sync_teacher(self, status: dict) -> None:
+        """Teacher tokens from the volume, not a counter nobody increments.
+
+        `pilot_status` reports scored actions per update; the SCORED marker
+        carries the real token count. Without this the ledger silently values
+        every DeepSeek call at $0.
+        """
+        total = 0
+        for row in status.get("updates", []):
+            t = row.get("teacher_input_tokens")
+            if t:
+                total += int(t)
+        if total:
+            self.teacher_tokens = total
+
     def estimate_usd(self) -> float:
         # One serving card up for the whole run, plus ~2 min of training GPU
         # per completed update, plus the teacher.
@@ -268,6 +289,21 @@ def refresh_already_done(a, state_dir: Path, idx: int, expected_name: str,
     log(f"  endpoint already serves {expected_name} "
         f"(adapter {expected_hash}, probe matches to {drift:.3g})")
     return True
+
+
+def guarded_run(ledger, fn: str, args: list[str], *, log_path: Path) -> int:
+    """Check the ceiling immediately before this stage, then dispatch.
+
+    Per-UPDATE checking is not enough: a 10x8 update is ~25 minutes across four
+    stages, so a run can pass the gate and then spend most of an hour before
+    the next one.
+    """
+    stop = ledger.check()
+    if stop is not None:
+        log(f"STOPPING before {fn}: {stop}")
+        return 2
+    ledger.save()
+    return modal_run(fn, args, log_path=log_path)
 
 
 def update_row(status: dict, idx: int) -> dict:
@@ -450,7 +486,7 @@ def main() -> int:
                 served_name = expected
                 _record_served(served_name)
             else:
-                rc = modal_run("refresh_only", [
+                rc = guarded_run(ledger, "refresh_only", [
                     "--run-id", a.run_id, "--update", str(idx),
                     "--api-base", a.api_base,
                     "--reload-url", a.reload_url,
@@ -505,7 +541,7 @@ def main() -> int:
                     "sample from; every archived episode is stamped with it "
                     "and batch_report checks the batch against it"
                 )
-            rc = modal_run("rollout_only", [
+            rc = guarded_run(ledger, "rollout_only", [
                 "--run-id", a.run_id, "--update", str(idx),
                 "--api-base", a.api_base,
                 "--student-model", served_name,
@@ -520,7 +556,7 @@ def main() -> int:
 
         # --- 2. SCORE (CPU + DeepSeek, no GPU) ----------------------------
         if not row.get("scored"):
-            rc = modal_run("rescore", [
+            rc = guarded_run(ledger, "rescore", [
                 "--run-id", a.run_id, "--update", str(idx),
             ], log_path=stage_log)
             if rc != 0:
@@ -536,7 +572,7 @@ def main() -> int:
             # Everything checkable is checked before this line: this is the
             # first stage that allocates a card.
             preflight_checkpoint(status, idx)
-            rc = modal_run("one_step", [
+            rc = guarded_run(ledger, "one_step", [
                 "--run-id", a.run_id, "--update", str(idx),
             ], log_path=stage_log)
             if rc != 0:
@@ -549,6 +585,7 @@ def main() -> int:
         status = fetch_status(a.run_id, state_dir)
         ledger.updates_done = len([u for u in status.get("updates", [])
                                    if u.get("trained")])
+        ledger.sync_teacher(status)
         ledger.save()
         log(f"update {idx} complete "
             f"({ledger.hours:.2f}h, ~${ledger.estimate_usd():.2f} of "
