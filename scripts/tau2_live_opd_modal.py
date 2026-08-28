@@ -452,7 +452,18 @@ def preflight(tau2_src: str = "") -> dict:
                    if not os.path.isfile(os.path.join(need, f))]
         if missing:
             raise FileNotFoundError(f"{need} missing {missing}")
-        return {"data_dir": root, "retail": "complete"}
+        # The USER SIMULATOR reads its own prompts from the same tree, and a
+        # rollout dies at episode start without them -- after the endpoint is
+        # up and paid for. Staging only the domain is not enough (cost one
+        # discarded episode 2026-08-28).
+        usim = os.path.join(root, "tau2", "user_simulator")
+        umissing = [f for f in ("simulation_guidelines.md",
+                                "simulation_guidelines_tools.md")
+                    if not os.path.isfile(os.path.join(usim, f))]
+        if umissing:
+            raise FileNotFoundError(f"{usim} missing {umissing}")
+        return {"data_dir": root, "retail": "complete",
+                "user_simulator": "complete"}
 
     check("tau2_domain_data", _domain_data)
     check("parent_adapter", _parent)
