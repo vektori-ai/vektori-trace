@@ -1478,6 +1478,155 @@ def rescore(run_id: str = "", update: int = 0,
     return text
 
 
+@app.function(
+    gpu=GPU,
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 60,
+    max_containers=1,
+)
+def one_step(run_id: str = "", update: int = 0,
+             learning_rate: float = 1e-5) -> str:
+    """Exactly one optimizer step from cached scores. No rollout, no teacher.
+
+    The `train` driver cannot do this: its loop samples fresh episodes before
+    scoring, so pointing it at an already-SCORED canary would resample over the
+    evidence rather than consume it. This is the narrow path -- load the paid
+    scores, build the projected batch, take one step, checkpoint, stop.
+
+    No teacher pool is constructed at all, so "zero new teacher calls" is a
+    property of the code rather than a number to check afterwards. No endpoint
+    is contacted: reload verification and the Tau2 episode are a separate,
+    later container, so the training GPU is never held while an endpoint runs.
+    """
+    import json
+    import os
+
+    from vektori_trace.tau2.live_score import ProjectedScore
+    from vektori_trace.tau2.live_train import (
+        load_live_update_inputs,
+        run_projected_train_stage,
+    )
+    from vektori_trace.tau2.opd_stages import set_commit_fn
+    from vektori_trace.tau2.reopd_checkpoint import adapter_hash
+    from vektori_trace.tau2.reopd_state import RunState, read_jsonl
+    from vektori_trace.tau2.reopd_trainer import ReOPDTrainer
+
+    set_commit_fn(vol.commit)
+
+    if not run_id:
+        raise ValueError("--run-id is required")
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    run = RunState(out, n_updates=1)
+    u = run.update(update)
+
+    if not u.reached("SCORED"):
+        raise RuntimeError(
+            f"{run_id} update {update} is not SCORED; this path trains from "
+            "cached scores and never buys new ones"
+        )
+    if u.reached("TRAINED"):
+        raise RuntimeError(
+            f"{run_id} update {update} is already TRAINED; refusing to train "
+            "twice from one parent"
+        )
+
+    with open(os.path.join(out, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+    parent_hash = adapter_hash(parent)
+    if parent_hash != PARENT_ADAPTER_HASH:
+        raise ValueError(
+            f"parent hashes to {parent_hash}, not the pinned "
+            f"{PARENT_ADAPTER_HASH}"
+        )
+    if manifest.get("adapter_hash") != PARENT_ADAPTER_HASH:
+        raise ValueError(
+            f"{run_id} manifest parent {manifest.get('adapter_hash')!r} is not "
+            "the untouched parent"
+        )
+
+    policy_version = manifest.get("policy_version") or "live-u000"
+    inputs = load_live_update_inputs(u, policy_version=policy_version)
+
+    # --- rehydrate the PAID scores. No pool exists in this container. ------
+    rows = {r["key"]: r for r in read_jsonl(u.scores_path)
+            if r.get("projection") == "semantic"}
+    missing = [r["key"] for r in inputs.capture_rows if r["key"] not in rows]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} actions have no cached semantic score "
+            f"({missing[:3]}); this path will not buy them"
+        )
+    projected = {
+        k: ProjectedScore(
+            key=k,
+            teacher_logprob_by_index={
+                int(i): float(v)
+                for i, v in r["teacher_logprob_by_index"].items()
+            },
+            excluded={int(i): v for i, v in r["excluded"].items()},
+            n_prefix_tokens=int(r.get("n_prefix_tokens", 0)),
+            n_teacher_tokens=int(r.get("n_teacher_tokens", 0)),
+            payload_report=r.get("payloads", {}),
+        )
+        for k, r in rows.items()
+    }
+    print(f"rehydrated {len(projected)} cached semantic scores; "
+          "no teacher pool constructed")
+
+    trainer = ReOPDTrainer(
+        base_model=manifest.get("base_model", "Qwen/Qwen3-4B"),
+        parent_adapter=parent,
+        learning_rate=learning_rate,
+        run_dir=out,
+        device="cuda",
+    )
+    trainer.load(resume_from=None)  # from the untouched parent
+
+    before = adapter_hash(parent)
+    state = run_projected_train_stage(
+        u, inputs, projected, trainer,
+        run_dir=out, policy_version=policy_version,
+        max_trace_share=inputs.max_trace_share,
+    )
+    vol.commit()
+
+    cp = u.checkpoint_path
+    child = adapter_hash(cp)
+    moved = child != before
+
+    lines = [
+        f"ONE-STEP OPD -- {run_id} update {update}",
+        "",
+        f"  cached scores    : {len(projected)} reused, 0 new teacher calls",
+        f"  parent           : {parent}",
+        f"  parent hash      : {before}",
+        f"  child hash       : {child}",
+        f"  weights moved    : {moved}",
+        "",
+        f"  loss             : {state.get('loss')}",
+        f"  grad_norm        : {state.get('grad_norm')}",
+        f"  policy_version   : {state.get('policy_version')}",
+        f"  parent_policy    : {state.get('parent_policy_hash')}",
+        f"  reload_verified  : {state.get('reload_verified')}",
+        f"  checkpoint       : {cp}",
+        f"  stage            : {u.stage()}",
+    ]
+    for k in ("supervised_tokens", "clip_fraction", "max_param_delta",
+              "n_examples"):
+        if k in state:
+            lines.append(f"  {k:17s}: {state[k]}")
+    text = "\n".join(lines)
+    print(text)
+
+    if not moved:
+        raise RuntimeError(
+            "child adapter hash equals the parent: the step changed nothing"
+        )
+    return text
+
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
     """Dump a run's manifest and stage markers verbatim. Read-only.
@@ -1858,6 +2007,7 @@ def main(
     build_canary_only: bool = False,
     show_markers_only: bool = False,
     rescore_only: bool = False,
+    one_step_only: bool = False,
     clamp_preview: float = 0.0,
     canary_run_id: str = "",
     classify_update: int = 0,
@@ -1902,6 +2052,12 @@ def main(
 
     if show_markers_only:
         show_markers.remote(run_id, classify_update)
+        return
+
+    if one_step_only:
+        print(f"one-step: TRAINING GPU on {run_id!r} update {classify_update}")
+        print("  cached scores only, no teacher pool, no rollout, no endpoint")
+        one_step.remote(run_id, classify_update, learning_rate)
         return
 
     if rescore_only:
