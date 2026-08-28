@@ -425,7 +425,31 @@ preserved it, but it does not block reuse if provenance is otherwise proven.
 
 ### Phase 1 — capture/scoring proof
 
-Run four complete live episodes with no training.
+**Run ONE episode first, not four.** `capture_live_update` catches a per-episode
+failure and continues to the next plan, rejecting only at `batch_report` -- so a
+four-episode update whose reasoning capture fails on episode 1 still pays the
+endpoint and user simulator for episodes 2-4 before refusing the batch. The
+single episode is the cheapest runtime test in the ladder and therefore comes
+first; the two-update proof is the smallest run that can fail at
+`checkpoint -> reload -> next rollout` specifically, which is a different and
+later question.
+
+The ladder, in cost order:
+
+```text
+preflight (CPU, $0)
+  -> 1 reasoning-required episode  (+ score exactly that episode)
+  -> 2 updates x 4 episodes        (the on-policy proof)
+  -> 5 updates x 8 episodes        (the signal pilot)
+  -> paired S16 evaluation
+```
+
+Do **not** run the diagnostic with `--allow-missing-reasoning`. The earlier
+13/13 `reasoning: None` result came from the obsolete pre-closed prompt; the
+corrected boundary deserves a real test, and relaxing the gate would prove
+nothing about it.
+
+Then run four complete live episodes with no training.
 
 Exit only with exact token/logprob lengths, raw/parsed linkage, complete finite
 DeepSeek scores, byte alignment, reproducible environment states and measured
@@ -456,9 +480,27 @@ If Phase 2 passes, restart from the frozen `A_sft_new` checkpoint and run:
 Use task-balanced C30 sampling and fixed generation settings. Save updates 0,
 1, 3 and 5.
 
-Against the reference OPD recipe this repository records (256 trajectories per
-update, ~150 updates, ~38,400 trajectories), 40 episodes is **32x smaller
-update batches, 30x fewer updates, 960x fewer complete trajectories**. The
+Against Thinking Machines' published numbers, restated in the unit that
+matters here -- *graded student sequences*:
+
+| Experiment | Updates | Graded sequences |
+| --- | ---: | ---: |
+| TML main reasoning (Qwen3-8B) | ~150 | ~308,000 (77K prompts x 4 samples) |
+| TML single-prompt data-reuse demo | 20 | 5,120 |
+| TML "recovered the teacher in <10 steps" | <10 | up to ~2,560 |
+| **Phase 3 here** | **5** | **~520** (40 episodes x ~13 turns) |
+
+So Phase 3 is roughly **590x** smaller than their main run, **10x** smaller
+than their single-prompt demo, and **5x** smaller than their fastest recovery
+result. Their main run also initialized from SFT on 400,000 prompts.
+
+Two accounting caveats, so these numbers are not over-claimed. TML's article
+reports 77K prompts while also calling `64 prompts x 4 samples = 256 rollouts`
+their default batch; the former is presumably a global/distributed batch and
+the article does not fully specify the relationship. And our 520 turns are
+*stateful, correlated, tool-using* turns within 40 episodes, not independent
+completions -- richer per sequence, but far less diverse than 520 separate
+prompts. The
 earlier replay run — 16 trajectories x 32 updates = 512 — was 75x short. A Tau2
 episode carries multiple supervised assistant turns, so a trajectory-count
 comparison against single-turn reasoning prompts is imperfect; it does not
@@ -468,6 +510,19 @@ is itself an estimate, because live turn counts have not been measured.
 Phase 3 exits with the numbers that determine the size of any later efficacy
 pilot: gradient variance, supervised actions and tokens per update, teacher and
 GPU cost per update, and measured checkpoint movement.
+
+**The closest affordable replication target**, to be sized from those numbers
+rather than committed to now:
+
+```text
+20 updates x  8 episodes = 160 episodes ~ 2,000 graded turns   (~TML's <10-step scale)
+20 updates x 16 episodes = 320 episodes ~ 4,000 graded turns   (~TML's reuse demo)
+```
+
+Decision rule after Phase 3: gradients collapse or behaviour degrades -> stop;
+healthy gradients but negligible movement -> 20x8; strong but noisy movement ->
+20x16 if budget allows; already-repeated positive paired changes -> report as
+preliminary and use the larger run as follow-up.
 
 Success for Phase 3 means:
 

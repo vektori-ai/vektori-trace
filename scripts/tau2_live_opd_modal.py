@@ -88,6 +88,9 @@ USER_MODEL = "fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731"
 #: `TAU2_DATA_DIR` is tau2's own documented override (utils.py:17).
 TAU2_DATA_IN_VOLUME = "tau2/tau2_data"
 
+TEACHER_MODEL = "accounts/fireworks/models/deepseek-v4-flash-0731"
+TEACHER_TOKENIZER = "deepseek-ai/DeepSeek-V4-Flash-0731"
+
 app = modal.App("tau2-live-opd")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
 hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=False)
@@ -464,6 +467,166 @@ def preflight(tau2_src: str = "") -> dict:
     return out
 
 
+@app.function(
+    # NO gpu= argument. Steps 2-4 of the ladder: roll out ONE episode, then
+    # score exactly that episode with the real DeepSeek teacher. No optimizer,
+    # no checkpoint, no weights. This is deliberately cheaper than the
+    # two-update proof and comes first, because `capture_live_update` catches a
+    # per-episode failure and continues to the next plan -- so a four-episode
+    # update whose reasoning capture fails on episode 1 still pays the endpoint
+    # and user simulator for episodes 2-4 before `batch_report` rejects the
+    # batch. One episode cannot waste three.
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
+)
+def diagnose(
+    api_base: str,
+    student_model: str,
+    task_id: str,
+    seed: int,
+    run_id: str,
+    max_input_tokens: int,
+    temperature: float,
+    user_model: str,
+    score: bool,
+    tau2_src: str = "",
+) -> dict:
+    """One reasoning-required episode, then real teacher scoring of it."""
+    import json
+    import os
+    import sys
+
+    sys.path.insert(0, "/root")
+    if tau2_src:
+        sys.path.insert(0, tau2_src)
+
+    from transformers import AutoTokenizer
+
+    from vektori_trace.tau2.live_rollout import (
+        EpisodePlan, RolloutSettings, Tau2EpisodeRunner, capture_live_update,
+    )
+    from vektori_trace.tau2.opd_stages import set_commit_fn
+    from vektori_trace.tau2.reopd_state import RunState
+
+    set_commit_fn(vol.commit)
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+
+    from vektori_trace.tau2.tools import load_domain_tools, tools_hash
+    tools = load_domain_tools("retail")
+
+    settings = RolloutSettings(
+        domain="retail",
+        student_model=student_model,
+        api_base=api_base,
+        policy_version="diagnose-u000",
+        adapter_hash=PARENT_ADAPTER_HASH,
+        gen_config_hash="diagnose",
+        max_tokens=4096,
+        max_input_tokens=max_input_tokens,
+        temperature=temperature,
+        user_model=user_model,
+        # NOT relaxed. The old 13/13 `reasoning: None` result came from the
+        # obsolete pre-closed prompt; the corrected boundary deserves a real
+        # test, and admitting reasoning-less actions here would prove nothing.
+        require_reasoning=True,
+    )
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B", trust_remote_code=True)
+    run = RunState(out, n_updates=1)
+    run.freeze_manifest({
+        "kind": "tau2_live_opd_diagnose", "task_id": task_id, "seed": seed,
+        "student_model": student_model, "tools_hash": tools_hash(tools),
+        "require_reasoning": True,
+    })
+    plan = EpisodePlan(episode_id=f"diag-task{task_id}-seed{seed}",
+                       task_id=task_id, seed=seed)
+
+    result: dict = {"run_id": run_id, "out_dir": f"{RUNS_IN_VOLUME}/{run_id}"}
+    try:
+        report = capture_live_update(
+            run.update(0), [plan], settings=settings,
+            teacher_context={"model": TEACHER_MODEL,
+                             "tokenizer": TEACHER_TOKENIZER,
+                             "renderer": "deepseek-v4-native"},
+            runner=Tau2EpisodeRunner(settings, tok),
+        )
+        result["rollout"] = report
+    except BaseException as exc:
+        vol.commit()
+        result["rollout_error"] = f"{type(exc).__name__}: {exc}"[:600]
+        # The archive is the point: even a failed episode recorded WHY.
+        from vektori_trace.tau2.live_episode import EpisodeArchive
+        arch = EpisodeArchive(os.path.join(out, "update-000", "live_archive"))
+        eps = arch.load_episodes()
+        result["episodes"] = {k: {"status": v.get("status"),
+                                  "discard_reason": v.get("discard_reason"),
+                                  "num_turns": v.get("num_turns"),
+                                  "num_failed_turns": v.get("num_failed_turns")}
+                              for k, v in eps.items()}
+        result["failures"] = [
+            {"turn": f.get("turn_index"), "kind": f.get("failure_kind"),
+             "error": str(f.get("error"))[:300]}
+            for f in arch.load_failures(plan.episode_id)
+        ][:8]
+        vol.commit()
+        return result
+    vol.commit()
+
+    # What the rollout actually captured -- the reasoning question, answered.
+    from vektori_trace.tau2.live_episode import EpisodeArchive
+    arch = EpisodeArchive(os.path.join(out, "update-000", "live_archive"))
+    turns = arch.load_turns(plan.episode_id)
+    result["turns"] = [
+        {"turn": t["capture"]["turn_index"],
+         "finish": t["capture"].get("finish_reason"),
+         "n_tok": len(t["capture"]["sampled_token_ids"]),
+         "n_logprobs": len(t["capture"]["behavior_logprobs"]),
+         "lengths_agree": (len(t["capture"]["sampled_token_ids"])
+                           == len(t["capture"]["behavior_logprobs"])),
+         "has_reasoning": bool((t["capture"].get("reasoning") or "").strip()),
+         "reasoning_chars": len((t["capture"].get("reasoning") or "")),
+         "n_reasoning_tokens": len(t["capture"].get("reasoning_token_indices") or []),
+         "bytes_exact": t["capture"].get("raw_is_exact_generated_bytes")}
+        for t in turns
+    ]
+    n = len(result["turns"])
+    result["reasoning_summary"] = {
+        "turns": n,
+        "with_reasoning": sum(1 for r in result["turns"] if r["has_reasoning"]),
+        "all_lengths_agree": all(r["lengths_agree"] for r in result["turns"]),
+        "all_bytes_exact": all(r["bytes_exact"] for r in result["turns"]),
+    }
+
+    if not score:
+        return result
+
+    # Step 4: prove REAL cross-tokenizer byte alignment on these exact bytes.
+    from vektori_trace.providers.teacher.fireworks import FireworksTeacherPool
+    from vektori_trace.tau2.live_train import load_live_update_inputs
+    from vektori_trace.vocab_bridge import load_tokenizer
+    from vektori_trace.replay_score import score_replay_batch
+
+    inputs = load_live_update_inputs(run.update(0),
+                                     policy_version="diagnose-u000")
+    teacher_tok = load_tokenizer(TEACHER_TOKENIZER)
+    pool = FireworksTeacherPool(model=TEACHER_MODEL)
+    scored, ledger = score_replay_batch(
+        inputs.actions, inputs.rendered, teacher_tok, pool)
+    vol.commit()
+    tin = ledger.get("teacher_input_tokens", 0)
+    result["scoring"] = {
+        "n_scored": len(scored),
+        "teacher_input_tokens": tin,
+        "est_cost_usd_uncached": round(tin * 0.22 / 1e6, 4),
+        "all_finite": all(
+            all(x == x and x not in (float("inf"), float("-inf")) for x in lps)
+            for _, lps in scored.values()),
+    }
+    return result
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -473,6 +636,10 @@ def main(
     seeds: str = "0",
     n_updates: int = 5,
     preflight_only: bool = False,
+    diagnose_one: bool = False,
+    diagnose_task: str = "57",
+    diagnose_seed: int = 0,
+    diagnose_score: bool = True,
     canary: bool = False,
     two_update_proof: bool = False,
     yes: bool = False,
@@ -504,6 +671,22 @@ def main(
         if not result.get("ok"):
             raise SystemExit("preflight FAILED -- do not launch a paid run")
         print("preflight OK")
+        return
+
+    if diagnose_one:
+        if not api_base:
+            raise SystemExit("--api-base is required for the diagnostic episode")
+        rid = run_id or f"diagnose_{time.strftime('%Y%m%d_%H%M%S')}"
+        print(f"diagnostic: ONE reasoning-required episode, task "
+              f"{diagnose_task} seed {diagnose_seed}")
+        print(f"  scoring:  {'yes (real DeepSeek)' if diagnose_score else 'no'}")
+        print(f"  no GPU, no optimizer, no checkpoint")
+        r = diagnose.remote(api_base, student_model, diagnose_task,
+                            diagnose_seed, rid, max_input_tokens, temperature,
+                            user_model, diagnose_score, tau2_src)
+        print(json.dumps(r, indent=2)[:6000])
+        if r.get("rollout_error"):
+            raise SystemExit("diagnostic FAILED -- see episodes/failures above")
         return
 
     modes = [m for m, on in (("canary", canary),
