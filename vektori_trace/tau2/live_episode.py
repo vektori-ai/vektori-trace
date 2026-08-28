@@ -28,23 +28,25 @@ import hashlib
 import json
 import re
 import time
+import uuid
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from vektori_trace.tau2.live_agent import TurnCapture
-from vektori_trace.tau2.reopd_state import append_jsonl
+from vektori_trace.tau2.reopd_state import append_jsonl, atomic_write_json
 
 __all__ = [
+    "EpisodeArchive",
     "EpisodeStatus",
-    "build_failed_turn",
-    "classify_failure",
-    "LiveTurn",
     "FailedTurn",
     "LiveEpisode",
-    "EpisodeArchive",
-    "semantic_hash",
+    "LiveTurn",
+    "build_failed_turn",
     "canonical_json",
+    "classify_failure",
+    "semantic_hash",
     "validate_episode_id",
 ]
 
@@ -222,6 +224,8 @@ class FailedTurn:
     behavior_logprobs: list[float] = field(default_factory=list)
     semantic_history: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    provider_response: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
     #: `True` only for failures that end the episode rather than one turn.
@@ -230,6 +234,9 @@ class FailedTurn:
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
         d["kind"] = "failed_turn"
+        raw = self.raw_text.encode("utf-8")
+        d["raw_bytes_hex"] = raw.hex()
+        d["raw_sha256"] = hashlib.sha256(raw).hexdigest()
         return d
 
 
@@ -250,6 +257,7 @@ class LiveEpisode:
     policy_version: str
     adapter_hash: str
     gen_config_hash: str
+    require_reasoning: bool = False
 
     status: str = EpisodeStatus.SAMPLING
     initial_env_state_hash: str | None = None
@@ -321,21 +329,42 @@ class EpisodeArchive:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.turns_dir = self.root / "turns"
+        self.simulations_dir = self.root / "simulations"
         self.root.mkdir(parents=True, exist_ok=True)
         self.turns_dir.mkdir(parents=True, exist_ok=True)
+        self.simulations_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def episodes_path(self) -> Path:
         return self.root / "episodes.jsonl"
+
+    @property
+    def events_path(self) -> Path:
+        """Unified, chronological, append-only audit stream."""
+        return self.root / "events.jsonl"
 
     def turns_path(self, episode_id: str) -> Path:
         return self.turns_dir / f"{validate_episode_id(episode_id)}.jsonl"
 
     # -- writes ------------------------------------------------------------
 
+    def _record_event(self, event: str, payload: dict[str, Any]) -> None:
+        append_jsonl(
+            self.events_path,
+            {
+                "schema_version": 1,
+                "event_id": str(uuid.uuid4()),
+                "event": event,
+                "recorded_at": time.time(),
+                "payload": payload,
+            },
+        )
+
     def record_episode(self, episode: LiveEpisode) -> None:
         """Persist the episode's current state. Called on every transition."""
-        append_jsonl(self.episodes_path, episode.to_json())
+        row = episode.to_json()
+        self._record_event("episode_state", row)
+        append_jsonl(self.episodes_path, row)
 
     def record_turn(self, turn: LiveTurn) -> None:
         """Persist one parsed generation, the moment it lands.
@@ -344,7 +373,9 @@ class EpisodeArchive:
         still absent. Waiting for it would risk the whole point of this write:
         behaviour logprobs cannot be recreated after sampling.
         """
-        append_jsonl(self.turns_path(turn.capture.episode_id), turn.to_json())
+        row = turn.to_json()
+        self._record_event("turn_sampled", row)
+        append_jsonl(self.turns_path(turn.capture.episode_id), row)
 
     def record_observation(
         self,
@@ -360,9 +391,7 @@ class EpisodeArchive:
         the earlier line would put a paid capture at risk to record an
         observation that can simply be re-derived.
         """
-        append_jsonl(
-            self.turns_path(episode_id),
-            {
+        row = {
                 "kind": "turn_observed",
                 "episode_id": episode_id,
                 "turn_index": turn_index,
@@ -375,12 +404,37 @@ class EpisodeArchive:
                     ).hexdigest()
                 ),
                 "env_state_hash": env_state_hash,
-            },
-        )
+            }
+        self._record_event("turn_observed", row)
+        append_jsonl(self.turns_path(episode_id), row)
 
     def record_failure(self, failure: FailedTurn) -> None:
         """Persist one unparseable generation, before the error propagates."""
-        append_jsonl(self.turns_path(failure.episode_id), failure.to_json())
+        row = failure.to_json()
+        self._record_event("turn_failed", row)
+        append_jsonl(self.turns_path(failure.episode_id), row)
+
+    def record_simulation(
+        self,
+        episode_id: str,
+        simulation: dict[str, Any],
+        *,
+        viewer_results: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist Tau2's complete ``SimulationRun`` after termination."""
+        validate_episode_id(episode_id)
+        row = {
+            "kind": "tau2_simulation",
+            "episode_id": episode_id,
+            "simulation": simulation,
+        }
+        self._record_event("tau2_simulation", row)
+        atomic_write_json(self.simulations_dir / f"{episode_id}.json", simulation)
+        if viewer_results is not None:
+            atomic_write_json(
+                self.simulations_dir / f"{episode_id}.results.json",
+                viewer_results,
+            )
 
     # -- reads -------------------------------------------------------------
 
@@ -410,7 +464,7 @@ class EpisodeArchive:
             else:
                 immutable = (
                     "task_id", "seed", "policy_version", "adapter_hash",
-                    "gen_config_hash",
+                    "gen_config_hash", "require_reasoning",
                 )
                 drift = {
                     k: (previous.get(k), row.get(k))
@@ -634,6 +688,41 @@ class EpisodeArchive:
                     f"{episode_id} turn {idx}: finish_reason 'length' -- a cap "
                     "termination is a fragment, not a completed action"
                 )
+            raw = str(cap.get("raw_text") or "").encode("utf-8")
+            generated_hex = cap.get("generated_bytes_hex")
+            if generated_hex is not None:
+                try:
+                    generated = bytes.fromhex(generated_hex)
+                except ValueError:
+                    problems.append(
+                        f"{episode_id} turn {idx}: generated_bytes_hex is invalid"
+                    )
+                else:
+                    token_bytes = b"".join(
+                        bytes.fromhex(piece)
+                        for piece in cap.get("action_token_bytes_hex", [])
+                    )
+                    if generated != token_bytes:
+                        problems.append(
+                            f"{episode_id} turn {idx}: generated byte dump does "
+                            "not equal concatenated per-token bytes"
+                        )
+            if meta.get("require_reasoning"):
+                if not str(cap.get("reasoning") or "").strip():
+                    problems.append(
+                        f"{episode_id} turn {idx}: reasoning-required episode "
+                        "has no captured reasoning"
+                    )
+                if not cap.get("reasoning_token_indices"):
+                    problems.append(
+                        f"{episode_id} turn {idx}: reasoning has no mapped "
+                        "student token indices"
+                    )
+                if b"<think>" not in raw or b"</think>" not in raw:
+                    problems.append(
+                        f"{episode_id} turn {idx}: raw action lacks complete "
+                        "reasoning delimiters"
+                    )
 
         return problems
 
@@ -814,6 +903,7 @@ FAILURE_MALFORMED_TOOL = "malformed_tool_call"
 FAILURE_NO_TOKEN_IDS = "no_token_ids"
 FAILURE_LOGPROB = "logprob_mismatch"
 FAILURE_BYTE_MISMATCH = "byte_mismatch"
+FAILURE_NO_REASONING = "no_reasoning"
 FAILURE_TRANSPORT = "transport"
 FAILURE_OTHER = "other"
 
@@ -835,6 +925,8 @@ def classify_failure(message: str) -> str:
         return FAILURE_LOGPROB
     if "do not reconstruct" in m:
         return FAILURE_BYTE_MISMATCH
+    if "no non-empty <think>" in m or "reasoning tokens were not generated" in m:
+        return FAILURE_NO_REASONING
     if "tool_call" in m or "json" in m or "hermes" in m:
         return FAILURE_MALFORMED_TOOL
     if "no choices" in m or "no 'text'" in m or "http " in m:
@@ -854,6 +946,7 @@ def build_failed_turn(
     prompt_ids: list[int],
     semantic_history: list[dict[str, Any]],
     error: BaseException,
+    request_payload: dict[str, Any] | None = None,
 ) -> FailedTurn:
     """Salvage everything the response body still holds.
 
@@ -879,4 +972,6 @@ def build_failed_turn(
         behavior_logprobs=[float(x) for x in raw_lps if x is not None],
         semantic_history=list(semantic_history),
         usage=dict(body.get("usage") or {}),
+        request_payload=dict(request_payload or {}),
+        provider_response=dict(body),
     )

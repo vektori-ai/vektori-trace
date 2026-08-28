@@ -21,7 +21,6 @@ from vektori_trace.tau2.live_agent import (
     verify_ids_reconstruct_text,
 )
 
-
 # --- split_generation: the work vLLM's parsers do server-side --------------
 
 
@@ -320,19 +319,8 @@ def test_split_conversational_target_yields_no_calls():
 # --- the think-wrapper boundary --------------------------------------------
 
 
-def test_render_appends_the_think_wrapper():
-    """Regression: the live render must end where the frozen prompt ends.
-
-    `add_generation_prompt=True` stops at `<|im_start|>assistant\\n`, but the
-    corpus's `prompt_token_ids` cut at the first *unmasked* label -- and
-    `mask_think_wrapper=True` masks the four `<think>\\n\\n</think>\\n\\n`
-    tokens, putting them on the prompt side of the cut.
-
-    Without the append, live render parity measured **0/289** on the box
-    (2026-08-28); with it, 289/289. A live agent that stopped four tokens early
-    would ask the model to open a reasoning block the corpus had already
-    closed, and the loss would still be finite and the logs still clean.
-    """
+def test_live_render_does_not_preclose_the_reasoning_block():
+    """Live OPD must let Qwen generate and score its reasoning tokens."""
     from vektori_trace.tau2 import live_agent
 
     calls = {}
@@ -344,19 +332,35 @@ def test_render_appends_the_think_wrapper():
 
     import vektori_trace.dataset as ds
 
-    orig_encode, orig_wrapper = ds._encode_messages, ds._think_wrapper_ids
+    orig_encode = ds._encode_messages
     ds._encode_messages = fake_encode
-    ds._think_wrapper_ids = lambda tok: [901, 902, 903, 904]
     try:
         ids = live_agent.render_prompt_ids(object(), [{"role": "system"}], [])
     finally:
-        ds._encode_messages, ds._think_wrapper_ids = orig_encode, orig_wrapper
+        ds._encode_messages = orig_encode
 
-    assert ids == [10, 11, 12, 901, 902, 903, 904]
+    assert ids == [10, 11, 12]
     # The serving template settings must be named, never left to defaults.
     assert calls["add_generation_prompt"] is True
     assert calls["template_kwargs"]["enable_thinking"] is True
     assert "tools" in calls["template_kwargs"]
+
+
+def test_reasoning_required_refuses_visible_only_generation():
+    with pytest.raises(LiveCaptureError, match="no non-empty <think>"):
+        _capture(_body("visible only"), require_reasoning=True)
+
+
+def test_reasoning_capture_records_byte_span_and_token_indices():
+    cap = _capture(
+        _body("<think>check the order</think>done"),
+        require_reasoning=True,
+    )
+    row = cap.to_json()
+    start, end = row["reasoning_byte_span"]
+    assert bytes.fromhex(row["raw_bytes_hex"])[start:end] == b"check the order"
+    assert row["reasoning_token_indices"]
+    assert row["raw_is_exact_generated_bytes"] is True
 
 
 # ---------------------------------------------------------------------------

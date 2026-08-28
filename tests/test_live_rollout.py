@@ -29,18 +29,20 @@ def _settings() -> RolloutSettings:
 
 
 def _capture(plan: EpisodePlan) -> TurnCapture:
+    raw = "<think>check</think>A"
+    pieces = [bytes([byte]) for byte in raw.encode()]
     return TurnCapture(
         episode_id=plan.episode_id,
         task_id=plan.task_id,
         turn_index=0,
         policy_version="policy-1",
         prompt_token_ids=[1, 2],
-        sampled_token_ids=[65],
-        behavior_logprobs=[-0.2],
-        action_token_bytes=[b"A"],
-        raw_text="A",
+        sampled_token_ids=list(raw.encode()),
+        behavior_logprobs=[-0.2] * len(pieces),
+        action_token_bytes=pieces,
+        raw_text=raw,
         finish_reason="stop",
-        reasoning=None,
+        reasoning="check",
         content="A",
         tool_calls=[],
     )
@@ -60,6 +62,8 @@ class SuccessfulRunner:
             reward_info={"reward": 1.0},
             initial_env_state_hash="db-before",
             final_env_state_hash="db-after",
+            simulation={"task_id": plan.task_id, "messages": []},
+            viewer_results={"tasks": [], "simulations": []},
         )
 
 
@@ -78,7 +82,7 @@ def test_capture_update_reaches_existing_sampled_boundary(tmp_path):
     update.validate()
     actions = read_jsonl(update.actions_path)
     assert [row["key"] for row in actions] == ["ep-1@0#0"]
-    assert actions[0]["behavior_logprobs"] == [-0.2]
+    assert len(actions[0]["behavior_logprobs"]) == len("<think>check</think>A")
     assert actions[0]["score_fingerprint"]
     rendered = json.loads((update.path / "rendered.json").read_text())
     assert rendered["ep-1@0"][-1]["content"] == "help"
@@ -87,6 +91,16 @@ def test_capture_update_reaches_existing_sampled_boundary(tmp_path):
     turn = archive.load_turns("ep-1")[0]
     assert turn["observation"]["content"] == "thanks"
     assert turn["env_state_hash"] == "db-after"
+    assert (archive.simulations_dir / "ep-1.json").exists()
+    assert (archive.simulations_dir / "ep-1.results.json").exists()
+    events = read_jsonl(archive.events_path)
+    assert [event["event"] for event in events] == [
+        "episode_state",
+        "turn_sampled",
+        "turn_observed",
+        "tau2_simulation",
+        "episode_state",
+    ]
 
 
 class CaptureFailureRunner:

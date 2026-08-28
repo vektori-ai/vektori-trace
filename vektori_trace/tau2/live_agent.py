@@ -40,9 +40,11 @@ Rendering parity is the point of `canonical_messages`
 were caught only by re-rendering and comparing bytes: the policy was omitted
 entirely, and the tools never reached the teacher. **Neither is caught by any
 hash, and both produce a finite loss, a successful alignment and clean logs.**
-So this module reconstructs the same head, from the same renderer, and
-`live_render_parity.py` asserts it against the frozen ids before any episode is
-paid for.
+So this module reconstructs the same semantic head with the same renderer. The
+boundary intentionally differs by the frozen rows' four-token *empty* think
+wrapper: those rows supervise visible actions only, while live OPD must stop
+before that wrapper so Qwen can generate real reasoning and we can capture its
+tokens and behavior logprobs. The distinction is explicit in the run manifest.
 
 Note that Tau2's own system prompt (`LLMAgent.system_prompt`) wraps the domain
 policy in `SYSTEM_PROMPT`/`AGENT_INSTRUCTION`. The corpus used the bare policy
@@ -62,10 +64,12 @@ Every one of these has a matching silent failure:
   consumed a different prompt than the one rendered;
 - a prompt longer than the endpoint's input budget -- vLLM truncates from the
   *front*, silently sampling a state the run cannot describe.
+- a reasoning-inclusive run whose response has no non-empty `<think>` span.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -124,6 +128,8 @@ class TurnCapture:
     content: str | None
     tool_calls: list[dict[str, Any]]
 
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    provider_response: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
@@ -131,6 +137,8 @@ class TurnCapture:
         """JSON-safe form. Bytes are hex; a lossy `.decode()` here would
         discard exactly the UTF-8 splits that commits `1e63b6e`/`f3a1983`
         were about."""
+        generated_bytes = b"".join(self.action_token_bytes)
+        reasoning_span = _reasoning_byte_span(self.raw_text)
         d = {
             "episode_id": self.episode_id,
             "task_id": self.task_id,
@@ -141,10 +149,25 @@ class TurnCapture:
             "behavior_logprobs": self.behavior_logprobs,
             "action_token_bytes_hex": [b.hex() for b in self.action_token_bytes],
             "raw_text": self.raw_text,
+            "raw_bytes_hex": self.raw_text.encode("utf-8").hex(),
+            "raw_sha256": hashlib.sha256(
+                self.raw_text.encode("utf-8")
+            ).hexdigest(),
+            "generated_bytes_hex": generated_bytes.hex(),
+            "generated_bytes_sha256": hashlib.sha256(generated_bytes).hexdigest(),
+            "raw_is_exact_generated_bytes": (
+                generated_bytes == self.raw_text.encode("utf-8")
+            ),
             "finish_reason": self.finish_reason,
             "reasoning": self.reasoning,
+            "reasoning_byte_span": reasoning_span,
+            "reasoning_token_indices": _tokens_overlapping_span(
+                self.action_token_bytes, reasoning_span
+            ),
             "content": self.content,
             "tool_calls": self.tool_calls,
+            "request_payload": self.request_payload,
+            "provider_response": self.provider_response,
             "usage": self.usage,
             "timestamp": self.timestamp,
         }
@@ -226,6 +249,34 @@ def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, A
     return reasoning, (content or None), tool_calls
 
 
+def _reasoning_byte_span(raw: str) -> list[int] | None:
+    """UTF-8 byte offsets of the reasoning payload inside the raw action."""
+    match = _THINK.search(raw)
+    if match is None:
+        return None
+    return [
+        len(raw[: match.start(1)].encode("utf-8")),
+        len(raw[: match.end(1)].encode("utf-8")),
+    ]
+
+
+def _tokens_overlapping_span(
+    token_bytes: list[bytes], span: list[int] | None
+) -> list[int]:
+    """Token indices whose byte intervals overlap ``span``."""
+    if span is None:
+        return []
+    start, end = span
+    position = 0
+    indices: list[int] = []
+    for index, piece in enumerate(token_bytes):
+        next_position = position + len(piece)
+        if position < end and next_position > start:
+            indices.append(index)
+        position = next_position
+    return indices
+
+
 def verify_ids_reconstruct_text(
     tokenizer: Any, token_ids: list[int], text: str
 ) -> list[bytes]:
@@ -261,6 +312,7 @@ def build_capture(
     prompt_ids: list[int],
     tokenizer: Any,
     max_tokens: int,
+    require_reasoning: bool = False,
 ) -> TurnCapture:
     """Turn a `/completions` response into a trainable capture, or raise."""
     choices = body.get("choices") or []
@@ -302,6 +354,12 @@ def build_capture(
 
     tok_bytes = verify_ids_reconstruct_text(tokenizer, list(token_ids), text)
     reasoning, content, tool_calls = split_generation(text)
+    if require_reasoning and not (reasoning and reasoning.strip()):
+        raise LiveCaptureError(
+            f"turn {turn_index}: generation has no non-empty <think> reasoning "
+            "span; reasoning-inclusive live OPD refuses an action whose "
+            "reasoning tokens were not generated and captured"
+        )
 
     return TurnCapture(
         episode_id=episode_id,
@@ -317,6 +375,7 @@ def build_capture(
         reasoning=reasoning,
         content=content,
         tool_calls=tool_calls,
+        provider_response=dict(body),
         usage=dict(body.get("usage") or {}),
     )
 
@@ -344,56 +403,16 @@ def render_prompt_ids(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
 ) -> list[int]:
-    """Prompt ids for the *next* assistant turn.
+    """Render the state immediately before Qwen generates its complete turn.
 
-    Uses `dataset._encode_messages` -- the same call `tokenize_messages` makes
-    to build the prefix half of every frozen C30 row -- with the template kwargs
-    `export.build_row` pinned: `{"tools": tools, "enable_thinking": True}`, and
-    `add_generation_prompt=True`.
-
-    That last flag is what puts the render exactly where the model will be asked
-    to generate: under `enable_thinking=True` it ends at
-    `<|im_start|>assistant\\n`. `build_row` relies on the same property to place
-    its supervised span, so matching it here is what makes a live prompt and a
-    frozen prefix comparable at all.
-
-    `_encode_messages` is private, and deliberately reached for rather than
-    reimplemented: a second renderer is a second thing to keep in sync, and the
-    whole point of `live_render_parity` is that this path and the corpus path
-    are the *same* code. Relying on tokenizer defaults instead of naming these
-    kwargs is how a corpus ends up rendered differently from the way it is
-    served; Qwen3's template has already cost this repo one silent label bug.
-
-    The `<think>\\n\\n</think>\\n\\n` wrapper
-    ----------------------------------------
-    `add_generation_prompt=True` ends the render at `<|im_start|>assistant\\n`.
-    The frozen prefixes go **four tokens further**, and that is not an accident
-    of the corpus build -- it is a consequence of how the boundary is defined.
-
-    `prompt_ids_from_row` cuts at the first *unmasked* label, and
-    `tokenize_messages(..., mask_think_wrapper=True)` masks exactly those four
-    wrapper tokens so the model is never trained to emit an empty reasoning
-    block. Masked means "not supervised", which puts the wrapper on the prompt
-    side of the cut:
-
-        ... <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n | No problem! I can ...
-                                  ^^^^ in the prompt ^^^^      ^ first supervised token
-
-    So a live render that stops at `add_generation_prompt` is four tokens short
-    of the state the corpus sampled from -- and, worse, would ask the model to
-    open its own `<think>` block while the corpus had already closed one. That
-    is a train/serve skew that produces a finite loss and clean logs.
-
-    Measured: without the wrapper, **0/289** prefixes re-render
-    (`tau2_live_render_parity.py`, 2026-08-28); every failure diverged at
-    exactly the prompt's last token with the frozen side reading
-    `<think>\\n\\n</think>\\n\\n`.
-
-    The ids are appended rather than hardcoded, and the caller-visible failure
-    is an assert in `dataset._think_wrapper_ids` on a tokenizer that disagrees
-    -- a CPU failure instead of a silently different prompt.
+    ``enable_thinking=True`` is explicit and the renderer stops at the normal
+    generation prompt. It must not append the frozen action-only corpus's
+    masked empty-think wrapper: that would close ``</think>`` before sampling
+    and make reasoning capture impossible. The sampled continuation therefore
+    contains reasoning, visible content/tool calls, and behavior logprobs for
+    every generated token.
     """
-    from ..dataset import _encode_messages, _think_wrapper_ids
+    from ..dataset import _encode_messages
 
     ids = _encode_messages(
         tokenizer,
@@ -401,7 +420,10 @@ def render_prompt_ids(
         {"tools": list(tools), "enable_thinking": True},
         add_generation_prompt=True,
     )
-    return list(ids) + list(_think_wrapper_ids(tokenizer))
+    # Do not append the frozen corpus's masked empty-think wrapper here. That
+    # boundary is correct for action-only SFT labels but would close reasoning
+    # before live sampling begins.
+    return list(ids)
 
 
 def tau2_messages_to_canonical(
@@ -488,6 +510,7 @@ class CapturingLLMAgent:
         max_input_tokens: int,
         temperature: float = 0.0,
         timeout: float = 600.0,
+        require_reasoning: bool = True,
         llm_args: dict | None = None,
         on_capture: Callable[[TurnCapture], None] | None = None,
         on_turn: (
@@ -516,6 +539,7 @@ class CapturingLLMAgent:
         self.max_input_tokens = max_input_tokens
         self.temperature = temperature
         self.timeout = timeout
+        self.require_reasoning = require_reasoning
         self._post = poster or post_json
         self._on_capture = on_capture
         # Higher-level archive hook. `on_capture` predates the live episode
@@ -606,23 +630,23 @@ class CapturingLLMAgent:
                 "would silently drop tokens from the front of the prompt."
             )
 
+        request_payload = {
+            "model": self.model,
+            "prompt": prompt_ids,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "logprobs": 0,
+            "return_token_ids": True,
+        }
         status, body = self._post(
             f"{self.api_base}/completions",
-            {
-                "model": self.model,
-                "prompt": prompt_ids,
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "logprobs": 0,
-                "return_token_ids": True,
-            },
+            request_payload,
             self.timeout,
         )
         if status != 200:
             raise LiveCaptureError(
                 f"turn {self.turn_index}: HTTP {status}: {str(body)[:300]}"
             )
-
         try:
             cap = build_capture(
                 body,
@@ -633,7 +657,9 @@ class CapturingLLMAgent:
                 prompt_ids=prompt_ids,
                 tokenizer=self.tokenizer,
                 max_tokens=self.max_tokens,
+                require_reasoning=self.require_reasoning,
             )
+            cap.request_payload = dict(request_payload)
         except LiveCaptureError as exc:
             # Archive before re-raising. Malformed Hermes, an empty generation
             # and a cap termination are all real measurements of the policy --
@@ -647,6 +673,7 @@ class CapturingLLMAgent:
                     turn_index=self.turn_index,
                     policy_version=self.policy_version,
                     prompt_ids=prompt_ids,
+                    request_payload=request_payload,
                     semantic_history=canonical,
                     error=exc,
                 )

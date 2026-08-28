@@ -222,9 +222,18 @@ Persist:
 ```text
 episode_id, task_id, seed, policy_version, turn_index,
 prompt_token_ids, sampled_token_ids, behavior_logprobs,
-raw_sampled_bytes, sampled-token mask, parsed message/tool call,
+raw_sampled_bytes, raw/action hashes, reasoning byte span and student-token indices,
+sampled-token mask, parsed reasoning/message/tool call,
 finish_reason, observation hash, state hash, usage and timestamps
 ```
+
+Live reasoning is part of the sampled action. The prompt stops at Qwen's normal
+generation boundary and must not append the frozen action-only corpus's masked
+empty `<think>...</think>` wrapper, which would close reasoning before sampling.
+A reasoning-required run rejects any turn without a non-empty reasoning span.
+Every episode transition, sampled turn, failed turn, observation and completed
+Tau2 `SimulationRun` is also appended immediately to `events.jsonl`; the latter
+is persisted in Tau2 `Results` form for the stock viewer.
 
 Malformed tools, empty outputs and cap terminations are archived as
 `FailedTurn` records **before** the parse error propagates — the generation was
@@ -356,23 +365,55 @@ Built:
    the semantic history is part of the identity. `stale_score_keys` remains the
    cheaper in-batch filter; `RunState` is the backstop.
 
-Still to build:
-
-4. **Live Tau2 rollout driver** — the main new component. Replay samples
+4. **Live Tau2 rollout driver** — `tau2/live_rollout.py` and
+   `scripts/tau2_live_rollout.py`. Replay samples
    `frozen prefix -> one action -> stop`; live runs
    `state -> action -> tool/user -> action -> ... -> episode end`. Selects tasks
-   and seeds, fixes one `policy_version` per batch, calls `set_episode()`,
-   persists each turn as it lands.
-5. **`scripts/tau2_live_opd_train.py`** — refactored from
-   `tau2_reopd_train.py`, substituting live sampling at SAMPLED and blocking
-   the optimizer until every required episode is COMPLETE. The shared
-   orchestration should be extracted into helpers so the two drivers cannot
-   drift.
-6. **Two-update on-policy proof** and the canary reports.
+   and seeds, fixes one `policy_version` per batch, persists each turn as it
+   lands, and stops at SAMPLED. Tau2's complete `SimulationRun` and a viewer
+   `Results` are archived per episode.
+5. **The SCORED → TRAINED → reload → next-rollout bridge** — `tau2/live_train.py`
+   and `scripts/tau2_live_opd_train.py`, with the post-sampling stages
+   extracted into `tau2/opd_stages.py`. **Only the live driver imports it so
+   far** -- `tau2_reopd_train.py` still carries its own copy, so this is a
+   shared destination rather than shared execution, and migrating replay onto
+   it is a separate change. The live driver
+   loops `refresh → roll out → score → step → checkpoint → refresh`, which is
+   what makes the arm on-policy: after an update changes the policy, the next
+   update's episodes visit *different* downstream conversation and tool states.
+
+   Three things live adds that replay does not need, each a silent failure
+   otherwise:
+
+   - **A share limit derived from the episode count.** An episode's turns all
+     carry one `trace_id`, so the replay default of 0.35 rejects any batch of
+     three or fewer episodes — including the Phase 1 four-episode proof. The
+     limit is `min(1, (1/n_episodes) * headroom)`, recorded in the manifest.
+   - **Stale-score filtering.** A live turn key can recur inside one update
+     after a discard-and-resample, where identical action bytes follow a
+     different history; `stale_score_keys` drops that paid score before it is
+     reused, and `score_row_provenance` writes the binding `RunState.validate()`
+     re-checks on every later resume.
+   - **A prompt-parity proof over persisted histories**, run before any teacher
+     call is paid for. A history that does not re-render to the captured prompt
+     ids is one the teacher would score under a conversation that never
+     happened — finite loss, clean logs, wrong number.
+
+Still to build:
+
+6. **Two-update on-policy proof** and the canary reports. The code path exists
+   and is unit-tested against injected trainer and teacher stubs; it has not
+   been run against a GPU, a live endpoint or a paid teacher call.
 
 The forward-pass cost of recomputing `log pi_current` over full Tau2 histories
 is the batch-size constraint and is **unmeasured**. Measure it in Phase 1
 rather than discovering it at the first real step.
+
+`MAX_ACTION_TOKENS` is **4096** on the live path, not the replay arm's 2048:
+live actions carry reasoning, and the stored-action measurement that justified
+2048 was taken over action-only rows. A cap hit is archived as a `FailedTurn`
+and fails its episode rather than being trained — a fragment is not a completed
+action, which is what the 256-token cap did to the 0/13 run.
 
 ## Execution plan
 

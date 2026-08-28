@@ -70,6 +70,8 @@ class EpisodeResult:
     reward_info: dict[str, Any]
     initial_env_state_hash: str | None
     final_env_state_hash: str | None
+    simulation: dict[str, Any] | None = None
+    viewer_results: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ class RolloutSettings:
     user: str = "user_simulator"
     user_model: str = "gpt-4o-mini"
     user_model_args: dict[str, Any] = field(default_factory=dict)
+    require_reasoning: bool = True
 
 
 class EpisodeRunner(Protocol):
@@ -118,10 +121,11 @@ class Tau2EpisodeRunner:
         on_observation: Callable[[int, dict[str, Any] | None, str | None], None],
     ) -> EpisodeResult:
         try:
+            from tau2.data_model.simulation import Results
             from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
             from tau2.orchestrator.orchestrator import Orchestrator, Role
             from tau2.registry import registry
-            from tau2.run import get_tasks
+            from tau2.run import get_info, get_tasks
         except ImportError as exc:  # pragma: no cover - live-machine dependency
             raise RuntimeError(
                 "Tau2 is not installed. Install the pinned v0.2 checkout on the "
@@ -159,6 +163,7 @@ class Tau2EpisodeRunner:
             max_input_tokens=s.max_input_tokens,
             temperature=s.temperature,
             timeout=s.timeout,
+            require_reasoning=s.require_reasoning,
             on_turn=archive_turn,
             on_failure=on_failure,
         )
@@ -214,12 +219,29 @@ class Tau2EpisodeRunner:
             solo_mode=False,
         )
         simulation.reward_info = reward_info
+        simulation.trial = 0
+        info = get_info(
+            domain=s.domain,
+            agent="llm_agent",
+            user=s.user,
+            llm_agent=s.student_model,
+            llm_args_agent={"temperature": s.temperature},
+            llm_user=s.user_model,
+            llm_args_user=dict(s.user_model_args),
+            num_trials=1,
+            max_steps=s.max_steps,
+            max_errors=s.max_errors,
+            seed=plan.seed,
+        )
+        viewer_results = Results(info=info, tasks=[task], simulations=[simulation])
         return EpisodeResult(
             termination_reason=str(simulation.termination_reason),
             reward=float(reward_info.reward),
             reward_info=_jsonable(reward_info),
             initial_env_state_hash=initial_hash,
             final_env_state_hash=environment.get_db_hash(),
+            simulation=_jsonable(simulation),
+            viewer_results=_jsonable(viewer_results),
         )
 
 
@@ -255,6 +277,7 @@ def capture_live_update(
         "policy_version": settings.policy_version,
         "adapter_hash": settings.adapter_hash,
         "gen_config_hash": settings.gen_config_hash,
+        "require_reasoning": settings.require_reasoning,
     }
     planned_marker = update.marker("PLANNED")
     if planned_marker.exists():
@@ -297,6 +320,7 @@ def capture_live_update(
             policy_version=settings.policy_version,
             adapter_hash=settings.adapter_hash,
             gen_config_hash=settings.gen_config_hash,
+            require_reasoning=settings.require_reasoning,
         )
         archive.record_episode(episode)
 
@@ -326,6 +350,12 @@ def capture_live_update(
             episode.termination_reason = result.termination_reason
             episode.reward = result.reward
             episode.reward_info = result.reward_info
+            if result.simulation is not None:
+                archive.record_simulation(
+                    plan.episode_id,
+                    result.simulation,
+                    viewer_results=result.viewer_results,
+                )
             episode.num_turns = len(archive.load_turns(plan.episode_id))
             episode.num_failed_turns = len(archive.load_failures(plan.episode_id))
             if episode.num_failed_turns:

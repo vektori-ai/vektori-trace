@@ -1,4 +1,4 @@
-"""Prove the live agent renders the same prompt the corpus froze. CPU, no GPU.
+"""Prove the live reasoning prompt differs only by the empty-think wrapper.
 
 Why this is a gate and not a nicety
 -----------------------------------
@@ -21,8 +21,9 @@ the same head from a different source -- so it gets the same gate.
 `TAU2-REOPD-PLAN.md` §5 records the corpus-side result: 289/289 prefixes
 re-render exactly. This asserts the same property for
 `live_agent.render_prompt_ids`, by replaying each frozen prefix's semantic
-history through the live rendering path and comparing against the frozen
-`prompt_token_ids`.
+history through the live rendering path. The frozen action-only prompt must be
+exactly ``live_ids + empty_think_wrapper_ids``. Equality without that explicit
+suffix would suppress reasoning; any other difference is semantic skew.
 
     python3 scripts/tau2_live_render_parity.py \
         --artifacts /data/tau2/artifacts_16384 \
@@ -49,6 +50,7 @@ def main() -> int:
 
     from transformers import AutoTokenizer
 
+    from vektori_trace.dataset import _think_wrapper_ids
     from vektori_trace.tau2.c30_loader import (
         load_c30_prefixes,
         recover_system_policy,
@@ -81,7 +83,8 @@ def main() -> int:
         # the renderer from the message-construction path.
         got = render_prompt_ids(tok, p.canonical_messages, p.tools)
         want = list(p.prompt_token_ids)
-        if got == want:
+        wrapper = list(_think_wrapper_ids(tok))
+        if got + wrapper == want and got[-len(wrapper):] != wrapper:
             n_ok += 1
             continue
         diverge = next(
@@ -99,7 +102,10 @@ def main() -> int:
             "want_tail": tok.decode(want[diverge:diverge + 24]),
         })
 
-    print(f"\n{n_ok}/{len(rows)} prefixes re-render exactly through the live path")
+    print(
+        f"\n{n_ok}/{len(rows)} live prefixes match the frozen semantic head "
+        "with only the intentional empty-think suffix removed"
+    )
     for f in failures[:10]:
         print(f"\nFAIL {f['prefix_id']} (task {f['task_id']} pos {f['position']})")
         print(f"  lengths  live={f['n_got']} frozen={f['n_want']}")
@@ -121,8 +127,8 @@ def main() -> int:
     if n_ok != len(rows):
         print(
             f"\nREFUSED: {len(rows) - n_ok} prefix(es) do not re-render. The "
-            "live agent would sample from a different state than the corpus "
-            "froze, and every downstream assertion would still pass."
+            "live reasoning boundary differs from the frozen action-only "
+            "boundary by more than the required empty-think suffix."
         )
         return 1
     return 0

@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-model", required=True)
     p.add_argument("--teacher-tokenizer", required=True)
     p.add_argument("--teacher-renderer", default="deepseek-v4-native")
+    p.add_argument(
+        "--allow-missing-reasoning",
+        action="store_true",
+        help="diagnostic only: admit actions without a non-empty <think> span",
+    )
     return p.parse_args()
 
 
@@ -81,6 +86,7 @@ def main() -> None:
         user=args.user,
         user_model=args.user_model,
         user_model_args=json.loads(args.user_model_args),
+        require_reasoning=not args.allow_missing_reasoning,
     )
     from transformers import AutoTokenizer
 
