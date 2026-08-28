@@ -205,6 +205,13 @@ class UpdateDir:
             # change the global denominator while looking complete.
             a_keys = [r.get("key") for r in actions]
             s_keys = [r.get("key") for r in scores]
+            action_dupes = {k for k in a_keys if a_keys.count(k) > 1}
+            if action_dupes:
+                raise ReOPDStateError(
+                    f"update {self.index}: duplicate action keys "
+                    f"{sorted(action_dupes)[:4]}; one sampled generation must "
+                    "have exactly one durable action row"
+                )
             dupes = {k for k in s_keys if s_keys.count(k) > 1}
             if dupes:
                 raise ReOPDStateError(
@@ -231,7 +238,10 @@ class UpdateDir:
             for s in scores:
                 want = by_key[s["key"]].get("score_fingerprint")
                 got = s.get("fingerprint")
-                if want and got and want != got:
+                # Replay rows without `want` are legacy-compatible. A row that
+                # opts into fingerprinting must have an exact score-side match;
+                # absence is not proof of provenance.
+                if want and got != want:
                     raise ReOPDStateError(
                         f"update {self.index}: score for {s['key']} was bought "
                         f"for a different action or teacher ({got} != {want})"

@@ -489,6 +489,7 @@ class CapturingLLMAgent:
         timeout: float = 600.0,
         llm_args: Optional[dict] = None,
         on_capture: Optional[Callable[[TurnCapture], None]] = None,
+        on_failure: Optional[Callable[..., None]] = None,
         poster: Optional[Callable[..., tuple[int, dict]]] = None,
     ) -> None:
         from tau2.agent.llm_agent import LLMAgent  # imported lazily; see above
@@ -512,6 +513,17 @@ class CapturingLLMAgent:
         self.timeout = timeout
         self._post = poster or post_json
         self._on_capture = on_capture
+        # Called with the raw response body before a `build_capture` failure
+        # propagates. The generation was paid for; its ids and behaviour
+        # logprobs exist only in that body and are gone once it is discarded.
+        #
+        # Scope is exactly that: a 200 response whose body did not yield a
+        # trainable capture -- malformed Hermes, a cap termination, missing
+        # ids, an unusable logprob. It does NOT cover failures with no
+        # generation to salvage: a non-200, a transport exception, or the
+        # prompt-budget refusal above, all of which raise before any tokens
+        # were produced. Those are the driver's to record at episode level.
+        self._on_failure = on_failure
 
         self.episode_id: str = "unset"
         self.task_id: str = "unset"
@@ -594,16 +606,34 @@ class CapturingLLMAgent:
                 f"turn {self.turn_index}: HTTP {status}: {str(body)[:300]}"
             )
 
-        cap = build_capture(
-            body,
-            episode_id=self.episode_id,
-            task_id=self.task_id,
-            turn_index=self.turn_index,
-            policy_version=self.policy_version,
-            prompt_ids=prompt_ids,
-            tokenizer=self.tokenizer,
-            max_tokens=self.max_tokens,
-        )
+        try:
+            cap = build_capture(
+                body,
+                episode_id=self.episode_id,
+                task_id=self.task_id,
+                turn_index=self.turn_index,
+                policy_version=self.policy_version,
+                prompt_ids=prompt_ids,
+                tokenizer=self.tokenizer,
+                max_tokens=self.max_tokens,
+            )
+        except LiveCaptureError as exc:
+            # Archive before re-raising. Malformed Hermes, an empty generation
+            # and a cap termination are all real measurements of the policy --
+            # they belong in the validity metrics -- and this is the only
+            # moment their raw ids and behaviour logprobs exist.
+            if self._on_failure is not None:
+                self._on_failure(
+                    body=body,
+                    episode_id=self.episode_id,
+                    task_id=self.task_id,
+                    turn_index=self.turn_index,
+                    policy_version=self.policy_version,
+                    prompt_ids=prompt_ids,
+                    semantic_history=canonical,
+                    error=exc,
+                )
+            raise
         self.captures.append(cap)
         if self._on_capture is not None:
             # Persist as it lands. A crash on turn 6 must not discard the

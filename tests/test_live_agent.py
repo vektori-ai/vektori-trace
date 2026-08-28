@@ -357,3 +357,77 @@ def test_render_appends_the_think_wrapper():
     assert calls["add_generation_prompt"] is True
     assert calls["template_kwargs"]["enable_thinking"] is True
     assert "tools" in calls["template_kwargs"]
+
+
+# ---------------------------------------------------------------------------
+# Failure archival: every capture refusal is a paid generation
+# ---------------------------------------------------------------------------
+
+
+def _archive_on_failure(body):
+    """What the agent's `on_failure` hook does: salvage, then re-raise.
+
+    Mirrors the call site in `_generate_next_message`, so a change to
+    `build_capture`'s refusals is caught here rather than silently producing
+    an `other`-bucketed record in a real run.
+    """
+    from vektori_trace.tau2.live_episode import build_failed_turn
+
+    try:
+        _capture(body)
+    except LiveCaptureError as exc:
+        return build_failed_turn(
+            body=body, episode_id="ep1", task_id="57", turn_index=0,
+            policy_version="sha-abc", prompt_ids=[1, 2, 3],
+            semantic_history=[{"role": "user", "content": "hi"}], error=exc,
+        )
+    raise AssertionError("expected a capture failure")
+
+
+def test_every_salvageable_capture_refusal_classifies_to_a_named_bucket():
+    """`classify_failure` matches on message text, so an unmatched refusal
+    would silently land in `other` and vanish from the validity metrics.
+
+    Scope is `build_capture` refusals on a 200 body. A non-200 or a transport
+    exception never reaches this hook -- there are no tokens to archive."""
+    ids = _ids_for("hi")
+    null_lp = [-0.1] * len(ids)
+    null_lp[0] = None
+    no_ids = _body("hi")
+    no_ids["choices"][0]["token_ids"] = []
+
+    cases = {
+        "cap_termination": _body("truncated", finish="length"),
+        "no_token_ids": no_ids,
+        "logprob_mismatch": _body("hello", logprobs=[-0.1, -0.2]),
+        "transport": {"choices": []},
+    }
+    for expected, body in cases.items():
+        assert _archive_on_failure(body).failure_kind == expected, expected
+
+    # A null logprob is a logprob problem, not an `other`.
+    assert _archive_on_failure(_body("hi", logprobs=null_lp)).failure_kind == (
+        "logprob_mismatch"
+    )
+
+
+def test_a_cap_termination_keeps_its_ids_and_logprobs_for_diagnosis():
+    ft = _archive_on_failure(_body("truncated mid-th", finish="length"))
+    assert ft.finish_reason == "length"
+    assert ft.sampled_token_ids == _ids_for("truncated mid-th")
+    assert len(ft.behavior_logprobs) == len(ft.sampled_token_ids)
+    assert ft.raw_text == "truncated mid-th"
+    # Archived for the validity metrics; never trainable as a finished action.
+    assert ft.failure_kind == "cap_termination"
+
+
+def test_on_failure_hook_is_wired_before_the_raise():
+    """The hook must fire on the way out, not be swallowed."""
+    import inspect
+
+    from vektori_trace.tau2 import live_agent
+
+    src = inspect.getsource(live_agent.CapturingLLMAgent._generate_next_message)
+    assert "self._on_failure(" in src
+    body = src[src.index("except LiveCaptureError") :]
+    assert body.rindex("raise") > body.index("self._on_failure(")

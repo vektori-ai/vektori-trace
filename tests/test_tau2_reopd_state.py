@@ -244,6 +244,29 @@ def test_stale_score_fingerprint_is_refused(tmp_path):
         rs.resume_point()
 
 
+def test_missing_required_score_fingerprint_is_refused(tmp_path):
+    rs = _run(tmp_path)
+    u = rs.update(0)
+    append_jsonl(u.actions_path, {"key": "0#0", "score_fingerprint": "aaa"})
+    u.mark("SAMPLED")
+    append_jsonl(u.scores_path, {"key": "0#0"})
+    u.mark("SCORED")
+    with pytest.raises(ReOPDStateError, match="different action or teacher"):
+        rs.resume_point()
+
+
+def test_duplicate_action_keys_are_refused(tmp_path):
+    rs = _run(tmp_path)
+    u = rs.update(0)
+    append_jsonl(u.actions_path, {"key": "0#0"})
+    append_jsonl(u.actions_path, {"key": "0#0"})
+    u.mark("SAMPLED")
+    append_jsonl(u.scores_path, {"key": "0#0"})
+    u.mark("SCORED")
+    with pytest.raises(ReOPDStateError, match="duplicate action keys"):
+        rs.resume_point()
+
+
 def test_malformed_middle_line_is_fatal(tmp_path):
     """Only a torn FINAL line is recoverable."""
     rs = _run(tmp_path)
