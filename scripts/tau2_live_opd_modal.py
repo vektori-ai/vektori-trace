@@ -1228,6 +1228,256 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
     return text
 
 
+@app.function(
+    # NO gpu= argument, and no trainer is ever constructed. This is the paid
+    # re-score and NOTHING else: the repaired scorer has never made a real
+    # teacher call, so the first valid advantage distribution must be readable
+    # before any weight moves. A clamp decision, or the discovery of a second
+    # scoring defect, has to happen while the parent adapter is still untouched.
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
+)
+def rescore(run_id: str = "", update: int = 0,
+                 clamp: float = 0.0) -> str:
+    """SCORED only. The real teacher, the production scorer, no optimizer step.
+
+    Calls `run_projected_score_stage` -- the same function `train_live_update`
+    calls -- rather than a re-implementation, so what is measured here is what
+    training would consume. Then builds the projected batch **for analysis
+    only** and reports the distribution.
+
+    Deliberately absent: `run_projected_train_stage`, any trainer, any
+    checkpoint, any reload, any rollout, any GPU. `--clamp` only annotates the
+    report with what a given threshold *would* do; it changes nothing on disk.
+    """
+    import base64
+    import json
+    import os
+
+    from vektori_trace.providers.teacher.fireworks import FireworksTeacherPool
+    from vektori_trace.tau2.live_batch import build_projected_batch
+    from vektori_trace.tau2.live_token_classes import classify_action
+    from vektori_trace.tau2.live_train import (
+        load_live_update_inputs,
+        run_projected_score_stage,
+    )
+    from vektori_trace.tau2.opd_stages import set_commit_fn
+    from vektori_trace.tau2.reopd_state import RunState, read_jsonl
+    from vektori_trace.vocab_bridge import load_tokenizer
+
+    # Without this the paid scores live on container-local disk and vanish when
+    # the container exits, having been billed for.
+    set_commit_fn(vol.commit)
+
+    if not run_id:
+        raise ValueError("--run-id is required; a paid re-score must name its "
+                         "target rather than guess the newest run")
+    out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
+    if not os.path.isdir(out):
+        raise FileNotFoundError(f"no run at {out}")
+
+    run = RunState(out, n_updates=1)
+    u = run.update(update)
+
+    # Refuse to re-buy scores, and refuse to touch a trained update.
+    if u.reached("TRAINED"):
+        raise RuntimeError(
+            f"{run_id} update {update} is already TRAINED; re-scoring it would "
+            "spend money to overwrite the record of a run that already "
+            "consumed its scores"
+        )
+
+    with open(os.path.join(out, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    if manifest.get("adapter_hash") != PARENT_ADAPTER_HASH:
+        raise ValueError(
+            f"{run_id} claims parent {manifest.get('adapter_hash')!r}, not the "
+            f"pinned {PARENT_ADAPTER_HASH}; refusing to score a batch whose "
+            "provenance is not the untouched parent"
+        )
+
+    policy_version = manifest.get("policy_version") or "live-u000"
+    inputs = load_live_update_inputs(u, policy_version=policy_version)
+    teacher_tok = load_tokenizer(TEACHER_TOKENIZER)
+    pool = FireworksTeacherPool(model=TEACHER_MODEL)
+
+    paid = run.paid_scores(update)
+    by_key = {r["key"]: r for r in inputs.capture_rows}
+
+    result = run_projected_score_stage(
+        u, inputs,
+        teacher_tok=teacher_tok, pool=pool, run_dir=out,
+        paid=paid, drop_keys=set(), by_key=by_key,
+    )
+    vol.commit()
+
+    # --- analysis ONLY: build the batch, never hand it to a trainer --------
+    # Same arguments `run_projected_train_stage` would pass, so the reported
+    # distribution is the one training would consume -- including the derived
+    # task share (the replay default of 0.5 rejects a legitimate live batch).
+    n_tasks = len({p.task for p in inputs.prefixes})
+    max_task_share = min(1.0, (1.0 / n_tasks) * 1.5) if n_tasks else 1.0
+    batch = build_projected_batch(
+        inputs.prefixes, inputs.actions, result.projected,
+        policy_version=policy_version,
+        max_task_share=max_task_share,
+        max_trace_share=inputs.max_trace_share,
+    )
+
+    def stats(xs):
+        if not xs:
+            return {}
+        s = sorted(xs)
+        n = len(s)
+        return {
+            "n": n,
+            "mean": round(sum(s) / n, 4),
+            "min": round(s[0], 4),
+            "p1": round(s[max(0, int(0.01 * n) - 1)], 4),
+            "p50": round(s[n // 2], 4),
+            "p99": round(s[min(n - 1, int(0.99 * n))], 4),
+            "max": round(s[-1], 4),
+            "n_pos": sum(1 for x in s if x > 0),
+            "n_neg": sum(1 for x in s if x < 0),
+            "n_zero": sum(1 for x in s if x == 0),
+        }
+
+    all_adv = []
+    by_class: dict = {}
+    per_action = []
+    extremes = []
+    for ta, row in zip(batch.advantages, inputs.capture_rows):
+        stu = [base64.b64decode(b) for b in row["action_token_bytes_b64"]]
+        classes = classify_action(stu)
+        vals = []
+        for i, a in enumerate(ta.advantages):
+            if not ta.supervised_mask[i]:
+                continue
+            vals.append(a)
+            all_adv.append(a)
+            by_class.setdefault(classes[i], []).append(a)
+            extremes.append((a, row["key"], i, classes[i],
+                             stu[i].decode("utf-8", "replace")))
+        per_action.append({
+            "key": row["key"],
+            "task": row.get("task_id"),
+            "turn": row.get("turn_index"),
+            "n_tokens": len(stu),
+            "n_supervised": ta.n_supervised,
+            **({"mean_adv": round(sum(vals) / len(vals), 4)} if vals else {}),
+        })
+
+    # structural / tool weight must be exactly zero
+    struct = {k: v for k, v in by_class.items()
+              if k in ("markup", "tool_json", "special")}
+
+    n_finite = sum(
+        1 for sc in result.projected.values()
+        for v in sc.teacher_logprob_by_index.values()
+        if v == v and abs(v) != float("inf")
+    )
+    n_total_credit = sum(len(sc.teacher_logprob_by_index)
+                         for sc in result.projected.values())
+
+    tot_tok = sum(len(r["action_token_bytes_b64"])
+                  for r in inputs.capture_rows)
+    tot_sup = sum(sc.n_supervised for sc in result.projected.values())
+    tot_exc = sum(len(sc.excluded) for sc in result.projected.values())
+
+    skips = []
+    for sc in result.projected.values():
+        for name, rep in (sc.payload_report or {}).items():
+            if isinstance(rep, dict) and rep.get("skipped"):
+                skips.append((sc.key, name, rep.get("reason")))
+
+    extremes.sort(key=lambda t: t[0])
+    lines = [
+        f"POST-FIX ADVANTAGE REPORT -- {run_id} update {update}",
+        "  SCORING ONLY. No optimizer step, no checkpoint, no GPU.",
+        "",
+        f"  scored           : {result.n_newly_scored} new / "
+        f"{result.n_reused} reused  ({result.seconds}s)",
+        f"  teacher tokens   : {result.teacher_input_tokens:,}",
+        f"  est cost         : "
+        f"${round(result.teacher_input_tokens * 0.22 / 1e6, 4)}",
+        "",
+        f"  actions scored   : {len(result.projected)}/"
+        f"{len(inputs.capture_rows)}",
+        f"  credits finite   : {n_finite}/{n_total_credit}",
+        f"  payload skips    : {len(skips) or 'none'}",
+        f"  accounting       : {tot_sup:,} supervised + {tot_exc:,} excluded "
+        f"= {tot_sup + tot_exc:,} vs {tot_tok:,} tokens "
+        f"({'OK' if tot_sup + tot_exc == tot_tok else 'MISMATCH'})",
+        f"  structural weight: "
+        f"{ {k: len(v) for k, v in struct.items()} or 'zero (correct)'}",
+        "",
+        "  ADVANTAGE DISTRIBUTION (supervised tokens only)",
+        f"    all      : {json.dumps(stats(all_adv))}",
+    ]
+    for cls in sorted(by_class):
+        lines.append(f"    {cls:9s}: {json.dumps(stats(by_class[cls]))}")
+    lines += ["", "  10 MOST NEGATIVE SUPERVISED TOKENS"]
+    for a, k, i, c, t in extremes[:10]:
+        lines.append(f"    {a:10.3f}  {c:9s} {k}[{i}] {t!r}")
+    lines += ["", "  10 MOST POSITIVE SUPERVISED TOKENS"]
+    for a, k, i, c, t in reversed(extremes[-10:]):
+        lines.append(f"    {a:10.3f}  {c:9s} {k}[{i}] {t!r}")
+
+    if clamp:
+        would = [x for x in all_adv if abs(x) > clamp]
+        lines += [
+            "",
+            f"  CLAMP PREVIEW at +/-{clamp} (nothing written)",
+            f"    would clip {len(would)} of {len(all_adv)} "
+            f"({100.0 * len(would) / max(1, len(all_adv)):.3f}%)",
+        ]
+
+    lines += ["", "  PER-ACTION (supervision, mean advantage)"]
+    for pa in per_action:
+        lines.append(
+            f"    {pa['key']:34s} task {pa.get('task'):>3s} turn "
+            f"{pa.get('turn'):>2} {pa['n_supervised']:>5}/{pa['n_tokens']:<5} "
+            f"mean={pa.get('mean_adv', 'n/a')}"
+        )
+
+    # fingerprints + stage, read back off disk
+    rows = read_jsonl(u.scores_path)
+    fp_ok = all(
+        r.get("fingerprint") == by_key[r["key"]].get("score_fingerprint")
+        for r in rows if r.get("key") in by_key
+    )
+    try:
+        u.validate()
+        val = "accepted"
+    except Exception as exc:  # noqa: BLE001
+        val = f"REFUSED: {exc}"[:120]
+    lines += [
+        "",
+        f"  score rows       : {len(rows)}",
+        f"  fingerprints     : {'all bound' if fp_ok else 'MISMATCH'}",
+        f"  UpdateDir.validate: {val}",
+        f"  stage            : {u.stage()}",
+        f"  TRAINED marker   : "
+        f"{'absent (correct)' if not u.reached('TRAINED') else 'PRESENT -- BUG'}",
+    ]
+
+    text = "\n".join(lines)
+    print(text)
+
+    if skips:
+        raise RuntimeError(f"payload skips: {skips[:4]}")
+    if tot_sup + tot_exc != tot_tok:
+        raise RuntimeError("token accounting incomplete")
+    if struct:
+        raise RuntimeError(f"structural tokens carry weight: "
+                           f"{ {k: len(v) for k, v in struct.items()} }")
+    if n_finite != n_total_credit:
+        raise RuntimeError("non-finite teacher credit present")
+    return text
+
+
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 10)
 def show_markers(run_id: str = "", update: int = 0) -> str:
     """Dump a run's manifest and stage markers verbatim. Read-only.
@@ -1607,6 +1857,8 @@ def main(
     predict_only: bool = False,
     build_canary_only: bool = False,
     show_markers_only: bool = False,
+    rescore_only: bool = False,
+    clamp_preview: float = 0.0,
     canary_run_id: str = "",
     classify_update: int = 0,
     show_full: bool = False,
@@ -1650,6 +1902,15 @@ def main(
 
     if show_markers_only:
         show_markers.remote(run_id, classify_update)
+        return
+
+    if rescore_only:
+        # The paid step. Scoring only: no trainer is constructed, no GPU is
+        # requested, and the update stops at SCORED so the first valid
+        # advantage distribution can be read before any weight moves.
+        print(f"rescore: SCORING ONLY on {run_id!r} update {classify_update}")
+        print("  no optimizer step, no checkpoint, no reload, no GPU")
+        rescore.remote(run_id, classify_update, clamp_preview)
         return
 
     if build_canary_only:
