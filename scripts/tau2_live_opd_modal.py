@@ -599,7 +599,11 @@ def diagnose(
          "has_reasoning": bool((t["capture"].get("reasoning") or "").strip()),
          "reasoning_chars": len((t["capture"].get("reasoning") or "")),
          "n_reasoning_tokens": len(t["capture"].get("reasoning_token_indices") or []),
-         "bytes_exact": t["capture"].get("raw_is_exact_generated_bytes")}
+         # Diagnostic only -- False is normal (trailing <|im_end|>). The
+         # real byte gate is verify_ids_reconstruct_text, which must have
+         # passed for the turn to exist at all.
+         "raw_eq_token_bytes": t["capture"].get(
+             "raw_equals_token_bytes_exactly")}
         for t in turns
     ]
     n = len(result["turns"])
@@ -607,7 +611,11 @@ def diagnose(
         "turns": n,
         "with_reasoning": sum(1 for r in result["turns"] if r["has_reasoning"]),
         "all_lengths_agree": all(r["lengths_agree"] for r in result["turns"]),
-        "all_bytes_exact": all(r["bytes_exact"] for r in result["turns"]),
+        # Every archived turn passed verify_ids_reconstruct_text by
+        # construction, so this is the meaningful statement about bytes.
+        "all_ids_reconstruct_text": True,
+        "raw_eq_token_bytes_all": all(
+            r["raw_eq_token_bytes"] for r in result["turns"]),
     }
 
     if not score:

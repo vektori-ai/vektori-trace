@@ -155,7 +155,13 @@ class TurnCapture:
             ).hexdigest(),
             "generated_bytes_hex": generated_bytes.hex(),
             "generated_bytes_sha256": hashlib.sha256(generated_bytes).hexdigest(),
-            "raw_is_exact_generated_bytes": (
+            # NOT a health check. `verify_ids_reconstruct_text` is the gate,
+            # and it already ran: a real mismatch raises LiveCaptureError and
+            # fails the turn. It deliberately allows a trailing special token
+            # (`<|im_end|>`), so the concatenated token bytes are routinely one
+            # token longer than `raw_text` and this reads False on a perfectly
+            # healthy turn. Kept only as a diagnostic detail.
+            "raw_equals_token_bytes_exactly": (
                 generated_bytes == self.raw_text.encode("utf-8")
             ),
             "finish_reason": self.finish_reason,

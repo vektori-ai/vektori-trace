@@ -360,7 +360,7 @@ def test_reasoning_capture_records_byte_span_and_token_indices():
     start, end = row["reasoning_byte_span"]
     assert bytes.fromhex(row["raw_bytes_hex"])[start:end] == b"check the order"
     assert row["reasoning_token_indices"]
-    assert row["raw_is_exact_generated_bytes"] is True
+    assert row["raw_equals_token_bytes_exactly"] is True
 
 
 # ---------------------------------------------------------------------------
