@@ -271,7 +271,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=100)
     p.add_argument("--max-errors", type=int, default=10)
     p.add_argument("--user", default="user_simulator")
-    p.add_argument("--user-model", default="gpt-4o-mini")
+    # Fireworks, not OpenAI: this environment has a FIREWORKS_API_KEY and no
+    # OpenAI Modal secret, and a `gpt-4o-mini` default fails mid-episode after
+    # turn 0's student generation has already been paid for.
+    p.add_argument(
+        "--user-model",
+        default="fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731",
+    )
     p.add_argument("--user-model-args", default="{}")
     p.add_argument("--allow-missing-reasoning", action="store_true",
                    help="diagnostic only: admit actions with no <think> span")

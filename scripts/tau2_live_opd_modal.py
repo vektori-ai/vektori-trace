@@ -50,12 +50,23 @@ HF_CACHE_MOUNT = "/root/.cache/huggingface"
 #: container cannot see the box's /data/tau2, and -- more importantly -- the
 #: serving container reloads checkpoints from this same volume, so a checkpoint
 #: written anywhere else can never be served to sample the next update.
-#: Verified against the volume 2026-08-28: `modal volume ls` shows
-#: `adapter_config.json`/`adapter_model.safetensors` at this run's ROOT, not
-#: under a `checkpoint-N` subdirectory (there is a `checkpoint-32`, which is a
-#: mid-training step, not the selected artifact). Naming a path that does not
-#: exist would fail only after the GPU had been allocated.
-PARENT_IN_VOLUME = "tau2/runs/a_sft_new_ck35_r2"
+#: Verified against the volume 2026-08-28 via `checkpoints.jsonl`: the run root
+#: and `checkpoint-32` carry the SAME adapter -- `adapter_model.safetensors`
+#: hashes to 3869b147ab7ce5d2 in both, which is also the adapter_hash the
+#: 2026-08-28 smoke run archived. Step 32 is the final step, not a mid-training
+#: one (the root row is `final: true`).
+#:
+#: `checkpoint-32` is nonetheless the right parent: it is the only one carrying
+#: `optimizer.pt`, `scheduler.pt` and `rng_state.pth`. The root holds the
+#: inference files only. Both would load and train identically, so naming the
+#: root would not error -- it would just quietly forgo the resume state, which
+#: is the kind of difference that shows up as an unexplained learning-rate
+#: change three updates later.
+PARENT_IN_VOLUME = "tau2/runs/a_sft_new_ck35_r2/checkpoint-32"
+
+#: The parent's adapter weights, from `checkpoints.jsonl`. Recorded so a run
+#: cannot silently train from a different adapter than the one it claims.
+PARENT_ADAPTER_HASH = "3869b147ab7ce5d2"
 RUNS_IN_VOLUME = "tau2/live-opd"
 
 GPU = "L40S"
@@ -64,6 +75,10 @@ GPU = "L40S"
 #: run records, which is the intended behaviour.
 TAU2_REPO = "https://github.com/sierra-research/tau2-bench.git"
 TAU2_COMMIT = "f8de30c"
+
+#: The Tau2 user simulator, served through litellm's Fireworks provider. The
+#: `fireworks_ai/` prefix is what routes it off OpenAI.
+USER_MODEL = "fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731"
 
 app = modal.App("tau2-live-opd")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
@@ -109,14 +124,11 @@ image = (
     volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
     timeout=60 * 60 * 6,
     max_containers=1,
-    secrets=[
-        modal.Secret.from_name("fireworks-api-key"),
-        # The user simulator is a separate paid model. Its key is a distinct
-        # secret from the teacher's, and a run that reaches the first user turn
-        # without it fails mid-episode -- after the student generation for turn
-        # 0 has already been paid for.
-        modal.Secret.from_name("openai-api-key"),
-    ],
+    # Fireworks only. Verified 2026-08-28: `modal secret list` shows exactly
+    # one secret, `fireworks-api-key`. Requiring an `openai-api-key` secret
+    # would fail the container at start -- and the default user simulator is
+    # now a Fireworks model, so nothing here needs an OpenAI key.
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
 )
 def train(
     api_base: str,
@@ -272,8 +284,12 @@ def train(
             f"under {out}. Refusing to report a trained adapter that does not "
             "exist."
         )
-    # The two-update proof's entire claim is that update 1 sampled from update
-    # 0's adapter. Two complete checkpoints are the artifact of that claim.
+    # The two-update proof's entire claim is that update 1's episodes were
+    # sampled from the adapter update 0 produced. Counting checkpoints does
+    # NOT establish that: a run whose serving refresh silently no-opped
+    # produces two checkpoints and a green log while update 1 resampled the
+    # parent policy -- which is precisely the failure the proof exists to
+    # catch. So compare the identities.
     if rc == 0 and mode == "two-update-proof":
         complete = [s for s in saved if s["complete"]]
         if len(complete) < 2:
@@ -283,8 +299,41 @@ def train(
                 "exactly what this mode exists to prove, so a single "
                 "checkpoint is a failed proof, not a partial success."
             )
+        u0_state = os.path.join(out, "update-000", "checkpoint", "state.json")
+        u0_hash = json.load(open(u0_state)).get("adapter_hash")
+
+        # What update 1 actually sampled under, read off its own archived
+        # episodes rather than off anything the driver reported.
+        eps = os.path.join(out, "update-001", "live_archive", "episodes.jsonl")
+        sampled_hashes = {
+            json.loads(line).get("adapter_hash")
+            for line in open(eps) if line.strip()
+        }
+        if sampled_hashes != {u0_hash}:
+            raise SystemExit(
+                "FAILED two-update proof: update 1 archived adapter_hash(es) "
+                f"{sorted(str(h) for h in sampled_hashes)} but update 0 "
+                f"produced {u0_hash!r}. Update 1 did not sample from the "
+                "adapter update 0 trained, so this run does not demonstrate an "
+                "on-policy loop -- it demonstrates two independent updates."
+            )
+        if u0_hash == PARENT_ADAPTER_HASH:
+            raise SystemExit(
+                "FAILED two-update proof: update 0's checkpoint hashes to the "
+                f"PARENT adapter ({PARENT_ADAPTER_HASH}). The optimizer step "
+                "did not change the weights, so update 1 resampled the SFT "
+                "policy under a new name."
+            )
+        result_proof = {
+            "update0_adapter_hash": u0_hash,
+            "update1_sampled_under": sorted(str(h) for h in sampled_hashes),
+            "parent_adapter_hash": PARENT_ADAPTER_HASH,
+            "on_policy_transition_verified": True,
+        }
+        print(json.dumps({"two_update_proof": result_proof}, indent=2))
 
     result = {"returncode": rc, "run_id": run_id, "mode": mode,
+              "two_update_proof": locals().get("result_proof"),
               "out_dir": f"{RUNS_IN_VOLUME}/{run_id}",
               "checkpoints": saved}
     p = os.path.join(out, "manifest.json")
@@ -299,6 +348,91 @@ def train(
     return result
 
 
+@app.function(
+    # NO gpu= argument: this allocates CPU only and cannot cost GPU time. It
+    # exists so the expensive run's prerequisites fail here, in seconds, rather
+    # than after a GPU has been allocated and turn 0 has been paid for.
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 15,
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
+)
+def preflight(tau2_src: str = "") -> dict:
+    """Prove every prerequisite exists. No GPU, no teacher call, no rollout."""
+    import json
+    import os
+    import sys
+
+    sys.path.insert(0, "/root")
+    if tau2_src:
+        sys.path.insert(0, tau2_src)
+
+    out: dict = {"ok": True, "checks": {}}
+
+    def check(name, fn):
+        try:
+            out["checks"][name] = {"ok": True, "value": fn()}
+        except Exception as exc:
+            out["ok"] = False
+            out["checks"][name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+    parent = os.path.join(VOLUME_MOUNT, PARENT_IN_VOLUME)
+
+    def _parent():
+        missing = [
+            f for f in ("adapter_config.json", "adapter_model.safetensors",
+                        "optimizer.pt", "scheduler.pt", "rng_state.pth")
+            if not os.path.isfile(os.path.join(parent, f))
+        ]
+        if missing:
+            raise FileNotFoundError(f"{parent} missing {missing}")
+        return parent
+
+    def _tau2():
+        import tau2
+        return getattr(tau2, "__version__", "installed")
+
+    def _tools():
+        from vektori_trace.tau2.tools import load_domain_tools, tools_hash
+        tools = load_domain_tools("retail")
+        return {"n": len(tools), "hash": tools_hash(tools)}
+
+    def _driver():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "t", "/root/scripts/tau2_live_opd_train.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return {"max_action_tokens": m.MAX_ACTION_TOKENS}
+
+    def _bridge():
+        from vektori_trace.tau2.live_train import live_max_trace_share
+        from vektori_trace.tau2.opd_stages import set_commit_fn
+        set_commit_fn(vol.commit)
+        return {"share_4_episodes": round(live_max_trace_share(4), 4),
+                "commit_fn_installed": True}
+
+    def _teacher_key():
+        if not os.environ.get("FIREWORKS_API_KEY"):
+            raise KeyError("FIREWORKS_API_KEY absent from the container env")
+        return "present"
+
+    def _torch():
+        import torch
+        return {"cuda_available": torch.cuda.is_available()}
+
+    check("parent_adapter", _parent)
+    check("tau2_importable", _tau2)
+    check("retail_tools", _tools)
+    check("driver_loads", _driver)
+    check("bridge_and_commit_fn", _bridge)
+    check("fireworks_key", _teacher_key)
+    check("torch", _torch)
+
+    print(json.dumps(out, indent=2))
+    return out
+
+
 @app.local_entrypoint()
 def main(
     api_base: str = "",
@@ -307,6 +441,7 @@ def main(
     task_ids: str = "57,73,75,93",
     seeds: str = "0",
     n_updates: int = 5,
+    preflight_only: bool = False,
     canary: bool = False,
     two_update_proof: bool = False,
     yes: bool = False,
@@ -319,13 +454,26 @@ def main(
     # only to override with a checkout staged on the volume.
     tau2_src: str = "",
     reload_url: str = "",
-    user_model: str = "gpt-4o-mini",
+    # The user simulator runs on Fireworks, like the teacher. `gpt-4o-mini`
+    # would need an OpenAI key this environment does not have as a Modal
+    # secret, and would fail mid-episode -- after turn 0's student generation
+    # had already been paid for. Same provider the 2026-08-28 smoke run used.
+    user_model: str = USER_MODEL,
     adapter_hash: str = "",
     allow_missing_reasoning: bool = False,
     max_input_tokens: int = 16384,
 ):
     import json
     import time
+
+    if preflight_only:
+        print("preflight: CPU only, no GPU, no teacher call, no rollout")
+        result = preflight.remote(tau2_src)
+        print(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            raise SystemExit("preflight FAILED -- do not launch a paid run")
+        print("preflight OK")
+        return
 
     modes = [m for m, on in (("canary", canary),
                              ("two-update-proof", two_update_proof),
