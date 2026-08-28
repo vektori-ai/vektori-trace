@@ -167,6 +167,7 @@ def train(
     allow_missing_reasoning: bool,
     max_input_tokens: int,
     parent_override: str = "",
+    resume_optimizer_from: str = "",
 ) -> dict:
     import importlib.util
     import json
@@ -1287,7 +1288,9 @@ def rescore(run_id: str = "", update: int = 0,
     if not os.path.isdir(out):
         raise FileNotFoundError(f"no run at {out}")
 
-    run = RunState(out, n_updates=1)
+    with open(os.path.join(out, "manifest.json")) as _fh:
+        _m = json.load(_fh)
+    run = RunState(out, n_updates=int(_m.get("n_updates", 1)))
     u = run.update(update)
 
     # Refuse to re-buy scores, and refuse to touch a trained update.
@@ -1300,12 +1303,30 @@ def rescore(run_id: str = "", update: int = 0,
 
     with open(os.path.join(out, "manifest.json")) as fh:
         manifest = json.load(fh)
-    if manifest.get("adapter_hash") != PARENT_ADAPTER_HASH:
+    # Validate against THIS update's own sampling policy, not the frozen SFT
+    # parent: update k>0 is sampled from update k-1's child, so pinning
+    # PARENT_ADAPTER_HASH here would reject every iterative update. The
+    # `.SAMPLED` marker records what actually generated these actions.
+    sampled_marker = u.marker("SAMPLED")
+    sampled_hash = None
+    if sampled_marker.exists():
+        try:
+            sampled_hash = json.loads(sampled_marker.read_text()).get(
+                "adapter_hash")
+        except (OSError, ValueError):
+            sampled_hash = None
+    if not sampled_hash:
         raise ValueError(
-            f"{run_id} claims parent {manifest.get('adapter_hash')!r}, not the "
-            f"pinned {PARENT_ADAPTER_HASH}; refusing to score a batch whose "
-            "provenance is not the untouched parent"
+            f"{run_id} update {update} has no adapter_hash in .SAMPLED; the "
+            "batch cannot name the policy that generated it, so the scores "
+            "could not be bound to a provenance"
         )
+    if update == 0 and sampled_hash != PARENT_ADAPTER_HASH:
+        raise ValueError(
+            f"update 0 was sampled from {sampled_hash!r}, not the untouched "
+            f"parent {PARENT_ADAPTER_HASH}; a clean pilot must start there"
+        )
+    print(f"scoring update {update}, sampled from {sampled_hash}")
 
     policy_version = manifest.get("policy_version") or "live-u000"
     inputs = load_live_update_inputs(u, policy_version=policy_version)
@@ -1495,7 +1516,8 @@ def rescore(run_id: str = "", update: int = 0,
     max_containers=1,
 )
 def one_step(run_id: str = "", update: int = 0,
-             learning_rate: float = 1e-5, parent_override: str = "") -> str:
+             learning_rate: float = 1e-5, parent_override: str = "",
+             resume_optimizer_from: str = "") -> str:
     """Exactly one optimizer step from cached scores. No rollout, no teacher.
 
     The `train` driver cannot do this: its loop samples fresh episodes before
@@ -1526,7 +1548,9 @@ def one_step(run_id: str = "", update: int = 0,
     if not run_id:
         raise ValueError("--run-id is required")
     out = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id)
-    run = RunState(out, n_updates=1)
+    with open(os.path.join(out, "manifest.json")) as _fh:
+        _m = json.load(_fh)
+    run = RunState(out, n_updates=int(_m.get("n_updates", 1)))
     u = run.update(update)
 
     if not u.reached("SCORED"):
@@ -1603,7 +1627,44 @@ def one_step(run_id: str = "", update: int = 0,
         run_dir=out,
         device="cuda",
     )
-    trainer.load(resume_from=None)  # from the untouched parent
+
+    # Adam's moments, the scheduler and the RNG -- NOT just the weights.
+    #
+    # `resume_from=None` builds a FRESH optimizer. Chaining updates by pointing
+    # `--parent-override` at the previous adapter therefore gives correct
+    # weights with zero moment estimates every time: with bias correction, the
+    # first step after a reset is near-full-magnitude regardless of history, so
+    # ten "iterative" updates are ten independent first steps. Nothing in the
+    # logs shows it -- `max_param_delta` reads 1.0e-05 either way, which is
+    # exactly what both engineering updates reported.
+    #
+    # So the optimizer state comes from the update that produced this parent.
+    # `ReOPDTrainer.load` reloads that checkpoint's adapter weights too, which
+    # is what makes the pair consistent: its docstring warns that resuming
+    # CK35's weights with update 19's optimizer "would be neither run".
+    resume_from = None
+    if update > 0:
+        prev = run.update(update - 1).checkpoint_path
+        if not (prev / "optimizer.pt").exists():
+            raise RuntimeError(
+                f"update {update} must resume optimizer state from update "
+                f"{update - 1}, but {prev}/optimizer.pt is missing. Training "
+                "with a fresh optimizer would silently change the recipe at "
+                "every update while every reported metric looked normal."
+            )
+        resume_from = prev
+    elif resume_optimizer_from:
+        resume_from = Path(resume_optimizer_from)
+        if not (resume_from / "optimizer.pt").exists():
+            raise RuntimeError(
+                f"--resume-optimizer-from {resume_from} has no optimizer.pt"
+            )
+
+    loaded = trainer.load(resume_from=resume_from)
+    print(f"trainer: parent_hash={loaded.get('parent_hash')} "
+          f"resumed={loaded.get('resumed')}"
+          + (f" from update {loaded.get('resumed_from_update')}"
+             if loaded.get("resumed") else " (fresh optimizer -- update 0)"))
 
     before = adapter_hash(parent)
     state = run_projected_train_stage(
@@ -2155,7 +2216,7 @@ def main(
         print(f"one-step: TRAINING GPU on {run_id!r} update {classify_update}")
         print("  cached scores only, no teacher pool, no rollout, no endpoint")
         one_step.remote(run_id, classify_update, learning_rate,
-                        parent_override)
+                        parent_override, resume_optimizer_from)
         return
 
     if rescore_only:
