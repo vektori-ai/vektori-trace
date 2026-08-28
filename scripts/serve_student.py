@@ -189,6 +189,14 @@ def main() -> int:
                          "not a limit vLLM enforces — do not tune against it. "
                          "40960 matches model_info's max_input_tokens (40,448) "
                          "and what run6 actually served (default: 40960)")
+    ap.add_argument("--tool-call-parser", default=None,
+                    help="vLLM tool-call parser (`hermes` for Qwen3). Also "
+                         "passes --enable-auto-tool-choice, which vLLM "
+                         "requires alongside it: without both, ANY request "
+                         "carrying `tools` is rejected with HTTP 400 and the "
+                         "endpoint looks healthy until the first tool turn. "
+                         "This repo's Tau2 path assumes `hermes` "
+                         "(vektori_trace/tau2/live_agent.py).")
     ap.add_argument("--reasoning-parser", default=None,
                     help="vLLM reasoning parser (e.g. `qwen3`). Without it a "
                          "thinking model's <think> block stays inside "
@@ -273,6 +281,16 @@ def main() -> int:
         extra_vllm_args += ["--reasoning-parser", args.reasoning_parser]
         print(f"reasoning parser   {args.reasoning_parser} "
               "(think goes to reasoning_content, not into the action JSON)")
+    if args.tool_call_parser:
+        # vLLM rejects any request carrying `tools` with HTTP 400 -- '"auto"
+        # tool choice requires --enable-auto-tool-choice and
+        # --tool-call-parser to be set' -- unless BOTH are passed. The two go
+        # together, so one flag sets both rather than leaving a combination
+        # that fails only when a request actually carries tools.
+        extra_vllm_args += ["--enable-auto-tool-choice",
+                            "--tool-call-parser", args.tool_call_parser]
+        print(f"tool-call parser   {args.tool_call_parser} "
+              "(+ --enable-auto-tool-choice; tool calls arrive structured)")
 
     def _record_app_id(app_id: str) -> None:
         print(f"  MODAL_APP_ID={app_id}", flush=True)
