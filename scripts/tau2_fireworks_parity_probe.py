@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""Does the deployed Fireworks model serialize the way `encoding_dsv4.py` says?
+"""Integer-ID scoring compatibility probe for the DeepSeek deployment.
 
-The whole cross-tokenizer objective rests on one unverified assumption: that
-the DeepSeek deployment behind Fireworks consumes the prompt format our local
-encoder produces. Everything downstream -- byte alignment, chunk advantages,
-the projection -- is computed against `encoding_dsv4.py`'s output. If the
-served model's actual serialization differs, every number is finite, plausible
-and wrong.
+**What this can and cannot prove.** `FireworksTeacherPool.score_ids` posts
 
-Seeing `reasoning_content` or OpenAI-shaped `tool_calls` in a Chat Completions
-response does **not** settle this. Those are Fireworks' *normalized interface*;
-they say nothing about the underlying prompt the model was trained on. Only the
-raw prompt fragments and returned token ids can answer it.
+    prompt = locally_rendered_prefix_ids + payload_ids
 
-What this probe does NOT do
----------------------------
-It does not use Chat Completions. `score_replay_batch` scores through
-`FireworksTeacherPool.score_ids`, which posts an **integer id array** to
-`/completions` with `echo`; a convenient chat request would exercise a
-different code path and prove nothing about the one we bill.
+as an **integer array** to `/completions`. Fireworks applies no chat template to
+an id array -- the serialization was already done here, by `encoding_dsv4.py`.
+So this probe cannot verify "the deployment serializes the way our encoder
+does": there is no server-side templating step to compare against. Claiming
+otherwise would be exactly the kind of plausible-but-wrong assertion this
+repository keeps paying for.
+
+What it *does* verify, which is what the billed path depends on:
+
+- the pinned deployment accepts our locally generated ids at all;
+- echoed ids come back identical -- no retokenization, no indexing shift;
+- returned logprobs align one-for-one with the requested scoring window;
+- the values are finite;
+- the request was served by the model and endpoint we think it was.
+
+The local rendering is verified *offline* instead, and that half is already
+green: the prefix ends at `<｜Assistant｜><think>`, and no `</think><think>`
+boundary appears -- the collision that made a bare `thinking_mode="thinking"`
+flag insufficient and motivated the semantic projection.
 
 Two cases, both tiny:
 
@@ -189,6 +194,16 @@ def main() -> int:
         "thinking_mode": THINKING_MODE,
         "route": "POST /completions via FireworksTeacherPool.score_ids "
                  "(the route score_replay_batch bills)",
+        "proves": [
+            "the deployment accepts locally rendered integer ids",
+            "logprobs align 1:1 with the requested scoring window",
+            "values are finite",
+        ],
+        "does_not_prove": [
+            "that Fireworks' own chat template matches encoding_dsv4.py -- an "
+            "integer-id request is never templated server-side, so there is "
+            "nothing to compare; local rendering is checked offline instead",
+        ],
         "mode": "dry-run" if a.dry_run else "paid",
         "cases": {},
         "ok": True,
@@ -223,20 +238,57 @@ def main() -> int:
             )
 
             prefix_ids = encode_teacher_ids(rendered["prefix_text"], tokenizer)
+            action_ids = list(ids["action_ids"])
             pool = FireworksTeacherPool(model=TEACHER_MODEL)
             t0 = time.time()
-            logps = pool.score_ids(prefix_ids, list(ids["action_ids"]))
+            logps = pool.score_ids(prefix_ids, action_ids)
+
+            # Echo identity: the ids the server scored must be the ids we sent.
+            # A retokenization or an indexing shift is the failure that leaves
+            # every logprob finite and attached to the wrong position, so it is
+            # checked against the raw entries rather than inferred from lengths.
+            echoed_ok = None
+            echoed_detail = ""
+            try:
+                entries = pool._scored_entries(
+                    [int(t) for t in prefix_ids], action_ids, top_k=1
+                )
+                echoed = [e.get("token_id") for e in entries]
+                if any(t is None for t in echoed):
+                    echoed_ok = None
+                    echoed_detail = "entries carry no token_id; cannot verify"
+                else:
+                    echoed_ok = [int(t) for t in echoed] == action_ids
+                    if not echoed_ok:
+                        first = next(
+                            (i for i, (a, b) in enumerate(zip(echoed, action_ids))
+                             if int(a) != b), None
+                        )
+                        echoed_detail = (
+                            f"first divergence at position {first}: "
+                            f"server={echoed[first] if first is not None else '?'} "
+                            f"sent={action_ids[first] if first is not None else '?'}"
+                        )
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                echoed_detail = f"{type(exc).__name__}: {exc}"[:200]
+
             entry["remote"] = {
                 "n_logprobs": len(logps),
-                "lengths_agree": len(logps) == len(ids["action_ids"]),
+                "n_action_ids": len(action_ids),
+                "lengths_agree": len(logps) == len(action_ids),
                 "all_finite": all(
                     x == x and abs(x) != float("inf") for x in logps
                 ),
+                "echoed_ids_match": echoed_ok,
+                "echoed_detail": echoed_detail,
                 "logprobs_head": [round(float(x), 4) for x in logps[:8]],
                 "seconds": round(time.time() - t0, 2),
+                "provenance": pool.provenance(),
             }
             if not (entry["remote"]["lengths_agree"]
                     and entry["remote"]["all_finite"]):
+                report["ok"] = False
+            if echoed_ok is False:
                 report["ok"] = False
 
         report["cases"][case["name"]] = entry
