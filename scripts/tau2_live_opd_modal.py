@@ -80,6 +80,14 @@ TAU2_COMMIT = "f8de30c"
 #: `fireworks_ai/` prefix is what routes it off OpenAI.
 USER_MODEL = "fireworks_ai/accounts/fireworks/models/deepseek-v4-flash-0731"
 
+#: Tau2's domain data (db.json, policy.md, tasks.json), staged on the volume.
+#: The pip install ships CODE ONLY -- with no TAU2_DATA_DIR, tau2 computes
+#: `Path(tau2/utils/utils.py).parents[3]/data`, which under site-packages
+#: resolves to the nonsensical /usr/local/lib/python3.12/data and every domain
+#: load raises FileNotFoundError. Caught by the no-spend preflight 2026-08-28.
+#: `TAU2_DATA_DIR` is tau2's own documented override (utils.py:17).
+TAU2_DATA_IN_VOLUME = "tau2/tau2_data"
+
 app = modal.App("tau2-live-opd")
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=False)
 hf_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=False)
@@ -114,6 +122,10 @@ image = (
     .env({
         "HF_HOME": HF_CACHE_MOUNT,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        # Points tau2 at the domain data staged on the volume. Without it the
+        # package resolves a path that does not exist and every retail load
+        # fails -- after the GPU would have been allocated.
+        "TAU2_DATA_DIR": f"{VOLUME_MOUNT}/{TAU2_DATA_IN_VOLUME}",
     })
     .add_local_dir("vektori_trace", remote_path="/root/vektori_trace",
                    ignore=["__pycache__"])
@@ -425,6 +437,21 @@ def preflight(tau2_src: str = "") -> dict:
         import torch
         return {"cuda_available": torch.cuda.is_available()}
 
+    def _domain_data():
+        root = os.environ.get("TAU2_DATA_DIR")
+        if not root:
+            raise KeyError(
+                "TAU2_DATA_DIR unset; tau2 would resolve its data dir relative "
+                "to site-packages and every retail load would fail"
+            )
+        need = os.path.join(root, "tau2", "domains", "retail")
+        missing = [f for f in ("db.json", "policy.md", "tasks.json")
+                   if not os.path.isfile(os.path.join(need, f))]
+        if missing:
+            raise FileNotFoundError(f"{need} missing {missing}")
+        return {"data_dir": root, "retail": "complete"}
+
+    check("tau2_domain_data", _domain_data)
     check("parent_adapter", _parent)
     check("tau2_importable", _tau2)
     check("retail_tools", _tools)
