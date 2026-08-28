@@ -20,9 +20,17 @@ why this driver exists rather than another capture script.
 
 Staged, and each stage separately authorized:
 
-    --dry-run       no endpoint, no teacher, no GPU: plan and validate only
-    --canary        one update, then stop (small paid spend)
-    --yes           the full multi-update run
+    --dry-run            no endpoint, no teacher, no GPU: plan and validate only
+    --canary             one update, then stop (small paid spend)
+    --two-update-proof   exactly two updates: the smallest run that proves
+                         checkpoint -> reload -> rollout from the NEW adapter
+    --yes                the full multi-update run
+
+`--canary` deliberately cannot prove the loop. One update ends at a saved
+checkpoint, so it exercises everything *except* the transition this driver
+exists for. `--two-update-proof` is its own authorization rather than a flavour
+of `--yes` for that reason: it is the cheapest run that can fail in the way
+that matters.
 
 Nothing here is authorized to spend by default. A GPU or paid teacher call
 requires explicit per-run approval; see CLAUDE.md.
@@ -160,8 +168,12 @@ def run_update(
         prev = run.update(idx - 1)
         prev.validate_checkpoint()
         refresh_live_policy(args, idx, prev.checkpoint_path, run_dir=args.run_dir)
+        # `refresh_live_policy` advanced both the served name and the adapter
+        # hash. Carrying the old hash here would archive this update's episodes
+        # under the parent SFT adapter while sampling from the new one.
         settings = RolloutSettings(
             **{**settings.__dict__, "student_model": args.student_model,
+               "adapter_hash": args.adapter_hash,
                "policy_version": policy_version}
         )
 
@@ -275,7 +287,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="plan and validate only: no endpoint, teacher or GPU")
     p.add_argument("--canary", action="store_true",
-                   help="one update only, then stop")
+                   help="one update only, then stop. Proves SAMPLED -> SCORED "
+                        "-> TRAINED -> checkpoint, but NOT the reload and "
+                        "next-policy rollout; use --two-update-proof for that")
+    p.add_argument("--two-update-proof", action="store_true",
+                   help="exactly two updates: the smallest run that proves "
+                        "checkpoint -> serving reload -> update-1 rollout from "
+                        "the NEW adapter. Separately authorized from --yes.")
     p.add_argument("--yes", action="store_true",
                    help="required for the full multi-update paid run")
     return p.parse_args()
@@ -290,7 +308,20 @@ def main() -> int:
     if not a.seeds:
         raise SystemExit("--seeds must name at least one seed")
 
-    n_updates = 1 if a.canary else a.n_updates
+    if a.canary and a.two_update_proof:
+        raise SystemExit(
+            "--canary and --two-update-proof are different authorizations; "
+            "pass exactly one"
+        )
+    if a.two_update_proof:
+        # Exactly two. The whole point is the transition between them, and a
+        # third update buys nothing this proof is for while costing another
+        # full batch of teacher calls.
+        n_updates = 2
+    elif a.canary:
+        n_updates = 1
+    else:
+        n_updates = a.n_updates
     a.run_dir = a.run_dir or f"runs/live-opd-{time.strftime('%Y%m%d-%H%M%S')}"
 
     n_episodes = len(a.task_ids) * len(a.seeds)
@@ -338,7 +369,8 @@ def main() -> int:
         # corpus by the empty-think wrapper. Recording it means a later reader
         # does not have to infer which convention a run used.
         "prompt_boundary": "generation-prompt (no empty-think wrapper)",
-        "mode": "canary" if a.canary else "full",
+        "mode": ("two-update-proof" if a.two_update_proof
+                 else "canary" if a.canary else "full"),
     }
 
     if a.dry_run:
@@ -357,10 +389,18 @@ def main() -> int:
         log("  nothing sampled, scored, or trained")
         return 0
 
-    if not a.canary and not a.yes:
+    if not (a.canary or a.two_update_proof or a.yes):
         raise SystemExit(
             "refusing the full run without --yes. Use --dry-run to validate, "
-            "or --canary for one small paid update first."
+            "--canary for one small paid update, or --two-update-proof for the "
+            "smallest run that proves the reload and next-policy rollout."
+        )
+    if a.two_update_proof and not a.reload_url:
+        raise SystemExit(
+            "--two-update-proof requires --reload-url (or STUDENT_RELOAD_URL): "
+            "the transition it exists to prove IS the serving reload, and "
+            "without it update 1 would resample the same policy as update 0 "
+            "while reporting success."
         )
     if not a.api_base:
         raise SystemExit("--api-base is required (or set STUDENT_API_BASE)")
@@ -472,9 +512,13 @@ def main() -> int:
     for idx in range(start, n_updates):
         log(f"update {idx}/{n_updates - 1}")
         policy_version = f"live-u{idx:03d}"
+        # `a.student_model` and `a.adapter_hash` both advance inside
+        # `refresh_live_policy`; read them together so the served policy and
+        # its recorded identity can never disagree.
         settings = RolloutSettings(
             **{**settings.__dict__, "policy_version": policy_version,
-               "student_model": a.student_model}
+               "student_model": a.student_model,
+               "adapter_hash": a.adapter_hash}
         )
         run_update(
             idx,

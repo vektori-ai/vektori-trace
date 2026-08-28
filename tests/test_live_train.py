@@ -358,3 +358,77 @@ def test_train_is_idempotent_across_a_resume(tmp_path, monkeypatch):
             max_new_tokens=4096,
         )
     assert len(trainer.steps) == 1
+
+
+# --- adapter-hash propagation ----------------------------------------------
+
+
+def _checkpoint(path, adapter_hash="adapter-u000"):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.json").write_text(json.dumps({
+        "update_index": 0, "policy_version": "live-u000",
+        "adapter_hash": adapter_hash, "parent_policy_hash": "p",
+        "rng_state": "r", "scheduler_state": {}, "reload_verified": True,
+    }))
+    return path
+
+
+class _Args:
+    """The argparse namespace `refresh_live_policy` mutates."""
+
+    def __init__(self):
+        self.api_base = "http://student"
+        self.initial_served_name = "a-sft-new"
+        self.served_name = "a-sft-new"
+        self.student_model = "a-sft-new"
+        self.adapter_hash = "sft-parent-hash"
+        self.probe_prompt_ids = [1, 2, 3]
+        self.probe_logprobs = [-0.1]
+        self.reload_url = "http://reload"
+
+
+def _patch_refresh(monkeypatch):
+    import vektori_trace.tau2.reopd_refresh as rr
+    monkeypatch.setattr(
+        rr, "refresh_policy",
+        lambda *a, **kw: {"probe_logprobs": [-0.2], "max_logprob_delta": 0.4},
+    )
+
+
+def test_refresh_advances_the_adapter_hash(tmp_path, monkeypatch):
+    """The hash is stamped on every archived episode. Leaving it at the parent
+    after repointing the endpoint makes update 1 sample the new adapter while
+    claiming the SFT one -- and every episode in the batch would agree, so
+    nothing downstream catches it."""
+    from vektori_trace.tau2.live_train import refresh_live_policy
+
+    _patch_refresh(monkeypatch)
+    cp = _checkpoint(tmp_path / "update-000" / "checkpoint")
+    args = _Args()
+
+    refresh_live_policy(args, 1, cp, run_dir=tmp_path)
+
+    assert args.adapter_hash == "adapter-u000"
+    assert args.student_model == "a-sft-new-u000"
+    assert args.served_name == "a-sft-new-u000"
+    assert args.probe_logprobs == [-0.2]
+
+
+def test_refresh_refuses_a_checkpoint_with_no_hash(tmp_path, monkeypatch):
+    from vektori_trace.tau2.live_train import refresh_live_policy
+
+    _patch_refresh(monkeypatch)
+    cp = tmp_path / "update-000" / "checkpoint"
+    cp.mkdir(parents=True)
+    (cp / "state.json").write_text(json.dumps({"update_index": 0}))
+
+    with pytest.raises(LiveTrainError, match="records no adapter_hash"):
+        refresh_live_policy(_Args(), 1, cp, run_dir=tmp_path)
+
+
+def test_refresh_refuses_an_unreadable_checkpoint(tmp_path, monkeypatch):
+    from vektori_trace.tau2.live_train import refresh_live_policy
+
+    _patch_refresh(monkeypatch)
+    with pytest.raises(LiveTrainError, match="cannot read"):
+        refresh_live_policy(_Args(), 1, tmp_path / "nope", run_dir=tmp_path)

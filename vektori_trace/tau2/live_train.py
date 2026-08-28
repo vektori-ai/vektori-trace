@@ -294,8 +294,34 @@ def refresh_live_policy(
 
     Update 0 needs no refresh: the SFT checkpoint *is* the current policy there,
     which is why a one-update canary is valid against a static endpoint.
+
+    **The adapter hash moves with the policy.** `RolloutSettings.adapter_hash`
+    is stamped onto every archived episode and is what `batch_report` checks a
+    batch against. Leaving it at the parent SFT hash after the endpoint has
+    been repointed produces a batch that samples from update *k-1*'s adapter
+    while claiming provenance of the SFT one -- a contradiction no assertion
+    downstream would catch, because every episode in the batch agrees with
+    every other. So the new hash is read from the checkpoint that was just
+    served, and a checkpoint that cannot state its own hash is refused rather
+    than defaulted.
     """
     from vektori_trace.tau2.reopd_refresh import refresh_policy
+
+    state_path = Path(checkpoint_path) / "state.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise LiveTrainError(
+            f"cannot read {state_path} to learn the adapter hash update "
+            f"{idx - 1} produced: {exc}. Refusing to sample update {idx} while "
+            "archiving the previous adapter's provenance."
+        ) from exc
+    new_hash = state.get("adapter_hash")
+    if not new_hash:
+        raise LiveTrainError(
+            f"{state_path} records no adapter_hash; update {idx} would archive "
+            "episodes under the wrong adapter identity"
+        )
 
     name = f"{args.initial_served_name}-u{idx - 1:03d}"
     rep = refresh_policy(
@@ -309,11 +335,16 @@ def refresh_live_policy(
     )
     args.student_model = name
     args.served_name = name
+    args.adapter_hash = new_hash
     args.probe_logprobs = rep["probe_logprobs"]
     log(
         f"  endpoint now serves {name} "
-        f"(probe delta {rep.get('max_logprob_delta', 'n/a')})"
+        f"(adapter {str(new_hash)[:16]}, "
+        f"probe delta {rep.get('max_logprob_delta', 'n/a')})"
     )
-    telemetry(run_dir, {"event": "refresh", "update": idx, **rep})
+    telemetry(
+        run_dir,
+        {"event": "refresh", "update": idx, "adapter_hash": new_hash, **rep},
+    )
     commit_scores("refresh", required=False)
     return rep
