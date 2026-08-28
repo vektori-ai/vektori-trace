@@ -106,7 +106,11 @@ image = (
     # so installing it here is what makes a live rollout possible at all. A
     # floating branch would let the grader and tool schemas change underneath a
     # run, which is exactly what `tools.load_domain_tools` exists to prevent.
-    .pip_install(f"tau2-bench @ git+{TAU2_REPO}@{TAU2_COMMIT}")
+    # `tau2`, NOT `tau2-bench`. The repo is named tau2-bench but its
+    # pyproject declares `name = "tau2"`, and pip refuses the mismatch:
+    #   "has inconsistent name: expected 'tau2-bench', but metadata has 'tau2'"
+    # Caught by the no-spend preflight 2026-08-28 before any GPU was allocated.
+    .pip_install(f"tau2 @ git+{TAU2_REPO}@{TAU2_COMMIT}")
     .env({
         "HF_HOME": HF_CACHE_MOUNT,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
