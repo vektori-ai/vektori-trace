@@ -68,7 +68,11 @@ from __future__ import annotations
 #:   JSON serialization, `<|im_end|>` and boundary-straddling tokens all carry
 #:   zero weight. Tool calls are conditioned on but never credited, because
 #:   Hermes JSON and DeepSeek DSML share no bytes to map through.
-PROJECTION_VERSION = "v1"
+#: - "v2" (2026-08-29): additionally excludes the whitespace run immediately
+#:   inside each payload boundary. Qwen opens `<think>\n`, DeepSeek does not,
+#:   so that newline drew -15..-23 in 11/11 canary turns and would have been
+#:   the batch's dominant gradient. Interior whitespace stays supervised.
+PROJECTION_VERSION = "v2"
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -184,9 +188,40 @@ def _find_payload_spans(raw: str, reasoning: str | None, content: str | None) ->
                 f"{search_from}; the byte range that carries the teacher score "
                 "is ambiguous, and picking one would be a guess"
             )
-        spans.append(PayloadSpan(kind, idx, idx + len(payload)))
+        start, end = _trim_boundary_whitespace(raw_b, idx, idx + len(payload))
+        if start < end:
+            spans.append(PayloadSpan(kind, start, end))
         search_from = idx + len(payload)
     return spans
+
+
+#: Bytes treated as serialization when they sit against a payload boundary.
+_WS = b" \t\r\n"
+
+
+def _trim_boundary_whitespace(raw_b: bytes, start: int, end: int) -> tuple[int, int]:
+    """Drop whitespace that hugs a payload boundary; keep the body intact.
+
+    Measured 2026-08-29 on the one-episode canary: **every** action opened
+    `<think>\nOkay`, Qwen gave that first newline a logprob of ~0 (it treats it
+    as mandatory), and DeepSeek gave it -15 to -23. In 11/11 turns the single
+    most negative supervised token was `'\n'` at action index 1. That is a
+    family-format preference -- where each model puts its newline after the
+    reasoning opener -- not feedback about the reasoning.
+
+    Left in, it dominates the gradient: the largest training signal in the
+    batch would be "delete the newline Qwen's own template requires".
+
+    Only the wrapper-adjacent run is serialization. Whitespace *inside* the
+    reasoning body is authored -- paragraph breaks, list formatting, the rhythm
+    of the argument -- and stays supervised. So this trims the leading and
+    trailing runs and touches nothing between them.
+    """
+    while start < end and raw_b[start:start + 1] in (b" ", b"\t", b"\r", b"\n"):
+        start += 1
+    while end > start and raw_b[end - 1:end] in (b" ", b"\t", b"\r", b"\n"):
+        end -= 1
+    return start, end
 
 
 def project_action(

@@ -130,5 +130,9 @@ class TestAccountingIsComplete:
 
 
 def test_projection_version_pinned():
-    """Bound into score fingerprints; a change must invalidate caches."""
-    assert PROJECTION_VERSION == "v1"
+    """Bound into score fingerprints; a change must invalidate caches.
+
+    v2 (2026-08-29) additionally excludes the whitespace run hugging each
+    payload boundary -- see test_projection_boundary_whitespace.py.
+    """
+    assert PROJECTION_VERSION == "v2"

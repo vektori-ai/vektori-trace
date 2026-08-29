@@ -626,6 +626,27 @@ def run_projected_train_stage(
     log(f"  trained in {train_s}s; loss={(opt or {}).get('loss')} "
         f"adapter={state.get('adapter_hash')} "
         f"supervised={batch.global_supervised_tokens}")
+
+    # The optimizer's own metrics travel with the checkpoint state. They live
+    # in `report.json` under "optimizer", but callers get `state` -- so before
+    # 2026-08-29 every caller printed `loss: None` while the trainer had just
+    # logged a real number. Over a 10-update run that silently disables the
+    # only per-update signal a stop condition could watch.
+    #
+    # Absence is a hard failure rather than a None: a step that reports no loss
+    # is a step nobody can supervise, and on a paid multi-update run that must
+    # stop the run, not decorate it.
+    for k in ("loss", "grad_norm"):
+        v = (opt or {}).get(k)
+        if v is None:
+            raise LiveTrainError(
+                f"trainer returned no {k!r} for update {update.index}. A paid "
+                "update whose metrics are missing cannot be monitored or "
+                "stopped on; refusing to report it as a clean step."
+            )
+        state[k] = v
+    state["n_examples"] = (opt or {}).get("n_examples")
+    state["global_supervised_tokens"] = batch.global_supervised_tokens
     return state
 
 
