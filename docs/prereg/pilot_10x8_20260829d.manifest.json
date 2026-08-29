@@ -521,7 +521,7 @@
     "reason": "update-0 rollout refused its exact batch: 2 episodes (68, 108) were valid implicit-boundary generations failed by a stale literal-</think> archive gate, and 1 (task 95 turn 7) was a genuine no-boundary generation. No .SAMPLED, no teacher call, no optimizer step; parent untouched.",
     "note": "c's archive is preserved unchanged and its 1/8 genuine format failure counts toward the reported rate."
   },
-  "code_commit": "f67692b739ddae6017331352488fca3394e84717",
+  "code_commit": "7fc08bbf3046a5998d3417d3d4c4af1d9d2391d5",
   "embedded_two_update_proof": {
     "updates": [
       0,
@@ -580,7 +580,8 @@
       "multiple openers, unpaired closer, malformed tool JSON"
     ],
     "fixed_2026_08_29": "verify_episode required a literal </think>, which is v1 logic. It failed tasks 68 and 108 whose reasoning was captured (2,193 and 2,056 chars) with 3 and 1 tool calls parsed. Update 0 would have been 7/8, not 5/8.",
-    "parser_version": "v3"
+    "parser_version": "v3",
+    "projection_version": "v4"
   },
   "retry_policy": {
     "rationale": "retrying until eight episodes happen to be format-valid selects lucky trajectories and hides the model's real failure rate. Bounded retries keep the run honest; the failure rate is itself a primary outcome.",
@@ -622,7 +623,46 @@
       "p_both_attempts_fail": 0.41,
       "note": "So ~2 in 3 updates fail the exact-batch gate on the first attempt, and ~41% exhaust the one-retry budget. An earlier draft said ~1 in 3 and ~1 in 9; that was wrong -- it conflated P(>=2 failures)=25% with P(>=1 failure)=64%. This is the real tax of require_reasoning on this SFT lineage and is a measurement, not an obstacle."
     },
-    "declared_conditional_sampling": "training batches are conditioned on format validity, so the pilot stays SIGNAL-SEEKING and is not clean efficacy evidence."
+    "declared_conditional_sampling": "training batches are conditioned on format validity, so the pilot stays SIGNAL-SEEKING and is not clean efficacy evidence.",
+    "retention_stop_rule": {
+      "declared_prospectively": "Set BEFORE seeing updates 1-9, so it cannot be chosen after the fact to accommodate whatever occurs.",
+      "stop_if": [
+        "total supervised-token retention in any update falls below 0.90",
+        "interleaved-tool exclusions exceed 2 of 8 episodes in any update, or 10% of reasoning bytes"
+      ],
+      "rationale": "Update 0 measured 0.9098 retention with 1/75 actions affected. A drift below 0.90, or interleaving becoming more than occasional, means the projection is losing enough signal that the run is measuring its own coverage rather than OPD.",
+      "note": "The true frequency of interleaving is UNKNOWN -- one observation on 75 actions. Later updates may show none or several."
+    }
   },
-  "code_commit_note": "The commit containing the retry/parser/projection implementation this run uses. Corrected twice, both times because the pin named code that predated a fix the run depends on:\n  f68edfc -- pre-fix retry: bulk-copied events/simulations and skipped the status/attempt/roster/plan-hash validations.\n  edefb83 -- had those validations but NOT the nested-payload event filter; a real events row carries its episode id inside `payload`, not at the top level, so that version matched nothing and would have copied all 17 of the retried episode's rows into the destination. The leak guard caught it on the first real invocation.\nArtifacts produced under either hash are not this experiment. This field names the CODE commit; the manifest edit that sets it is necessarily a later commit, since a commit cannot contain its own hash. Verify with `git merge-base --is-ancestor f67692b HEAD`."
+  "code_commit_note": "The commit containing the projection/parser/retry implementation this run uses (PROJECTION_VERSION v4, PARSER_VERSION v3, chunk-v2). Earlier drafts pinned f68edfc (pre-fix retry: bulk-copied events, no validations) and edefb83 (lacked the nested-payload event filter). Artifacts produced under either are not this experiment.",
+  "declared_exclusions": {
+    "interleaved_tool_calls_in_reasoning": {
+      "what": "Qwen sometimes emits <tool_call> blocks INSIDE <think>. The tool JSON is excluded (DeepSeek never sees Hermes serialization), leaving the reasoning discontiguous. A PayloadSpan is one byte range, so that payload is SKIPPED rather than scored.",
+      "observed_update_0": {
+        "actions_affected": 1,
+        "actions_total": 75,
+        "reasoning_bytes_excluded": 8611,
+        "reasoning_bytes_total": 201909,
+        "pct_reasoning_bytes": 4.7,
+        "retention_after": 0.9098,
+        "identities": [
+          "u000-task76-seed0@9#0"
+        ]
+      },
+      "why_not_fixed_now": "Multi-segment support (980e06f) passed every mechanical gate at 94.8% retention and was reverted: it left Hermes markup inside the text sent to DeepSeek as reasoning_content, so the teacher scored later segments conditioned on foreign notation, and _locate's cursor-less find() could map identical segments to the same occurrence. A stub-teacher dry-run cannot detect either. Applying contaminated credit is worse than losing 4.7% of reasoning bytes.",
+      "proper_fix_requires": [
+        "remove tool blocks from the TEACHER's reasoning context, not merely from supervised student indices",
+        "define what context each later reasoning segment is scored under",
+        "locate segments monotonically by occurrence, never plain find()",
+        "bump PROJECTION_VERSION and re-pin the manifest",
+        "verify with a non-stub teacher, not only the dry-run"
+      ],
+      "per_update_reporting": [
+        "number and percentage of affected actions",
+        "reasoning bytes excluded",
+        "total retention",
+        "task/turn identities"
+      ]
+    }
+  }
 }
