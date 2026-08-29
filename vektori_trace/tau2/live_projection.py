@@ -358,6 +358,7 @@ def project_action(
     # is actually supervised: shrink it to the byte range its surviving tokens
     # cover. Nothing is added -- only the unscoreable edge is given up.
     if out.payloads:
+        raw_b = raw_text.encode("utf-8")
         bounds: dict[str, tuple[int, int]] = {}
         pos = 0
         for i, tok in enumerate(token_bytes):
@@ -372,7 +373,32 @@ def project_action(
             b = bounds.get(sp.kind)
             if b is None:
                 continue  # every token of this payload was excluded
-            rebuilt.append(PayloadSpan(sp.kind, b[0], b[1]))
+            lo, hi = b
+            # Reconciling to whole tokens can RE-ADD boundary whitespace the
+            # trim removed: when the last reasoning token is `'.\n'`, it
+            # straddles the trimmed end and is excluded, but the surviving
+            # token before it ends at a byte range that once more includes a
+            # trailing newline. Re-trim, then drop any token no longer wholly
+            # inside -- otherwise the span disagrees with `normalize_payload`
+            # and `score_live_action` refuses the action (observed on
+            # u000-task76-seed0@8#0, 2026-08-29).
+            lo, hi = _trim_boundary_whitespace(raw_b, lo, hi)
+            if lo >= hi:
+                for i, kind in list(out.supervised.items()):
+                    if kind == sp.kind:
+                        del out.supervised[i]
+                        out.excluded[i] = EXCLUDE_STRADDLE
+                continue
+            pos = 0
+            for i, tok in enumerate(token_bytes):
+                nxt = pos + len(tok)
+                if out.supervised.get(i) == sp.kind and not (
+                    pos >= lo and nxt <= hi
+                ):
+                    del out.supervised[i]
+                    out.excluded[i] = EXCLUDE_STRADDLE
+                pos = nxt
+            rebuilt.append(PayloadSpan(sp.kind, lo, hi))
         out.payloads = rebuilt
 
     return out

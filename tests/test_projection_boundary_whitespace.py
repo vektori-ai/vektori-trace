@@ -143,3 +143,53 @@ def test_fingerprint_changes_with_projection_version(monkeypatch):
     assert live_score_fingerprint(row) != now, (
         "a v1 score row must not pass fingerprint reuse under v2"
     )
+
+
+class TestReconciliationDoesNotReAddWhitespace:
+    """Span reconciliation must not undo the trim at the boundary.
+
+    Observed on u000-task76-seed0@8#0 (2026-08-29). The last reasoning token
+    was `'.\n'`: it straddles the trimmed end, so it is excluded -- but
+    shrinking the span back to whole surviving tokens re-included a trailing
+    newline. `score_live_action`'s symmetry assert then refused the action,
+    because the student span no longer matched what was rendered to DeepSeek.
+    """
+
+    def test_trailing_dot_newline_token(self):
+        raw = "<think>\nOkay, do the thing.\n</think>Done."
+        toks = [b"<think>", b"\n", b"Okay, do the thing", b".\n",
+                b"</think>", b"Done."]
+        p = project_action(raw, toks)
+        for sp in p.payloads:
+            payload = raw.encode("utf-8")[sp.byte_start:sp.byte_end].decode()
+            from vektori_trace.tau2.live_projection import normalize_payload
+            assert payload == normalize_payload(payload)[0], (
+                f"{sp.kind} span carries boundary whitespace: {payload[-20:]!r}")
+        assert 3 not in p.supervised, "the '.\\n' straddler must be excluded"
+
+    def test_every_span_is_normalized(self):
+        """The invariant score_live_action asserts."""
+        from vektori_trace.tau2.live_projection import normalize_payload
+        cases = [
+            ("<think>\nA.\n</think>B.", [b"<think>", b"\n", b"A", b".\n",
+                                        b"</think>", b"B."]),
+            ("<think>\nA\n\nB.\n</think>C", [b"<think>", b"\n", b"A", b"\n\n",
+                                             b"B", b".\n", b"</think>", b"C"]),
+            ("<think>\nA.\n</think>\nB\n", [b"<think>", b"\n", b"A", b".\n",
+                                            b"</think>", b"\n", b"B", b"\n"]),
+        ]
+        for raw, toks in cases:
+            p = project_action(raw, toks)
+            for sp in p.payloads:
+                payload = raw.encode("utf-8")[sp.byte_start:sp.byte_end].decode()
+                assert payload == normalize_payload(payload)[0], (
+                    f"{raw!r} -> {sp.kind} span {payload!r}")
+
+    def test_interior_blank_line_survives_reconciliation(self):
+        raw = "<think>\nFirst.\n\nSecond.\n</think>Done."
+        toks = [b"<think>", b"\n", b"First", b".\n\n", b"Second", b".\n",
+                b"</think>", b"Done."]
+        p = project_action(raw, toks)
+        sup = b"".join(toks[i] for i in sorted(p.supervised)
+                       if p.supervised[i] == "reasoning").decode()
+        assert "First" in sup and "Second" in sup
