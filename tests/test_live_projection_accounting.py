@@ -135,4 +135,4 @@ def test_projection_version_pinned():
     v2 (2026-08-29) additionally excludes the whitespace run hugging each
     payload boundary -- see test_projection_boundary_whitespace.py.
     """
-    assert PROJECTION_VERSION == "v3"
+    assert PROJECTION_VERSION == "v4"

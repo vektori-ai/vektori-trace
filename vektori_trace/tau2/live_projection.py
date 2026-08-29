@@ -78,7 +78,24 @@ from __future__ import annotations
 #:   teacher token straddle the payload start on nearly every turn and dropped
 #:   retention to 11.1%. The teacher-rendered bytes change, so scores bought
 #:   under v2 are not reusable.
-PROJECTION_VERSION = "v3"
+#: - "v4" (2026-08-29): span reconciliation iterates to a fixed point, so a
+#:   span never claims bytes its surviving tokens do not cover. Trimming can
+#:   orphan a token, dropping it shrinks the range, and the new range can
+#:   again end in whitespace. A fused boundary token (`b'.\n'`, `b'.\n\n'` --
+#:   both confirmed present in captured output) is excluded WHOLE, period
+#:   included: one weight covers the whole token, so keeping the period would
+#:   put gradient on the newline. Interior whitespace stays supervised.
+#:
+#:   NOT in v4: multi-segment payloads. Tool calls emitted inside reasoning
+#:   leave it discontiguous; that payload is SKIPPED rather than scored.
+#:   An attempt at multi-segment support (980e06f) passed every mechanical
+#:   gate at 94.8% retention and was reverted: it left Hermes `<tool_call>`
+#:   markup inside the text sent to DeepSeek as `reasoning_content`, so the
+#:   teacher read foreign notation and scored later segments conditioned on
+#:   it, and `_locate`'s cursor-less `find()` could map identical segments to
+#:   the same occurrence. Skipping loses ~4.7% of reasoning bytes; the
+#:   alternative applied contaminated credit.
+PROJECTION_VERSION = "v4"
 
 from dataclasses import dataclass, field
 from typing import Any

@@ -92,7 +92,7 @@ class TestRehearsal:
     def test_versions_are_recorded(self, corpus):
         rep = _MOD.rehearse(corpus)
         assert rep["parser_version"] == "v3"
-        assert rep["projection_version"] == "v3"
+        assert rep["projection_version"] == "v4"
         assert rep["score_algorithm"] == "chunk-v2"
 
     def test_declares_the_teacher_is_fake(self, corpus):
