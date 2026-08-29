@@ -321,7 +321,7 @@ def score_live_action(
                 "whitespace after projection; student and teacher payloads "
                 "would not be byte-identical"
             )
-        d_start, d_end = _locate(action_text_ds, payload_text, span.kind)
+        d_start, d_end = _locate(action_text_ds, payload_text, span.label)
         d_start_b = len(action_text_ds[:d_start].encode("utf-8"))
         d_end_b = len(action_text_ds[:d_end].encode("utf-8"))
 
@@ -340,16 +340,21 @@ def score_live_action(
         if straddle or not t_pieces:
             # A teacher token crossing the payload boundary cannot be split, so
             # the payload is skipped rather than scored on a guessed fraction.
-            report[span.kind] = {"skipped": "teacher token straddles boundary"}
+            report[span.label] = {"skipped": "teacher token straddles boundary"}
             for i, kind in list(projected.supervised.items()):
-                if kind == span.kind:
+                if kind == span.label:
                     out.excluded[i] = "teacher_boundary_straddle"
             continue
 
-        s_indices = [i for i, k in projected.supervised.items() if k == span.kind]
+        # Select by LABEL, not kind: a reasoning payload interrupted by tool
+        # calls is split into `reasoning`, `reasoning#1`, ... and selecting by
+        # kind would pool every segment's tokens against one segment's teacher
+        # bytes.
+        s_indices = [i for i, k in projected.supervised.items()
+                     if k == span.label]
         s_pieces = [student_token_bytes[i] for i in sorted(s_indices)]
         if b"".join(s_pieces) != b"".join(t_pieces):
-            report[span.kind] = {"skipped": "student/teacher payload bytes differ"}
+            report[span.label] = {"skipped": "student/teacher payload bytes differ"}
             for i in s_indices:
                 out.excluded[i] = "payload_bytes_disagree"
             continue
@@ -365,7 +370,7 @@ def score_live_action(
             idx = tuple(ordered[si] for si in chunk.student_idx)
             out.chunks.append(
                 ProjectedChunk(
-                    chunk_id=f"{span.kind}:{ci}",
+                    chunk_id=f"{span.label}:{ci}",
                     kind=span.kind,
                     student_idx=idx,
                     teacher_logprobs=lps,
@@ -375,7 +380,7 @@ def score_live_action(
             share = sum(lps) / len(idx)
             for i in idx:
                 out.teacher_logprob_by_index[i] = share
-        report[span.kind] = {
+        report[span.label] = {
             "n_student_tokens": len(s_pieces),
             "n_teacher_tokens": len(t_pieces),
             "n_chunks": len(alignment.spans),
