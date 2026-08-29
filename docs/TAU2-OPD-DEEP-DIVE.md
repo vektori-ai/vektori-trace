@@ -661,18 +661,48 @@ correction, not checkpoint selection or replacement sampling.
 
 No GPU, endpoint, rollout, teacher call or training step is authorized until:
 
-1. implicit Qwen tool-call reasoning boundaries match pinned vLLM behavior and
-   pass raw-byte/span/execution/projection tests;
+1. ~~implicit Qwen tool-call reasoning boundaries match pinned vLLM behavior
+   and pass raw-byte/span/execution/projection tests~~ — **met** 2026-08-29
+   (`eb2a79e`). `PARSER_VERSION = "v2"`; one resolver shared by
+   `split_generation` and `_reasoning_byte_span` so the parse and the scored
+   byte span cannot disagree. Ambiguity still refuses: multiple openers, an
+   unpaired closer, empty reasoning, an incomplete tool call.
 2. ~~N:1 and M:N advantages match `chunk_opd.py` exactly~~ — **met**
    2026-08-29 (`4b82d09`); chunk identity carried through scoring, persistence
-   and resume, arithmetic delegated to `chunk_opd`;
-3. teacher `thinking_mode` and parser contract are fingerprinted;
-4. score reuse checks fingerprints and stale rows cannot duplicate keys;
-5. content-boundary loss is measured and resolved or explicitly preregistered;
+   and resume, arithmetic delegated to `chunk_opd`.
+3. ~~teacher `thinking_mode` and parser contract are fingerprinted~~ — **met**
+   2026-08-29 (`eb2a79e`). `live_score_fingerprint` binds `PARSER_VERSION`,
+   `PROJECTION_VERSION`, `SCORE_ALGORITHM`, `thinking_mode` and
+   tokenizer/teacher identity, so the parser change in gate 1 invalidates
+   every score bought under the old splitter.
+4. ~~score reuse checks fingerprints and stale rows cannot duplicate keys~~ —
+   **met** 2026-08-29 (`eb2a79e`). Reuse requires exact fingerprint equality;
+   a rescore replaces atomically and pre-existing duplicates collapse.
+5. ~~content-boundary loss is measured and resolved or explicitly
+   preregistered~~ — **met (preregistered)** 2026-08-29 (`eb2a79e`).
+   `PROJECTION_VERSION = "v1"` supervises reasoning and visible content only;
+   Qwen markup, Hermes tool JSON, `<|im_end|>` and boundary-straddling tokens
+   carry zero weight and are counted by reason, with `retained_fraction`
+   reported every run. **Tool calls are conditioned on but never credited** —
+   Hermes JSON and DeepSeek DSML share no bytes to map through. This is a
+   declared scope limit, not a defect, and it is why this arm is an
+   *adaptation* of the paper's cross-tokenizer OPD rather than a reproduction.
 6. rollout retry semantics and `--start-at` guards match the runbook;
 7. a fresh manifest freezes the unchanged 80-pair schedule and records the
    amendment;
-8. CPU-only tests and a no-teacher scoring dry run pass.
+8. ~~CPU-only tests and a no-teacher scoring dry run pass~~ — **met**
+   2026-08-29. Full suite green; `scripts/tau2_offline_rehearsal.py` runs
+   archived actions through the real parser, projector and chunk-advantage
+   code with a deterministic fake teacher, and a mocked two-update rehearsal
+   proves Adam-state continuation and update-1-parented-on-update-0 lineage.
+
+   **What the rehearsal cannot prove.** Score rows archived before 2026-08-29
+   hold only flat per-token credit whose chunk grouping is unrecoverable, so
+   no genuine post-repair numerical replay can be produced from them — that
+   they are refused *is* the fix. Real advantages require a paid DeepSeek
+   rescore, which is the first paid step below and nothing earlier.
+
+Gates 6 and 7 remain open and are operational, not numerical.
 
 Then use the original cost ladder rather than jumping directly to unattended
 10×8 execution: one reasoning-required episode, a two-update on-policy proof,
