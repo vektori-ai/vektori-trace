@@ -151,6 +151,13 @@ def _resolve_reasoning(raw: str) -> _ReasoningSpan | None:
         # More than one opener with a closed block is ambiguous nesting.
         if len(opens) > 1:
             return None
+        if not closed.group(1).strip():
+            # Whitespace-only reasoning is the wrapper without the thing it
+            # wraps -- exactly the empty `<think>\n\n</think>` SFT was trained
+            # under. The implicit branch already refuses it; the closed branch
+            # must agree, or a reasoning-required run accepts a turn that
+            # reasoned about nothing.
+            return None
         return _ReasoningSpan(
             text=closed.group(1),
             start=closed.start(1),

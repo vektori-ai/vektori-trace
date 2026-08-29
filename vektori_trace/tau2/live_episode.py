@@ -718,10 +718,26 @@ class EpisodeArchive:
                         f"{episode_id} turn {idx}: reasoning has no mapped "
                         "student token indices"
                     )
-                if b"<think>" not in raw or b"</think>" not in raw:
+                # Ask the SAME resolver the parser and the byte-span mapper
+                # use, rather than testing for a literal `</think>`. That
+                # literal test is PARSER_VERSION v1 logic: vLLM `92762ed` and
+                # our v2 parser both accept an unclosed `<think>` terminated by
+                # a complete valid `<tool_call>`, so the old check rejected
+                # generations the capture path had already parsed correctly --
+                # it failed two of eight episodes on 2026-08-29 whose reasoning
+                # was captured, non-empty and index-mapped by the two asserts
+                # directly above.
+                from vektori_trace.tau2.live_agent import _resolve_reasoning
+
+                try:
+                    span = _resolve_reasoning(raw.decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001
+                    span = None
+                if span is None:
                     problems.append(
-                        f"{episode_id} turn {idx}: raw action lacks complete "
-                        "reasoning delimiters"
+                        f"{episode_id} turn {idx}: raw action has no "
+                        "resolvable reasoning span (no closed <think> block "
+                        "and no valid tool call to bound an open one)"
                     )
 
         return problems
