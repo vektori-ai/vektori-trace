@@ -112,13 +112,10 @@ def main():
     for a in actions:
         raw = base64.b64decode(a["action_bytes_b64"]).decode("utf-8", "replace")
         try:
-            parsed = split_generation(raw)
+            text, _content, _tools = split_generation(raw)
         except Exception:
             n_unparsed += 1
             continue
-        text = getattr(parsed, "reasoning", None)
-        if isinstance(parsed, dict):
-            text = parsed.get("reasoning")
         if not text or not text.strip():
             n_empty += 1
             continue
