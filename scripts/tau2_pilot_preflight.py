@@ -107,12 +107,34 @@ try:
 except RuntimeError as e:
     chk("URL never fabricated", "modal.run" not in str(e))
 
-fw = os.environ.get("FIREWORKS_API_KEY") or ""
-if not fw:
-    for f in (R/".env.run", R/".env.rollout", Path.home()/".fireworks/auth.ini"):
-        if f.exists() and "FIREWORKS" in f.read_text().upper():
-            fw = "present-in-" + f.name; break
-chk("Fireworks secret present", bool(fw), f"len={len(fw)}" if fw.startswith("fw") else fw)
+# Presence only -- the value is never printed, compared or logged. A key
+# that is merely NAMED in a file is not enough: an empty assignment would
+# pass a substring check and then fail at the first paid call.
+def _fireworks_source() -> str:
+    v = os.environ.get("FIREWORKS_API_KEY", "").strip()
+    if v:
+        return f"env:FIREWORKS_API_KEY (len {len(v)})"
+    for f in (R/".env", R/".env.run", R/".env.rollout",
+              Path.home()/".fireworks/auth.ini"):
+        try:
+            if not f.exists():
+                continue
+            for line in f.read_text().splitlines():
+                line = line.strip().lstrip("export ").strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, val = line.partition("=")
+                if "FIREWORKS" in k.upper() and "KEY" in k.upper():
+                    val = val.strip().strip("'\"")
+                    if val:
+                        return f"{f.name}:{k.strip()} (len {len(val)})"
+        except OSError:
+            continue
+    return ""
+
+fw = _fireworks_source()
+chk("Fireworks secret present", bool(fw), fw or "not found in env, .env, "
+    ".env.run, .env.rollout or ~/.fireworks/auth.ini")
 
 app = subprocess.run("modal app list 2>/dev/null | grep -c ephemeral", shell=True,
                      capture_output=True, text=True, cwd=R).stdout.strip() or "0"
