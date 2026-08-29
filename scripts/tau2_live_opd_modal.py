@@ -2390,6 +2390,139 @@ def show_markers(run_id: str = "", update: int = 0) -> str:
 
 
 @app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
+def retry_slot(source_run_id: str = "", dest_run_id: str = "",
+               update: int = 0, episode_id: str = "",
+               attempt: int = 2) -> str:
+    """Carry the valid episodes of a refused batch forward; re-roll ONE slot.
+
+    A live update is refused unless every planned episode is `sampled`. When
+    one slot fails on format, rerunning all eight throws away seven already
+    valid, independent, paid episodes -- same untouched parent, same policy
+    version, same generation config -- and adds sampling variation for nothing.
+
+    So this copies the immutable sampling evidence for every episode EXCEPT the
+    named one, and leaves that slot empty for a fresh roll. `capture_live_update`
+    skips any episode id already present (episodes are stateful and cannot be
+    rewound), so an absent slot is exactly what makes it resample -- no change
+    to that loop's contract.
+
+    What is copied: episodes.jsonl rows for the kept episodes, their turn
+    files, events, simulations, and `.PLANNED`. What is NOT copied: the failed
+    episode, any score, checkpoint, optimizer state, or the SCORED/TRAINED
+    markers. The failed attempt stays on disk untouched as evidence, and its
+    format failure counts toward the reported rate.
+
+    This is declared conditional sampling. `retry_provenance.json` records the
+    source run, the retried slot, the attempt number and what was carried, so
+    the batch can never look like eight clean first-attempt episodes.
+    """
+    import json
+    import os
+    import shutil
+
+    if not source_run_id or not dest_run_id or not episode_id:
+        raise ValueError("--source-run-id, --dest-run-id and --episode-id are required")
+    if source_run_id == dest_run_id:
+        raise ValueError("dest must differ from source; the failed attempt is evidence")
+
+    base = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME)
+    src_u = os.path.join(base, source_run_id, f"update-{update:03d}")
+    dst_u = os.path.join(base, dest_run_id, f"update-{update:03d}")
+    if not os.path.isdir(src_u):
+        raise FileNotFoundError(src_u)
+    if os.path.exists(dst_u):
+        raise FileExistsError(
+            f"{dst_u} exists; refusing to overwrite. Use a new --dest-run-id."
+        )
+
+    src_arch = os.path.join(src_u, "live_archive")
+    eps_path = os.path.join(src_arch, "episodes.jsonl")
+    if not os.path.isfile(eps_path):
+        raise FileNotFoundError(eps_path)
+
+    latest = {}
+    for line in open(eps_path):
+        if line.strip():
+            r = json.loads(line)
+            latest[r["episode_id"]] = r
+    if episode_id not in latest:
+        raise ValueError(f"{episode_id} is not in {eps_path}")
+
+    keep = {e: r for e, r in latest.items()
+            if e != episode_id and r.get("status") == "sampled"}
+    if not keep:
+        raise ValueError("no sampled episodes to carry forward")
+
+    # One policy, one adapter, one recipe -- or the carried batch is a mixture.
+    for field in ("adapter_hash", "policy_version", "gen_config_hash",
+                  "require_reasoning"):
+        vals = {r.get(field) for r in keep.values()}
+        if len(vals) > 1:
+            raise ValueError(
+                f"carried episodes disagree on {field}: {vals}; they are not "
+                "one batch and must not be assembled as one"
+            )
+
+    dst_arch = os.path.join(dst_u, "live_archive")
+    os.makedirs(os.path.join(dst_arch, "turns"), exist_ok=True)
+    with open(os.path.join(dst_arch, "episodes.jsonl"), "w") as fh:
+        for line in open(eps_path):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["episode_id"] in keep:
+                fh.write(line if line.endswith("\n") else line + "\n")
+
+    copied = []
+    for e in keep:
+        t = os.path.join(src_arch, "turns", f"{e}.jsonl")
+        if os.path.isfile(t):
+            shutil.copy2(t, os.path.join(dst_arch, "turns", f"{e}.jsonl"))
+            copied.append(e)
+    for sub in ("events.jsonl",):
+        f = os.path.join(src_arch, sub)
+        if os.path.isfile(f):
+            shutil.copy2(f, os.path.join(dst_arch, sub))
+    sims = os.path.join(src_arch, "simulations")
+    if os.path.isdir(sims):
+        shutil.copytree(sims, os.path.join(dst_arch, "simulations"),
+                        dirs_exist_ok=True)
+    planned = os.path.join(src_u, ".PLANNED")
+    if os.path.isfile(planned):
+        shutil.copy2(planned, os.path.join(dst_u, ".PLANNED"))
+
+    prov = {
+        "kind": "retry_slot",
+        "source_run_id": source_run_id,
+        "dest_run_id": dest_run_id,
+        "update": update,
+        "retried_episode_id": episode_id,
+        "retry_attempt": attempt,
+        "retried_because": latest[episode_id].get("status"),
+        "carried_episodes": sorted(keep),
+        "n_carried": len(keep),
+        "turn_files_copied": sorted(copied),
+        "declared": "CONDITIONAL SAMPLING. The retried slot was resampled "
+                    "after a format failure; the failed attempt is preserved "
+                    "in the source run and counts toward the reported "
+                    "format-failure rate. This batch must never be described "
+                    "as eight clean first-attempt episodes.",
+        "not_copied": ["scores", "checkpoint", "optimizer state",
+                       "SCORED marker", "TRAINED marker",
+                       "the failed episode itself"],
+    }
+    with open(os.path.join(dst_u, "retry_provenance.json"), "w") as fh:
+        json.dump(prov, fh, indent=2)
+    vol.commit()
+
+    out = (f"carried {len(keep)} sampled episode(s) from {source_run_id} to "
+           f"{dest_run_id} update {update}; slot {episode_id} left empty for "
+           f"retry attempt {attempt}\n  " + "\n  ".join(sorted(keep)))
+    print(out)
+    return out
+
+
+@app.function(image=image, volumes={VOLUME_MOUNT: vol}, timeout=60 * 20)
 def build_canary(source_run_id: str = "", canary_run_id: str = "",
                  update: int = 0) -> str:
     """Gate 4 -- a fresh SAMPLED-only run directory from immutable evidence.
