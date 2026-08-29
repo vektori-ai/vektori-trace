@@ -463,7 +463,7 @@
   ],
   "prompt_boundary": "generation-prompt (no empty-think wrapper)",
   "require_reasoning": true,
-  "run_id": "pilot_10x8_20260829b",
+  "run_id": "pilot_10x8_20260829c",
   "sealed_pool": "F38",
   "seeds": [
     0,
@@ -525,7 +525,7 @@
       "score fingerprints bind parser/projection/thinking_mode/algorithm, so scores bought under the old splitter are refused, not reused",
       "--start-at cannot skip an untrained update"
     ],
-    "note": "the superseded run's archive is preserved unchanged as evidence. This is a restart of the SAME frozen schedule under a declared implementation correction -- not checkpoint selection, not replacement sampling."
+    "note": "the superseded run's archive is preserved unchanged as evidence. This is a restart of the SAME frozen schedule under a declared implementation correction -- not checkpoint selection, not replacement sampling. 20260829b was staged but never sampled; c carries projection v3 and the embedded-proof holds."
   },
   "code_commit": "26da90385af4f5c41a4db9c5a75b631d467e6842",
   "embedded_two_update_proof": {
