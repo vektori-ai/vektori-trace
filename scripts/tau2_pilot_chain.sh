@@ -45,6 +45,19 @@ for U in $(seq "$FIRST" "$LAST"); do
   echo "================ UPDATE $U ================"
   date -u +"start %H:%M:%SZ"
 
+  # Resume from stage markers: a halt must never redo a rollout or, worse,
+  # re-pay the teacher for scores already on the volume.
+  MK=$($M volume ls "$VOL" "$RUNS/$RUN/update-$UU" 2>/dev/null)
+  HAVE_SAMPLED=0; HAVE_SCORED=0; HAVE_TRAINED=0
+  echo "$MK" | grep -q '\.SAMPLED' && HAVE_SAMPLED=1
+  echo "$MK" | grep -q '\.SCORED'  && HAVE_SCORED=1
+  echo "$MK" | grep -q '\.TRAINED' && HAVE_TRAINED=1
+  if [ $HAVE_TRAINED -eq 1 ]; then
+    echo "already TRAINED -- skipping"; continue
+  fi
+  [ $HAVE_SAMPLED -eq 1 ] && echo "resume: .SAMPLED present, skipping rollout"
+  [ $HAVE_SCORED  -eq 1 ] && echo "resume: .SCORED present, reusing paid scores"
+
   # --- parent checkpoint hash: what this rollout must sample from ----------
   vget "$RUNS/$RUN/update-$PP/checkpoint/state.json" /tmp/parent_state.json \
     || halt "$U" "parent update-$PP has no checkpoint" "volume"
@@ -53,18 +66,27 @@ for U in $(seq "$FIRST" "$LAST"); do
   echo "parent checkpoint: update-$PP  hash $PHASH"
 
   # --- rollout, with the endpoint torn down on every exit path ------------
+  if [ $HAVE_SAMPLED -eq 1 ]; then
+   echo "skip rollout (already sampled)"
+  else
   RLOG=$STATE/u${U}_rollout.log
+  # The endpoint URL is not known until serve_student.py writes it, so the
+  # rollout is invoked through `bash -c`: the wrapper sources the env file
+  # before running this, and the single quotes defer $STUDENT_API_BASE to
+  # that moment. Passing it directly through "$@" would hand the rollout the
+  # literal string '$STUDENT_API_BASE' -- verified, it does not expand.
   bash scripts/tau2_serve_and_run.sh \
       --adapter "/adapters/$RUNS/$RUN/update-$PP/checkpoint" \
       --tag "chain_u$U" --max-hours 1 \
-      -- $M run scripts/tau2_live_opd_modal.py::rollout_only \
-           --run-id "$RUN" --update "$U" \
-           --api-base "\$STUDENT_API_BASE" --student-model Qwen3-4B-sft \
-           --adapter-hash-expect "$PHASH" \
+      -- bash -c "$M run scripts/tau2_live_opd_modal.py::rollout_only \
+           --run-id '$RUN' --update '$U' \
+           --api-base \"\$STUDENT_API_BASE\" --student-model Qwen3-4B-sft \
+           --adapter-hash-expect '$PHASH'" \
       > "$RLOG" 2>&1
   RC=$?
   grep -aE "rollout took|episodes" "$RLOG" | tail -2
   [ $RC -eq 0 ] || halt "$U" "rollout failed (exit $RC)" "$RLOG"
+  fi
 
   # --- free dry-run: retention, accounting, structural weight --------------
   DLOG=$STATE/u${U}_dryrun.log
@@ -95,6 +117,9 @@ for U in $(seq "$FIRST" "$LAST"); do
   fi
 
   # --- paid scoring --------------------------------------------------------
+  if [ $HAVE_SCORED -eq 1 ]; then
+   echo "skip scoring (.SCORED present, scores reused)"
+  else
   SLOG=$STATE/u${U}_score.log
   timeout 2400 $M run scripts/tau2_live_opd_modal.py::rescore \
       --run-id "$RUN" --update "$U" > "$SLOG" 2>&1
@@ -103,6 +128,7 @@ for U in $(seq "$FIRST" "$LAST"); do
   if [ $SRC -ne 0 ]; then
     grep -aE "UNDECLARED|RuntimeError" "$SLOG" | tail -3
     halt "$U" "scoring stage failed (exit $SRC) -- scores may still be on disk" "$SLOG"
+  fi
   fi
 
   # --- one optimizer step from the cached scores ---------------------------
