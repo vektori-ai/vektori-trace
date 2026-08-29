@@ -110,21 +110,10 @@ class PayloadSpan:
     kind: str          # "reasoning" | "content"
     byte_start: int
     byte_end: int
-    #: Which contiguous run of this kind. A model that emits `<tool_call>`
-    #: blocks INSIDE its reasoning leaves the reasoning discontiguous: the tool
-    #: JSON is excluded (DeepSeek never sees Hermes serialization), so no
-    #: single byte range describes the survivors. Each run is its own span and
-    #: is aligned and scored on its own.
-    segment: int = 0
 
     @property
     def n_bytes(self) -> int:
         return self.byte_end - self.byte_start
-
-    @property
-    def label(self) -> str:
-        """Stable key for reports and for tagging supervised tokens."""
-        return self.kind if self.segment == 0 else f"{self.kind}#{self.segment}"
 
 
 @dataclass
@@ -434,69 +423,7 @@ def project_action(
                         del out.supervised[i]
                         out.excluded[i] = EXCLUDE_STRADDLE
                 continue
-
-            # Split into CONTIGUOUS runs. Tool calls emitted inside the
-            # reasoning are excluded as serialization, which leaves holes; a
-            # single range would either swallow the tool JSON or claim bytes no
-            # supervised token covers, and the scorer refuses the whole payload
-            # (8,324 of 8,611 bytes on u000-task76-seed0@9#0, 2026-08-29).
-            runs: list[tuple[int, int, list[int]]] = []
-            pos = 0
-            cur: list[int] | None = None
-            cur_lo = cur_hi = 0
-            for i, tok in enumerate(token_bytes):
-                nxt = pos + len(tok)
-                if out.supervised.get(i) == sp.kind and pos >= lo and nxt <= hi:
-                    if cur is None:
-                        cur, cur_lo = [], pos
-                    cur.append(i)
-                    cur_hi = nxt
-                elif cur is not None:
-                    runs.append((cur_lo, cur_hi, cur))
-                    cur = None
-                pos = nxt
-            if cur is not None:
-                runs.append((cur_lo, cur_hi, cur))
-
-            for seg, (r_lo, r_hi, idxs) in enumerate(runs):
-                # Same fixed point as above, per run: trimming the range can
-                # leave it ending mid-token, dropping that token shrinks the
-                # range, and the new range can again end in whitespace.
-                keep_idx = list(idxs)
-                for _ in range(len(idxs) + 2):
-                    r_lo, r_hi = _trim_boundary_whitespace(raw_b, r_lo, r_hi)
-                    kept, pos2 = [], 0
-                    for i, tok in enumerate(token_bytes):
-                        nxt2 = pos2 + len(tok)
-                        if i in keep_idx:
-                            if pos2 >= r_lo and nxt2 <= r_hi:
-                                kept.append(i)
-                            else:
-                                out.supervised.pop(i, None)
-                                out.excluded[i] = EXCLUDE_STRADDLE
-                        pos2 = nxt2
-                    if not kept:
-                        keep_idx = []
-                        break
-                    pos2 = n_lo = n_hi = 0
-                    seen2 = False
-                    for i, tok in enumerate(token_bytes):
-                        nxt2 = pos2 + len(tok)
-                        if i in kept:
-                            if not seen2:
-                                n_lo, seen2 = pos2, True
-                            n_hi = nxt2
-                        pos2 = nxt2
-                    stable = (kept == keep_idx and (n_lo, n_hi) == (r_lo, r_hi))
-                    keep_idx, r_lo, r_hi = kept, n_lo, n_hi
-                    if stable:
-                        break
-                if not keep_idx:
-                    continue
-                span_new = PayloadSpan(sp.kind, r_lo, r_hi, segment=seg)
-                for i in keep_idx:
-                    out.supervised[i] = span_new.label
-                rebuilt.append(span_new)
+            rebuilt.append(PayloadSpan(sp.kind, lo, hi))
         out.payloads = rebuilt
 
     return out
