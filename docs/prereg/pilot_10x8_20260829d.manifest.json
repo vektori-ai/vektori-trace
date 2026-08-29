@@ -521,7 +521,7 @@
     "reason": "update-0 rollout refused its exact batch: 2 episodes (68, 108) were valid implicit-boundary generations failed by a stale literal-</think> archive gate, and 1 (task 95 turn 7) was a genuine no-boundary generation. No .SAMPLED, no teacher call, no optimizer step; parent untouched.",
     "note": "c's archive is preserved unchanged and its 1/8 genuine format failure counts toward the reported rate."
   },
-  "code_commit": "f68edfc221d47527183737320ca6fb1e4f6e6e1e",
+  "code_commit": "edefb837deb89efb4986387931de0942e1a27383",
   "embedded_two_update_proof": {
     "updates": [
       0,
@@ -623,5 +623,6 @@
       "note": "So ~2 in 3 updates fail the exact-batch gate on the first attempt, and ~41% exhaust the one-retry budget. An earlier draft said ~1 in 3 and ~1 in 9; that was wrong -- it conflated P(>=2 failures)=25% with P(>=1 failure)=64%. This is the real tax of require_reasoning on this SFT lineage and is a measurement, not an obstacle."
     },
     "declared_conditional_sampling": "training batches are conditioned on format validity, so the pilot stays SIGNAL-SEEKING and is not clean efficacy evidence."
-  }
+  },
+  "code_commit_note": "The commit containing the retry/parser/projection implementation this run uses. It previously named f68edfc -- the pre-fix retry path that bulk-copied events/simulations (carrying the failed episode's material forward) and skipped the status/attempt/roster/plan-hash validations. Artifacts produced under f68edfc are not this experiment. This field names the CODE commit; the manifest edit that set it is necessarily a later commit, since a commit cannot contain its own hash. Verify with `git merge-base --is-ancestor edefb83 HEAD`."
 }
