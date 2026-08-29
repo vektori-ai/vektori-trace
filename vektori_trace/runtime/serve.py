@@ -121,6 +121,48 @@ def _resolve_volume_adapter(adapter_path: str | None) -> str | None:
     )
 
 
+def resolve_web_url(*candidates: Any, what: str = "endpoint") -> str:
+    """The URL Modal actually assigned, or a hard failure.
+
+    Extracted so it can be tested without Modal, a GPU or a network: the
+    2026-08-28 incident was two endpoint starts that logged "UP in 183s" and
+    then 404'd every request, because no URL could be obtained and the caller
+    fabricated `https://{app_name}--openai-compat.modal.run` -- missing the
+    workspace prefix, the class segment and an ephemeral app's `-dev` suffix.
+    A fabricated address is strictly worse than an error: the endpoint looks
+    healthy until the first real request, and the failure reads as the model's.
+
+    Candidates are tried in order; for each, `get_web_url()` first, then a
+    `web_url` attribute. A candidate that raises is skipped rather than
+    aborting the search.
+    """
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        url = None
+        getter = getattr(candidate, "get_web_url", None)
+        if callable(getter):
+            try:
+                url = getter()
+            except Exception:  # noqa: BLE001
+                url = None
+        if not url:
+            url = getattr(candidate, "web_url", None)
+        if url and isinstance(url, str) and url.startswith("https://"):
+            return url
+        if url:
+            raise RuntimeError(
+                f"Modal returned {url!r} for the {what} URL, which is not an "
+                "https:// address; refusing to use it"
+            )
+    raise RuntimeError(
+        f"Modal did not expose a URL for the {what}. Refusing to guess one: a "
+        "fabricated URL 404s on every request while the server itself looks "
+        "healthy, so the failure reads as a model failure rather than an "
+        "addressing one."
+    )
+
+
 @contextmanager
 def serve_model(
     base_model: str,
@@ -480,25 +522,24 @@ def serve_model(
         server = VllmServer()
         _ = server.health.remote()
         web = server.openai_compat
-        # Ask the CLASS's method, not the instance's bound one. `server` is an
-        # instantiated Cls, and on modal 1.5.3 `server.openai_compat` does not
-        # carry `get_web_url()` -- the `hasattr` guard below then silently
-        # falls through. `VllmServer.openai_compat` is the Function that owns
-        # the URL. This is what made the old fallback fire on every start.
-        url = None
-        for candidate in (getattr(VllmServer, "openai_compat", None), web):
-            if candidate is None:
-                continue
-            getter = getattr(candidate, "get_web_url", None)
-            if callable(getter):
-                try:
-                    url = getter()
-                except Exception:  # noqa: BLE001
-                    url = None
-            if not url:
-                url = getattr(candidate, "web_url", None)
-            if url:
-                break
+        # Try every source that can name the URL, class Function first, and
+        # raise if none does.
+        #
+        # An earlier note here asserted that `get_web_url()` exists only on the
+        # class's Function and never on the instance's bound method on modal
+        # 1.5.3. That is NOT established -- later probes on both the laptop and
+        # the box returned a correct URL from the bound method -- so it is not
+        # the root cause and should not be repeated as one. What *is* verified
+        # is the failure it produced: no URL was obtained, and the old fallback
+        # fabricated one (below). Trying both candidates costs nothing and does
+        # not depend on which explanation is right.
+        try:
+            url = resolve_web_url(
+                getattr(VllmServer, "openai_compat", None), web,
+                what="OpenAI-compatible endpoint",
+            )
+        except RuntimeError:
+            url = None
         if not url:
             # NEVER fabricate this. The old fallback built
             # `https://{app_name}--openai-compat.modal.run`, which is missing
@@ -514,26 +555,17 @@ def serve_model(
                 "endpoint. Refusing to guess one: a fabricated URL 404s on "
                 "every request while the server itself looks healthy."
             )
-        reload_url = None
-        for candidate in (getattr(VllmServer, "reload_volume", None),
-                          server.reload_volume):
-            if candidate is None:
-                continue
-            getter = getattr(candidate, "get_web_url", None)
-            if callable(getter):
-                try:
-                    reload_url = getter()
-                except Exception:  # noqa: BLE001
-                    reload_url = None
-            if not reload_url:
-                reload_url = getattr(candidate, "web_url", None)
-            if reload_url:
-                break
-        if not reload_url:
+        try:
+            reload_url = resolve_web_url(
+                getattr(VllmServer, "reload_volume", None),
+                server.reload_volume,
+                what="serving-volume reload endpoint",
+            )
+        except RuntimeError as exc:
             raise RuntimeError(
                 "Modal did not expose the serving-volume reload endpoint; "
-                "multi-update ReOPD cannot see newly committed checkpoints"
-            )
+                f"multi-update ReOPD cannot see newly committed checkpoints ({exc})"
+            ) from exc
         served = ServedModel(
             api_base=url.rstrip("/") + "/v1",
             model_name=served_name,

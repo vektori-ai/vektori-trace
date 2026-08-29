@@ -45,15 +45,7 @@ from vektori_trace.tau2.opd_stages import (
 )
 from vektori_trace.tau2.reopd_state import RunState, UpdateDir, read_jsonl
 
-#: Bumped whenever the scoring/credit algorithm changes shape. A cached score
-#: row tagged with a different value is not reusable: it was produced by a
-#: different function, and reinterpreting it under the current one is exactly
-#: the silent-revert failure the chunk repair exists to prevent.
-#: - "flat-v1" (implicit, pre-2026-08-29): L_T divided across a chunk's student
-#:   tokens, chunk identity discarded, one ratio per token.
-#: - "chunk-v2": chunks persisted whole; one ratio per chunk via
-#:   `chunk_opd.assign_chunk_advantages`.
-SCORE_ALGORITHM = "chunk-v2"
+from vektori_trace.tau2.live_score import SCORE_ALGORITHM
 
 __all__ = [
     "LiveTrainError",
@@ -381,7 +373,9 @@ def run_projected_score_stage(
     import time as _time
 
     from vektori_trace.tau2.live_score import score_live_action
-    from vektori_trace.tau2.reopd_state import append_jsonl, read_jsonl
+    from vektori_trace.tau2.reopd_state import (
+        append_jsonl, atomic_write_jsonl, read_jsonl,
+    )
 
     drop = set(drop_keys or ())
     by_key = by_key or {}
@@ -390,19 +384,56 @@ def run_projected_score_stage(
     # grouping was destroyed at write time and cannot be recovered. Reading one
     # under the repaired algorithm would silently resurrect the per-token ratio,
     # so a row without `chunks` is not a cache hit -- it is rescored.
-    rows_on_disk = {}
-    n_incompatible = 0
+    # A cached score is reusable only when it is a score for *this* action
+    # under *these* algorithms. Three ways it can fail to be:
+    #
+    #   - it predates the chunk-grouped algorithm, so its credit is flat and
+    #     its grouping unrecoverable (2026-08-29);
+    #   - its fingerprint disagrees with the action's `score_fingerprint`,
+    #     which now binds parser, projection, thinking mode and algorithm --
+    #     so a parser change alone invalidates it;
+    #   - the file holds more than one row for the key, in which case "the"
+    #     cached score is ambiguous.
+    #
+    # Later rows win on duplicates *before* the checks, so a rescore that
+    # appended rather than replaced still resolves to its newest value.
+    seen: dict[str, dict] = {}
+    dup_keys: set[str] = set()
     for r in read_jsonl(update.scores_path):
         if not r.get("key") or r.get("projection") != "semantic":
             continue
+        if r["key"] in seen:
+            dup_keys.add(r["key"])
+        seen[r["key"]] = r
+
+    rows_on_disk = {}
+    n_stale_algo = n_bad_fp = 0
+    for key, r in seen.items():
         if r.get("score_algorithm") != SCORE_ALGORITHM or "chunks" not in r:
-            n_incompatible += 1
+            n_stale_algo += 1
             continue
-        rows_on_disk[r["key"]] = r
-    if n_incompatible:
-        log(f"    {n_incompatible} cached score row(s) predate the chunk-grouped "
+        want = (by_key.get(key) or {}).get("score_fingerprint")
+        if want is not None and r.get("fingerprint") != want:
+            n_bad_fp += 1
+            continue
+        rows_on_disk[key] = r
+    if n_stale_algo:
+        log(f"    {n_stale_algo} cached score row(s) predate the chunk-grouped "
             f"algorithm ({SCORE_ALGORITHM}); rescoring them rather than "
             "reinterpreting flat credit")
+    if n_bad_fp:
+        log(f"    {n_bad_fp} cached score row(s) have a fingerprint that no "
+            "longer matches their action (parser/projection/thinking-mode or "
+            "history change); rescoring")
+    if dup_keys:
+        log(f"    {len(dup_keys)} key(s) had duplicate score rows; taking the "
+            "last and rewriting the file without duplicates")
+        atomic_write_jsonl(
+            update.scores_path,
+            [r for r in read_jsonl(update.scores_path)
+             if r.get("key") not in dup_keys] + [seen[k] for k in sorted(dup_keys)],
+        )
+        dup_keys = set()
 
     projected: dict[str, Any] = {}
     n_new = n_reused = 0
@@ -476,7 +507,20 @@ def run_projected_score_stage(
             out["semantic_history_hash"] = src.get("semantic_history_hash")
             out["teacher_context_hash"] = src.get("teacher_context_hash")
             out["policy_version"] = src.get("policy_version")
-        append_jsonl(update.scores_path, out)
+        # A rescore must REPLACE, not append: `RunState.validate()` refuses a
+        # scores file holding two rows for one key, so appending beside a
+        # stale row turns a recovered score into a failed resume. Append is
+        # still the fast path for a key that is not yet on disk.
+        if key in seen or key in dup_keys:
+            rows = [r for r in read_jsonl(update.scores_path)
+                    if r.get("key") != key]
+            rows.append(out)
+            atomic_write_jsonl(update.scores_path, rows)
+            seen.pop(key, None)
+            dup_keys.discard(key)
+        else:
+            append_jsonl(update.scores_path, out)
+        seen[key] = out
         commit_scores("projected score")
 
     seconds = round(_time.time() - t0, 1)

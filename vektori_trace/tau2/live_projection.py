@@ -61,6 +61,15 @@ A token straddling a payload boundary is dropped whole and counted.
 
 from __future__ import annotations
 
+#: Bumped when the semantic-projection scope changes -- which bytes are
+#: eligible to carry teacher credit. Bound into score fingerprints: a cached
+#: score is only valid for the projection that produced its spans.
+#: - "v1": reasoning + visible content; Qwen markup, tool-call wrappers, tool
+#:   JSON serialization, `<|im_end|>` and boundary-straddling tokens all carry
+#:   zero weight. Tool calls are conditioned on but never credited, because
+#:   Hermes JSON and DeepSeek DSML share no bytes to map through.
+PROJECTION_VERSION = "v1"
+
 from dataclasses import dataclass, field
 from typing import Any
 

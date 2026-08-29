@@ -57,14 +57,32 @@ def test_token_straddling_a_payload_boundary_is_dropped_whole():
     assert p.supervised[2] == "content"
 
 
-def test_unterminated_think_has_no_reasoning_payload():
-    """The update-1 regression. split_generation finds no closed block, so
-    there is no reasoning payload to transfer credit onto -- and the projection
-    says so rather than inventing one."""
+def test_unterminated_think_is_bounded_by_a_valid_tool_call():
+    """PARSER_VERSION v2 (vLLM `92762ed`), 2026-08-29.
+
+    This case previously asserted the opposite -- that an unclosed `<think>`
+    yielded no reasoning payload at all. That refusal is what discarded three
+    of eight update-0 episodes whose reasoning was present, coherent and
+    followed by valid tool calls. The rule now treats the first complete tool
+    call as the implicit end of reasoning, so the payload is supervised while
+    the markup and the tool call itself still carry no weight.
+    """
     raw = '<think>reasoning<tool_call>\n{"name": "get_order"}\n</tool_call>'
     toks = _toks("<think>", "reasoning", "<tool_call>",
                  '\n{"name": "get_order"}\n', "</tool_call>")
     p = project_action(raw, toks)
+    # the reasoning token, and only it, is supervised
+    assert p.supervised == {1: "reasoning"}
+    assert p.report()["has_reasoning"] is True
+    # the opener, the tool-call markup and its JSON stay unsupervised
+    for i in (0, 2, 3, 4):
+        assert i not in p.supervised
+
+
+def test_unterminated_think_with_no_tool_call_still_refused():
+    """The narrow rule does not become a general reasoning-to-end heuristic."""
+    raw = "<think>reasoning that simply stops"
+    p = project_action(raw, _toks("<think>", "reasoning that simply stops"))
     assert p.supervised == {}
     assert p.report()["has_reasoning"] is False
 

@@ -77,7 +77,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import NamedTuple, Any
 
 from ..replay_sample import token_bytes_from_ids
 
@@ -101,6 +101,97 @@ _THINK = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 #: vLLM's `Hermes2ProToolParser`; `live_parser_parity.py` runs the same corpus
 #: through *this* regex so the two splitters are known to agree.
 _TOOLCALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+#: An opened-but-unclosed reasoning block. vLLM commit `92762ed` ("Treat
+#: `<tool_call>` as implicit reasoning end in Qwen3 parser") accepts this form:
+#: the model opens `<think>`, reasons, and emits a tool call without ever
+#: closing the block. Three of the eight update-0 episodes on 2026-08-29 ended
+#: this way -- 288-1,347 tokens of coherent reasoning, valid tool calls, and
+#: `finish_reason: stop`, so neither truncation nor absent reasoning.
+_THINK_OPEN = re.compile(r"<think>", re.DOTALL)
+_TOOLCALL_OPEN = re.compile(r"<tool_call>", re.DOTALL)
+
+#: Bumped when the split contract changes. Bound into score fingerprints so a
+#: cached score cannot be reused across a parser that would have segmented the
+#: same bytes differently.
+#: - "v1": closed `<think>...</think>` only.
+#: - "v2": adds the implicit boundary above (vLLM `92762ed`).
+PARSER_VERSION = "v2"
+
+
+class _ReasoningSpan(NamedTuple):
+    """Where reasoning lives in the raw bytes, and what remains around it."""
+
+    text: str
+    #: Character offsets of the reasoning payload within `raw`.
+    start: int
+    end: int
+    #: `raw` with the whole reasoning construct removed, for tool/content parse.
+    rest: str
+    #: "closed" or "implicit_tool_call".
+    mode: str
+
+
+def _resolve_reasoning(raw: str) -> _ReasoningSpan | None:
+    """The one place the reasoning boundary is decided.
+
+    `split_generation` and `_reasoning_byte_span` must agree exactly -- a span
+    that disagrees with the parse would hand the teacher bytes the student did
+    not reason with -- so both call this rather than re-deriving it.
+
+    Closed `<think>...</think>` keeps its existing meaning. If the block is
+    left open and a complete, valid `<tool_call>` begins later, that opening is
+    the implicit end of reasoning; the two spans are disjoint and no `</think>`
+    bytes are invented. Anything ambiguous returns None and the caller refuses.
+    """
+    closed = _THINK.search(raw)
+    opens = list(_THINK_OPEN.finditer(raw))
+
+    if closed is not None:
+        # More than one opener with a closed block is ambiguous nesting.
+        if len(opens) > 1:
+            return None
+        return _ReasoningSpan(
+            text=closed.group(1),
+            start=closed.start(1),
+            end=closed.end(1),
+            rest=raw[: closed.start()] + raw[closed.end():],
+            mode="closed",
+        )
+
+    if not opens:
+        return None
+    if len(opens) > 1:
+        # Multiple unclosed openers: no unambiguous single reasoning span.
+        return None
+    if "</think>" in raw:
+        # A closer exists but did not pair with the opener (e.g. it precedes
+        # it). Refuse rather than guess which delimiter was meant.
+        return None
+
+    open_m = opens[0]
+    tc = _TOOLCALL_OPEN.search(raw, open_m.end())
+    if tc is None:
+        return None
+    # The tool call must actually be complete and parseable, or this is not a
+    # boundary -- it is a truncated fragment wearing one.
+    closing = _TOOLCALL.search(raw, tc.start())
+    if closing is None or closing.start() != tc.start():
+        return None
+
+    text = raw[open_m.end():tc.start()]
+    if not text.strip():
+        # Empty reasoning: the wrapper without the thing it wraps.
+        return None
+    return _ReasoningSpan(
+        text=text,
+        start=open_m.end(),
+        end=tc.start(),
+        # Drop only the opener and the reasoning bytes; the tool call stays in
+        # `rest` so it is parsed exactly once, as a tool.
+        rest=raw[: open_m.start()] + raw[tc.start():],
+        mode="implicit_tool_call",
+    )
 
 
 @dataclass
@@ -213,13 +304,17 @@ def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, A
     malformed block raises: a tool call the student emitted but that cannot be
     executed is a *student mistake* worth training on, but it is the caller's
     job to record it as such, not this function's job to guess a repair.
+
+    Reasoning boundaries come from `_resolve_reasoning`, which accepts both a
+    closed `<think>...</think>` and vLLM `92762ed`'s implicit form where a
+    valid `<tool_call>` ends an unclosed block. Ambiguous shapes -- multiple
+    openers, an unpaired `</think>`, empty reasoning, an unclosed block with no
+    complete tool call -- yield no reasoning span, and a reasoning-required run
+    then refuses the turn rather than guessing.
     """
-    reasoning = None
-    m = _THINK.search(raw)
-    rest = raw
-    if m:
-        reasoning = m.group(1)
-        rest = raw[: m.start()] + raw[m.end() :]
+    span = _resolve_reasoning(raw)
+    reasoning = span.text if span else None
+    rest = span.rest if span else raw
 
     tool_calls: list[dict[str, Any]] = []
     for i, tc in enumerate(_TOOLCALL.finditer(rest)):
@@ -257,12 +352,12 @@ def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, A
 
 def _reasoning_byte_span(raw: str) -> list[int] | None:
     """UTF-8 byte offsets of the reasoning payload inside the raw action."""
-    match = _THINK.search(raw)
-    if match is None:
+    span = _resolve_reasoning(raw)
+    if span is None:
         return None
     return [
-        len(raw[: match.start(1)].encode("utf-8")),
-        len(raw[: match.end(1)].encode("utf-8")),
+        len(raw[: span.start].encode("utf-8")),
+        len(raw[: span.end].encode("utf-8")),
     ]
 
 

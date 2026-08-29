@@ -291,6 +291,11 @@ def live_prefixes(capture_rows: list[dict[str, Any]]) -> list[LivePrefix]:
     ]
 
 
+def _SCORE_ALGORITHM() -> str:
+    from vektori_trace.tau2.live_score import SCORE_ALGORITHM
+    return SCORE_ALGORITHM
+
+
 def live_score_fingerprint(capture_row: dict[str, Any]) -> str:
     """What a paid teacher score for this live turn is valid for.
 
@@ -306,7 +311,19 @@ def live_score_fingerprint(capture_row: dict[str, Any]) -> str:
     prefix, whose id names a fixed history. It is not sufficient here: two live
     turns can share a key, an action and a policy version and still follow
     different conversations, so the semantic history is part of the identity.
+
+    The identity also binds the *algorithms* that produced the score, not only
+    the inputs. A paid score is a function of how the action was split into
+    reasoning/content/tools (`PARSER_VERSION`), which bytes were eligible to
+    carry credit (`PROJECTION_VERSION`), how the teacher was asked
+    (`thinking_mode`), how credit was grouped (`SCORE_ALGORITHM`), and which
+    tokenizers defined the two token streams. Changing any of them changes the
+    score for identical bytes -- the 2026-08-29 parser repair is exactly such a
+    change -- so a cached score must not survive it.
     """
+    from vektori_trace.tau2.live_agent import PARSER_VERSION
+    from vektori_trace.tau2.live_projection import PROJECTION_VERSION
+
     h = hashlib.sha256()
     for part in (
         capture_row["key"],
@@ -314,6 +331,13 @@ def live_score_fingerprint(capture_row: dict[str, Any]) -> str:
         capture_row["semantic_history_hash"],
         capture_row["teacher_context_hash"],
         capture_row["action_bytes_b64"],
+        # Algorithm identity -- see docstring.
+        PARSER_VERSION,
+        PROJECTION_VERSION,
+        _SCORE_ALGORITHM(),
+        capture_row.get("thinking_mode", "thinking"),
+        capture_row.get("student_tokenizer", ""),
+        capture_row.get("teacher_model", ""),
     ):
         h.update(str(part).encode())
         h.update(b"\x00")
@@ -351,7 +375,23 @@ def score_row_provenance(
         "policy_version": capture_row["policy_version"],
         "episode_id": capture_row["episode_id"],
         "turn_index": capture_row["turn_index"],
+        # Readable alongside the opaque fingerprint, so a mismatch can be
+        # diagnosed from the row instead of by bisecting code versions.
+        "parser_version": _PARSER_VERSION(),
+        "projection_version": _PROJECTION_VERSION(),
+        "score_algorithm": _SCORE_ALGORITHM(),
+        "thinking_mode": capture_row.get("thinking_mode", "thinking"),
     }
+
+
+def _PARSER_VERSION() -> str:
+    from vektori_trace.tau2.live_agent import PARSER_VERSION
+    return PARSER_VERSION
+
+
+def _PROJECTION_VERSION() -> str:
+    from vektori_trace.tau2.live_projection import PROJECTION_VERSION
+    return PROJECTION_VERSION
 
 
 def verify_prompt_parity(

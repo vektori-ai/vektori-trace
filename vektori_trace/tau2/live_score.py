@@ -44,11 +44,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "SCORE_ALGORITHM",
     "LiveScoreError",
     "ProjectedChunk",
     "ProjectedScore",
     "score_live_action",
 ]
+
+
+#: Bumped whenever the scoring/credit algorithm changes shape. A cached score
+#: row tagged with a different value is not reusable: it was produced by a
+#: different function, and reinterpreting it under the current one is exactly
+#: the silent-revert failure the chunk repair exists to prevent.
+#: - "flat-v1" (implicit, pre-2026-08-29): L_T divided across a chunk's student
+#:   tokens, chunk identity discarded, one ratio per token.
+#: - "chunk-v2": chunks persisted whole; one ratio per chunk via
+#:   `chunk_opd.assign_chunk_advantages`.
+SCORE_ALGORITHM = "chunk-v2"
 
 
 class LiveScoreError(RuntimeError):
