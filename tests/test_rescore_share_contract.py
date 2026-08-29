@@ -80,3 +80,47 @@ class TestBehaviour:
         src = MODAL.read_text()
         i = src.index("enforce_shares=False")
         assert "spread" in src[i:i + 3000] or "share" in src[i:i + 3000]
+
+
+class TestDeclaredSkips:
+    """A preregistered exclusion must not fail the stage that declared it.
+
+    The manifest permits exactly one payload skip -- the interleaved-reasoning
+    exclusion on u000-task76-seed0@9#0. `rescore` hard-raised on ANY skip, so
+    update 0 failed its own preregistration after the teacher was paid.
+    """
+
+    def test_undeclared_skips_still_fail(self):
+        src = MODAL.read_text()
+        assert "UNDECLARED payload skips" in src
+        i = src.index("undeclared = [sk for sk in skips")
+        assert "raise RuntimeError" in src[i:i + 400]
+
+    def test_declared_skips_are_read_from_the_manifest(self):
+        src = MODAL.read_text()
+        i = src.index("declared_skips = set()")
+        window = src[i:i + 900]
+        assert "declared_exclusions" in window
+        assert "identities" in window
+
+    def test_declared_skips_are_reported_not_hidden(self):
+        src = MODAL.read_text()
+        assert "declared skips   :" in src
+
+    @staticmethod
+    def _filter(skips, declared):
+        return [sk for sk in skips if sk[0] not in declared]
+
+    def test_the_observed_case_passes(self):
+        skips = [("u000-task76-seed0@9#0", "reasoning", None)]
+        assert self._filter(skips, {"u000-task76-seed0@9#0"}) == []
+
+    def test_a_new_skip_fails(self):
+        skips = [("u000-task76-seed0@9#0", "reasoning", None),
+                 ("u000-task44-seed1@2#0", "reasoning", None)]
+        out = self._filter(skips, {"u000-task76-seed0@9#0"})
+        assert len(out) == 1 and out[0][0] == "u000-task44-seed1@2#0"
+
+    def test_no_declaration_means_any_skip_fails(self):
+        skips = [("u000-task76-seed0@9#0", "reasoning", None)]
+        assert len(self._filter(skips, set())) == 1

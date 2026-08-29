@@ -1536,8 +1536,33 @@ def rescore(run_id: str = "", update: int = 0,
     text = "\n".join(lines)
     print(text)
 
+    # A payload skip fails the stage UNLESS the run's frozen manifest declared
+    # it. The manifest permits exactly one -- the interleaved-reasoning
+    # exclusion on u000-task76-seed0@9#0 -- and a hard refusal here would make
+    # that declaration unusable: the stage would fail its own preregistration
+    # after the teacher had been paid. An UNdeclared skip still fails.
+    declared_skips = set()
+    try:
+        _mpath = os.path.join(VOLUME_MOUNT, RUNS_IN_VOLUME, run_id,
+                              "manifest.json")
+        with open(_mpath) as _fh:
+            _m = json.load(_fh)
+        for _d in (_m.get("declared_exclusions") or {}).values():
+            for _k in (_d.get("observed_update_0") or {}).get("identities", []):
+                declared_skips.add(_k)
+    except (OSError, ValueError, KeyError):
+        declared_skips = set()
+
+    undeclared = [sk for sk in skips if sk[0] not in declared_skips]
+    if undeclared:
+        raise RuntimeError(
+            f"UNDECLARED payload skips: {undeclared[:4]} "
+            f"(declared: {sorted(declared_skips) or 'none'})"
+        )
     if skips:
-        raise RuntimeError(f"payload skips: {skips[:4]}")
+        print(f"  declared skips   : {len(skips)} "
+              f"({', '.join(sorted(sk[0] for sk in skips))}) -- permitted by "
+              "the frozen manifest's declared_exclusions")
     if tot_sup + tot_exc != tot_tok:
         raise RuntimeError("token accounting incomplete")
     if struct:
