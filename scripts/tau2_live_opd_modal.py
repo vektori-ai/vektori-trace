@@ -1370,9 +1370,22 @@ def rescore(run_id: str = "", update: int = 0,
     vol.commit()
 
     # --- analysis ONLY: build the batch, never hand it to a trainer --------
-    # Same arguments `run_projected_train_stage` would pass, so the reported
-    # distribution is the one training would consume -- including the derived
-    # task share (the replay default of 0.5 rejects a legitimate live batch).
+    # Same arguments `run_projected_train_stage` would pass -- INCLUDING
+    # `enforce_shares=False`, which this call previously omitted while its
+    # comment claimed parity. The default is to enforce, so analysis refused
+    # batches training would accept: update 0 died here with "task share 0.287
+    # exceeds 0.1875" AFTER all 75 teacher scores were bought and written.
+    #
+    # Enforcement is wrong on the live path for the reason
+    # `build_projected_batch` documents: an episode's length is an OUTCOME, so
+    # rejecting a batch after seeing its realized length is outcome-dependent
+    # selection -- it systematically excludes the long, hard trajectories
+    # on-policy distillation exists to learn from. Balance is enforced BEFORE
+    # the rollout by the frozen schedule. The shares are still computed and
+    # reported below, so concentration stays visible.
+    #
+    # This is restart gate 6: "`rescore` and training disagree on share
+    # enforcement. Make analysis use the training contract."
     n_tasks = len({p.task for p in inputs.prefixes})
     max_task_share = min(1.0, (1.0 / n_tasks) * 1.5) if n_tasks else 1.0
     batch = build_projected_batch(
@@ -1380,6 +1393,7 @@ def rescore(run_id: str = "", update: int = 0,
         policy_version=policy_version,
         max_task_share=max_task_share,
         max_trace_share=inputs.max_trace_share,
+        enforce_shares=False,
     )
 
     def stats(xs):
