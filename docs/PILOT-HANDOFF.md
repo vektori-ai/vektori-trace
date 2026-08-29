@@ -1,212 +1,230 @@
-# Pilot handoff — live OPD, halted before restart
+# Tau2 live-OPD pilot — handoff (2026-08-29)
 
-Branch `feat/tau2-live-opd` · HEAD `fcad207` · written 2026-08-29 ~05:15 IST
+**Stop point.** Everything below is verified. The next action is a **single
+episode re-roll** (task 95 / seed 1), not an eight-episode rollout.
 
-**Authority:** `docs/TAU2-OPD-DEEP-DIVE.md` § "Pilot incident" is the record of
-what the pilot established and what must be fixed. This file is the operational
-companion: current state, teardown, and what was verified first-hand versus
-what is assumed. Where the two disagree, the deep dive wins.
-
----
-
-## 0. TEARDOWN — check before ending any session
-
-```bash
-cd /data/vektori-trace && .venv/bin/modal app list | grep ephemeral
-# any row with Tasks>=1 is billing. Expect ZERO.
-.venv/bin/modal app stop <app-id> -y          # -y MANDATORY, silent no-op without it
-cat /data/tau2/pilot-state/owned_apps.json    # non-empty => a stop FAILED, do it by hand
-```
-
-Check from **both** the box and locally — separate Modal clients. Re-check after
-~60 s; an app can report `stopped` while its container drains.
-
-**State at time of writing: 0 ephemeral apps, no tmux sessions, nothing
-billing.** Verified from both clients.
+Authority for design and restart gates: `docs/TAU2-OPD-DEEP-DIVE.md`.
+This file is the operational state and the exact commands to resume.
 
 ---
 
-## 1. Where things stand
-
-**The pilot is halted and must not restart** until the gates in the deep dive
-pass. Update 0 failed during rollout. **No teacher call and no optimizer step
-ever ran**, so no trained artifact is contaminated.
+## 1. State
 
 | | |
 | --- | --- |
-| run id | `pilot_10x8_20260829` (failed, keep as evidence) |
-| plan hash | `aa9251ccb6d566fa` — 80 distinct C30 `(task, seed)` pairs |
-| parent | `3869b147ab7ce5d2`, untouched `A_sft_new` |
-| stage reached | `.PLANNED` only; `.SAMPLED` absent |
-| spend tonight | **~$3.60** total (mechanism proof ~$2.75 + failed pilot ~$0.85) |
-| host | EC2 `i-0a348ff3d7be9769a`, **SSM only**; state in `/data/tau2/pilot-state` |
+| Branch | `feat/tau2-live-opd` |
+| Contract | parser **v3**, projection **v3**, scoring **chunk-v2** |
+| Parent adapter | `3869b147ab7ce5d2` — untouched, never trained |
+| Frozen plan | `aa9251ccb6d566fa`, 80 distinct C30 `(task, seed)` pairs |
+| Running | nothing — 0 ephemeral Modal apps, 0 GPUs |
+| Spend | ~$1.00 this session (rollout + serving; $0.0155 teacher) |
 
-Do not delete or edit the failed archive. Restart is a **new run id** carrying
-the same 80 pairs and plan hash, per the deep dive.
-
----
-
-## 2. Update 0, exactly as archived
-
-| episode | status | turns | outcome |
-| --- | --- | ---: | --- |
-| task 95 / seed 1 | sampled | 10 | reward 1.0 |
-| task 71 / seed 1 | sampled | 9 | reward 1.0 |
-| task 53 / seed 2 | sampled | 8 | reward 1.0 |
-| task 108 / seed 1 | sampled | 8 | reward 1.0 |
-| task 44 / seed 1 | failed | 3 | unclosed `<think>` |
-| task 68 / seed 0 | failed | 3 | unclosed `<think>` |
-| task 76 / seed 0 | failed | 2 | unclosed `<think>` |
-| task 109 / seed 0 | discarded | 1 | HTTP 408 |
-
-**Read the denominators the way the deep dive states them**, not the way I first
-reported them: 3/7 non-infrastructure *episodes* (42.9%), but only 3 of ~43
-generated *turns* (~7%). I conflated those two rates earlier; the turn rate is
-the one that describes how often the parser is wrong.
-
-`4/4 completed episodes scored reward 1.0` is a **conditional** result on the
-episodes that finished — not a batch success rate.
+Quarantined, never a parent: checkpoint `90e4511f26247f33` (trained under
+projection v1, whose dominant gradient was a serialization artifact). All v1
+and v2 score rows are refused by fingerprint.
 
 ---
 
-## 3. Verified first-hand (I ran these)
+## 2. What the next run is
 
-- **Raw generations of all three failures**, read off the volume via
-  `inspect_failed_turns`. Each: one `<think>`, zero `</think>`, 288–1,347 tokens
-  of coherent reasoning, one or more valid `<tool_call>` blocks, and
-  `finish_reason: stop`. So "dropped reasoning" and "truncated" are both false.
-- **The prompt does not pre-open `<think>`** — `apply_chat_template(...,
-  enable_thinking=True)` ends at `<|im_start|>assistant\n`. The model emits both
-  delimiters itself.
-- **SFT masked the wrapper.** `dataset.py` defines
-  `THINK_WRAPPER_TEXT = "<think>\n\n</think>\n\n"` and `mask_think_wrapper=True`
-  keeps those four tokens out of the loss — the closing tag was context, never a
-  supervised target.
-- **The N:1 advantage defect**, by reading both implementations:
-  `chunk_opd.assign_chunk_advantages` sums `L_S` over the chunk;
-  `live_batch` divided the chunk's `L_T` across its student tokens and took a
-  fresh ratio per token. Worked example, verified numerically — 3 student
-  tokens with **unequal** logprobs `[-0.5, -1.0, -1.5]`, teacher agreeing
-  exactly (`L_T = L_S = -3.0`): the chunk rule gives `[0, 0, 0]`, the per-token
-  rule gives `[-0.5, 0, +0.5]`. Opposing gradients at exact agreement.
+Update 0 of run `c` produced **7 sampled + 1 failed**. The seven are valid and
+paid for; only task 95's slot is unusable.
 
-  **Correction to an earlier version of this file:** it used three *equal*
-  logprobs (`-1.0` each) and claimed the live path produced `A_i = -2.0`. That
-  is wrong — with equal logprobs both rules return `[0, 0, 0]`, and a
-  regression test built on that example would have passed against the defect.
-  The distinguishing case requires unequal student logprobs within one chunk.
+```text
+u000-task44-seed1   sampled   8 turns      u000-task76-seed0   sampled  10
+u000-task53-seed2   sampled   8            u000-task108-seed1  sampled   8
+u000-task68-seed0   sampled   9            u000-task109-seed0  sampled  14
+u000-task71-seed1   sampled   9            u000-task95-seed1   FAILED    7
+```
 
-  **Repaired 2026-08-29 (`4b82d09`)** — chunks persisted whole through
-  scoring, persistence and resume; arithmetic delegated to `chunk_opd`.
-- **Endpoint URL fabrication** (fixed, `8bcb047`): the fallback invented a URL
-  missing the workspace prefix, class segment and `-dev` suffix, so every
-  request 404'd while vLLM logged `UP in 183s`. Never fabricate the URL —
-  resolve it.
+All seven share one adapter, one policy version (`live-u000`), one generation
+config, `require_reasoning=True`. Rerunning them would discard valid work and
+add sampling variation that answers nothing.
 
-  **Not established:** that `get_web_url()` works only on the class's Function
-  and not on a bound instance method. Both a laptop and a box probe returned a
-  correct URL from the bound class method, so that explanation is unproven and
-  should not be repeated as the root cause. What is verified is the fabricated
-  fallback and its 404s.
-- **Teardown works.** The orchestrator stopped its endpoint on failure both
-  times; `owned_apps.json` came back empty.
-
-## 3b. NOT verified — do not repeat these as facts
-
-- **Whether the 4 successful episodes closed their think tags.** Never checked.
-  If some turns close and some do not, the form is stochastic; if the successes
-  never opened `<think>` at all, the story is different again. This is free to
-  check from the archive and has not been done.
-- **Whether SFT masking *causes* the unclosed form.** Plausible and consistent,
-  but it is a hypothesis. The deep dive says so; I stated it more firmly than
-  the evidence supports at one point.
-- **Whether the HTTP 408 is random.** Needs correlation with request duration
-  and client/server timeouts before being called infrastructure noise.
-- **Cumulative Modal spend.** Never pulled from modal.com. The $30 ceiling is
-  per-run and cannot see the account total.
-- **The earlier claim that one OPD update broke `</think>`** (in the older
-  handoff) is an unproven causal hypothesis. The untouched parent produces the
-  same form.
+**So: carry the seven forward, re-roll one.**
 
 ---
 
-## 4. Restart gates
+## 3. Commands (run on the box, as `ubuntu`)
 
-See `docs/TAU2-OPD-DEEP-DIVE.md` § "Mandatory restart gates" — eight items.
-The two that block everything:
+```bash
+cd /data/vektori-trace
+git -c safe.directory=/data/vektori-trace fetch -q origin feat/tau2-live-opd
+git -c safe.directory=/data/vektori-trace reset --hard origin/feat/tau2-live-opd
+set -a; . ./.env; set +a
+```
 
-1. **N:1 / M:N advantages must match `chunk_opd.py` exactly.** Carry aligned
-   chunk membership through projected scoring rather than collapsing to
-   per-index. Add the regression test where equal aggregate likelihoods produce
-   zero advantage for every token in the chunk. Until this passes, a finite loss
-   and a healthy gradient norm are **not** evidence the update direction is
-   right.
-2. **Parser parity with pinned vLLM.** Port the narrow upstream behavior
-   (vLLM `92762ed`): first valid `<tool_call>` opening is the implicit end of an
-   unclosed `<think>`; spans stay disjoint; invent no bytes; refuse the
-   ambiguous cases. Not a general "reasoning to end of generation" rule — that
-   would sweep the tool calls into the reasoning payload.
+### 3.1 Stage the destination run (free)
 
-The root cause of the parser drift is worth keeping in mind: live capture posts
-pre-tokenized ids to `/completions`, so vLLM's `qwen3` and `hermes` parsers
-never run. `split_generation()` is a client-side reimplementation that fell
-behind upstream.
+`retry_slot` refuses to run without the destination's frozen manifest.
+
+```bash
+cp docs/prereg/pilot_10x8_20260829d.manifest.json /tmp/md.json
+.venv/bin/modal run scripts/tau2_live_opd_modal.py::stage_manifest \
+  --run-id pilot_10x8_20260829d --manifest-json "$(cat /tmp/md.json)"
+```
+
+### 3.2 Carry the seven, leave task 95 empty (free)
+
+```bash
+.venv/bin/modal run scripts/tau2_live_opd_modal.py::retry_slot \
+  --source-run-id pilot_10x8_20260829c \
+  --dest-run-id   pilot_10x8_20260829d \
+  --update 0 --episode-id u000-task95-seed1 --attempt 2
+```
+
+Writes `retry_provenance.json`. Refuses on: a non-`failed` episode, `attempt`
+other than 2, a carried set that is not the planned roster minus the retried
+slot, a plan-hash mismatch, a missing turn file, or any leak of the retried
+episode into the destination.
+
+### 3.3 Start the endpoint (**first spend**, L40S ≈ $1.95/h)
+
+```bash
+tmux new-session -d -s pd-serve 'cd /data/vektori-trace && set -a && . ./.env && set +a && \
+  .venv/bin/python scripts/serve_student.py \
+    --base-model Qwen/Qwen3-4B \
+    --adapter sft=/adapters/tau2/runs/a_sft_new_ck35_r2/checkpoint-32 \
+    --gpu L40S --max-model-len 24576 --max-lora-rank 16 \
+    --reasoning-parser qwen3 \
+    --write-env /data/tau2/pilotd_student.env \
+    --write-app-id /data/tau2/pilotd_app_id.txt \
+    --gpu-log /data/tau2/pilotd_gpu.jsonl --max-hours 2 \
+    2>&1 | tee /data/tau2/pilotd_serve.log'
+
+# ready when this prints a URL (~2 min):
+grep STUDENT_API_BASE /data/tau2/pilotd_student.env
+```
+
+### 3.4 Re-roll ONLY task 95
+
+The absent slot is what makes `capture_live_update` resample it; the seven
+present ids are skipped.
+
+```bash
+set -a; . /data/tau2/pilotd_student.env; set +a
+mkdir -p /data/tau2/pilotd-state
+tmux new-session -d -s pd-u0 "cd /data/vektori-trace && set -a && . ./.env && . /data/tau2/pilotd_student.env && set +a && \
+  .venv/bin/modal run scripts/tau2_live_opd_modal.py::rollout_only \
+    --run-id pilot_10x8_20260829d --update 0 \
+    --api-base \"\$STUDENT_API_BASE\" --student-model Qwen3-4B-sft \
+    --adapter-hash-expect 3869b147ab7ce5d2 \
+    > /data/tau2/pilotd-state/u0_retry.log 2>&1"
+
+tail -f /data/tau2/pilotd-state/u0_retry.log | grep --line-buffered -E "rolling out|rollout took|Traceback|episode"
+```
+
+**Tear down the moment it finishes** — the scorer needs no GPU:
+
+```bash
+tmux kill-session -t pd-u0 2>/dev/null; tmux kill-session -t pd-serve 2>/dev/null
+for a in $(.venv/bin/modal app list 2>/dev/null | grep ephemeral | grep -oE "ap-[A-Za-z0-9]+"); do
+  .venv/bin/modal app stop -y "$a"; done
+.venv/bin/modal app list | grep -c ephemeral      # must print 0
+```
+
+### 3.5 Free check before paying the teacher
+
+```bash
+.venv/bin/modal run scripts/tau2_live_opd_modal.py::scoring_dryrun \
+  --run-id pilot_10x8_20260829d --update 0
+```
+
+Six gates must read **True**: all actions scored, token accounting complete,
+supervision retained, no index-1 boundary newline, no payload skips, interior
+whitespace kept. Expect ~96% retention.
+
+### 3.6 Then the update-0 hold
+
+```bash
+.venv/bin/modal run scripts/tau2_live_opd_modal.py::rescore \
+  --run-id pilot_10x8_20260829d --update 0     # ≈ $0.02
+```
+
+**Stop and inspect before any optimizer step** (§5).
+
+### Progress at any time
+
+```bash
+bash scripts/pilotc_status.sh pilot_10x8_20260829d
+```
 
 ---
 
-## 5. Operational facts worth not re-deriving
+## 4. What was fixed today, and why each mattered
 
-- vLLM serves adapters **prefixed**: `a-sft-new` → `Qwen3-4B-a-sft-new`. An
-  unknown name silently resolves to the base model. This cost one launch.
-- `serve_student.py` writes `pilot_env.sh` only after a real completion
-  succeeds. That smoke test is the readiness signal, not the log line.
-- `--tool-call-parser hermes` is required or vLLM 400s on any request carrying
-  `tools`; `/models`, `/health` and plain completions all look fine until the
-  first tool turn.
-- **~8 turns/episode**, measured. The proposal's "~13" was an estimate. 10×8 is
-  therefore ~640 actions.
-- Failed and discarded episodes are **terminal**. A resume reloads them, refuses
-  to resample, and fails the same 8/8 check. `--start-at 0` does not force
-  resampling.
-- The alerting substrings `refus` and `Error` false-positive constantly on
-  `update-NNN.log` — it is retail dialogue full of "refund", "return",
-  "refusal". Match orchestrator strings (`STOPPING`, `failed (rc=`, `!!`,
-  `Traceback`) in `pilot_run.log` only.
-- `scripts/pilot_watch.sh` hardcodes a laptop scratchpad path and is **useless
-  on the box**. Fix or delete it.
+| Defect | Consequence if unfixed | Commit |
+| --- | --- | --- |
+| Live path took one L_T/L_S ratio **per token**, not per chunk | Opposing gradients at exact teacher/student agreement. `[-0.5,-1.0,-1.5]` vs `L_T=-3.0` → chunk rule `[0,0,0]`, per-token `[-0.5,0,+0.5]`. Equal logprobs agree either way, which is why it hid | `4b82d09` |
+| Parser required literal `</think>` | Discarded episodes whose reasoning was present and coherent | `eb2a79e` |
+| Score fingerprints ignored parser/projection/thinking mode | A resume would silently reuse scores bought under a different contract | `eb2a79e` |
+| Boundary `\n` carried teacher credit | Largest gradient in the batch was "delete the newline your template requires" (−15..−23, 11/11 turns) | `19ac0c2` |
+| Trim applied to student side only | Teacher token straddled the payload start; retention **96.5% → 11.1%** | `45c4b46` |
+| Span claimed bytes its tokens no longer covered | Failure moved to `payload_bytes_disagree`, still 11.1% | `26da903` |
+| `verify_episode` required literal `</think>` | Failed tasks 68 and 108 whose reasoning **was** captured (2,193 / 2,056 chars). Update 0 was really 7/8, not 5/8 | `3a85022` |
+| `_resolve_reasoning` accepted whitespace-only reasoning as `closed` | A reasoning-required run could accept a turn that reasoned about nothing — the empty SFT wrapper | `3a85022` |
+| `loss`/`grad_norm` reported `None` | No per-update signal for a stop condition | `19ac0c2` |
+| `--start-at` ignored `next_update` | Could skip an untrained update, leaving every later one parented on a checkpoint that never existed | `2b66a13` |
+
+**Two bugs were caught only by the free dry-run on real captured bytes**, not by
+unit tests: the one-sided normalization and the span/token disagreement. Run
+§3.5 before every paid rescore.
 
 ---
 
-## 6. Commits this session
+## 5. The two holds (preregistered, not optional)
 
-| commit | what |
-| --- | --- |
-| `6047ccd` | gate 4 — canary from SAMPLED-only evidence |
-| `7409099` | `--rescore-only` — paid scoring, no optimizer step |
-| `cf54d32` | `--one-step-only` — one step from cached scores |
-| `b5b777c` | `--tool-call-parser`, or every tool turn is a 400 |
-| `115c151` | `--parent-override`, or update 2 retrains from the SFT adapter |
-| `324da9b` | live share limits are telemetry, not refusal |
-| `26d2ed3` | `one_step` must resume Adam, not just the weights |
-| `221daf9` | per-update identity + `rollout_only` |
-| `47bb680` | pilot orchestrator, resume and scoped teardown |
-| `c7a8fda` | freeze 80 distinct C30 plans before update 0 |
-| `ea01216` | rehearsal, ledger fixes, frozen preregistration |
-| `1a568d6` | `stage_manifest` |
-| `8bcb047` | never fabricate the endpoint URL |
-| `fcad207` | `inspect_failed_turns` — read raw bytes before diagnosing |
+**After update-0 SCORED:** 100% planned coverage · no payload skips · zero
+boundary-newline/markup/tool-JSON weight · exact accounting · all advantages
+finite · no zero-supervision actions · negative tail semantic rather than
+serialization.
 
-Full suite at `ea01216`: **1,982 passed, 2 skipped, 0 failed**.
+**After update-1 SAMPLED:** sampled from update-0's verified child hash · valid
+explicit or implicit reasoning boundaries · tools executable · no format
+regression · complete roster.
+
+Updates 2–9 are **not authorized** until both pass.
 
 ---
 
-## 7. The two-update mechanism proof is now suspect
+## 6. Retry policy (manifest `pilot_10x8_20260829d`)
 
-`b6c160fcf9792e92` and `01a95c2368661cd7` were trained through the same
-projected path that carries the N:1 defect, so **their loss and gradient
-numbers were computed with inflated ratios**. Treat those runs as evidence that
-the *plumbing* executes end to end, not as evidence about the update direction.
+Format failures (`status="failed"`) are a measurement **of the policy**:
+one slot-level retry, **stop on ≥2 in any attempt, or any failure on the
+retry**. Infrastructure failures (`status="discarded"`) get two retries with
+backoff, then stop. Never conflated; the archive already distinguishes them.
 
-They also trained on tasks 57/73/75/93, which are **S16** — fine for a mechanism
-test, disqualifying for the pilot lineage. The pilot restarts from the untouched
-parent and those two checkpoints are never in it.
+At a 12% per-episode format-failure rate: P(≥1 in 8) = **64%**, P(≥2) = 25%,
+P(both attempts fail) = **41%**. So ~2 in 3 updates fail the gate on first
+attempt. That is the real tax of `require_reasoning` on this SFT lineage, and
+it is a measurement, not an obstacle.
+
+---
+
+## 7. What this run cannot claim
+
+It is an **instrumentation, stability and sizing** run. It cannot establish
+efficacy: 16 S16 episodes cannot separate a modest improvement from sampling
+variation, and there is no matched continued-SFT control. Batches are
+conditioned on format validity, so it stays signal-seeking.
+
+Do not size an extension from external rollout counts — our correlated
+multi-turn Tau2 turns are not comparable to independent single-turn rollouts.
+Size it from this run's measured gradient variance, policy movement and
+evaluation variance. A balanced 10×8 extension to 20×8 is predeclared and
+would also be exploratory.
+
+---
+
+## 8. Open, not fixed
+
+- **Task 95's form is a real model failure.** 925 chars: opens `<think>`,
+  reasons, then drifts into addressing the user, with no closing tag and no
+  tool call. There is no non-arbitrary boundary; refusing is correct. It may
+  recur on the re-roll — if it does, stop rather than resample again.
+- **`</think>` is accommodated, not taught.** Markup carries zero OPD weight by
+  construction, so live OPD provides no positive target for the closing tag.
+  Any formatting effect is indirect.
+- **HTTP 408/500** seen twice; timeout cause never correlated with request
+  duration.
+- Cost figures are **estimates**, never reconciled against a Modal invoice.

@@ -521,7 +521,7 @@
     "reason": "update-0 rollout refused its exact batch: 2 episodes (68, 108) were valid implicit-boundary generations failed by a stale literal-</think> archive gate, and 1 (task 95 turn 7) was a genuine no-boundary generation. No .SAMPLED, no teacher call, no optimizer step; parent untouched.",
     "note": "c's archive is preserved unchanged and its 1/8 genuine format failure counts toward the reported rate."
   },
-  "code_commit": "3a85022b11aec06b4c8f3897d2f4e8f682add6d9",
+  "code_commit": "f68edfc221d47527183737320ca6fb1e4f6e6e1e",
   "embedded_two_update_proof": {
     "updates": [
       0,
@@ -576,22 +576,34 @@
     "refused": [
       "no <think> at all",
       "unclosed <think> with no complete valid <tool_call> to bound it",
-      "whitespace-only reasoning (the empty SFT wrapper) in EITHER mode",
+      "whitespace-only reasoning in EITHER branch (parser v3; v2 accepted it in the closed branch, which is the empty wrapper SFT trained under)",
       "multiple openers, unpaired closer, malformed tool JSON"
     ],
-    "fixed_2026_08_29": "verify_episode required a literal </think>, which is v1 logic. It failed tasks 68 and 108 whose reasoning was captured (2,193 and 2,056 chars) with 3 and 1 tool calls parsed. Update 0 would have been 7/8, not 5/8."
+    "fixed_2026_08_29": "verify_episode required a literal </think>, which is v1 logic. It failed tasks 68 and 108 whose reasoning was captured (2,193 and 2,056 chars) with 3 and 1 tool calls parsed. Update 0 would have been 7/8, not 5/8.",
+    "parser_version": "v3"
   },
   "retry_policy": {
     "rationale": "retrying until eight episodes happen to be format-valid selects lucky trajectories and hides the model's real failure rate. Bounded retries keep the run honest; the failure rate is itself a primary outcome.",
     "format_failures": {
       "definition": "episode status 'failed' -- a measurement OF THE POLICY",
       "max_retries": 1,
-      "unit": "whole batch; never combine successful episodes across attempts",
+      "unit": "SLOT-LEVEL. Only the format-failed episode is resampled; the other seven planned episodes are carried forward unchanged from the refused attempt.",
       "stop_if": [
         ">=2 format-failed episodes in ANY single 8-episode attempt",
         "any format failure on the retry attempt (budget exhausted, no exact batch exists)"
       ],
-      "reporting": "PRIMARY outcome. Rate is computed over ALL attempted episodes including rejected attempts, and includes the 1/8 observed in pilot_10x8_20260829c update 0."
+      "reporting": "PRIMARY outcome. Rate is computed over ALL attempted episodes including rejected attempts, and includes the 1/8 observed in pilot_10x8_20260829c update 0.",
+      "superseded_unit": "An earlier draft of this manifest said 'whole batch; never combine successful episodes across attempts'. That is withdrawn as needlessly wasteful: the seven survivors were audited to share one adapter (3869b147ab7ce5d2), one policy version (live-u000), one generation config and require_reasoning=True, and Tau2 episodes are independent of one another. Rerunning them would discard valid paid work and add sampling variation that answers nothing.",
+      "why_this_is_still_honest": [
+        "the refused attempt is preserved unchanged and its format failure counts toward the reported rate",
+        "retry_provenance.json in the destination names the retried slot, the attempt number and every carried episode",
+        "the carried set must equal the planned roster minus the retried slot -- no shrinking, no foreign ids",
+        "source and destination plan hashes must match",
+        "only status='failed' may be retried; a 'discarded' episode follows the infrastructure policy and a 'sampled' one is never resampled",
+        "events and simulations are FILTERED, so no material from the retried episode survives into the destination"
+      ],
+      "bias_note": "This is conditional sampling at the SLOT level rather than the batch level. It conditions one planned slot on producing a parseable action, which is a weaker conditioning than resampling the whole batch would be, but it is conditioning nonetheless and keeps the pilot signal-seeking.",
+      "mechanism": "scripts/tau2_live_opd_modal.py::retry_slot"
     },
     "infrastructure_failures": {
       "definition": "episode status 'discarded' -- an environment event, not a policy measurement (e.g. HTTP 408/500)",

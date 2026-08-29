@@ -80,7 +80,7 @@ class TestProvenance:
             key = "ep1@0"
         prov = score_row_provenance(S(), _row())
         assert prov["score_algorithm"] == SCORE_ALGORITHM
-        assert prov["parser_version"] == "v2"
+        assert prov["parser_version"] == "v3"
         assert prov["projection_version"] == "v3"
         assert prov["thinking_mode"] == "thinking"
         assert prov["fingerprint"] == live_score_fingerprint(_row())

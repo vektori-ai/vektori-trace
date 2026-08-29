@@ -2448,10 +2448,58 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
     if episode_id not in latest:
         raise ValueError(f"{episode_id} is not in {eps_path}")
 
+    if latest[episode_id].get("status") != "failed":
+        raise ValueError(
+            f"{episode_id} has status {latest[episode_id].get('status')!r}, not "
+            "'failed'. Only a format failure may be retried -- an infrastructure "
+            "discard follows the infrastructure retry policy, and a sampled "
+            "episode must never be resampled."
+        )
+    if attempt != 2:
+        raise ValueError(
+            f"attempt={attempt}: the preregistered format-retry budget is "
+            "exactly one, so the only permitted retry is attempt 2. A third "
+            "attempt means the budget is exhausted and the run must stop."
+        )
+
     keep = {e: r for e, r in latest.items()
             if e != episode_id and r.get("status") == "sampled"}
     if not keep:
         raise ValueError("no sampled episodes to carry forward")
+
+    # The carried set must be EXACTLY the planned roster minus the retried
+    # slot. A short set would silently shrink the update; a foreign id would
+    # smuggle in an episode the schedule never planned.
+    planned_path = os.path.join(base, dest_run_id, "manifest.json")
+    if not os.path.isfile(planned_path):
+        raise FileNotFoundError(
+            f"{planned_path} is missing: stage the destination run's frozen "
+            "manifest before carrying episodes into it, or the batch has no "
+            "schedule to be checked against"
+        )
+    with open(planned_path) as fh:
+        dest_manifest = json.load(fh)
+    planned_ids = {p["episode_id"] for p in dest_manifest["plans_by_update"][update]}
+    if episode_id not in planned_ids:
+        raise ValueError(f"{episode_id} is not planned in update {update}")
+    want = planned_ids - {episode_id}
+    if set(keep) != want:
+        missing = sorted(want - set(keep))
+        extra = sorted(set(keep) - want)
+        raise ValueError(
+            f"carried set is not the planned roster minus {episode_id}: "
+            f"missing={missing} unexpected={extra}"
+        )
+    src_manifest = os.path.join(base, source_run_id, "manifest.json")
+    if os.path.isfile(src_manifest):
+        with open(src_manifest) as fh:
+            sm = json.load(fh)
+        if sm.get("plan_hash") != dest_manifest.get("plan_hash"):
+            raise ValueError(
+                f"source plan_hash {sm.get('plan_hash')} != destination "
+                f"{dest_manifest.get('plan_hash')}; these are different "
+                "schedules and their episodes are not interchangeable"
+            )
 
     # One policy, one adapter, one recipe -- or the carried batch is a mixture.
     for field in ("adapter_hash", "policy_version", "gen_config_hash",
@@ -2473,23 +2521,76 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
             if r["episode_id"] in keep:
                 fh.write(line if line.endswith("\n") else line + "\n")
 
+    # Every carried episode must bring its turn file. A row without turns is
+    # an episode whose evidence is missing -- it would pass the batch count and
+    # then supervise nothing.
     copied = []
-    for e in keep:
+    for e in sorted(keep):
         t = os.path.join(src_arch, "turns", f"{e}.jsonl")
-        if os.path.isfile(t):
-            shutil.copy2(t, os.path.join(dst_arch, "turns", f"{e}.jsonl"))
-            copied.append(e)
-    for sub in ("events.jsonl",):
-        f = os.path.join(src_arch, sub)
-        if os.path.isfile(f):
-            shutil.copy2(f, os.path.join(dst_arch, sub))
-    sims = os.path.join(src_arch, "simulations")
-    if os.path.isdir(sims):
-        shutil.copytree(sims, os.path.join(dst_arch, "simulations"),
-                        dirs_exist_ok=True)
+        if not os.path.isfile(t):
+            raise FileNotFoundError(
+                f"{e} is marked sampled but has no turn file at {t}; refusing "
+                "to carry an episode whose evidence is missing"
+            )
+        shutil.copy2(t, os.path.join(dst_arch, "turns", f"{e}.jsonl"))
+        copied.append(e)
+
+    # FILTER events and simulations -- never bulk-copy them. `events.jsonl`
+    # holds one stream for the whole update and `simulations/` one file per
+    # episode, so copying either wholesale carries the FAILED episode's
+    # material into a destination whose episode row was deliberately removed.
+    # The retry would then contain stale task-95 evidence that no episodes.jsonl
+    # row accounts for.
+    ev_src = os.path.join(src_arch, "events.jsonl")
+    n_events = n_dropped = 0
+    if os.path.isfile(ev_src):
+        with open(os.path.join(dst_arch, "events.jsonl"), "w") as out_fh:
+            for line in open(ev_src):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                eid = row.get("episode_id")
+                if eid is not None and eid not in keep:
+                    n_dropped += 1
+                    continue
+                out_fh.write(line if line.endswith("\n") else line + "\n")
+                n_events += 1
+
+    sims_src = os.path.join(src_arch, "simulations")
+    sims_copied = []
+    if os.path.isdir(sims_src):
+        os.makedirs(os.path.join(dst_arch, "simulations"), exist_ok=True)
+        for name in sorted(os.listdir(sims_src)):
+            stem = name.split(".")[0]
+            if stem not in keep:
+                continue
+            shutil.copy2(os.path.join(sims_src, name),
+                         os.path.join(dst_arch, "simulations", name))
+            sims_copied.append(name)
+
     planned = os.path.join(src_u, ".PLANNED")
     if os.path.isfile(planned):
         shutil.copy2(planned, os.path.join(dst_u, ".PLANNED"))
+
+    # Nothing belonging to the retried slot may survive the copy.
+    for root, _dirs, files in os.walk(dst_u):
+        for name in files:
+            if episode_id in name:
+                raise AssertionError(
+                    f"retried episode {episode_id} leaked into the destination "
+                    f"as {os.path.join(root, name)}"
+                )
+    ev_check = os.path.join(dst_arch, "events.jsonl")
+    if os.path.isfile(ev_check):
+        for line in open(ev_check):
+            if episode_id in line:
+                raise AssertionError(
+                    f"retried episode {episode_id} leaked into the copied "
+                    "events stream"
+                )
 
     prov = {
         "kind": "retry_slot",
@@ -2502,6 +2603,9 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
         "carried_episodes": sorted(keep),
         "n_carried": len(keep),
         "turn_files_copied": sorted(copied),
+        "events_copied": n_events,
+        "events_dropped_for_retried_slot": n_dropped,
+        "simulations_copied": sims_copied,
         "declared": "CONDITIONAL SAMPLING. The retried slot was resampled "
                     "after a format failure; the failed attempt is preserved "
                     "in the source run and counts toward the reported "

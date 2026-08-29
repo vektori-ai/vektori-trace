@@ -186,4 +186,4 @@ class TestArchivedPilotFixtures:
 
 def test_parser_version_is_v2():
     """Fingerprints bind this; a bump must be deliberate."""
-    assert PARSER_VERSION == "v2"
+    assert PARSER_VERSION == "v3"

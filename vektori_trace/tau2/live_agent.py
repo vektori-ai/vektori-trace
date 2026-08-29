@@ -116,7 +116,13 @@ _TOOLCALL_OPEN = re.compile(r"<tool_call>", re.DOTALL)
 #: same bytes differently.
 #: - "v1": closed `<think>...</think>` only.
 #: - "v2": adds the implicit boundary above (vLLM `92762ed`).
-PARSER_VERSION = "v2"
+#: - "v3" (2026-08-29): whitespace-only reasoning is refused in the CLOSED
+#:   branch too, not just the implicit one. `<think>   </think>` previously
+#:   resolved as mode="closed" with blank text -- exactly the empty wrapper
+#:   SFT trained under -- so a reasoning-required run could accept a turn that
+#:   reasoned about nothing. This changes which generations are accepted, so
+#:   scores bound to v2 are not valid under it.
+PARSER_VERSION = "v3"
 
 
 class _ReasoningSpan(NamedTuple):
