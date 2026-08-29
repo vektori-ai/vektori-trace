@@ -59,6 +59,7 @@ MODAL=$REPO/.venv/bin/modal
 
 SERVE_PID=""
 TORN_DOWN=0
+TEARDOWN_RC=0
 
 cleanup() {
   # Runs on success, failure, and interrupt. Idempotent: EXIT fires after
@@ -86,24 +87,55 @@ cleanup() {
     app_id=$(grep -oE 'ap-[A-Za-z0-9]+' "$SERVE_LOG" | head -1)
   fi
 
+  # A GPU that keeps billing is the failure this script exists to prevent, so
+  # an unstopped endpoint must be an ERROR, never a warning: the caller has to
+  # be able to halt the chain on it. Retry, then verify, then fail loudly.
   if [ -n "$app_id" ]; then
-    echo "[teardown] stopping serving app $app_id"
-    "$MODAL" app stop -y "$app_id" 2>&1 | tail -2
-    if "$MODAL" app list 2>/dev/null | grep -q "$app_id.*ephemeral"; then
-      echo "[teardown] WARNING: $app_id still listed ephemeral -- stop it by hand:"
-      echo "           $MODAL app stop -y $app_id"
-    else
+    local stopped=0
+    for attempt in 1 2 3; do
+      echo "[teardown] stopping serving app $app_id (attempt $attempt)"
+      "$MODAL" app stop -y "$app_id" 2>&1 | tail -2
+      sleep 3
+      if "$MODAL" app list 2>/dev/null | grep "$app_id" | grep -q ephemeral; then
+        echo "[teardown] still ephemeral, retrying"
+      else
+        stopped=1; break
+      fi
+    done
+    if [ "$stopped" = "1" ]; then
       echo "[teardown] $app_id stopped"
+    else
+      echo "[teardown] ERROR: $app_id STILL BILLING after 3 attempts."
+      echo "           Stop it by hand NOW: $MODAL app stop -y $app_id"
+      echo "TEARDOWN_FAILED $app_id"
+      TEARDOWN_RC=90
     fi
   else
-    echo "[teardown] WARNING: no app id found in $APP_FILE or $SERVE_LOG."
-    echo "           If an endpoint started, stop it by hand:"
-    echo "           $MODAL app list   # then: $MODAL app stop -y <ap-...>"
+    # No id and a serve pid means an endpoint may exist that we cannot name.
+    if [ -n "$SERVE_PID" ]; then
+      echo "[teardown] ERROR: serve was started but no app id was ever recorded."
+      echo "           Check for a stray endpoint: $MODAL app list"
+      echo "TEARDOWN_FAILED unknown"
+      TEARDOWN_RC=91
+    else
+      echo "[teardown] no endpoint was created; nothing to stop"
+    fi
   fi
   echo "[teardown] remaining ephemeral apps (FYI, not touched):"
   "$MODAL" app list 2>/dev/null | grep -c ephemeral
 }
-trap 'cleanup $?' EXIT
+
+# A failed teardown outranks the command's own status: the caller must halt.
+finish() {
+  local rc=$?
+  cleanup "$rc"
+  if [ "$TEARDOWN_RC" != "0" ]; then
+    echo "[teardown] exiting $TEARDOWN_RC because teardown failed"
+    exit "$TEARDOWN_RC"
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 trap 'echo "[teardown] interrupted"; cleanup 130; exit 130' INT TERM
 
 echo "[serve] adapter   $ADAPTER"

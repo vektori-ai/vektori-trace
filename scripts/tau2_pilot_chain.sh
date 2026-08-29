@@ -34,16 +34,36 @@ mkdir -p "$STATE"
 
 halt() { echo ""; echo "!!!! HALT at update $1: $2"; echo "     see $3"; exit 1; }
 
+# Download and PROVE it landed. An unchecked `volume get` that fails leaves a
+# stale file from a previous update in place, and the verifier then passes on
+# the wrong update's data -- a fail-open path, not a missing feature.
 vget() { # vget <volume-path> <local>
-  $M volume get "$VOL" "$1" "$2" --force >/dev/null 2>&1
+  rm -f "$2"
+  if ! $M volume get "$VOL" "$1" "$2" >/dev/null 2>&1; then
+    return 1
+  fi
+  [ -s "$2" ] || return 1
+  return 0
 }
 
 for U in $(seq "$FIRST" "$LAST"); do
   P=$((U-1))
   UU=$(printf "%03d" "$U"); PP=$(printf "%03d" "$P")
+  # Fresh scratch per update: nothing can leak across iterations.
+  TMP=$(mktemp -d "/tmp/chain_${RUN}_u${U}_XXXXXX") || halt "$U" "mktemp failed" -
+  trap 'rm -rf "$TMP"' RETURN 2>/dev/null || true
   echo ""
   echo "================ UPDATE $U ================"
   date -u +"start %H:%M:%SZ"
+
+  # --- parent checkpoint hash: what this rollout must sample from ----------
+  # Resolved BEFORE the marker checks, because verifying an existing
+  # .TRAINED checkpoint compares its parent_policy_hash against this.
+  vget "$RUNS/$RUN/update-$PP/checkpoint/state.json" "$TMP/parent_state.json" \
+    || halt "$U" "parent update-$PP has no checkpoint" "volume"
+  PHASH=$($PY -c "import json;print(json.load(open('$TMP/parent_state.json'))['adapter_hash'])")
+  [ -n "$PHASH" ] || halt "$U" "could not read parent adapter hash" "$TMP/parent_state.json"
+  echo "parent checkpoint: update-$PP  hash $PHASH"
 
   # Resume from stage markers: a halt must never redo a rollout or, worse,
   # re-pay the teacher for scores already on the volume.
@@ -52,18 +72,38 @@ for U in $(seq "$FIRST" "$LAST"); do
   echo "$MK" | grep -q '\.SAMPLED' && HAVE_SAMPLED=1
   echo "$MK" | grep -q '\.SCORED'  && HAVE_SCORED=1
   echo "$MK" | grep -q '\.TRAINED' && HAVE_TRAINED=1
+  # Markers must be consistent: a later stage without its predecessor means
+  # the volume is in a state this script did not create, so stop for a human.
+  if [ $HAVE_SCORED -eq 1 ] && [ $HAVE_SAMPLED -eq 0 ]; then
+    halt "$U" ".SCORED present without .SAMPLED -- inconsistent markers" "volume"
+  fi
+  if [ $HAVE_TRAINED -eq 1 ] && [ $HAVE_SCORED -eq 0 ]; then
+    halt "$U" ".TRAINED present without .SCORED -- inconsistent markers" "volume"
+  fi
+
   if [ $HAVE_TRAINED -eq 1 ]; then
-    echo "already TRAINED -- skipping"; continue
+    # Never skip on a marker alone: verify the checkpoint the marker claims.
+    vget "$RUNS/$RUN/update-$UU/checkpoint/state.json" "$TMP/done_state.json" \
+      || halt "$U" ".TRAINED but checkpoint state.json is missing" "volume"
+    $PY - "$PHASH" "$TMP/done_state.json" <<'PYD' || halt "$U" ".TRAINED checkpoint failed verification" "$TMP/done_state.json"
+import json, sys
+s = json.load(open(sys.argv[2])); parent = sys.argv[1]; ok = True
+if s.get("parent_policy_hash") != parent:
+    print("  !! parent %s != expected %s" % (s.get("parent_policy_hash"), parent)); ok = False
+if not s.get("reload_verified") or not s.get("bytes_verified"):
+    print("  !! reload/bytes not verified"); ok = False
+r = s.get("reload_report") or {}
+if r.get("n_matched") != r.get("n_tensors"):
+    print("  !! tensors %s/%s" % (r.get("n_matched"), r.get("n_tensors"))); ok = False
+print("  verified existing checkpoint %s (tensors %s/%s)"
+      % (s.get("adapter_hash"), r.get("n_matched"), r.get("n_tensors")))
+sys.exit(0 if ok else 1)
+PYD
+    echo "already TRAINED and verified -- skipping"; rm -rf "$TMP"; continue
   fi
   [ $HAVE_SAMPLED -eq 1 ] && echo "resume: .SAMPLED present, skipping rollout"
   [ $HAVE_SCORED  -eq 1 ] && echo "resume: .SCORED present, reusing paid scores"
 
-  # --- parent checkpoint hash: what this rollout must sample from ----------
-  vget "$RUNS/$RUN/update-$PP/checkpoint/state.json" /tmp/parent_state.json \
-    || halt "$U" "parent update-$PP has no checkpoint" "volume"
-  PHASH=$($PY -c 'import json,sys; print(json.load(open("/tmp/parent_state.json"))["adapter_hash"])')
-  [ -n "$PHASH" ] || halt "$U" "could not read parent adapter hash" /tmp/parent_state.json
-  echo "parent checkpoint: update-$PP  hash $PHASH"
 
   # --- rollout, with the endpoint torn down on every exit path ------------
   if [ $HAVE_SAMPLED -eq 1 ]; then
@@ -85,6 +125,12 @@ for U in $(seq "$FIRST" "$LAST"); do
       > "$RLOG" 2>&1
   RC=$?
   grep -aE "rollout took|episodes" "$RLOG" | tail -2
+  # 90/91 are the wrapper's teardown-failure codes: an endpoint may still be
+  # billing, so the chain must stop rather than start another update.
+  if grep -aq "TEARDOWN_FAILED" "$RLOG"; then
+    grep -a "TEARDOWN_FAILED" "$RLOG" | tail -2
+    halt "$U" "ENDPOINT TEARDOWN FAILED -- a GPU may still be billing" "$RLOG"
+  fi
   [ $RC -eq 0 ] || halt "$U" "rollout failed (exit $RC)" "$RLOG"
   fi
 
@@ -92,6 +138,9 @@ for U in $(seq "$FIRST" "$LAST"); do
   DLOG=$STATE/u${U}_dryrun.log
   timeout 900 $M run scripts/tau2_live_opd_modal.py::scoring_dryrun \
       --run-id "$RUN" --update "$U" > "$DLOG" 2>&1
+  DRC=$?
+  # An ignored exit code lets a crashed dry-run pass on stale matching text.
+  [ $DRC -eq 0 ] || halt "$U" "dry-run failed (exit $DRC)" "$DLOG"
   RET=$(grep -aoE 'retained: [0-9.]+' "$DLOG" | tail -1 | grep -oE '[0-9.]+')
   echo "retention: $RET"
   [ -n "$RET" ] || halt "$U" "dry-run produced no retention figure" "$DLOG"
@@ -101,13 +150,37 @@ for U in $(seq "$FIRST" "$LAST"); do
     || halt "$U" "boundary-newline weight present" "$DLOG"
   grep -aq "token accounting complete   : True" "$DLOG" \
     || halt "$U" "token accounting incomplete" "$DLOG"
+  grep -aq "structural weight zero" "$DLOG" \
+    || grep -aq "no index-1 boundary newline : True" "$DLOG" \
+    || halt "$U" "structural/markup tokens may carry weight" "$DLOG"
+
+  # Declared stop rule: >10% of reasoning bytes excluded. Derived from the
+  # dry-run's own exclusion counters rather than assumed from retention.
+  $PY - "$DLOG" <<'PYB' || halt "$U" "excluded reasoning exceeds 10%" "$DLOG"
+import json, re, sys
+t = open(sys.argv[1], errors="replace").read()
+m = re.search(r"exclusion reasons: (\{.*?\})", t)
+tot = re.search(r"student tokens: (\d+)", t)
+if not m or not tot:
+    print("  !! could not read exclusion counters"); sys.exit(1)
+ex = json.loads(m.group(1)); total = int(tot.group(1))
+# reasoning-side exclusions: payload disagreement + boundary straddles
+rb = ex.get("payload_bytes_disagree", 0) + ex.get("straddles_payload_boundary", 0)
+frac = rb / total if total else 1.0
+print("  reasoning-side exclusions: %d/%d = %.2f%% (rule: stop above 10%%)"
+      % (rb, total, 100 * frac))
+sys.exit(0 if frac <= 0.10 else 1)
+PYB
 
   # --- exclusions must match the DECLARED policy, not merely be few -------
-  vget "$RUNS/$RUN/update-$UU/actions.jsonl" /tmp/chain_actions.jsonl
-  vget "$RUNS/$RUN/manifest.json" /tmp/chain_manifest.json
+  vget "$RUNS/$RUN/update-$UU/actions.jsonl" "$TMP/actions.jsonl" \
+    || halt "$U" "could not download actions.jsonl" "volume"
+  vget "$RUNS/$RUN/manifest.json" "$TMP/manifest.json" \
+    || halt "$U" "could not download manifest.json" "volume"
   ELOG=$STATE/u${U}_exclusions.log
-  $PY scripts/pilotd_verify_exclusions.py /tmp/chain_manifest.json \
-      /tmp/chain_actions.jsonl > "$ELOG" 2>&1
+  $PY scripts/pilotd_verify_exclusions.py "$TMP/manifest.json" \
+      "$TMP/actions.jsonl" > "$ELOG" 2>&1 \
+    || halt "$U" "exclusion verifier crashed" "$ELOG"
   grep -aE "affected (actions|episodes)|undeclared classes" "$ELOG"
   grep -aq "VERDICT: all skips covered by declared policy" "$ELOG" \
     || halt "$U" "undeclared exclusion class" "$ELOG"
@@ -131,6 +204,26 @@ for U in $(seq "$FIRST" "$LAST"); do
   fi
   fi
 
+  # --- post-score validation: the marker alone is not evidence ------------
+  MK2=$($M volume ls "$VOL" "$RUNS/$RUN/update-$UU" 2>/dev/null)
+  echo "$MK2" | grep -q '\.SCORED' || halt "$U" ".SCORED missing after scoring" "$SLOG"
+  vget "$RUNS/$RUN/update-$UU/scores.jsonl" "$TMP/scores.jsonl" \
+    || halt "$U" "scores.jsonl missing after scoring" "volume"
+  $PY scripts/pilotd_scorerow.py "$TMP/scores.jsonl" "$TMP/actions.jsonl" \
+      > "$STATE/u${U}_scorecheck.log" 2>&1 \
+    || halt "$U" "score-row check crashed" "$STATE/u${U}_scorecheck.log"
+  grep -aE "matched [0-9]+   mismatched" "$STATE/u${U}_scorecheck.log"
+  $PY - "$STATE/u${U}_scorecheck.log" <<'PYF' || halt "$U" "score fingerprints not bound to actions" "$STATE/u${U}_scorecheck.log"
+import re, sys
+t = open(sys.argv[1], errors="replace").read()
+m = re.search(r"matched (\d+)\s+mismatched (\d+)\s+no action row (\d+)", t)
+if not m:
+    print("  !! no fingerprint binding line"); sys.exit(1)
+ok, bad, miss = (int(x) for x in m.groups())
+print("  fingerprints matched=%d mismatched=%d orphan=%d" % (ok, bad, miss))
+sys.exit(0 if (bad == 0 and miss == 0 and ok > 0) else 1)
+PYF
+
   # --- one optimizer step from the cached scores ---------------------------
   TLOG=$STATE/u${U}_train.log
   timeout 2400 $M run scripts/tau2_live_opd_modal.py::one_step \
@@ -140,11 +233,11 @@ for U in $(seq "$FIRST" "$LAST"); do
   [ $TRC -eq 0 ] || halt "$U" "training failed (exit $TRC)" "$TLOG"
 
   # --- checkpoint verification: lineage, movement, reload ------------------
-  vget "$RUNS/$RUN/update-$UU/checkpoint/state.json" /tmp/child_state.json \
+  vget "$RUNS/$RUN/update-$UU/checkpoint/state.json" "$TMP/child_state.json" \
     || halt "$U" "no checkpoint written" "$TLOG"
-  $PY - "$PHASH" <<'PYV' || halt "$U" "checkpoint verification failed" /tmp/child_state.json
+  $PY - "$PHASH" "$TMP/child_state.json" <<'PYV' || halt "$U" "checkpoint verification failed" "$TMP/child_state.json"
 import json, sys, math
-s = json.load(open("/tmp/child_state.json"))
+s = json.load(open(""$TMP/child_state.json""))
 parent = sys.argv[1]
 ok = True
 if s.get("parent_policy_hash") != parent:
@@ -178,6 +271,7 @@ for n in ("loss", "grad_norm"):
 PYL
 
   date -u +"done  %H:%M:%SZ"
+  rm -rf "$TMP"
   echo "---- update $U OK ----"
 done
 
