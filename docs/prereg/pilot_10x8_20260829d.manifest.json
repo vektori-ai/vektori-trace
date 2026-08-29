@@ -521,7 +521,7 @@
     "reason": "update-0 rollout refused its exact batch: 2 episodes (68, 108) were valid implicit-boundary generations failed by a stale literal-</think> archive gate, and 1 (task 95 turn 7) was a genuine no-boundary generation. No .SAMPLED, no teacher call, no optimizer step; parent untouched.",
     "note": "c's archive is preserved unchanged and its 1/8 genuine format failure counts toward the reported rate."
   },
-  "code_commit": "edefb837deb89efb4986387931de0942e1a27383",
+  "code_commit": "f67692b739ddae6017331352488fca3394e84717",
   "embedded_two_update_proof": {
     "updates": [
       0,
@@ -624,5 +624,5 @@
     },
     "declared_conditional_sampling": "training batches are conditioned on format validity, so the pilot stays SIGNAL-SEEKING and is not clean efficacy evidence."
   },
-  "code_commit_note": "The commit containing the retry/parser/projection implementation this run uses. It previously named f68edfc -- the pre-fix retry path that bulk-copied events/simulations (carrying the failed episode's material forward) and skipped the status/attempt/roster/plan-hash validations. Artifacts produced under f68edfc are not this experiment. This field names the CODE commit; the manifest edit that set it is necessarily a later commit, since a commit cannot contain its own hash. Verify with `git merge-base --is-ancestor edefb83 HEAD`."
+  "code_commit_note": "The commit containing the retry/parser/projection implementation this run uses. Corrected twice, both times because the pin named code that predated a fix the run depends on:\n  f68edfc -- pre-fix retry: bulk-copied events/simulations and skipped the status/attempt/roster/plan-hash validations.\n  edefb83 -- had those validations but NOT the nested-payload event filter; a real events row carries its episode id inside `payload`, not at the top level, so that version matched nothing and would have copied all 17 of the retried episode's rows into the destination. The leak guard caught it on the first real invocation.\nArtifacts produced under either hash are not this experiment. This field names the CODE commit; the manifest edit that sets it is necessarily a later commit, since a commit cannot contain its own hash. Verify with `git merge-base --is-ancestor f67692b HEAD`."
 }
