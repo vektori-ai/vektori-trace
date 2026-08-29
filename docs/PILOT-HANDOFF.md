@@ -84,14 +84,30 @@ episodes that finished — not a batch success rate.
   supervised target.
 - **The N:1 advantage defect**, by reading both implementations:
   `chunk_opd.assign_chunk_advantages` sums `L_S` over the chunk;
-  `live_batch.projected_turn_advantages` uses one token's `L_S` against the
-  chunk's `L_T`. Worked example — 3 student tokens each `log p = -1.0`, teacher
-  agrees exactly (`L_T = L_S = -3.0`): reference gives `A_i = 0`, live gives
-  **`A_i = -2.0`**. A strong wrong-direction advantage where the models agree.
-- **Endpoint URL fabrication** (fixed, `8bcb047`): `get_web_url()` lives on the
-  class's Function, not the instance's bound method; the fallback invented a URL
+  `live_batch` divided the chunk's `L_T` across its student tokens and took a
+  fresh ratio per token. Worked example, verified numerically — 3 student
+  tokens with **unequal** logprobs `[-0.5, -1.0, -1.5]`, teacher agreeing
+  exactly (`L_T = L_S = -3.0`): the chunk rule gives `[0, 0, 0]`, the per-token
+  rule gives `[-0.5, 0, +0.5]`. Opposing gradients at exact agreement.
+
+  **Correction to an earlier version of this file:** it used three *equal*
+  logprobs (`-1.0` each) and claimed the live path produced `A_i = -2.0`. That
+  is wrong — with equal logprobs both rules return `[0, 0, 0]`, and a
+  regression test built on that example would have passed against the defect.
+  The distinguishing case requires unequal student logprobs within one chunk.
+
+  **Repaired 2026-08-29 (`4b82d09`)** — chunks persisted whole through
+  scoring, persistence and resume; arithmetic delegated to `chunk_opd`.
+- **Endpoint URL fabrication** (fixed, `8bcb047`): the fallback invented a URL
   missing the workspace prefix, class segment and `-dev` suffix, so every
-  request 404'd while vLLM logged `UP in 183s`.
+  request 404'd while vLLM logged `UP in 183s`. Never fabricate the URL —
+  resolve it.
+
+  **Not established:** that `get_web_url()` works only on the class's Function
+  and not on a bound instance method. Both a laptop and a box probe returned a
+  correct URL from the bound class method, so that explanation is unproven and
+  should not be repeated as the root cause. What is verified is the fabricated
+  fallback and its 404s.
 - **Teardown works.** The orchestrator stopped its endpoint on failure both
   times; `owned_apps.json` came back empty.
 

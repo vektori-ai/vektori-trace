@@ -1,8 +1,10 @@
 # Live cross-tokenizer OPD on Tau2 retail
 
-Date: 2026-08-28
-Status: **proposal**, not yet the plan of record — see §0
-Budget ceiling: $40 provisional, unvalidated until Phase 1 measures it
+Date: 2026-08-28; incident audit updated 2026-08-29
+Status: **proposal plus pilot incident record**, not yet the plan of record —
+see §0 and §"Pilot incident"
+Budget ceiling: $40 in the original proposal; the attempted 10×8 pilot used a
+$30 per-run ceiling
 
 ## 0. Scope, and what this does and does not supersede
 
@@ -414,6 +416,268 @@ live actions carry reasoning, and the stored-action measurement that justified
 2048 was taken over action-only rows. A cap hit is archived as a `FailedTurn`
 and fails its episode rather than being trained — a fragment is not a completed
 action, which is what the 256-token cap did to the 0/13 run.
+
+## Pilot incident — consolidated audit and restart gate (2026-08-29)
+
+This section is the single current record of what the attempted live pilot
+established. Where it conflicts with estimates or operational claims elsewhere
+in this document, **this section wins**. The failed volume archive must be kept
+unchanged as evidence.
+
+### Attempt and observed outcomes
+
+Run `pilot_10x8_20260829`, plan hash `aa9251ccb6d566fa`, attempted update 0
+from untouched parent adapter hash `3869b147ab7ce5d2`. Its frozen manifest
+contains 10 updates × 8 episodes = 80 distinct C30 `(task, seed)` pairs. No
+teacher scoring or OPD training occurred.
+
+All eight update-0 episodes reached a terminal archive state:
+
+| Episode | Status | Turns | Reward / reason |
+| --- | --- | ---: | --- |
+| task 95 / seed 1 | sampled | 10 | 1.0 |
+| task 71 / seed 1 | sampled | 9 | 1.0 |
+| task 53 / seed 2 | sampled | 8 | 1.0 |
+| task 108 / seed 1 | sampled | 8 | 1.0 |
+| task 44 / seed 1 | failed | 3 | unclosed `<think>` before tool call |
+| task 68 / seed 0 | failed | 3 | unclosed `<think>` before tool call |
+| task 76 / seed 0 | failed | 2 | unclosed `<think>` before tool call |
+| task 109 / seed 0 | discarded | 1 | HTTP 408 infrastructure loss |
+
+The honest denominators are different and must not be conflated:
+
+- 4/8 planned episodes completed and were gradeable;
+- 4/4 completed episodes received reward 1.0, a selected conditional result,
+  **not** a 100% batch success rate;
+- 3/7 non-infrastructure episode attempts encountered the parser-visible
+  delimiter form (42.9% of episodes);
+- the form occurred on 3 of roughly 43 generated assistant turns (about 7% of
+  turns), not "40% of turns";
+- one of eight planned episodes was lost to infrastructure.
+
+Measured successful episodes averaged about 8 turns, superseding the proposal's
+unmeasured "~13 turns" estimate. Consequently 10×8 is roughly 640 actions, not
+about 1,040. These are correlated turns inside stateful episodes, not independent
+single-turn prompts.
+
+### Raw-generation diagnosis
+
+The three failed generations were read directly from the Modal volume. Each:
+
+1. contains `<think>`;
+2. contains 288–1,347 tokens of coherent task-related reasoning;
+3. contains one or more syntactically valid `<tool_call>...</tool_call>` blocks;
+4. omits `</think>` before the first tool call; and
+5. ends with `finish_reason: stop`, not `length`.
+
+Therefore "the model dropped reasoning" and "the output was truncated" are
+false descriptions. The raw model output used an unclosed-think/tool-call form.
+The current client parser then misclassified it:
+
+```text
+raw: <think> reasoning ... <tool_call>...</tool_call>
+                         ^ implicit reasoning boundary
+
+current _THINK regex: requires <think>...</think> -> no match
+current result: reasoning=None -> require_reasoning gate refuses the turn
+```
+
+This form is not merely a local repair hypothesis. vLLM upstream commit
+[`92762ed`](https://github.com/vllm-project/vllm/commit/92762edc535c696c3b8a5f3ffee9bc1c0fac10e6),
+"Treat `<tool_call>` as implicit reasoning end in Qwen3 parser", explicitly
+supports it. The repository pins vLLM 0.21.0, but live capture posts
+pre-tokenized ids to `/completions`; vLLM's `qwen3` reasoning parser and
+`hermes` tool parser do not run on that route. `split_generation()` replaces
+them client-side and has drifted behind the upstream Qwen parser contract.
+
+There is a second, model-side contributor: SFT supervised visible actions only
+after a template-provided empty `<think>\n\n</think>\n\n` wrapper. The closing
+tag was context, not a supervised target. Live sampling correctly stops at
+`<|im_start|>assistant\n` so reasoning can be generated, which requires the
+model to emit both delimiters itself. Thus:
+
+- parser parity drift is the immediate capture defect;
+- SFT/live generation-boundary skew plausibly raises the frequency of this
+  output form;
+- the untouched parent produced it before OPD, so OPD did not cause these three
+  failures;
+- the earlier claim that one OPD update broke `</think>` remains an unproven
+  causal hypothesis, not a finding.
+
+No evidence points to `enable_thinking`, a stop string, or the action-token cap:
+thinking is explicitly enabled, the completion request sends no stop sequence,
+and these responses ended with `stop`.
+
+### Required parser correction
+
+Port the narrow upstream behavior, rather than inventing a general
+"reasoning-to-end" heuristic:
+
+1. Preserve normal closed `<think>...</think>` handling.
+2. If `<think>` is unclosed and a complete, valid `<tool_call>` begins later,
+   treat the first tool-call opening as the implicit end of reasoning.
+3. Reasoning bytes end immediately before that tool-call opening. Tool-call
+   bytes are parsed only as tools; the two spans must be disjoint.
+4. Do not invent `</think>` bytes or tokens.
+5. Refuse an unclosed think with no unambiguous valid tool-call boundary,
+   malformed tool JSON, empty reasoning, mixed unexplained suffix text, or
+   multiple ambiguous reasoning blocks.
+6. Persist a recovery/parser-mode field and include the parser contract/version
+   in generation and score fingerprints.
+
+Required tests cover closed think, one and multiple implicit-boundary tool
+calls, malformed/unterminated tools, empty reasoning, mixed text, multiple
+think blocks, raw-byte reconstruction, disjoint token masks, Tau2 execution,
+DeepSeek semantic rendering, and parity with the pinned vLLM Qwen parser.
+
+This is a preregistration amendment because it changes capture eligibility.
+It does not authorize accepting arbitrary missing-reasoning output.
+
+### Independent numerical blocker: projected chunk advantages
+
+The pilot must **not restart after only the parser fix**. The live projected
+training path currently diverges from `chunk_opd.py` for N:1 or M:N
+cross-tokenizer alignments.
+
+The reference computes one ratio per aligned byte chunk:
+
+```text
+L_S = sum student behavior logprobs in the chunk
+L_T = sum teacher logprobs in the chunk
+ratio = L_T / L_S
+A_i = (ratio - 1) * behavior_logprob_i
+```
+
+The live path instead divided `L_T` equally among student tokens and computed a
+separate ratio against each token's `L_S`. The two functions differ whenever the
+student logprobs **inside one chunk** are unequal.
+
+Worked N:1 case, verified numerically 2026-08-29 — one teacher token against
+three student tokens, teacher and student chunk likelihoods exactly equal
+(`L_S = L_T = -3.0`):
+
+```text
+student logprobs   [-0.5, -1.0, -1.5]      teacher chunk total  -3.0
+
+chunk rule     ratio = L_T/L_S = 1      -> A = [ 0.0,  0.0,  0.0]
+per-token rule share = L_T/3 = -1.0     -> A = [-0.5,  0.0, +0.5]
+```
+
+Opposing gradients at exact teacher/student agreement, cancelling in aggregate
+and wrong individually.
+
+**The equal-logprob case does not expose this.** For `[-1.0, -1.0, -1.0]`
+against the same `L_T`, both rules return `[0, 0, 0]`. An earlier draft of this
+section used such an example and claimed a nonzero divergence; that arithmetic
+was wrong, and a regression test built on it would have passed against the
+defect. The distinguishing case must use **unequal** student logprobs. This is
+also why one-byte-per-token and uniform-logprob fixtures hid the bug.
+
+**Repaired 2026-08-29 in commit `4b82d09`.** `live_score` now persists whole
+`ProjectedChunk` records (chunk id, kind, action-level student indices, teacher
+logprobs); `live_batch.chunks_to_alignment` maps the sparse live frame into the
+dense frame and delegates to `chunk_opd.assign_chunk_advantages`, so the
+arithmetic exists once. The endpoint remains tokenwise advantages for a
+tokenwise loss; only the ratio is chunkwise:
+
+```text
+aligned chunk -> one chunk ratio -> tokenwise advantages -> tokenwise loss
+```
+
+Chunk identity is carried through all three layers — in-memory score,
+persisted score row (`score_algorithm: "chunk-v2"`), and resume
+reconstruction — because a fresh run alone being correct while a resume
+reverted to flat credit is the same defect with a longer fuse. Score rows
+predating the fix are refused rather than reinterpreted.
+
+19 equivalence tests cover 1:1, 1:N, N:1, M:N, mixed and sparse-index shapes
+against `chunk_opd`, and pin both the defective rule and the equal-logprob
+blind spot.
+
+**The two earlier mechanism-proof checkpoints ran through the pre-repair path.**
+They establish that the pipeline executes end to end — sampling, scoring,
+optimizer step, reload — and they do **not** establish that the update
+direction was correct, because chunk grouping had been discarded before the
+advantages were formed. Their loss and gradient numbers are evidence of
+execution, not of trustworthy OPD signal.
+
+### Other confirmed correctness and reliability issues
+
+These are restart gates unless explicitly classified otherwise:
+
+1. **Visible content before tools can lose all teacher weight.** A DeepSeek
+   token that straddles the content/DSML boundary causes the entire content
+   payload to be excluded. Fifty content-class tokens were omitted in one
+   archived reconciliation. Quantify and either repair boundary handling or
+   preregister the omission; do not silently call it complete coverage.
+2. **`thinking_mode` is absent from teacher identity.** The scorer hardcodes
+   `"thinking"`, but the teacher-context hash does not bind it. Add it to the
+   manifest, context hash and score fingerprint so a mode change invalidates
+   cached scores.
+3. **Disk score reuse is key-only.** A cached score row is reused without first
+   comparing its fingerprint to the current action's `score_fingerprint`.
+   Require exact equality before reuse.
+4. **Stale rescoring can append duplicate score keys.** Replacing a stale row
+   currently appends beside the old row; later validation then fails. Rewrite
+   atomically or deduplicate before commit.
+5. **Multiple think blocks and duplicate reasoning text are ambiguous.** Refuse
+   them or define and test a unique byte-span rule; never supervise leftover
+   markup as visible content.
+6. **`rescore` and training disagree on share enforcement.** Training treats
+   realized shares as telemetry, while `rescore` still defaults to enforcing
+   them. Make analysis use the training contract.
+7. **HTTP 408 remains an infrastructure issue.** Correlate request duration,
+   client timeout and server expiry before labeling it random. It must not be
+   counted as a policy failure.
+
+### Why the failed run cannot simply resume
+
+Stage-local recovery works for completed rollout, partial scoring, and failed
+training. It does **not** recover a terminal failed/discarded episode:
+
+1. the archive marks failed, discarded and interrupted episodes terminal;
+2. on resume, `capture_live_update()` skips every episode id already present;
+3. `batch_report` still requires all eight planned ids to be `sampled`;
+4. therefore update 0 remains below 8/8 forever and `.SAMPLED` is never written;
+5. `--start-at 0` reruns the same validation; it does not force resampling.
+
+The existing "discard-and-resample" and generic "resume stage-locally" wording
+overclaims the implementation. `--start-at N` can also skip an incomplete
+earlier update and must be guarded against `pilot_status.next_update`.
+
+Do not delete or surgically edit the failed archive. The safe restart is a new
+run id with:
+
+- the same untouched parent;
+- the same exact 80 frozen `(task, seed)` pairs and plan hash;
+- an amended manifest binding parser behavior/version and all scoring
+  identities;
+- a link to the failed run and this incident record.
+
+This is a restart of the same planned schedule under a declared implementation
+correction, not checkpoint selection or replacement sampling.
+
+### Mandatory restart gates
+
+No GPU, endpoint, rollout, teacher call or training step is authorized until:
+
+1. implicit Qwen tool-call reasoning boundaries match pinned vLLM behavior and
+   pass raw-byte/span/execution/projection tests;
+2. ~~N:1 and M:N advantages match `chunk_opd.py` exactly~~ — **met**
+   2026-08-29 (`4b82d09`); chunk identity carried through scoring, persistence
+   and resume, arithmetic delegated to `chunk_opd`;
+3. teacher `thinking_mode` and parser contract are fingerprinted;
+4. score reuse checks fingerprints and stale rows cannot duplicate keys;
+5. content-boundary loss is measured and resolved or explicitly preregistered;
+6. rollout retry semantics and `--start-at` guards match the runbook;
+7. a fresh manifest freezes the unchanged 80-pair schedule and records the
+   amendment;
+8. CPU-only tests and a no-teacher scoring dry run pass.
+
+Then use the original cost ladder rather than jumping directly to unattended
+10×8 execution: one reasoning-required episode, a two-update on-policy proof,
+and only then the signal pilot. Every exit path must still verify zero Modal
+ephemeral apps from both clients.
 
 ## Execution plan
 
