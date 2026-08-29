@@ -90,12 +90,51 @@ def test_content_is_supervised_when_no_tool_block_abuts_it(tokenizer):
     assert "content" in sc.payload_report
 
 
-def test_unterminated_think_yields_no_credit_at_all(tokenizer):
-    """The update-1 regression: no closed reasoning block, so no payload."""
+def test_unterminated_think_is_scored_via_the_implicit_boundary(tokenizer):
+    """PARSER_VERSION v2 (vLLM `92762ed`), 2026-08-29.
+
+    This case previously asserted that an unclosed `<think>` yielded no
+    payload and no credit. That refusal is what discarded three of eight
+    update-0 episodes whose reasoning was present, coherent and followed by
+    valid tool calls. The first complete tool call now bounds the reasoning
+    span, so the payload is scored -- through the real DeepSeek tokenizer,
+    with chunk identity preserved.
+    """
     raw = '<think>reasoning<tool_call>\n{"name": "get_order_details"}\n</tool_call>'
     pool = _Pool()
     sc = score_live_action(
         key="ep@1#0", raw_text=raw, student_token_bytes=_bytes_for(raw),
+        semantic_history=HISTORY, teacher_tokenizer=tokenizer, pool=pool,
+    )
+    assert sc.n_supervised > 0
+    assert sc.payload_report["n_payloads"] == 1
+    assert "reasoning" in sc.payload_report
+    assert pool.calls, "there is a payload now, so the teacher is billed"
+
+    # Chunks are whole, disjoint, and cover exactly the supervised tokens.
+    assert sc.chunks
+    covered = [i for c in sc.chunks for i in c.student_idx]
+    assert len(covered) == len(set(covered)) == sc.n_supervised
+    assert all(c.teacher_logprobs for c in sc.chunks)
+
+    # The tool call itself carries no credit -- Hermes JSON and DSML share no
+    # bytes to map through.
+    tool_at = raw.index("<tool_call>")
+    prefix_tokens = len(raw[:tool_at].encode("utf-8"))
+    byte_pos, tool_token_idx = 0, set()
+    for i, tok in enumerate(_bytes_for(raw)):
+        if byte_pos >= prefix_tokens:
+            tool_token_idx.add(i)
+        byte_pos += len(tok)
+    assert not (set(covered) & tool_token_idx)
+
+
+def test_unterminated_think_with_no_tool_call_still_yields_nothing(tokenizer):
+    """The rule stays narrow: no boundary, no credit, no teacher call."""
+    raw = "<think>reasoning that simply stops"
+    pool = _Pool()
+    sc = score_live_action(
+        key="ep@1#1", raw_text=raw, student_token_bytes=_bytes_for(raw),
         semantic_history=HISTORY, teacher_tokenizer=tokenizer, pool=pool,
     )
     assert sc.n_supervised == 0
