@@ -62,8 +62,15 @@ def tree(tmp_path, monkeypatch):
         (arch / "simulations" / f"{e}.json").write_text('{"sim": true}')
     with (arch / "events.jsonl").open("w") as fh:
         for e in ALL:
+            # Top-level id (older shape)
             fh.write(json.dumps({"episode_id": e, "event": "turn"}) + "\n")
-        fh.write(json.dumps({"event": "update_start"}) + "\n")  # no episode_id
+            # REAL shape: id nested in payload, nothing top-level.
+            fh.write(json.dumps({
+                "event": "turn_sampled", "event_id": f"{e}-1",
+                "schema_version": 1, "recorded_at": 0,
+                "payload": {"episode_id": e, "turn_index": 0},
+            }) + "\n")
+        fh.write(json.dumps({"event": "update_start"}) + "\n")  # no id at all
     (src_u / ".PLANNED").write_text("{}")
 
     manifest = {
@@ -102,8 +109,14 @@ class TestNoContamination:
         fn(source_run_id="src", dest_run_id="dst", update=0, episode_id=BAD)
         ev = (base / "dst" / "update-000" / "live_archive" / "events.jsonl")
         rows = [json.loads(l) for l in ev.read_text().splitlines() if l.strip()]
-        ids = {r.get("episode_id") for r in rows} - {None}
-        assert ids == set(KEPT)
+        def _eid(r):
+            if r.get("episode_id"):
+                return r["episode_id"]
+            pl = r.get("payload")
+            return pl.get("episode_id") if isinstance(pl, dict) else None
+        ids = {_eid(r) for r in rows} - {None}
+        assert ids == set(KEPT), f"unexpected ids carried: {ids}"
+        assert BAD not in ev.read_text()
         # the episode-less row survives
         assert any(r.get("event") == "update_start" for r in rows)
 

@@ -2552,7 +2552,22 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # The episode id is NOT top-level in a real events row: the
+                # schema is {event, event_id, payload, recorded_at,
+                # schema_version} and the id lives inside `payload`. A
+                # top-level lookup silently matched nothing and would have
+                # copied all 17 of the retried episode's rows through -- the
+                # leak guard below caught exactly that on 2026-08-29.
                 eid = row.get("episode_id")
+                if eid is None:
+                    payload = row.get("payload")
+                    if isinstance(payload, dict):
+                        eid = payload.get("episode_id")
+                if eid is None and episode_id in json.dumps(row):
+                    # Belt and braces: an id reachable only by some other
+                    # nesting still belongs to the retried slot.
+                    n_dropped += 1
+                    continue
                 if eid is not None and eid not in keep:
                     n_dropped += 1
                     continue
