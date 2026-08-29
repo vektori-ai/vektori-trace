@@ -77,17 +77,33 @@ DECLARATION = {
         "episode": "remains sampled and trainable; other turns are unaffected",
     },
     "observed": [
-        {"update": 0, "key": "u000-task76-seed0@9#0", "form": "B",
-         "rate": "1/75 actions = 1.3%",
-         "detail": ("2578 tokens; reasoning 8614 bytes with dead <tool_call> "
-                    "markup at offset 1119; 0 tool calls extracted; visible "
-                    "content 604 bytes of authored text")},
-        {"update": 1, "key": "u001-task4-seed1@4#0", "form": "A",
-         "rate": "1/77 actions = 1.3%",
-         "detail": ("1137 tokens, 0 supervised; reasoning 3454 bytes with "
-                    "<tool_call> at offset 2907; 5 tool calls; content was "
-                    "'<|im_end|>' markup only, so nothing was recoverable")},
+        {"update": 0, "affected_actions": 2, "of": 75, "rate": 0.0267,
+         "episodes": "1/8 (task76-seed0)",
+         "keys": ["u000-task76-seed0@8#0 (markup@847, 1 call, content 10b)",
+                  "u000-task76-seed0@9#0 (markup@1119, 0 calls, content 604b)"]},
+        {"update": 1, "affected_actions": 4, "of": 77, "rate": 0.0519,
+         "episodes": "2/8 (task4-seed1, task76-seed1)",
+         "keys": ["u001-task4-seed1@4#0 (markup@2907, 5 calls, content 10b)",
+                  "u001-task76-seed1@4#0 (markup@5500, 1 call, content 10b)",
+                  "u001-task76-seed1@7#0 (markup@340, 1 call, content 10b)",
+                  "u001-task76-seed1@10#0 (markup@894, 1 call, content 10b)"]},
     ],
+    "measurement_note": (
+        "An earlier reading of this run took the dry-run's 'payload skips: 1' "
+        "counter as the incidence rate and reported 1/75 and 1/77 (1.3%, "
+        "'unchanged'). That was wrong: that counter is narrower than the "
+        "number of actions carrying Hermes markup inside the reasoning span. "
+        "Re-derived from captured bytes by scripts/pilotd_verify_exclusions.py, "
+        "the rate is 2.67% (update 0) and 5.19% (update 1) -- it roughly "
+        "doubled rather than holding flat, and update 1 sits AT the 2/8 "
+        "episode stop-rule boundary."
+    ),
+    "concentration": (
+        "5 of the 6 occurrences across both updates are task 76 "
+        "(task76-seed0 in update 0, task76-seed1 in update 1). The per-update "
+        "rate will therefore track whether task 76 is in a given roster, so "
+        "the trend across updates must not be read as a pure time trend."
+    ),
     "stop_rules": {
         "retention_below": 0.90,
         "interleaved_episodes_per_update_above": "2/8",
