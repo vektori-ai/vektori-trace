@@ -684,7 +684,7 @@
       "finding": "all ten most-negative supervised tokens are the literal word 'Okay' at token index 2 -- the first word after <think>\\n -- at -18.2 to -22.0.",
       "student_logprob_median": -0.01057,
       "template_newline_logprob_median": -0.0,
-      "why_kept": "Unlike the index-1 newline (median logprob -0.00000, emitted by Qwen's chat template, unactionable by any weight change), 'Okay' is a learned stylistic habit at ~98.9% confidence. Training CAN move it. Masking it would be deciding which of the teacher's preferences are allowed to count, which is the opposite of what OPD is for: shifting the student toward the teacher's distribution."
+      "why_kept": "COMPARABILITY, not reachability. An earlier draft claimed the index-1 newline was template-forced and 'unactionable by any weight change'. That is FALSE: the newline appears in sampled_token_ids WITH a behavior logprob, so the model generated it -- its probability is merely ~1.0. A genuinely template-inserted byte would belong to the rendered prompt and carry no sampled logprob at all. Both tokens are therefore reachable learned behaviour: the newline near-deterministic formatting, 'Okay' a 98.9%-confidence discourse habit.\nThe newline is excluded because Qwen and DeepSeek assign that byte DIFFERENT STRUCTURAL ROLES, so its teacher score is not comparable across the two renderings. 'Okay' is retained because it is comparable authored text: same bytes, same role, a real disagreement about style."
     },
     "competing_hypotheses": {
       "signal": "a correct, strong gradient on a real habit. 'Okay' moves, the negative tail shrinks in update 1, mean advantage rises toward zero. This is OPD working.",
@@ -692,6 +692,19 @@
     },
     "discriminating_measurement": "compare update 1's advantage report against update 0's: (a) is 'Okay' still the most-negative token, (b) does its magnitude fall, (c) does the overall mean move toward zero, (d) does the p1 tail shrink.",
     "if_amplifier": "clamp. chunk_opd already supports opd_loss_max_clamp (upstream's symmetric per-token cap); it is currently None. Setting it is a preregistration amendment, not a silent tweak.",
-    "no_masking": "'Okay' is NOT masked in this run under any outcome."
+    "no_masking": "'Okay' is NOT masked in this run under any outcome.",
+    "clamp_policy": "opd_loss_max_clamp stays None for this run. No post-hoc clamp is introduced on the basis of one update.",
+    "update_1_rollout_measurements": [
+      "fraction of reasoning turns beginning with 'Okay'",
+      "median student behavior logprob for 'Okay'",
+      "reasoning-boundary validity, and the missing/empty <think> rate",
+      "whether another opener simply replaces 'Okay'"
+    ],
+    "update_1_scored_measurements": [
+      "'Okay' advantage distribution",
+      "its share of total absolute advantage",
+      "whether the negative tail becomes less concentrated"
+    ],
+    "prediction": "After one update, 'Okay' frequency or confidence should decline while reasoning-boundary validity stays intact. If its tail remains dominant across SUBSEQUENT scored updates, the unclamped ratio may be acting as an amplifier -- but one update is an early indication, not grounds to redesign the loss."
   }
 }
