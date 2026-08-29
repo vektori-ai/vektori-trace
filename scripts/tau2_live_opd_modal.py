@@ -1174,6 +1174,9 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
     n_ok = n_fail = 0
     tot_tokens = tot_sup = 0
     reasons: dict = {}
+    ws_tokens = []
+    ws_supervised = []
+    idx1_ws_supervised = []
     payload_skips: dict = {}
     failures = []
     per_action = []
@@ -1213,6 +1216,32 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
                 payload_skips[k] = payload_skips.get(k, 0) + 1
         per_action.append((a["key"], sc.n_supervised, len(stu)))
 
+        # PROJECTION v2 gate. The canary's dominant negative signal was '\n'
+        # at action index 1 -- the newline Qwen's template puts after
+        # `<think>`, which DeepSeek scored -15..-23. It must no longer be
+        # eligible. Interior whitespace is authored and must still be.
+        sup_idx = set(sc.teacher_logprob_by_index)
+        for i, tb in enumerate(stu):
+            try:
+                txt = tb.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if not txt.strip() and txt:
+                ws_tokens.append((a["key"], i, repr(txt), i in sup_idx))
+                if i in sup_idx:
+                    ws_supervised.append((a["key"], i, repr(txt)))
+        if 1 in sup_idx:
+            tb = stu[1] if len(stu) > 1 else b""
+            try:
+                if tb.decode("utf-8").strip() == "":
+                    idx1_ws_supervised.append((a["key"], repr(tb.decode())))
+            except UnicodeDecodeError:
+                pass
+
+    n_ws = len(ws_tokens)
+    n_ws_sup = len(ws_supervised)
+    interior_ws_sup = [w for w in ws_tokens if w[3] and w[1] > 1]
+
     out = [
         f"run {os.path.basename(run)} update {update}",
         f"actions: {len(actions)}   scored OK: {n_ok}   failed: {n_fail}",
@@ -1223,12 +1252,23 @@ def scoring_dryrun(run_id: str = "", update: int = 0) -> str:
         "exclusion reasons: " + json.dumps(reasons),
         "payload skips    : " + json.dumps(payload_skips),
         "",
+        f"whitespace-only tokens: {n_ws}   of which supervised: {n_ws_sup}",
+        f"  index-1 whitespace supervised: {len(idx1_ws_supervised)} "
+        f"(must be 0 under projection v2)",
+        f"  interior whitespace supervised: {len(interior_ws_sup)} "
+        f"(authored; expected > 0)",
+        "",
         "ACCEPTANCE:",
         f"  all actions scored          : {n_fail == 0}",
         f"  token accounting complete   : {not any('accounting' in f[1] for f in failures)}",
         f"  some supervision retained   : {tot_sup > 0}",
+        f"  no index-1 boundary newline : {not idx1_ws_supervised}",
+        f"  no payload skips            : {not payload_skips}",
+        f"  interior whitespace kept    : {bool(interior_ws_sup)}",
         "",
     ]
+    for k, t in idx1_ws_supervised[:6]:
+        out.append(f"  LEAK {k} index 1 {t} is still supervised")
     for key, sup, tot in per_action[:40]:
         out.append(f"  {key:34s} {sup:4d}/{tot:4d} = {sup/tot:.3f}")
     for f in failures[:12]:
