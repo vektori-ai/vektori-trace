@@ -1806,9 +1806,20 @@ def token_shares(run_id: str = "", update: int = 0) -> str:
     timeout=60 * 90,
     secrets=[modal.Secret.from_name("fireworks-api-key")],
 )
+def _is_diagnostic_run(run_id: str) -> bool:
+    """Is this run id explicitly a diagnostic, not a preregistered update?
+
+    Naming is the fence rather than a boolean flag: a flag can be passed by
+    accident to the real run, but a run id is chosen once and written into
+    every artifact, so a shrunken batch is self-identifying forever after.
+    """
+    low = (run_id or "").lower()
+    return "diag" in low or "canary" in low
+
+
 def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
                  student_model: str = "", adapter_hash_expect: str = "",
-                 tau2_src: str = "",
+                 tau2_src: str = "", max_episodes: int = 0,
                  allow_missing_reasoning: bool = False) -> dict:
     """Stage 1: sample one update's episodes, stop at SAMPLED.
 
@@ -1922,6 +1933,29 @@ def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
             f"update {update} has {len(block)} planned episodes, expected "
             f"{expected_n}"
         )
+
+    # DIAGNOSTIC ONLY. A preregistered update samples every planned episode;
+    # batch completeness is what stops a run from quietly training on whichever
+    # episodes happened to succeed. But a *diagnostic* -- does the parser hold,
+    # does the scorer produce sane advantages -- does not need eight episodes,
+    # and paying for eight to answer a one-episode question is waste.
+    #
+    # So the shrink is allowed, and fenced: it is refused unless the run id is
+    # explicitly marked a diagnostic, so it can never silently apply to the
+    # preregistered schedule. The manifest records it either way.
+    if max_episodes and max_episodes < len(block):
+        if not _is_diagnostic_run(run_id):
+            raise ValueError(
+                f"--max-episodes {max_episodes} would shrink update {update} "
+                f"from {len(block)} episodes, but run id {run_id!r} is not a "
+                "diagnostic run. Batch completeness is what keeps a "
+                "preregistered update from training on a self-selected "
+                "subset. Use a run id containing 'diag' or 'canary'."
+            )
+        print(f"DIAGNOSTIC: sampling {max_episodes} of {len(block)} planned "
+              f"episodes; this batch is NOT the preregistered update")
+        block = block[:max_episodes]
+        expected_n = len(block)
     ids = [p["episode_id"] for p in block]
     pairs = [(str(p["task_id"]), int(p["seed"])) for p in block]
     if len(set(ids)) != len(ids):
