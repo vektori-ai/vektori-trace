@@ -45,6 +45,16 @@ from vektori_trace.tau2.opd_stages import (
 )
 from vektori_trace.tau2.reopd_state import RunState, UpdateDir, read_jsonl
 
+#: Bumped whenever the scoring/credit algorithm changes shape. A cached score
+#: row tagged with a different value is not reusable: it was produced by a
+#: different function, and reinterpreting it under the current one is exactly
+#: the silent-revert failure the chunk repair exists to prevent.
+#: - "flat-v1" (implicit, pre-2026-08-29): L_T divided across a chunk's student
+#:   tokens, chunk identity discarded, one ratio per token.
+#: - "chunk-v2": chunks persisted whole; one ratio per chunk via
+#:   `chunk_opd.assign_chunk_advantages`.
+SCORE_ALGORITHM = "chunk-v2"
+
 __all__ = [
     "LiveTrainError",
     "LiveUpdateInputs",
@@ -375,16 +385,30 @@ def run_projected_score_stage(
 
     drop = set(drop_keys or ())
     by_key = by_key or {}
-    rows_on_disk = {
-        r["key"]: r for r in read_jsonl(update.scores_path)
-        if r.get("key") and r.get("projection") == "semantic"
-    }
+    # `projection == "semantic"` alone is not enough: rows written before
+    # 2026-08-29 carry only the flat `teacher_logprob_by_index`, whose chunk
+    # grouping was destroyed at write time and cannot be recovered. Reading one
+    # under the repaired algorithm would silently resurrect the per-token ratio,
+    # so a row without `chunks` is not a cache hit -- it is rescored.
+    rows_on_disk = {}
+    n_incompatible = 0
+    for r in read_jsonl(update.scores_path):
+        if not r.get("key") or r.get("projection") != "semantic":
+            continue
+        if r.get("score_algorithm") != SCORE_ALGORITHM or "chunks" not in r:
+            n_incompatible += 1
+            continue
+        rows_on_disk[r["key"]] = r
+    if n_incompatible:
+        log(f"    {n_incompatible} cached score row(s) predate the chunk-grouped "
+            f"algorithm ({SCORE_ALGORITHM}); rescoring them rather than "
+            "reinterpreting flat credit")
 
     projected: dict[str, Any] = {}
     n_new = n_reused = 0
     t0 = _time.time()
 
-    from vektori_trace.tau2.live_score import ProjectedScore
+    from vektori_trace.tau2.live_score import ProjectedChunk, ProjectedScore
 
     for row, action in zip(inputs.capture_rows, inputs.actions):
         key = row["key"]
@@ -392,9 +416,10 @@ def run_projected_score_stage(
         if cached is not None and key not in drop:
             projected[key] = ProjectedScore(
                 key=key,
+                chunks=[ProjectedChunk.from_json(c) for c in cached["chunks"]],
                 teacher_logprob_by_index={
                     int(k): float(v)
-                    for k, v in cached["teacher_logprob_by_index"].items()
+                    for k, v in cached.get("teacher_logprob_by_index", {}).items()
                 },
                 excluded={int(k): v for k, v in cached["excluded"].items()},
                 n_prefix_tokens=int(cached.get("n_prefix_tokens", 0)),
@@ -434,6 +459,9 @@ def run_projected_score_stage(
         out = {
             "key": key,
             "projection": "semantic",
+            "score_algorithm": SCORE_ALGORITHM,
+            "chunks": [c.to_json() for c in sc.chunks],
+            # Diagnostics only. `chunks` is what training reads.
             "teacher_logprob_by_index": {
                 str(k): v for k, v in sc.teacher_logprob_by_index.items()
             },

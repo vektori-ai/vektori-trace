@@ -45,6 +45,7 @@ from typing import Any
 
 __all__ = [
     "LiveScoreError",
+    "ProjectedChunk",
     "ProjectedScore",
     "score_live_action",
 ]
@@ -54,17 +55,82 @@ class LiveScoreError(RuntimeError):
     """A live action whose semantics could not be scored defensibly."""
 
 
+@dataclass(frozen=True)
+class ProjectedChunk:
+    """One byte-aligned chunk, kept whole.
+
+    The paper's credit rule is defined **per chunk**: one `L_T/L_S` ratio for
+    the whole aligned span, then redistributed across that span's student
+    tokens. Dividing `L_T` among tokens first and taking a ratio per token is a
+    different function whenever the student logprobs inside a chunk differ --
+    for student logprobs `[-0.5, -1.0, -1.5]` against `L_T = -3.0` the chunk
+    rule gives `[0, 0, 0]` and the per-token rule gives `[-0.5, 0, +0.5]`:
+    opposing gradients where teacher and student agree exactly.
+
+    So the chunk is the unit that is persisted. `student_idx` are indices into
+    the **action** token sequence (not the payload-local ones `align_by_bytes`
+    returns), already ordered, because that is what the trainer must group by.
+    `teacher_logprobs` is kept rather than only its sum so a resumed run can
+    reconstruct `L_T` and prove it, instead of trusting a stored scalar.
+    """
+
+    #: Stable within one action: payload kind + ordinal, e.g. "reasoning:3".
+    chunk_id: str
+    #: Which projected payload this chunk came from ("reasoning" / "content").
+    kind: str
+    #: Action-level student token indices covered, ascending.
+    student_idx: tuple[int, ...]
+    #: Teacher token logprobs for the chunk; `L_T` is their sum.
+    teacher_logprobs: tuple[float, ...]
+
+    @property
+    def teacher_logprob_sum(self) -> float:
+        return float(sum(self.teacher_logprobs))
+
+    @property
+    def n_student(self) -> int:
+        return len(self.student_idx)
+
+    @property
+    def n_teacher(self) -> int:
+        return len(self.teacher_logprobs)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "kind": self.kind,
+            "student_idx": list(self.student_idx),
+            "teacher_logprobs": list(self.teacher_logprobs),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> "ProjectedChunk":
+        return cls(
+            chunk_id=str(d["chunk_id"]),
+            kind=str(d["kind"]),
+            student_idx=tuple(int(i) for i in d["student_idx"]),
+            teacher_logprobs=tuple(float(v) for v in d["teacher_logprobs"]),
+        )
+
+
 @dataclass
 class ProjectedScore:
     """Teacher credit for one live action, mapped onto student token indices.
 
-    `advantage_weights` is the mask the training path must honour: a student
-    token absent from `teacher_logprob_by_index` carries zero OPD weight, by
-    construction rather than by a downstream filter that could be forgotten.
+    `chunks` is the training input: the byte-aligned chunks, kept whole, which
+    `live_batch` hands to `chunk_opd.assign_chunk_advantages`. A student token
+    in no chunk carries zero OPD weight, by construction rather than by a
+    downstream filter that could be forgotten.
+
+    `teacher_logprob_by_index` is **diagnostics only** and must never drive
+    training again: it is `L_T` pre-divided across a chunk's student tokens,
+    which loses the grouping the credit rule is defined over.
     """
 
     key: str
-    #: student token index -> teacher logprob for the chunk covering it
+    #: Byte-aligned chunks, whole. The training input.
+    chunks: list["ProjectedChunk"] = field(default_factory=list)
+    #: DIAGNOSTIC ONLY -- student token index -> chunk L_T / n_student.
     teacher_logprob_by_index: dict[int, float] = field(default_factory=dict)
     #: student token index -> why it carries no weight
     excluded: dict[int, str] = field(default_factory=dict)
@@ -74,12 +140,13 @@ class ProjectedScore:
 
     @property
     def n_supervised(self) -> int:
-        return len(self.teacher_logprob_by_index)
+        return sum(c.n_student for c in self.chunks)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "key": self.key,
             "n_supervised": self.n_supervised,
+            "n_chunks": len(self.chunks),
             "n_excluded": len(self.excluded),
             "n_prefix_tokens": self.n_prefix_tokens,
             "n_teacher_tokens": self.n_teacher_tokens,
@@ -256,10 +323,24 @@ def score_live_action(
         alignment = align_by_bytes(s_pieces, t_pieces)
         payload_lp = [float(logprobs[j]) for j in t_indices]
         ordered = sorted(s_indices)
-        for chunk in alignment.spans:
-            lp = sum(payload_lp[j] for j in chunk.teacher_idx)
-            for si in chunk.student_idx:
-                out.teacher_logprob_by_index[ordered[si]] = lp / len(chunk.student_idx)
+        for ci, chunk in enumerate(alignment.spans):
+            # Keep the chunk whole. `align_by_bytes` indexes payload-locally;
+            # `ordered` lifts those back to action-level token indices, which is
+            # the frame the trainer groups by.
+            lps = tuple(payload_lp[j] for j in chunk.teacher_idx)
+            idx = tuple(ordered[si] for si in chunk.student_idx)
+            out.chunks.append(
+                ProjectedChunk(
+                    chunk_id=f"{span.kind}:{ci}",
+                    kind=span.kind,
+                    student_idx=idx,
+                    teacher_logprobs=lps,
+                )
+            )
+            # Diagnostic mirror only -- see ProjectedScore. Never a train input.
+            share = sum(lps) / len(idx)
+            for i in idx:
+                out.teacher_logprob_by_index[i] = share
         report[span.kind] = {
             "n_student_tokens": len(s_pieces),
             "n_teacher_tokens": len(t_pieces),

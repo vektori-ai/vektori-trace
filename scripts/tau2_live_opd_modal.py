@@ -1595,12 +1595,27 @@ def one_step(run_id: str = "", update: int = 0,
             f"{len(missing)} actions have no cached semantic score "
             f"({missing[:3]}); this path will not buy them"
         )
+    from vektori_trace.tau2.live_score import ProjectedChunk
+    from vektori_trace.tau2.live_train import SCORE_ALGORITHM
+
+    stale = sorted(
+        k for k, r in rows.items()
+        if r.get("score_algorithm") != SCORE_ALGORITHM or "chunks" not in r
+    )
+    if stale:
+        raise SystemExit(
+            f"{len(stale)} cached score row(s) ({stale[:3]}) predate the "
+            f"chunk-grouped algorithm ({SCORE_ALGORITHM}). They hold only flat "
+            "per-token credit, whose chunk grouping is unrecoverable; training "
+            "on them would silently restore the per-token ratio. Rescore them."
+        )
     projected = {
         k: ProjectedScore(
             key=k,
+            chunks=[ProjectedChunk.from_json(c) for c in r["chunks"]],
             teacher_logprob_by_index={
                 int(i): float(v)
-                for i, v in r["teacher_logprob_by_index"].items()
+                for i, v in r.get("teacher_logprob_by_index", {}).items()
             },
             excluded={int(i): v for i, v in r["excluded"].items()},
             n_prefix_tokens=int(r.get("n_prefix_tokens", 0)),
@@ -1730,18 +1745,27 @@ def token_shares(run_id: str = "", update: int = 0) -> str:
     for a in acts:
         t = a["task_id"]
         sc = scores.get(a["key"], {})
-        tl = sc.get("teacher_logprob_by_index", {}) or {}
         ntok = len(a["action_token_ids"])
         beh = list(a["behavior_logprobs"])
+        # Report the advantages training would actually use: one ratio per
+        # aligned chunk, via the canonical rule. Recomputing a per-token ratio
+        # here would misreport magnitude wherever a chunk spans unequal
+        # student logprobs.
         mag = 0.0
-        for idx, tv in tl.items():
-            i = int(idx)
-            if i >= len(beh):
-                continue
-            ls = float(beh[i])
-            if abs(ls) < 1e-8:
-                continue
-            mag += abs((float(tv) / ls - 1.0) * ls)
+        chunk_rows = sc.get("chunks") or []
+        if chunk_rows:
+            from vektori_trace.tau2.live_batch import projected_turn_advantages
+            from vektori_trace.tau2.live_score import ProjectedChunk
+            try:
+                ta = projected_turn_advantages(
+                    turn_index=0,
+                    action_token_ids=list(a["action_token_ids"]),
+                    behavior_logprobs=beh,
+                    chunks=[ProjectedChunk.from_json(c) for c in chunk_rows],
+                )
+                mag = sum(abs(x) for x in ta.advantages)
+            except Exception:
+                mag = 0.0
         turns[t] = turns.get(t, 0) + 1
         raw[t] = raw.get(t, 0) + ntok
         sup[t] = sup.get(t, 0) + len(tl)

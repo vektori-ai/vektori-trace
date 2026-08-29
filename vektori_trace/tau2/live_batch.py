@@ -10,17 +10,32 @@ reintroduce the contamination `live_score` exists to remove.
 So the live path stops before that seam. `score_live_action` has already done
 the alignment -- per payload, on byte-identical text -- and produced
 `teacher_logprob_by_index`: a chunk logprob for each *eligible* student token.
-This module converts that into the `TurnAdvantages` the optimizer consumes,
-applying upstream's credit rule (`chunk_opd`) per token rather than per
-re-derived chunk:
+-- as `ProjectedChunk` records, each holding the action-level student token
+indices it covers and the teacher logprobs whose sum is that chunk's `L_T`.
 
-    A_i = (L_T / L_S - 1) * log p_i        for an eligible token
-    A_i = 0, supervised_mask[i] = False    for everything else
+This module converts those into the `TurnAdvantages` the optimizer consumes.
+The endpoint is still **tokenwise** advantages for a tokenwise loss; what must
+stay chunkwise is the *ratio*:
 
-The mask is the whole point. A token absent from `teacher_logprob_by_index` --
-`<tool_call>`, `<|im_end|>`, tool JSON, a boundary straddler -- contributes
-nothing to the loss *and* nothing to the global denominator, so it can neither
-push the policy nor dilute the tokens that should.
+    aligned chunk -> one L_T/L_S ratio -> tokenwise advantages -> tokenwise loss
+
+The arithmetic is not reimplemented here. `chunk_opd.assign_chunk_advantages`
+is the canonical rule and is called with a synthetic `Alignment` built from the
+persisted chunks, so live and replay cannot drift.
+
+Until 2026-08-29 this module instead read a flat `teacher_logprob_by_index`,
+where each chunk's `L_T` had already been divided among its student tokens, and
+took a fresh ratio per token. That is a different function whenever student
+logprobs inside a chunk differ: for `[-0.5, -1.0, -1.5]` against `L_T = -3.0`
+the chunk rule yields `[0, 0, 0]` and the per-token rule `[-0.5, 0, +0.5]` --
+opposing gradients at exact teacher/student agreement. An equal-logprob chunk
+produces `[0, 0, 0]` either way, which is why one-byte-per-token and
+uniform-logprob tests never caught it.
+
+The mask is the other half. A token in no chunk -- `<tool_call>`, `<|im_end|>`,
+tool JSON, a boundary straddler -- contributes nothing to the loss *and*
+nothing to the global denominator, so it can neither push the policy nor dilute
+the tokens that should.
 """
 
 from __future__ import annotations
@@ -31,6 +46,7 @@ from typing import Any, Sequence
 __all__ = [
     "LiveBatchError",
     "estimate_batch_shares",
+    "chunks_to_alignment",
     "projected_turn_advantages",
     "build_projected_batch",
 ]
@@ -117,22 +133,96 @@ def estimate_batch_shares(
     }
 
 
+def chunks_to_alignment(
+    chunks: Sequence[Any],
+    n_action_tokens: int,
+) -> tuple[Any, list[int], list[float]]:
+    """Persisted chunks -> the `(Alignment, order, teacher_logprobs)` triple.
+
+    `assign_chunk_advantages` works in a dense frame: student tokens `0..n-1`
+    all covered by spans. Live-eligible tokens are sparse -- markup interleaves
+    -- so the supervised tokens are gathered into a compact frame, aligned
+    there, and mapped back by `order`.
+
+    Fails closed on a chunk that is empty, out of range, unordered, or shares a
+    student token with another chunk. Overlap would let one token take credit
+    from two chunks and be counted twice in the denominator.
+    """
+    from vektori_trace.align import Alignment, Span
+
+    order: list[int] = []
+    seen: set[int] = set()
+    for c in chunks:
+        idx = tuple(c.student_idx)
+        if not idx:
+            raise LiveBatchError(f"chunk {c.chunk_id!r} covers no student token")
+        if not c.teacher_logprobs:
+            raise LiveBatchError(f"chunk {c.chunk_id!r} carries no teacher logprob")
+        if list(idx) != sorted(idx):
+            raise LiveBatchError(f"chunk {c.chunk_id!r} student_idx is not ascending")
+        for i in idx:
+            if not (0 <= i < n_action_tokens):
+                raise LiveBatchError(
+                    f"chunk {c.chunk_id!r} references student token {i}, outside "
+                    f"the action's {n_action_tokens} tokens"
+                )
+            if i in seen:
+                raise LiveBatchError(
+                    f"chunk {c.chunk_id!r} reuses student token {i}; overlapping "
+                    "chunks would double-count it in the denominator"
+                )
+            seen.add(i)
+        order.extend(idx)
+
+    # Chunks in ascending student order, so the compact frame is contiguous.
+    paired = sorted(zip(chunks, range(len(chunks))), key=lambda t: t[0].student_idx[0])
+    order = [i for c, _ in paired for i in c.student_idx]
+
+    spans: list[Any] = []
+    teacher_logprobs: list[float] = []
+    s_cur = t_cur = 0
+    for c, _ in paired:
+        n_s, n_t = len(c.student_idx), len(c.teacher_logprobs)
+        spans.append(
+            Span(
+                student_idx=range(s_cur, s_cur + n_s),
+                teacher_idx=range(t_cur, t_cur + n_t),
+                byte_start=s_cur,
+                byte_end=s_cur + n_s,
+            )
+        )
+        teacher_logprobs.extend(float(v) for v in c.teacher_logprobs)
+        s_cur += n_s
+        t_cur += n_t
+
+    alignment = Alignment(
+        spans=tuple(spans),
+        n_student_tokens=s_cur,
+        n_teacher_tokens=t_cur,
+        granularity=(len(spans) / s_cur) if s_cur else 0.0,
+        dropped=0,
+    )
+    return alignment, order, teacher_logprobs
+
+
 def projected_turn_advantages(
     *,
     turn_index: int,
     action_token_ids: list[int],
     behavior_logprobs: list[float],
-    teacher_logprob_by_index: dict[int, float],
+    chunks: Sequence[Any],
     prompt_token_ids: list[int] | None = None,
     clamp: float | None = None,
 ) -> Any:
-    """Per-token advantages from already-aligned teacher credit.
+    """Per-token advantages from aligned teacher credit, grouped by chunk.
 
-    `teacher_logprob_by_index[i]` is the teacher's log-likelihood for the chunk
-    covering student token `i`, as established by `score_live_action` against
-    byte-identical payload text. Tokens absent from it are unsupervised.
+    One `L_T/L_S` ratio per aligned chunk -- `L_S` summed over the chunk's
+    student tokens, `L_T` over its teacher tokens -- redistributed to tokenwise
+    advantages by `chunk_opd.assign_chunk_advantages`, the canonical rule. This
+    function does not compute the ratio itself; it only moves the live sparse
+    frame into and out of the dense one that function expects.
     """
-    from vektori_trace.chunk_opd import ChunkStats
+    from vektori_trace.chunk_opd import ChunkStats, assign_chunk_advantages
     from vektori_trace.opd_rollout import TurnAdvantages
 
     n = len(action_token_ids)
@@ -144,37 +234,37 @@ def projected_turn_advantages(
 
     advantages = [0.0] * n
     supervised = [False] * n
-    stats = ChunkStats()
-    n_clamped = 0
 
-    for i in range(n):
-        if i not in teacher_logprob_by_index:
-            continue
-        L_T = float(teacher_logprob_by_index[i])
-        L_S = float(behavior_logprobs[i])
-        if not math.isfinite(L_T) or not math.isfinite(L_S):
+    if not chunks:
+        return TurnAdvantages(
+            turn_index=turn_index,
+            action_token_ids=list(action_token_ids),
+            behavior_logprobs=list(behavior_logprobs),
+            advantages=advantages,
+            supervised_mask=supervised,
+            stats=ChunkStats(n_sentinel_tokens=n),
+            prompt_token_ids=list(prompt_token_ids) if prompt_token_ids else None,
+        )
+
+    alignment, order, teacher_lp = chunks_to_alignment(chunks, n)
+    compact_behavior = [float(behavior_logprobs[i]) for i in order]
+    for pos, i in enumerate(order):
+        if not math.isfinite(compact_behavior[pos]):
             raise LiveBatchError(
-                f"turn {turn_index}: non-finite logprob at token {i} "
-                f"(teacher={L_T}, behavior={L_S})"
+                f"turn {turn_index}: non-finite behavior logprob at token {i}"
             )
-        if abs(L_S) < DEGENERATE_LS_EPS:
-            # Upstream's degenerate branch: the student assigns ~no mass here,
-            # so the proportional rule is undefined. Hand the token the
-            # teacher's budget directly rather than dividing by ~0.
-            adv = L_T - L_S
-            stats.n_degenerate_chunks += 1
-        else:
-            adv = (L_T / L_S - 1.0) * L_S
-        if clamp is not None and abs(adv) > clamp:
-            adv = math.copysign(clamp, adv)
-            n_clamped += 1
-        advantages[i] = adv
-        supervised[i] = True
-        stats.n_supervised_tokens += 1
-        stats.advantage_sum += adv
-        stats.advantage_abs_sum += abs(adv)
 
-    stats.n_clamped_tokens = n_clamped
+    try:
+        compact_adv, compact_sup, stats = assign_chunk_advantages(
+            alignment, compact_behavior, teacher_lp, clamp=clamp
+        )
+    except Exception as exc:  # ChunkOPDError and friends -- fail closed.
+        raise LiveBatchError(f"turn {turn_index}: {exc}") from exc
+
+    for pos, i in enumerate(order):
+        advantages[i] = compact_adv[pos]
+        supervised[i] = compact_sup[pos]
+
     stats.n_sentinel_tokens = n - stats.n_supervised_tokens
 
     return TurnAdvantages(
@@ -236,7 +326,7 @@ def build_projected_batch(
             turn_index=i,
             action_token_ids=action.action_token_ids,
             behavior_logprobs=action.behavior_logprobs,
-            teacher_logprob_by_index=score.teacher_logprob_by_index,
+            chunks=score.chunks,
             prompt_token_ids=action.prompt_token_ids,
             clamp=clamp,
         )
