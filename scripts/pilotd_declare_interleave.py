@@ -38,36 +38,55 @@ DECLARATION = {
     ),
     "shape": {
         "description": (
-            "An action opens <think>, emits reasoning, then emits one or more "
-            "Hermes <tool_call> blocks WITHOUT ever closing with </think>, "
-            "ending at <|im_end|>. The parser (v3) applies vLLM 92762ed's "
-            "implicit boundary, so the reasoning span ends at the first "
-            "complete tool call -- but the span still contains <tool_call> "
-            "markup that DeepSeek's DSML rendering has no counterpart for."
+            "Hermes <tool_call> markup appears INSIDE the reasoning span. "
+            "DeepSeek's rendering has no counterpart for those bytes -- its "
+            "tool calls are DSML -- so the student and teacher reasoning "
+            "payloads disagree byte-for-byte and the payload is skipped whole."
         ),
-        "not_this_shape": (
-            "a closed <think>...</think> containing an embedded tool call; "
-            "the observed instances have no closing tag at all"
+        "two_observed_surface_forms": {
+            "A_unclosed_think_with_real_calls": (
+                "<think>, reasoning, then one or more REAL <tool_call> blocks, "
+                "no </think>, ends at <|im_end|>. Parser v3 applies vLLM "
+                "92762ed's implicit boundary; the span still carries markup. "
+                "Observed: u001-task4-seed1@4#0 (5 tool calls extracted)."
+            ),
+            "B_dead_markup_mid_reasoning": (
+                "<tool_call> markup embedded mid-reasoning that the parser does "
+                "NOT extract as a call (0 tool calls), with reasoning continuing "
+                "past it and a normal visible-content payload following. "
+                "Observed: u000-task76-seed0@9#0 (markup at byte 1119, 0 calls)."
+            ),
+        },
+        "unifying_condition": (
+            "presence of Hermes markup within the reasoning byte span -- NOT "
+            "the presence or absence of </think>, and NOT whether the block "
+            "parses as an executable call. Both were initially mis-described "
+            "as one shape; they are not, and the class is defined by the "
+            "condition that actually triggers the skip."
         ),
-        "finish_reason": "stop (not length -- this is not a cap truncation)",
+        "finish_reason": "stop in both (not length -- not a cap truncation)",
     },
     "handling": {
         "reasoning_payload": "skipped whole; student/teacher bytes cannot align",
         "visible_content_payload": (
-            "supervised independently when it is authored text. In the two "
-            "observed instances it was markup only ('<|im_end|>'), already "
-            "zero-weighted as outside_any_payload, so nothing was recoverable."
+            "supervised independently when it is authored text -- form B's "
+            "604 bytes are exactly that case. Form A's content was markup "
+            "only ('<|im_end|>'), already zero-weighted as outside_any_payload."
         ),
         "tool_calls": "conditioned on, never credited (projection v4, gate 5)",
         "episode": "remains sampled and trainable; other turns are unaffected",
     },
     "observed": [
-        {"update": 0, "key": "u000-task76-seed0@9#0", "rate": "1/75 actions = 1.3%"},
-        {"update": 1, "key": "u001-task4-seed1@4#0",
+        {"update": 0, "key": "u000-task76-seed0@9#0", "form": "B",
+         "rate": "1/75 actions = 1.3%",
+         "detail": ("2578 tokens; reasoning 8614 bytes with dead <tool_call> "
+                    "markup at offset 1119; 0 tool calls extracted; visible "
+                    "content 604 bytes of authored text")},
+        {"update": 1, "key": "u001-task4-seed1@4#0", "form": "A",
          "rate": "1/77 actions = 1.3%",
-         "detail": ("1137 student tokens, 0 supervised; reasoning 3454 bytes with "
+         "detail": ("1137 tokens, 0 supervised; reasoning 3454 bytes with "
                     "<tool_call> at offset 2907; 5 tool calls; content was "
-                    "'<|im_end|>' only")},
+                    "'<|im_end|>' markup only, so nothing was recoverable")},
     ],
     "stop_rules": {
         "retention_below": 0.90,
