@@ -118,6 +118,14 @@ def main() -> int:
     ap.add_argument("--max-action-tokens", type=int, default=4096)
     ap.add_argument("--max-input-tokens", type=int, default=16384)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--thinking-mode", default="thinking",
+                    help="teacher thinking mode; bound into score fingerprints")
+    ap.add_argument("--supersedes", default=None,
+                    help="run_id this manifest restarts, e.g. a failed pilot")
+    ap.add_argument("--supersedes-reason", default=None)
+    ap.add_argument("--expect-plan-hash", default=None,
+                    help="refuse to write unless plan_hash matches; use when "
+                         "restarting a frozen schedule that must not change")
     a = ap.parse_args()
 
     split = load_split(Path(a.split))
@@ -194,9 +202,48 @@ def main() -> int:
                      "final checkpoint; never inspected mid-run",
         "sealed_pool": "F38",
     }
+
+    # Algorithm identity. A manifest that records only the plan cannot say
+    # which code produced the run, and the 2026-08-29 repairs each change the
+    # meaning of a scored action for identical bytes: the parser decides where
+    # reasoning ends, the projection decides which bytes may carry credit, and
+    # the scoring algorithm decides how credit is grouped. These are the same
+    # values `live_score_fingerprint` binds, so a cached score bought under
+    # different ones is refused rather than reinterpreted.
+    from vektori_trace.tau2.live_agent import PARSER_VERSION
+    from vektori_trace.tau2.live_projection import PROJECTION_VERSION
+    from vektori_trace.tau2.live_score import SCORE_ALGORITHM
+
+    manifest["parser_version"] = PARSER_VERSION
+    manifest["projection_version"] = PROJECTION_VERSION
+    manifest["score_algorithm"] = SCORE_ALGORITHM
+    manifest["thinking_mode"] = a.thinking_mode
+    manifest["projection_scope"] = (
+        "reasoning + visible content only; Qwen markup, Hermes tool JSON, "
+        "<|im_end|> and boundary-straddling tokens carry zero weight. Tool "
+        "calls are conditioned on but never credited -- Hermes JSON and "
+        "DeepSeek DSML share no bytes to map through."
+    )
+    if a.supersedes:
+        manifest["supersedes"] = {
+            "run_id": a.supersedes,
+            "reason": a.supersedes_reason,
+            "note": "the superseded run's archive is preserved unchanged as "
+                    "evidence; this is a restart of the same frozen schedule "
+                    "under a declared implementation correction, not "
+                    "checkpoint selection or replacement sampling",
+        }
+
     manifest["plan_hash"] = hashlib.sha256(
         json.dumps(manifest["plans_by_update"], sort_keys=True).encode()
     ).hexdigest()[:16]
+    if a.expect_plan_hash and manifest["plan_hash"] != a.expect_plan_hash:
+        raise SystemExit(
+            f"plan_hash {manifest['plan_hash']} != expected "
+            f"{a.expect_plan_hash}. The schedule is NOT the same 80 pairs; "
+            "refusing to write a manifest that claims continuity it does not "
+            "have."
+        )
 
     print(f"run          : {a.run_id}")
     print(f"schedule     : {a.n_updates} x {a.episodes_per_update} = "
@@ -205,6 +252,12 @@ def main() -> int:
           f"{len(used_tasks)} distinct tasks from C30")
     print(f"seeds        : {seeds}")
     print(f"plan_hash    : {manifest['plan_hash']}")
+    print(f"parser       : {manifest['parser_version']}  "
+          f"projection: {manifest['projection_version']}  "
+          f"scoring: {manifest['score_algorithm']}")
+    print(f"thinking     : {manifest['thinking_mode']}")
+    if manifest.get("supersedes"):
+        print(f"supersedes   : {manifest['supersedes']['run_id']}")
     print(f"split hash   : {manifest['split_manifest_hash']}")
     print(f"eval (S16)   : {len(s16)} tasks x {manifest['eval_seeds']} seeds")
     print()
