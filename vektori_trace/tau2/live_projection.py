@@ -382,22 +382,47 @@ def project_action(
             # inside -- otherwise the span disagrees with `normalize_payload`
             # and `score_live_action` refuses the action (observed on
             # u000-task76-seed0@8#0, 2026-08-29).
-            lo, hi = _trim_boundary_whitespace(raw_b, lo, hi)
+            # Iterate to a fixed point. Trimming can orphan a token, dropping
+            # that token can shrink the covered range, and the new range can
+            # again end in whitespace. One pass leaves the span claiming bytes
+            # its survivors do not cover -- 845 vs 844 on
+            # u000-task76-seed0@8#0 and 8611 vs 8324 on @9#0 -- which
+            # `score_live_action` refuses as `payload_bytes_disagree`.
+            for _ in range(len(token_bytes) + 2):
+                lo, hi = _trim_boundary_whitespace(raw_b, lo, hi)
+                dropped = False
+                pos = 0
+                for i, tok in enumerate(token_bytes):
+                    nxt = pos + len(tok)
+                    if out.supervised.get(i) == sp.kind and not (
+                        pos >= lo and nxt <= hi
+                    ):
+                        del out.supervised[i]
+                        out.excluded[i] = EXCLUDE_STRADDLE
+                        dropped = True
+                    pos = nxt
+                # Re-derive the range from what actually survived.
+                pos = new_lo = new_hi = 0
+                seen = False
+                for i, tok in enumerate(token_bytes):
+                    nxt = pos + len(tok)
+                    if out.supervised.get(i) == sp.kind:
+                        if not seen:
+                            new_lo, seen = pos, True
+                        new_hi = nxt
+                    pos = nxt
+                if not seen:
+                    lo = hi = 0
+                    break
+                if not dropped and (new_lo, new_hi) == (lo, hi):
+                    break
+                lo, hi = new_lo, new_hi
             if lo >= hi:
                 for i, kind in list(out.supervised.items()):
                     if kind == sp.kind:
                         del out.supervised[i]
                         out.excluded[i] = EXCLUDE_STRADDLE
                 continue
-            pos = 0
-            for i, tok in enumerate(token_bytes):
-                nxt = pos + len(tok)
-                if out.supervised.get(i) == sp.kind and not (
-                    pos >= lo and nxt <= hi
-                ):
-                    del out.supervised[i]
-                    out.excluded[i] = EXCLUDE_STRADDLE
-                pos = nxt
             rebuilt.append(PayloadSpan(sp.kind, lo, hi))
         out.payloads = rebuilt
 
