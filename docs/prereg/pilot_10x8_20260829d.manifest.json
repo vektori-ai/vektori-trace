@@ -1,0 +1,615 @@
+{
+  "adapter_hash": "3869b147ab7ce5d2",
+  "base_model": "Qwen/Qwen3-4B",
+  "domain": "retail",
+  "episodes_per_update": 8,
+  "eval_note": "evaluated ONCE on the untouched parent and once on the final checkpoint; never inspected mid-run",
+  "eval_pool": "S16",
+  "eval_seeds": [
+    0,
+    1
+  ],
+  "eval_task_ids": [
+    "0",
+    "1",
+    "21",
+    "30",
+    "32",
+    "38",
+    "43",
+    "56",
+    "57",
+    "59",
+    "73",
+    "75",
+    "84",
+    "92",
+    "93",
+    "110"
+  ],
+  "frozen_at": "2026-08-29T13:20:02",
+  "kind": "tau2_live_opd_pilot",
+  "learning_rate": 1e-05,
+  "loss_aggregation": "token-mean over one global supervised-token denominator (unchanged from the mechanism proof)",
+  "max_action_tokens": 4096,
+  "max_input_tokens": 16384,
+  "max_turns": 30,
+  "n_planned_episodes": 80,
+  "n_updates": 10,
+  "parent": "/tau2/runs/a_sft_new_ck35_r2/checkpoint-32",
+  "plan_hash": "aa9251ccb6d566fa",
+  "plan_seed": 20260829,
+  "plans_by_update": [
+    [
+      {
+        "episode_id": "u000-task44-seed1",
+        "seed": 1,
+        "task_id": "44"
+      },
+      {
+        "episode_id": "u000-task95-seed1",
+        "seed": 1,
+        "task_id": "95"
+      },
+      {
+        "episode_id": "u000-task71-seed1",
+        "seed": 1,
+        "task_id": "71"
+      },
+      {
+        "episode_id": "u000-task53-seed2",
+        "seed": 2,
+        "task_id": "53"
+      },
+      {
+        "episode_id": "u000-task68-seed0",
+        "seed": 0,
+        "task_id": "68"
+      },
+      {
+        "episode_id": "u000-task76-seed0",
+        "seed": 0,
+        "task_id": "76"
+      },
+      {
+        "episode_id": "u000-task108-seed1",
+        "seed": 1,
+        "task_id": "108"
+      },
+      {
+        "episode_id": "u000-task109-seed0",
+        "seed": 0,
+        "task_id": "109"
+      }
+    ],
+    [
+      {
+        "episode_id": "u001-task76-seed1",
+        "seed": 1,
+        "task_id": "76"
+      },
+      {
+        "episode_id": "u001-task71-seed2",
+        "seed": 2,
+        "task_id": "71"
+      },
+      {
+        "episode_id": "u001-task66-seed1",
+        "seed": 1,
+        "task_id": "66"
+      },
+      {
+        "episode_id": "u001-task58-seed1",
+        "seed": 1,
+        "task_id": "58"
+      },
+      {
+        "episode_id": "u001-task64-seed0",
+        "seed": 0,
+        "task_id": "64"
+      },
+      {
+        "episode_id": "u001-task4-seed1",
+        "seed": 1,
+        "task_id": "4"
+      },
+      {
+        "episode_id": "u001-task98-seed1",
+        "seed": 1,
+        "task_id": "98"
+      },
+      {
+        "episode_id": "u001-task50-seed0",
+        "seed": 0,
+        "task_id": "50"
+      }
+    ],
+    [
+      {
+        "episode_id": "u002-task28-seed2",
+        "seed": 2,
+        "task_id": "28"
+      },
+      {
+        "episode_id": "u002-task98-seed0",
+        "seed": 0,
+        "task_id": "98"
+      },
+      {
+        "episode_id": "u002-task9-seed2",
+        "seed": 2,
+        "task_id": "9"
+      },
+      {
+        "episode_id": "u002-task64-seed2",
+        "seed": 2,
+        "task_id": "64"
+      },
+      {
+        "episode_id": "u002-task68-seed1",
+        "seed": 1,
+        "task_id": "68"
+      },
+      {
+        "episode_id": "u002-task4-seed0",
+        "seed": 0,
+        "task_id": "4"
+      },
+      {
+        "episode_id": "u002-task102-seed1",
+        "seed": 1,
+        "task_id": "102"
+      },
+      {
+        "episode_id": "u002-task26-seed1",
+        "seed": 1,
+        "task_id": "26"
+      }
+    ],
+    [
+      {
+        "episode_id": "u003-task28-seed0",
+        "seed": 0,
+        "task_id": "28"
+      },
+      {
+        "episode_id": "u003-task63-seed1",
+        "seed": 1,
+        "task_id": "63"
+      },
+      {
+        "episode_id": "u003-task85-seed2",
+        "seed": 2,
+        "task_id": "85"
+      },
+      {
+        "episode_id": "u003-task23-seed1",
+        "seed": 1,
+        "task_id": "23"
+      },
+      {
+        "episode_id": "u003-task2-seed2",
+        "seed": 2,
+        "task_id": "2"
+      },
+      {
+        "episode_id": "u003-task66-seed0",
+        "seed": 0,
+        "task_id": "66"
+      },
+      {
+        "episode_id": "u003-task108-seed2",
+        "seed": 2,
+        "task_id": "108"
+      },
+      {
+        "episode_id": "u003-task87-seed2",
+        "seed": 2,
+        "task_id": "87"
+      }
+    ],
+    [
+      {
+        "episode_id": "u004-task50-seed2",
+        "seed": 2,
+        "task_id": "50"
+      },
+      {
+        "episode_id": "u004-task28-seed1",
+        "seed": 1,
+        "task_id": "28"
+      },
+      {
+        "episode_id": "u004-task8-seed2",
+        "seed": 2,
+        "task_id": "8"
+      },
+      {
+        "episode_id": "u004-task102-seed2",
+        "seed": 2,
+        "task_id": "102"
+      },
+      {
+        "episode_id": "u004-task85-seed1",
+        "seed": 1,
+        "task_id": "85"
+      },
+      {
+        "episode_id": "u004-task96-seed0",
+        "seed": 0,
+        "task_id": "96"
+      },
+      {
+        "episode_id": "u004-task45-seed2",
+        "seed": 2,
+        "task_id": "45"
+      },
+      {
+        "episode_id": "u004-task66-seed2",
+        "seed": 2,
+        "task_id": "66"
+      }
+    ],
+    [
+      {
+        "episode_id": "u005-task67-seed2",
+        "seed": 2,
+        "task_id": "67"
+      },
+      {
+        "episode_id": "u005-task76-seed2",
+        "seed": 2,
+        "task_id": "76"
+      },
+      {
+        "episode_id": "u005-task102-seed0",
+        "seed": 0,
+        "task_id": "102"
+      },
+      {
+        "episode_id": "u005-task2-seed0",
+        "seed": 0,
+        "task_id": "2"
+      },
+      {
+        "episode_id": "u005-task78-seed1",
+        "seed": 1,
+        "task_id": "78"
+      },
+      {
+        "episode_id": "u005-task63-seed0",
+        "seed": 0,
+        "task_id": "63"
+      },
+      {
+        "episode_id": "u005-task23-seed2",
+        "seed": 2,
+        "task_id": "23"
+      },
+      {
+        "episode_id": "u005-task109-seed1",
+        "seed": 1,
+        "task_id": "109"
+      }
+    ],
+    [
+      {
+        "episode_id": "u006-task4-seed2",
+        "seed": 2,
+        "task_id": "4"
+      },
+      {
+        "episode_id": "u006-task63-seed2",
+        "seed": 2,
+        "task_id": "63"
+      },
+      {
+        "episode_id": "u006-task67-seed1",
+        "seed": 1,
+        "task_id": "67"
+      },
+      {
+        "episode_id": "u006-task96-seed1",
+        "seed": 1,
+        "task_id": "96"
+      },
+      {
+        "episode_id": "u006-task50-seed1",
+        "seed": 1,
+        "task_id": "50"
+      },
+      {
+        "episode_id": "u006-task87-seed0",
+        "seed": 0,
+        "task_id": "87"
+      },
+      {
+        "episode_id": "u006-task45-seed1",
+        "seed": 1,
+        "task_id": "45"
+      },
+      {
+        "episode_id": "u006-task95-seed0",
+        "seed": 0,
+        "task_id": "95"
+      }
+    ],
+    [
+      {
+        "episode_id": "u007-task108-seed0",
+        "seed": 0,
+        "task_id": "108"
+      },
+      {
+        "episode_id": "u007-task69-seed1",
+        "seed": 1,
+        "task_id": "69"
+      },
+      {
+        "episode_id": "u007-task53-seed0",
+        "seed": 0,
+        "task_id": "53"
+      },
+      {
+        "episode_id": "u007-task101-seed0",
+        "seed": 0,
+        "task_id": "101"
+      },
+      {
+        "episode_id": "u007-task67-seed0",
+        "seed": 0,
+        "task_id": "67"
+      },
+      {
+        "episode_id": "u007-task44-seed2",
+        "seed": 2,
+        "task_id": "44"
+      },
+      {
+        "episode_id": "u007-task2-seed1",
+        "seed": 1,
+        "task_id": "2"
+      },
+      {
+        "episode_id": "u007-task9-seed1",
+        "seed": 1,
+        "task_id": "9"
+      }
+    ],
+    [
+      {
+        "episode_id": "u008-task53-seed1",
+        "seed": 1,
+        "task_id": "53"
+      },
+      {
+        "episode_id": "u008-task8-seed0",
+        "seed": 0,
+        "task_id": "8"
+      },
+      {
+        "episode_id": "u008-task58-seed0",
+        "seed": 0,
+        "task_id": "58"
+      },
+      {
+        "episode_id": "u008-task109-seed2",
+        "seed": 2,
+        "task_id": "109"
+      },
+      {
+        "episode_id": "u008-task98-seed2",
+        "seed": 2,
+        "task_id": "98"
+      },
+      {
+        "episode_id": "u008-task78-seed2",
+        "seed": 2,
+        "task_id": "78"
+      },
+      {
+        "episode_id": "u008-task85-seed0",
+        "seed": 0,
+        "task_id": "85"
+      },
+      {
+        "episode_id": "u008-task26-seed2",
+        "seed": 2,
+        "task_id": "26"
+      }
+    ],
+    [
+      {
+        "episode_id": "u009-task8-seed1",
+        "seed": 1,
+        "task_id": "8"
+      },
+      {
+        "episode_id": "u009-task58-seed2",
+        "seed": 2,
+        "task_id": "58"
+      },
+      {
+        "episode_id": "u009-task69-seed0",
+        "seed": 0,
+        "task_id": "69"
+      },
+      {
+        "episode_id": "u009-task101-seed1",
+        "seed": 1,
+        "task_id": "101"
+      },
+      {
+        "episode_id": "u009-task78-seed0",
+        "seed": 0,
+        "task_id": "78"
+      },
+      {
+        "episode_id": "u009-task68-seed2",
+        "seed": 2,
+        "task_id": "68"
+      },
+      {
+        "episode_id": "u009-task23-seed0",
+        "seed": 0,
+        "task_id": "23"
+      },
+      {
+        "episode_id": "u009-task9-seed0",
+        "seed": 0,
+        "task_id": "9"
+      }
+    ]
+  ],
+  "prompt_boundary": "generation-prompt (no empty-think wrapper)",
+  "require_reasoning": true,
+  "run_id": "pilot_10x8_20260829d",
+  "sealed_pool": "F38",
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "share_metrics": "telemetry only; balance is enforced by this frozen plan, not by rejecting realized batches",
+  "split_manifest_hash": "b741bfceb1f3d027",
+  "student_tokenizer": "Qwen/Qwen3-4B",
+  "task_ids": [
+    "2",
+    "4",
+    "8",
+    "9",
+    "23",
+    "26",
+    "28",
+    "44",
+    "45",
+    "50",
+    "53",
+    "58",
+    "63",
+    "64",
+    "66",
+    "67",
+    "68",
+    "69",
+    "71",
+    "76",
+    "78",
+    "85",
+    "87",
+    "95",
+    "96",
+    "98",
+    "101",
+    "102",
+    "108",
+    "109"
+  ],
+  "task_pool": "C30",
+  "teacher_model": "accounts/fireworks/models/deepseek-v4-flash-0731",
+  "teacher_renderer": "deepseek-v4-native",
+  "teacher_tokenizer": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "temperature": 1.0,
+  "tools_hash": "1881b37265759ea3",
+  "parser_version": "v2",
+  "projection_version": "v3",
+  "score_algorithm": "chunk-v2",
+  "thinking_mode": "thinking",
+  "projection_scope": "reasoning + visible content only; Qwen markup, Hermes tool JSON, <|im_end|> and boundary-straddling tokens carry zero weight. Tool calls are conditioned on but never credited -- Hermes JSON and DeepSeek DSML share no bytes to map through. Declared scope, not a defect.",
+  "supersedes": {
+    "run_id": "pilot_10x8_20260829c",
+    "reason": "update-0 rollout refused its exact batch: 2 episodes (68, 108) were valid implicit-boundary generations failed by a stale literal-</think> archive gate, and 1 (task 95 turn 7) was a genuine no-boundary generation. No .SAMPLED, no teacher call, no optimizer step; parent untouched.",
+    "note": "c's archive is preserved unchanged and its 1/8 genuine format failure counts toward the reported rate."
+  },
+  "code_commit": "3a85022b11aec06b4c8f3897d2f4e8f682add6d9",
+  "embedded_two_update_proof": {
+    "updates": [
+      0,
+      1
+    ],
+    "rationale": "updates 0-1 ARE the two-update proof; running a separate one would discard its rollouts and pay twice for the same evidence. The tradeoff is accepted deliberately: if checkpoint/reload or next-policy behaviour fails, we paid for 8-episode updates rather than a smaller proof.",
+    "holds": [
+      {
+        "after": "update-0 SCORED",
+        "requires": [
+          "100% planned episode and action coverage",
+          "no payload skips",
+          "zero boundary-newline, markup and tool-JSON weight",
+          "exact token accounting",
+          "all advantages finite",
+          "no zero-supervision actions",
+          "negative tail is semantic, not serialization"
+        ]
+      },
+      {
+        "after": "update-1 SAMPLED",
+        "requires": [
+          "sampled from update 0's verified child adapter hash",
+          "valid explicit or implicit reasoning boundaries",
+          "tools executable",
+          "no format regression vs update 0",
+          "complete planned roster"
+        ]
+      }
+    ],
+    "updates_2_to_9": "NOT authorized until both holds pass"
+  },
+  "status_claim": "instrumentation / stability / signal-seeking and empirical sizing run. This design CANNOT establish efficacy: 16 S16 episodes cannot separate a modest improvement from sampling variation, and no matched continued-SFT control is run. Report gradient and movement diagnostics, never an efficacy claim.",
+  "extension_policy": {
+    "predeclared": "a clean but noisy positive result MAY trigger a balanced 10x8 extension to 20x8 total, keeping 8 episodes per update so the optimization recipe is unchanged and only the optimizer-step count doubles.",
+    "pair_reuse": "reusing a (task, seed) in a later update is valid -- the policy has changed, so the trajectory is new and on-policy -- but must be declared and balanced: the extension cycles C30 pairs so exposure counts differ by at most one.",
+    "sizing": "chosen from THIS run's measured gradient norm/variance, policy movement, advantage stability and evaluation variance -- not from external rollout counts, which are not comparable: our correlated multi-turn Tau2 turns are not independent rollouts.",
+    "still_exploratory": "20x8 would also be signal-seeking, not confirmatory."
+  },
+  "evaluation_note": "16 S16 episodes are weak. Evaluation power should be raised separately -- e.g. all 16 S16 tasks over several fixed seeds -- without touching training or opening F38.",
+  "quarantined": {
+    "checkpoint": "90e4511f26247f33",
+    "why": "trained under projection v1, whose dominant negative tail was the boundary-newline serialization artifact. Evidence only; never a parent.",
+    "scores": "v1 and v2 score rows are not reusable; fingerprints reject them."
+  },
+  "reasoning_contract": {
+    "resolver": "live_agent._resolve_reasoning -- the SINGLE definition, used by split_generation, _reasoning_byte_span AND LiveEpisodeArchive.verify_episode",
+    "accepted_modes": [
+      "closed",
+      "implicit_tool_call"
+    ],
+    "refused": [
+      "no <think> at all",
+      "unclosed <think> with no complete valid <tool_call> to bound it",
+      "whitespace-only reasoning (the empty SFT wrapper) in EITHER mode",
+      "multiple openers, unpaired closer, malformed tool JSON"
+    ],
+    "fixed_2026_08_29": "verify_episode required a literal </think>, which is v1 logic. It failed tasks 68 and 108 whose reasoning was captured (2,193 and 2,056 chars) with 3 and 1 tool calls parsed. Update 0 would have been 7/8, not 5/8."
+  },
+  "retry_policy": {
+    "rationale": "retrying until eight episodes happen to be format-valid selects lucky trajectories and hides the model's real failure rate. Bounded retries keep the run honest; the failure rate is itself a primary outcome.",
+    "format_failures": {
+      "definition": "episode status 'failed' -- a measurement OF THE POLICY",
+      "max_retries": 1,
+      "unit": "whole batch; never combine successful episodes across attempts",
+      "stop_if": [
+        ">=2 format-failed episodes in ANY single 8-episode attempt",
+        "any format failure on the retry attempt (budget exhausted, no exact batch exists)"
+      ],
+      "reporting": "PRIMARY outcome. Rate is computed over ALL attempted episodes including rejected attempts, and includes the 1/8 observed in pilot_10x8_20260829c update 0."
+    },
+    "infrastructure_failures": {
+      "definition": "episode status 'discarded' -- an environment event, not a policy measurement (e.g. HTTP 408/500)",
+      "max_retries": 2,
+      "backoff": "exponential, versioned attempt identity",
+      "stop_if": [
+        "retry cap exhausted -- the run environment is unreliable"
+      ],
+      "reporting": "separate from format failures; never conflated"
+    },
+    "expected_cost": {
+      "assumed_per_episode_format_failure_rate": 0.12,
+      "p_at_least_one_in_8": 0.64,
+      "p_exactly_one_in_8": 0.39,
+      "p_two_or_more_in_8": 0.25,
+      "p_both_attempts_fail": 0.41,
+      "note": "So ~2 in 3 updates fail the exact-batch gate on the first attempt, and ~41% exhaust the one-retry budget. An earlier draft said ~1 in 3 and ~1 in 9; that was wrong -- it conflated P(>=2 failures)=25% with P(>=1 failure)=64%. This is the real tax of require_reasoning on this SFT lineage and is a measurement, not an obstacle."
+    },
+    "declared_conditional_sampling": "training batches are conditioned on format validity, so the pilot stays SIGNAL-SEEKING and is not clean efficacy evidence."
+  }
+}
