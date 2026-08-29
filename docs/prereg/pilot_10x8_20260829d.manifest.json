@@ -533,7 +533,7 @@
         "after": "update-0 SCORED",
         "requires": [
           "100% planned episode and action coverage",
-          "no payload skips",
+          "no UNDECLARED payload skips; update 0 permits only the preregistered u000-task76-seed0@9#0 interleaved-reasoning exclusion (see declared_exclusions)",
           "zero boundary-newline, markup and tool-JSON weight",
           "exact token accounting",
           "all advantages finite",
@@ -552,7 +552,8 @@
         ]
       }
     ],
-    "updates_2_to_9": "NOT authorized until both holds pass"
+    "updates_2_to_9": "NOT authorized until both holds pass",
+    "holds_note": "The update-0 hold originally required 'no payload skips' while declared_exclusions permits exactly one. As written the paid result was guaranteed to fail its own hold. Corrected to forbid UNDECLARED skips."
   },
   "status_claim": "instrumentation / stability / signal-seeking and empirical sizing run. This design CANNOT establish efficacy: 16 S16 episodes cannot separate a modest improvement from sampling variation, and no matched continued-SFT control is run. Report gradient and movement diagnostics, never an efficacy claim.",
   "extension_policy": {
