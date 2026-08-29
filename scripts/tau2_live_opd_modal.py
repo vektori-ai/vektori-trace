@@ -1796,16 +1796,6 @@ def token_shares(run_id: str = "", update: int = 0) -> str:
 
 
 
-@app.function(
-    # NO gpu=. Rollout drives the SERVING endpoint over HTTP -- the generation
-    # happens on that card, not in this container. The monolithic `train`
-    # allocated a training GPU here and then held it through scoring too,
-    # which over a 10-update run is hours of an idle card.
-    image=image,
-    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
-    timeout=60 * 90,
-    secrets=[modal.Secret.from_name("fireworks-api-key")],
-)
 def _is_diagnostic_run(run_id: str) -> bool:
     """Is this run id explicitly a diagnostic, not a preregistered update?
 
@@ -1817,6 +1807,16 @@ def _is_diagnostic_run(run_id: str) -> bool:
     return "diag" in low or "canary" in low
 
 
+@app.function(
+    # NO gpu=. Rollout drives the SERVING endpoint over HTTP -- the generation
+    # happens on that card, not in this container. The monolithic `train`
+    # allocated a training GPU here and then held it through scoring too,
+    # which over a 10-update run is hours of an idle card.
+    image=image,
+    volumes={VOLUME_MOUNT: vol, HF_CACHE_MOUNT: hf_cache},
+    timeout=60 * 90,
+    secrets=[modal.Secret.from_name("fireworks-api-key")],
+)
 def rollout_only(run_id: str = "", update: int = 0, api_base: str = "",
                  student_model: str = "", adapter_hash_expect: str = "",
                  tau2_src: str = "", max_episodes: int = 0,

@@ -27,7 +27,10 @@ def _fence():
     src = (Path(__file__).parent.parent / "scripts"
            / "tau2_live_opd_modal.py").read_text()
     start = src.index("def _is_diagnostic_run(")
-    end = src.index("def rollout_only(", start)
+    # Stop at whatever follows the helper -- it sits above rollout_only's
+    # @app.function decorator, so slicing to "def rollout_only(" would drag
+    # the decorator in and try to execute Modal at import time.
+    end = src.index("@app.function(", start)
     ns: dict = {}
     exec(compile(src[start:end], "<fence>", "exec"), ns)
     return ns["_is_diagnostic_run"]
