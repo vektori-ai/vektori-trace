@@ -677,5 +677,21 @@
         "for_this_pilot": "v4's conservative skip is correct. The prospective stop rules keep it from silently consuming the run."
       }
     }
+  },
+  "okay_token_prediction": {
+    "declared_before": "the update-0 optimizer step, so neither outcome can be rationalised after the fact",
+    "observation_update_0": {
+      "finding": "all ten most-negative supervised tokens are the literal word 'Okay' at token index 2 -- the first word after <think>\\n -- at -18.2 to -22.0.",
+      "student_logprob_median": -0.01057,
+      "template_newline_logprob_median": -0.0,
+      "why_kept": "Unlike the index-1 newline (median logprob -0.00000, emitted by Qwen's chat template, unactionable by any weight change), 'Okay' is a learned stylistic habit at ~98.9% confidence. Training CAN move it. Masking it would be deciding which of the teacher's preferences are allowed to count, which is the opposite of what OPD is for: shifting the student toward the teacher's distribution."
+    },
+    "competing_hypotheses": {
+      "signal": "a correct, strong gradient on a real habit. 'Okay' moves, the negative tail shrinks in update 1, mean advantage rises toward zero. This is OPD working.",
+      "amplifier": "near-deterministic tokens amplify the advantage: A_i = (L_T/L_S - 1) * log p_i, and log p_i ~ -0.01 with the teacher surprised makes L_T/L_S ~ 2000x. 75 nearly identical huge gradients land on one position while genuine reasoning differences sit at +/-1, so the update spends its capacity on the opener."
+    },
+    "discriminating_measurement": "compare update 1's advantage report against update 0's: (a) is 'Okay' still the most-negative token, (b) does its magnitude fall, (c) does the overall mean move toward zero, (d) does the p1 tail shrink.",
+    "if_amplifier": "clamp. chunk_opd already supports opd_loss_max_clamp (upstream's symmetric per-token cap); it is currently None. Setting it is a preregistration amendment, not a silent tweak.",
+    "no_masking": "'Okay' is NOT masked in this run under any outcome."
   }
 }
