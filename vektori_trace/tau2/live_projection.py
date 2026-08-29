@@ -68,16 +68,23 @@ from __future__ import annotations
 #:   JSON serialization, `<|im_end|>` and boundary-straddling tokens all carry
 #:   zero weight. Tool calls are conditioned on but never credited, because
 #:   Hermes JSON and DeepSeek DSML share no bytes to map through.
-#: - "v2" (2026-08-29): additionally excludes the whitespace run immediately
-#:   inside each payload boundary. Qwen opens `<think>\n`, DeepSeek does not,
-#:   so that newline drew -15..-23 in 11/11 canary turns and would have been
-#:   the batch's dominant gradient. Interior whitespace stays supervised.
-PROJECTION_VERSION = "v2"
+#: - "v2" (2026-08-29): excludes the whitespace run immediately inside each
+#:   payload boundary. Qwen opens `<think>\n`, DeepSeek does not, so that
+#:   newline drew -15..-23 in 11/11 canary turns and would have been the
+#:   batch's dominant gradient. Interior whitespace stays supervised.
+#: - "v3" (2026-08-29): applies that same trim SYMMETRICALLY -- the normalized
+#:   payload is what gets rendered into the DeepSeek message, so both sides
+#:   hold identical bytes. v2 trimmed only the student side, which made a
+#:   teacher token straddle the payload start on nearly every turn and dropped
+#:   retention to 11.1%. The teacher-rendered bytes change, so scores bought
+#:   under v2 are not reusable.
+PROJECTION_VERSION = "v3"
 
 from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "normalize_payload",
     "ProjectionError",
     "PayloadSpan",
     "ProjectedAction",
@@ -196,7 +203,32 @@ def _find_payload_spans(raw: str, reasoning: str | None, content: str | None) ->
 
 
 #: Bytes treated as serialization when they sit against a payload boundary.
-_WS = b" \t\r\n"
+_WS = (b" ", b"\t", b"\r", b"\n")
+
+
+def normalize_payload(text: str) -> tuple[str, int, int]:
+    """The payload with its wrapper-adjacent whitespace removed.
+
+    THE single definition of that trim. Both sides of the projection must use
+    it: the student span AND the text rendered into the DeepSeek message. A
+    one-sided trim was tried on 2026-08-29 and collapsed retention from 96.5%
+    to 11.1% -- the student asked for `"Okay ..."` while the teacher render
+    still held `"\nOkay ..."`, DeepSeek's tokenizer fuses that newline with the
+    first word, so a teacher token straddled the requested start on nearly
+    every turn and the whole payload was refused. The straddle check was right;
+    the asymmetry was the bug.
+
+    Returns `(normalized, lead, trail)` where `lead`/`trail` are the number of
+    **characters** removed from each end, so a caller can map the normalized
+    text back onto the original byte span.
+    """
+    n = len(text)
+    i, j = 0, n
+    while i < j and text[i] in " \t\r\n":
+        i += 1
+    while j > i and text[j - 1] in " \t\r\n":
+        j -= 1
+    return text[i:j], i, n - j
 
 
 def _trim_boundary_whitespace(raw_b: bytes, start: int, end: int) -> tuple[int, int]:
@@ -217,9 +249,9 @@ def _trim_boundary_whitespace(raw_b: bytes, start: int, end: int) -> tuple[int, 
     of the argument -- and stays supervised. So this trims the leading and
     trailing runs and touches nothing between them.
     """
-    while start < end and raw_b[start:start + 1] in (b" ", b"\t", b"\r", b"\n"):
+    while start < end and raw_b[start:start + 1] in _WS:
         start += 1
-    while end > start and raw_b[end - 1:end] in (b" ", b"\t", b"\r", b"\n"):
+    while end > start and raw_b[end - 1:end] in _WS:
         end -= 1
     return start, end
 

@@ -128,7 +128,7 @@ class TestProjection:
 
 def test_projection_version_bumped():
     """Cache identity must change loudly: old score rows must not be reused."""
-    assert PROJECTION_VERSION == "v2"
+    assert PROJECTION_VERSION == "v3"
 
 
 def test_fingerprint_changes_with_projection_version(monkeypatch):
@@ -139,7 +139,7 @@ def test_fingerprint_changes_with_projection_version(monkeypatch):
                prompt_token_ids=[1], episode_id="e", turn_index=0)
     now = live_score_fingerprint(row)
     import vektori_trace.tau2.live_projection as lp
-    monkeypatch.setattr(lp, "PROJECTION_VERSION", "v1")
+    monkeypatch.setattr(lp, "PROJECTION_VERSION", "v2")
     assert live_score_fingerprint(row) != now, (
         "a v1 score row must not pass fingerprint reuse under v2"
     )

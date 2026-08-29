@@ -245,7 +245,20 @@ def score_live_action(
         return out
 
     reasoning, content, tool_calls = split_generation(raw_text)
-    assistant = _deepseek_assistant_message(reasoning, content, tool_calls)
+    # SYMMETRY (projection v3). The student span has had its wrapper-adjacent
+    # whitespace trimmed, so the teacher must be shown the SAME bytes. Trimming
+    # only the student side made a DeepSeek token straddle the payload start on
+    # nearly every turn -- its tokenizer fuses the boundary newline with the
+    # first word -- and the straddle guard then refused whole payloads,
+    # dropping retention from 96.5% to 11.1% (measured 2026-08-29).
+    #
+    # `normalize_payload` is the one definition of that trim; calling `.strip()`
+    # here instead would be a second rule free to drift from the projection's.
+    from vektori_trace.tau2.live_projection import normalize_payload
+
+    reasoning_n = normalize_payload(reasoning)[0] if reasoning else reasoning
+    content_n = normalize_payload(content)[0] if content else content
+    assistant = _deepseek_assistant_message(reasoning_n, content_n, tool_calls)
 
     prefix_text = render_teacher_prefix(
         semantic_history, thinking_mode=thinking_mode
@@ -298,7 +311,16 @@ def score_live_action(
         payload = raw_text.encode("utf-8")[span.byte_start : span.byte_end]
         payload_text = payload.decode("utf-8")
 
-        # Same text on both sides -- that is the premise of the projection.
+        # Same text on both sides -- that is the premise of the projection, and
+        # under v3 it holds by construction: `project_action` trimmed this span
+        # with `normalize_payload`, and the DeepSeek message above was rendered
+        # from the output of that same function.
+        if payload_text != normalize_payload(payload_text)[0]:
+            raise LiveScoreError(
+                f"{key}: the {span.kind} span still carries boundary "
+                "whitespace after projection; student and teacher payloads "
+                "would not be byte-identical"
+            )
         d_start, d_end = _locate(action_text_ds, payload_text, span.kind)
         d_start_b = len(action_text_ds[:d_start].encode("utf-8"))
         d_end_b = len(action_text_ds[:d_end].encode("utf-8"))

@@ -177,3 +177,60 @@ def test_length_mismatch_is_refused(tokenizer):
             key="ep@4#0", raw_text=raw, student_token_bytes=_bytes_for(raw),
             semantic_history=HISTORY, teacher_tokenizer=tokenizer, pool=_Short(),
         )
+
+
+def test_boundary_whitespace_is_symmetric_real_tokenizer(tokenizer):
+    """Projection v3: the trim is applied to BOTH sides, so alignment holds.
+
+    The exact canary shape -- `<think>\nOkay...\n</think>` -- through the real
+    DeepSeek tokenizer. v2 trimmed only the student span; DeepSeek fuses the
+    boundary newline with the following word, so a teacher token straddled the
+    payload start on nearly every turn and the straddle guard (correctly)
+    refused the whole payload. Retention fell 96.5% -> 11.1%.
+
+    Under v3 the normalized text is what gets rendered to the teacher, so the
+    two sides are byte-identical and the payload is scored.
+    """
+    raw = ("<think>\nOkay, I need to look up the order first.\n\n"
+           "Then I will check the item.\n</think>Checking now.")
+    toks = _bytes_for(raw)
+    pool = _Pool()
+
+    sc = score_live_action(
+        key="ep@ws#0", raw_text=raw, student_token_bytes=toks,
+        semantic_history=HISTORY, teacher_tokenizer=tokenizer, pool=pool,
+    )
+
+    # The payload must be SCORED, not skipped.
+    assert "skipped" not in sc.payload_report.get("reasoning", {}), (
+        f"reasoning payload was skipped: {sc.payload_report}")
+    assert sc.n_supervised > 0
+
+    # Retention must be substantial, not a residue.
+    assert sc.n_supervised / len(toks) > 0.5, (
+        f"only {sc.n_supervised}/{len(toks)} supervised -- the v2 collapse")
+
+    # The boundary newline itself carries no credit.
+    sup = set(sc.teacher_logprob_by_index)
+    bpos = 0
+    for i, tok in enumerate(toks):
+        txt = tok.decode("utf-8", "replace")
+        # token 1 is the '\n' right after <think> in this tokenization
+        if bpos == len("<think>") and txt.strip() == "":
+            assert i not in sup, "boundary newline must not be supervised"
+        bpos += len(tok)
+
+    # Interior blank line survives inside the supervised span.
+    covered = b"".join(toks[i] for i in sorted(sup)).decode("utf-8", "replace")
+    assert "\n\n" in covered, "interior paragraph break must stay supervised"
+
+
+def test_normalize_payload_is_the_only_trim_rule():
+    """One definition, so the two sides cannot drift apart."""
+    from vektori_trace.tau2.live_projection import normalize_payload
+
+    assert normalize_payload("\nOkay.\n") == ("Okay.", 1, 1)
+    assert normalize_payload("Okay.") == ("Okay.", 0, 0)
+    assert normalize_payload("\n\n a \n\n") == ("a", 3, 3)
+    # interior whitespace is never touched
+    assert normalize_payload("\na\n\nb\n")[0] == "a\n\nb"
