@@ -687,7 +687,12 @@ No GPU, endpoint, rollout, teacher call or training step is authorized until:
    Hermes JSON and DeepSeek DSML share no bytes to map through. This is a
    declared scope limit, not a defect, and it is why this arm is an
    *adaptation* of the paper's cross-tokenizer OPD rather than a reproduction.
-6. rollout retry semantics and `--start-at` guards match the runbook;
+6. ~~rollout retry semantics and `--start-at` guards match the runbook~~ —
+   **met** 2026-08-29. `--start-at` now refuses to step over an update the
+   volume reports as untrained (`next_update`), which was logged but never
+   enforced; `--allow-gap` is the explicit, warned override. A skipped update
+   leaves every later update parented on a checkpoint that was never
+   produced, and nothing downstream can tell.
 7. a fresh manifest freezes the unchanged 80-pair schedule and records the
    amendment;
 8. ~~CPU-only tests and a no-teacher scoring dry run pass~~ — **met**
@@ -702,7 +707,8 @@ No GPU, endpoint, rollout, teacher call or training step is authorized until:
    they are refused *is* the fix. Real advantages require a paid DeepSeek
    rescore, which is the first paid step below and nothing earlier.
 
-Gates 6 and 7 remain open and are operational, not numerical.
+Gate 7 (a fresh frozen manifest under a new run id) remains open;
+it is operational, not numerical, and is the last step before the paid ladder.
 
 Then use the original cost ladder rather than jumping directly to unattended
 10×8 execution: one reasoning-required episode, a two-update on-policy proof,

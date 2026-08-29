@@ -363,6 +363,12 @@ def main() -> int:
     ap.add_argument("--state-dir", default="",
                     help="where owned app ids and stage logs live")
     ap.add_argument("--start-at", type=int, default=0)
+    ap.add_argument(
+        "--allow-gap", action="store_true",
+        help="permit --start-at to skip an untrained update; the "
+             "resulting schedule has a hole and every later update "
+             "is parented on a checkpoint that was never produced",
+    )
     ap.add_argument("--max-usd", type=float, default=30.0,
                     help="hard stop when the ESTIMATED spend reaches this. "
                          "Checked before every paid stage, so an unattended "
@@ -432,6 +438,23 @@ def main() -> int:
     log(f"status: {len(status.get('trained_updates', []))}/"
         f"{status.get('n_updates')} updates trained, "
         f"next={status.get('next_update')}, plan={status.get('plan_hash')}")
+
+    # `--start-at` must not step over an update that never finished. Skipping
+    # one leaves a hole in the schedule that every later update is parented
+    # on, so the run reports N updates of on-policy training while some
+    # prefix of them never happened -- and nothing downstream can tell.
+    # `next_update` is what the volume actually says comes next.
+    nxt = status.get("next_update")
+    if nxt is not None and a.start_at > nxt and not a.allow_gap:
+        raise SystemExit(
+            f"--start-at {a.start_at} would skip update {nxt}, which is not "
+            f"trained. Resume at {nxt}, or pass --allow-gap if the gap is "
+            "deliberate and recorded. A skipped update leaves every later "
+            "update parented on a checkpoint that was never produced."
+        )
+    if nxt is not None and a.start_at > nxt and a.allow_gap:
+        log(f"WARNING: --allow-gap, starting at {a.start_at} with update "
+            f"{nxt} untrained; the schedule will have a hole")
 
     # Endpoint recovery: after an orchestrator restart the served policy is
     # whatever the last completed refresh left. Derive it from the markers
