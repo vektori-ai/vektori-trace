@@ -662,7 +662,19 @@
         "reasoning bytes excluded",
         "total retention",
         "task/turn identities"
-      ]
+      ],
+      "reframed": "This is a MALFORMED GENERATION, not a representation problem for the projector to solve. A real tool call ENDS the assistant action: the environment executes it and a new turn begins. Text emitted after a <tool_call> inside <think> is the model continuing past where it should have stopped -- not a second reasoning segment deserving faithful representation. That is why multi-segment support was the wrong fix: it built machinery to represent something that should not be represented.",
+      "long_term_fix": {
+        "not": "more special cases in the projector; each token shape patched individually turns the scorer into a fragile parser maze",
+        "structural": [
+          "enforce the output protocol at generation time -- a tool call ends the action; an embedded one is malformed format, not arbitrary reasoning",
+          "parse into an ORDERED semantic representation (ReasoningText | ToolCall | VisibleContent nodes), each keeping its exact byte range and token indices; unknown or ambiguous structures fail closed",
+          "render only what DeepSeek supports natively -- if it cannot represent the same ordering without changing context, that region carries no transferred credit; never manufacture adjacency or pass embedded Hermes JSON off as a native tool call",
+          "reduce the behaviour through TRAINING: clean examples that close reasoning before a tool call, or a decoding constraint. This addresses why Qwen produces the shape at all",
+          "test invariants rather than a growing list of strings: every token supervised or explicitly excluded; supervised bytes identical on both sides; markup zero weight; byte ranges never overlap; locations monotonic and occurrence-specific; ambiguous input fails closed; cache versions change whenever semantics change"
+        ],
+        "for_this_pilot": "v4's conservative skip is correct. The prospective stop rules keep it from silently consuming the run."
+      }
     }
   }
 }
