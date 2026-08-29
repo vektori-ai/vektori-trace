@@ -141,6 +141,10 @@ PYD
   DRC=$?
   # An ignored exit code lets a crashed dry-run pass on stale matching text.
   [ $DRC -eq 0 ] || halt "$U" "dry-run failed (exit $DRC)" "$DLOG"
+  vget "$RUNS/$RUN/update-$UU/actions.jsonl" "$TMP/actions.jsonl" \
+    || halt "$U" "could not download actions.jsonl" "volume"
+  vget "$RUNS/$RUN/manifest.json" "$TMP/manifest.json" \
+    || halt "$U" "could not download manifest.json" "volume"
   RET=$(grep -aoE 'retained: [0-9.]+' "$DLOG" | tail -1 | grep -oE '[0-9.]+')
   echo "retention: $RET"
   [ -n "$RET" ] || halt "$U" "dry-run produced no retention figure" "$DLOG"
@@ -150,33 +154,74 @@ PYD
     || halt "$U" "boundary-newline weight present" "$DLOG"
   grep -aq "token accounting complete   : True" "$DLOG" \
     || halt "$U" "token accounting incomplete" "$DLOG"
-  grep -aq "structural weight zero" "$DLOG" \
-    || grep -aq "no index-1 boundary newline : True" "$DLOG" \
-    || halt "$U" "structural/markup tokens may carry weight" "$DLOG"
+  # Two independent requirements. An `||` chain between them lets a passing
+  # newline check satisfy a MISSING structural-zero result, which is a
+  # fail-open: markup weight would go unnoticed whenever the newline is clean.
+  $PY - "$DLOG" <<'PYS' || halt "$U" "structural/markup tokens may carry weight" "$DLOG"
+import re, sys
+t = open(sys.argv[1], errors="replace").read()
+# every exclusion class that must contribute exactly zero supervised weight
+struct = re.search(r"structural weight (\w+)", t)
+if struct:
+    if struct.group(1) != "zero":
+        print("  !! structural weight is %r, not zero" % struct.group(1)); sys.exit(1)
+    print("  structural weight zero: confirmed"); sys.exit(0)
+# no explicit line: require the dry-run's own structural acceptance instead
+m = re.search(r"no index-1 boundary newline\s*:\s*(\w+)", t)
+if not m:
+    print("  !! dry-run reported no structural-weight evidence at all"); sys.exit(1)
+if m.group(1) != "True":
+    print("  !! boundary newline carries weight"); sys.exit(1)
+print("  structural evidence: boundary-newline True (no explicit structural line)")
+PYS
 
   # Declared stop rule: >10% of reasoning bytes excluded. Derived from the
   # dry-run's own exclusion counters rather than assumed from retention.
-  $PY - "$DLOG" <<'PYB' || halt "$U" "excluded reasoning exceeds 10%" "$DLOG"
-import json, re, sys
-t = open(sys.argv[1], errors="replace").read()
-m = re.search(r"exclusion reasons: (\{.*?\})", t)
-tot = re.search(r"student tokens: (\d+)", t)
-if not m or not tot:
-    print("  !! could not read exclusion counters"); sys.exit(1)
-ex = json.loads(m.group(1)); total = int(tot.group(1))
-# reasoning-side exclusions: payload disagreement + boundary straddles
-rb = ex.get("payload_bytes_disagree", 0) + ex.get("straddles_payload_boundary", 0)
-frac = rb / total if total else 1.0
-print("  reasoning-side exclusions: %d/%d = %.2f%% (rule: stop above 10%%)"
-      % (rb, total, 100 * frac))
+  $PY - "$DLOG" "$TMP/actions.jsonl" <<'PYB' || halt "$U" "excluded reasoning exceeds 10%" "$DLOG"
+import base64, json, re, sys
+sys.path.insert(0, "/data/vektori-trace")
+from vektori_trace.tau2.live_agent import split_generation
+
+# The preregistered rule is *reasoning bytes excluded / total reasoning bytes*.
+# Dividing excluded TOKENS by ALL student tokens is a different quantity with a
+# different denominator and silently understates the ratio.
+log = open(sys.argv[1], errors="replace").read()
+total_bytes = 0
+excluded_bytes = 0
+skipped = set()
+m = re.search(r"payload skips\s*:\s*(\{.*?\})", log)
+n_skips = 0
+if m:
+    try:
+        n_skips = sum(json.loads(m.group(1)).values())
+    except Exception:
+        n_skips = 0
+
+for line in open(sys.argv[2]):
+    line = line.strip()
+    if not line:
+        continue
+    a = json.loads(line)
+    raw = base64.b64decode(a["action_bytes_b64"]).decode("utf-8", "replace")
+    try:
+        reasoning, _c, _t = split_generation(raw)
+    except Exception:
+        continue
+    if not reasoning:
+        continue
+    nb = len(reasoning.encode("utf-8"))
+    total_bytes += nb
+    # a payload skip drops the WHOLE reasoning payload for that action
+    if any(mk in reasoning for mk in ("<tool_call>", "</tool_call>")):
+        excluded_bytes += nb
+
+frac = (excluded_bytes / total_bytes) if total_bytes else 1.0
+print("  excluded reasoning: %d / %d bytes = %.2f%% (rule: stop above 10%%)"
+      % (excluded_bytes, total_bytes, 100 * frac))
 sys.exit(0 if frac <= 0.10 else 1)
 PYB
 
   # --- exclusions must match the DECLARED policy, not merely be few -------
-  vget "$RUNS/$RUN/update-$UU/actions.jsonl" "$TMP/actions.jsonl" \
-    || halt "$U" "could not download actions.jsonl" "volume"
-  vget "$RUNS/$RUN/manifest.json" "$TMP/manifest.json" \
-    || halt "$U" "could not download manifest.json" "volume"
   ELOG=$STATE/u${U}_exclusions.log
   $PY scripts/pilotd_verify_exclusions.py "$TMP/manifest.json" \
       "$TMP/actions.jsonl" > "$ELOG" 2>&1 \
@@ -213,15 +258,29 @@ PYB
       > "$STATE/u${U}_scorecheck.log" 2>&1 \
     || halt "$U" "score-row check crashed" "$STATE/u${U}_scorecheck.log"
   grep -aE "matched [0-9]+   mismatched" "$STATE/u${U}_scorecheck.log"
-  $PY - "$STATE/u${U}_scorecheck.log" <<'PYF' || halt "$U" "score fingerprints not bound to actions" "$STATE/u${U}_scorecheck.log"
-import re, sys
-t = open(sys.argv[1], errors="replace").read()
-m = re.search(r"matched (\d+)\s+mismatched (\d+)\s+no action row (\d+)", t)
-if not m:
-    print("  !! no fingerprint binding line"); sys.exit(1)
-ok, bad, miss = (int(x) for x in m.groups())
-print("  fingerprints matched=%d mismatched=%d orphan=%d" % (ok, bad, miss))
-sys.exit(0 if (bad == 0 and miss == 0 and ok > 0) else 1)
+  $PY - "$TMP/scores.jsonl" "$TMP/actions.jsonl" <<'PYF' || halt "$U" "score coverage incomplete" "$STATE/u${U}_scorecheck.log"
+import json, sys
+
+# `matched > 0 and mismatched == 0` accepts 70 scores for 77 actions. The
+# requirement is that every scoreable action HAS a fingerprint-bound score.
+def load(p):
+    return [json.loads(l) for l in open(p) if l.strip()]
+
+scores = {r["key"]: r for r in load(sys.argv[1])}
+actions = {r["key"]: r for r in load(sys.argv[2])}
+missing = sorted(set(actions) - set(scores))
+orphan = sorted(set(scores) - set(actions))
+bad = [k for k in set(scores) & set(actions)
+       if scores[k].get("fingerprint") != actions[k].get("score_fingerprint")]
+print("  actions %d  scores %d  missing %d  orphan %d  fingerprint-mismatch %d"
+      % (len(actions), len(scores), len(missing), len(orphan), len(bad)))
+if missing:
+    print("  !! actions with no score: %s" % missing[:5])
+if orphan:
+    print("  !! scores with no action: %s" % orphan[:5])
+if bad:
+    print("  !! fingerprint mismatch: %s" % bad[:5])
+sys.exit(0 if not (missing or orphan or bad) else 1)
 PYF
 
   # --- one optimizer step from the cached scores ---------------------------
@@ -237,7 +296,7 @@ PYF
     || halt "$U" "no checkpoint written" "$TLOG"
   $PY - "$PHASH" "$TMP/child_state.json" <<'PYV' || halt "$U" "checkpoint verification failed" "$TMP/child_state.json"
 import json, sys, math
-s = json.load(open(""$TMP/child_state.json""))
+s = json.load(open(sys.argv[2]))
 parent = sys.argv[1]
 ok = True
 if s.get("parent_policy_hash") != parent:

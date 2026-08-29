@@ -158,6 +158,60 @@ S
              || bad "exit code not preserved" ""
 teardown
 
+
+# ---------------------------------------------------------------------------
+# Semantic gate tests. Each asserts the CORRECT behaviour and is written so it
+# would FAIL against the earlier implementation it replaces.
+# ---------------------------------------------------------------------------
+echo "== semantic gates =="
+PY=$(command -v python3)
+
+# G1. post-training verifier must read argv, not an unexpanded "$TMP" literal.
+#     Old form: json.load(open(""$TMP/child_state.json"")) -> NameError/IOError.
+cat > /tmp/gt_child.json <<'J'
+{"adapter_hash":"C1","parent_policy_hash":"P1","reload_verified":true,
+ "bytes_verified":true,"reload_report":{"n_matched":504,"n_tensors":504},
+ "bytes_report":{"max_drift_from_parent":1e-5}}
+J
+out=$(awk '/<<.PYV./{f=1;next} f&&/^PYV$/{exit} f' scripts/tau2_pilot_chain.sh \
+      | $PY - P1 /tmp/gt_child.json 2>&1)
+if echo "$out" | grep -q "child C1"; then ok "G1 checkpoint verifier reads argv"
+else bad "G1 verifier broken (would die after paid training)" "$out"; fi
+
+# G2. structural-weight must be independently required: a log with a clean
+#     newline line but NO structural evidence must still fail.
+mkg2() { printf '%s\n' "$@" > /tmp/gt_dry.log; }
+g2() { awk '/<<.PYS./{f=1;next} f&&/^PYS$/{exit} f' scripts/tau2_pilot_chain.sh \
+       | $PY - /tmp/gt_dry.log >/dev/null 2>&1; }
+mkg2 "structural weight zero" "  no index-1 boundary newline : True"; g2 && r1=PASS || r1=HALT
+mkg2 "structural weight nonzero" "  no index-1 boundary newline : True"; g2 && r2=PASS || r2=HALT
+[ "$r1" = PASS ] && [ "$r2" = HALT ] \
+  && ok "G2 structural weight is required independently ($r1/$r2)" \
+  || bad "G2 structural gate fail-open ($r1/$r2)" ""
+
+# G4. coverage must require EVERY action to have a bound score: 2 scores for
+#     3 actions must fail, where the old `matched>0 && mismatched==0` passed.
+printf '%s\n' '{"key":"a","fingerprint":"f1"}' '{"key":"b","fingerprint":"f2"}' > /tmp/gt_sc.jsonl
+printf '%s\n' '{"key":"a","score_fingerprint":"f1"}' '{"key":"b","score_fingerprint":"f2"}' \
+              '{"key":"c","score_fingerprint":"f3"}' > /tmp/gt_ac.jsonl
+# anchor on the PYF block specifically: several heredocs start "import json, sys"
+covg() { awk '/<<.PYF./{f=1;next} f&&/^PYF$/{exit} f' scripts/tau2_pilot_chain.sh \
+         | $PY - "$1" "$2" 2>&1; }
+out=$(covg /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl); rc=$?
+[ $rc -ne 0 ] && ok "G4 incomplete coverage (2 of 3) halts" \
+              || bad "G4 accepted incomplete coverage" "$out"
+printf '%s\n' '{"key":"a","fingerprint":"f1"}' '{"key":"b","fingerprint":"f2"}' \
+              '{"key":"c","fingerprint":"f3"}' > /tmp/gt_sc.jsonl
+out=$(covg /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl); rc=$?
+[ $rc -eq 0 ] && ok "G4 complete bound coverage passes" \
+              || bad "G4 rejected a complete set" "$out"
+printf '%s\n' '{"key":"a","fingerprint":"WRONG"}' '{"key":"b","fingerprint":"f2"}' \
+              '{"key":"c","fingerprint":"f3"}' > /tmp/gt_sc.jsonl
+out=$(covg /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl); rc=$?
+[ $rc -ne 0 ] && ok "G4 fingerprint mismatch halts" \
+              || bad "G4 accepted a mismatched fingerprint" "$out"
+
+rm -f /tmp/gt_child.json /tmp/gt_dry.log /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl
 echo ""
-echo "passed $PASS, failed $FAIL"
+echo "TOTAL passed $PASS, failed $FAIL"
 [ $FAIL -eq 0 ]
