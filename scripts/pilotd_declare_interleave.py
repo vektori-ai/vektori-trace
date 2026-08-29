@@ -29,7 +29,7 @@ import json
 import sys
 
 DECLARATION = {
-    "id": "interleaved_tool_calls_unclosed_think",
+    "id": "hermes_markup_inside_reasoning_span",
     "declared": "2026-08-29",
     "scope": "all updates of this run, prospectively",
     "supersedes": (
@@ -113,13 +113,13 @@ def main():
     plan_before = m.get("plan_hash")
 
     excl = m.setdefault("declared_exclusions", {})
-    excl["interleaved_tool_calls_unclosed_think"] = DECLARATION
+    excl["hermes_markup_inside_reasoning_span"] = DECLARATION
 
     m.setdefault("amendments", []).append({
         "date": "2026-08-29",
         "kind": "prospective_exclusion_class_declaration",
         "what_changed": [
-            "declared_exclusions gains interleaved_tool_calls_unclosed_think, "
+            "declared_exclusions gains hermes_markup_inside_reasoning_span, "
             "covering the shape for all remaining updates",
         ],
         "why": (
@@ -142,7 +142,7 @@ def main():
     with open(sys.argv[2], "w") as fh:
         json.dump(m, fh, indent=1, sort_keys=True)
         fh.write("\n")
-    print("declared class: interleaved_tool_calls_unclosed_think")
+    print("declared class: hermes_markup_inside_reasoning_span")
     print("plan_hash unchanged: %s" % m["plan_hash"])
     print("declared_exclusions keys: %s" % sorted(excl.keys()))
 
