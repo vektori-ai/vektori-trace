@@ -183,8 +183,8 @@ else bad "G1 verifier broken (would die after paid training)" "$out"; fi
 mkg2() { printf '%s\n' "$@" > /tmp/gt_dry.log; }
 g2() { awk '/<<.PYS./{f=1;next} f&&/^PYS$/{exit} f' scripts/tau2_pilot_chain.sh \
        | $PY - /tmp/gt_dry.log >/dev/null 2>&1; }
-mkg2 "structural weight zero" "  no index-1 boundary newline : True"; g2 && r1=PASS || r1=HALT
-mkg2 "structural weight nonzero" "  no index-1 boundary newline : True"; g2 && r2=PASS || r2=HALT
+mkg2 "  structural weight: zero (correct)"; g2 && r1=PASS || r1=HALT
+mkg2 "  structural weight: nonzero"; g2 && r2=PASS || r2=HALT
 [ "$r1" = PASS ] && [ "$r2" = HALT ] \
   && ok "G2 structural weight is required independently ($r1/$r2)" \
   || bad "G2 structural gate fail-open ($r1/$r2)" ""
@@ -210,6 +210,69 @@ printf '%s\n' '{"key":"a","fingerprint":"WRONG"}' '{"key":"b","fingerprint":"f2"
 out=$(covg /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl); rc=$?
 [ $rc -ne 0 ] && ok "G4 fingerprint mismatch halts" \
               || bad "G4 accepted a mismatched fingerprint" "$out"
+
+# G2b. missing structural line must HALT -- a clean newline is not a substitute.
+mkg2 "  no index-1 boundary newline : True"; g2 && r3=PASS || r3=HALT  # no structural line
+[ "$r3" = HALT ] && ok "G2b missing structural evidence halts (no fallback)" \
+                 || bad "G2b accepted newline as structural proof" ""
+
+# G3. the 10% reasoning-BYTE boundary, built from real action rows.
+#     Bytes are counted over the reasoning span, so each fixture is sized to
+#     land exactly on, just over, and well under the rule.
+mkact() { # mkact <out> <n_clean> <n_excluded> <span_bytes>
+  $PY - "$@" <<'MK'
+import base64, json, sys
+out, n_clean, n_excl, span = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+rows = []
+def row(key, body):
+    raw = "<think>\n" + body + "\n</think>\nvisible"
+    return {"key": key, "episode_id": "e", "action_bytes_b64":
+            base64.b64encode(raw.encode()).decode()}
+for i in range(n_clean):
+    rows.append(row("clean%d" % i, "x" * span))
+for i in range(n_excl):
+    # a tool_call inside the span marks the whole payload excluded
+    pad = span - len("<tool_call>{}</tool_call>")
+    rows.append(row("excl%d" % i, "<tool_call>{}</tool_call>" + "y" * max(pad, 0)))
+open(out, "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
+MK
+}
+bytegate() { awk '/<<.PYB./{f=1;next} f&&/^PYB$/{exit} f' scripts/tau2_pilot_chain.sh \
+             | $PY - /tmp/gt_dry.log "$1" 2>&1; }
+: > /tmp/gt_dry.log
+
+mkact /tmp/gt_b.jsonl 9 1 400          # 1 of 10 spans excluded = exactly 10%
+out=$(bytegate /tmp/gt_b.jsonl); rc=$?
+echo "$out" | grep -q "10.00%" && [ $rc -eq 0 ] \
+  && ok "G3 exactly 10% passes" || bad "G3 exactly 10% (rc=$rc)" "$out"
+
+mkact /tmp/gt_b.jsonl 8 2 400          # 2 of 10 = 20%
+out=$(bytegate /tmp/gt_b.jsonl); rc=$?
+[ $rc -ne 0 ] && ok "G3 above 10% halts" || bad "G3 accepted >10%" "$out"
+
+mkact /tmp/gt_b.jsonl 19 1 400         # 1 of 20 = 5%
+out=$(bytegate /tmp/gt_b.jsonl); rc=$?
+[ $rc -eq 0 ] && ok "G3 under 10% passes" || bad "G3 rejected <10%" "$out"
+
+# parser failure / missing reasoning must fail closed, never shrink the denominator
+$PY - <<'MKBAD'
+import base64, json
+rows = []
+for i in range(9):
+    raw = "<think>\n" + "x" * 400 + "\n</think>\nvisible"
+    rows.append({"key": "ok%d" % i, "episode_id": "e",
+                 "action_bytes_b64": base64.b64encode(raw.encode()).decode()})
+rows.append({"key": "nothink", "episode_id": "e",
+             "action_bytes_b64": base64.b64encode(b"no reasoning at all").decode()})
+open("/tmp/gt_b.jsonl", "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
+MKBAD
+out=$(bytegate /tmp/gt_b.jsonl); rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "could not be accounted for"; then
+  ok "G3 unaccounted action halts (denominator not silently shrunk)"
+else
+  bad "G3 swallowed an unparseable action" "$out"
+fi
+rm -f /tmp/gt_b.jsonl
 
 rm -f /tmp/gt_child.json /tmp/gt_dry.log /tmp/gt_sc.jsonl /tmp/gt_ac.jsonl
 echo ""

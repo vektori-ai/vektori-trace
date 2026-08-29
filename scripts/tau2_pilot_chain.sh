@@ -150,6 +150,7 @@ PYD
   [ -n "$RET" ] || halt "$U" "dry-run produced no retention figure" "$DLOG"
   $PY -c "import sys; sys.exit(0 if float('$RET') >= 0.90 else 1)" \
     || halt "$U" "retention $RET < 0.90" "$DLOG"
+  # Independent of the structural check below -- neither substitutes for the other.
   grep -aq "no index-1 boundary newline : True" "$DLOG" \
     || halt "$U" "boundary-newline weight present" "$DLOG"
   grep -aq "token accounting complete   : True" "$DLOG" \
@@ -157,45 +158,20 @@ PYD
   # Two independent requirements. An `||` chain between them lets a passing
   # newline check satisfy a MISSING structural-zero result, which is a
   # fail-open: markup weight would go unnoticed whenever the newline is clean.
-  $PY - "$DLOG" <<'PYS' || halt "$U" "structural/markup tokens may carry weight" "$DLOG"
-import re, sys
-t = open(sys.argv[1], errors="replace").read()
-# every exclusion class that must contribute exactly zero supervised weight
-struct = re.search(r"structural weight (\w+)", t)
-if struct:
-    if struct.group(1) != "zero":
-        print("  !! structural weight is %r, not zero" % struct.group(1)); sys.exit(1)
-    print("  structural weight zero: confirmed"); sys.exit(0)
-# no explicit line: require the dry-run's own structural acceptance instead
-m = re.search(r"no index-1 boundary newline\s*:\s*(\w+)", t)
-if not m:
-    print("  !! dry-run reported no structural-weight evidence at all"); sys.exit(1)
-if m.group(1) != "True":
-    print("  !! boundary newline carries weight"); sys.exit(1)
-print("  structural evidence: boundary-newline True (no explicit structural line)")
-PYS
 
   # Declared stop rule: >10% of reasoning bytes excluded. Derived from the
   # dry-run's own exclusion counters rather than assumed from retention.
   $PY - "$DLOG" "$TMP/actions.jsonl" <<'PYB' || halt "$U" "excluded reasoning exceeds 10%" "$DLOG"
-import base64, json, re, sys
+import base64, json, sys
 sys.path.insert(0, "/data/vektori-trace")
 from vektori_trace.tau2.live_agent import split_generation
 
 # The preregistered rule is *reasoning bytes excluded / total reasoning bytes*.
 # Dividing excluded TOKENS by ALL student tokens is a different quantity with a
 # different denominator and silently understates the ratio.
-log = open(sys.argv[1], errors="replace").read()
 total_bytes = 0
 excluded_bytes = 0
-skipped = set()
-m = re.search(r"payload skips\s*:\s*(\{.*?\})", log)
-n_skips = 0
-if m:
-    try:
-        n_skips = sum(json.loads(m.group(1)).values())
-    except Exception:
-        n_skips = 0
+unparsed = []
 
 for line in open(sys.argv[2]):
     line = line.strip()
@@ -205,15 +181,27 @@ for line in open(sys.argv[2]):
     raw = base64.b64decode(a["action_bytes_b64"]).decode("utf-8", "replace")
     try:
         reasoning, _c, _t = split_generation(raw)
-    except Exception:
+    except Exception as e:
+        # Swallowing this shrinks the denominator precisely when parsing is
+        # going wrong, understating the excluded fraction. Fail closed.
+        unparsed.append((a.get("key"), str(e)[:60]))
         continue
     if not reasoning:
+        unparsed.append((a.get("key"), "no reasoning span"))
         continue
     nb = len(reasoning.encode("utf-8"))
     total_bytes += nb
     # a payload skip drops the WHOLE reasoning payload for that action
     if any(mk in reasoning for mk in ("<tool_call>", "</tool_call>")):
         excluded_bytes += nb
+
+if unparsed:
+    print("  !! %d action(s) could not be accounted for; refusing to compute a"
+          % len(unparsed))
+    print("     ratio over an incomplete denominator:")
+    for k, why in unparsed[:5]:
+        print("       %s: %s" % (k, why))
+    sys.exit(1)
 
 frac = (excluded_bytes / total_bytes) if total_bytes else 1.0
 print("  excluded reasoning: %d / %d bytes = %.2f%% (rule: stop above 10%%)"
@@ -248,6 +236,26 @@ PYB
     halt "$U" "scoring stage failed (exit $SRC) -- scores may still be on disk" "$SLOG"
   fi
   fi
+
+  # --- structural weight: checked HERE because only `rescore` reports it ---
+  # The dry-run prints no structural line, so gating on one there would halt
+  # every update on a condition that can never be satisfied. `rescore` emits
+  # "structural weight: zero (correct)". Markup and tool JSON carrying weight
+  # is a correctness failure, not a warning, and the boundary-newline result
+  # is NOT a substitute for this evidence.
+  $PY - "$SLOG" <<'PYS' || halt "$U" "structural/markup tokens carry weight" "$SLOG"
+import re, sys
+t = open(sys.argv[1], errors="replace").read()
+m = re.search(r"structural weight\s*:?\s*(\w+)", t)
+if not m:
+    print("  !! scoring log reports no structural-weight line; refusing to")
+    print("     infer it from any other check")
+    sys.exit(1)
+if m.group(1) != "zero":
+    print("  !! structural weight is %r, not zero" % m.group(1))
+    sys.exit(1)
+print("  structural weight zero: confirmed")
+PYS
 
   # --- post-score validation: the marker alone is not evidence ------------
   MK2=$($M volume ls "$VOL" "$RUNS/$RUN/update-$UU" 2>/dev/null)
