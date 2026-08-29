@@ -1,98 +1,164 @@
-"""Read-only: verify a live-OPD update's rollout hold. No spend, no GPU.
+"""Read-only: verify a live-OPD rollout hold. No spend, no GPU.
 
-Usage: python scripts/pilotd_hold.py <report.json> <actions.jsonl> [episodes.jsonl]
+Usage:
+  python scripts/pilotd_hold.py <report.json> <actions.jsonl> <episodes.jsonl> \
+      [--expect-adapter HASH]
 
-Checks the structural gate (sampling provenance, roster, format failures) and
-computes the preregistered `Okay` measurements from the captured tokens.
+Structural gate: sampling provenance (every episode on the expected adapter),
+one policy version, complete roster, zero format failures/discards.
+
+Preregistered `Okay` measurements: opener frequency over reasoning turns, the
+median behaviour logprob of the `Okay` token, reasoning-boundary validity, the
+missing/empty reasoning rate, and whether another opener replaced it.
+
+Reasoning spans come from the repository's own parser (`split_generation` /
+PARSER_VERSION), never a local re-implementation, so this measures what the
+scorer would actually see.
 """
+import argparse
 import base64
 import collections
 import json
 import statistics
 import sys
 
+sys.path.insert(0, "/data/vektori-trace")
+
+from vektori_trace.tau2.live_agent import PARSER_VERSION, split_generation
+from vektori_trace.tau2.live_projection import PROJECTION_VERSION
+from vektori_trace.tau2.live_score import SCORE_ALGORITHM
+
 
 def load_jsonl(path):
-    rows = []
+    out = []
     with open(path) as fh:
         for line in fh:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
-    return rows
+                out.append(json.loads(line))
+    return out
 
 
 def show(label, value):
-    print("  %-34s %s" % (label, value))
+    print("  %-32s %s" % (label, value))
 
 
 def main():
-    report = json.load(open(sys.argv[1]))
-    actions = load_jsonl(sys.argv[2])
-    episodes = load_jsonl(sys.argv[3]) if len(sys.argv) > 3 else []
+    ap = argparse.ArgumentParser()
+    ap.add_argument("report")
+    ap.add_argument("actions")
+    ap.add_argument("episodes")
+    ap.add_argument("--expect-adapter", default=None)
+    args = ap.parse_args()
 
-    print("== report ==")
-    for k in ("update_index", "policy_version", "adapter_hash", "parent_adapter_hash",
-              "sampled_from_adapter", "n_episodes", "n_turns", "n_failed",
-              "n_discarded", "max_trace_share", "generation_config"):
+    report = json.load(open(args.report))
+    actions = load_jsonl(args.actions)
+    episodes = load_jsonl(args.episodes)
+
+    print("contract: parser=%s projection=%s score=%s"
+          % (PARSER_VERSION, PROJECTION_VERSION, SCORE_ALGORITHM))
+
+    print("\n== batch report ==")
+    for k in ("ok", "requested", "trainable", "trainable_turns", "failed",
+              "failed_turns", "discarded", "duplicates", "problems", "policy_versions"):
         if k in report:
-            show(k, json.dumps(report[k])[:200])
+            show(k, json.dumps(report[k])[:160])
 
-    if episodes:
-        seen = {}
-        for r in episodes:
-            seen[r["episode_id"]] = r
-        status = collections.Counter(r["status"] for r in seen.values())
-        print("\n== episodes ==")
-        show("distinct", len(seen))
-        show("by status", dict(status))
-        show("turns total", sum(r.get("num_turns", 0) for r in seen.values()))
-        pv = set(r.get("policy_version") for r in seen.values() if r.get("policy_version"))
-        show("policy_version(s)", pv or "not recorded per-episode")
+    # --- structural: sampling provenance ----------------------------------
+    seen = {}
+    for r in episodes:
+        seen[r["episode_id"]] = r
+    print("\n== episodes (%d distinct) ==" % len(seen))
+    adapters = collections.Counter(r.get("adapter_hash") for r in seen.values())
+    pvs = collections.Counter(r.get("policy_version") for r in seen.values())
+    gens = collections.Counter(r.get("gen_config_hash") for r in seen.values())
+    status = collections.Counter(r.get("status") for r in seen.values())
+    show("status", dict(status))
+    show("adapter_hash", dict(adapters))
+    show("policy_version", dict(pvs))
+    show("gen_config_hash", dict(gens))
+    show("require_reasoning", dict(collections.Counter(
+        r.get("require_reasoning") for r in seen.values())))
+    show("failed turns (sum)", sum(r.get("num_failed_turns", 0) for r in seen.values()))
+    rewards = [r.get("reward") for r in seen.values() if r.get("reward") is not None]
+    if rewards:
+        show("reward", "%s/%s = %.3f" % (int(sum(rewards)), len(rewards),
+                                         sum(rewards) / len(rewards)))
+
+    ok = True
+    if args.expect_adapter:
+        bad = {h: n for h, n in adapters.items() if h != args.expect_adapter}
+        if bad:
+            ok = False
+            print("  !! FAIL episodes not on expected adapter %s: %s"
+                  % (args.expect_adapter, bad))
+        else:
+            print("  OK  all %d episodes sampled from %s"
+                  % (len(seen), args.expect_adapter))
+    if len(pvs) > 1:
+        ok = False
+        print("  !! FAIL multiple policy versions in one batch")
+    if len(gens) > 1:
+        ok = False
+        print("  !! FAIL multiple generation configs in one batch")
 
     # --- the preregistered Okay measurements -------------------------------
     print("\n== reasoning boundaries and the Okay opener ==")
     openers = collections.Counter()
     okay_lp = []
-    n_react = 0
-    missing_reasoning = 0
+    n_reasoning = 0
+    n_empty = 0
+    n_unparsed = 0
     for a in actions:
-        txt = a.get("reasoning_text")
-        if txt is None:
-            b64 = a.get("reasoning_b64") or a.get("action_b64")
-            if b64:
-                try:
-                    txt = base64.b64decode(b64).decode("utf-8", "replace")
-                except Exception:
-                    txt = None
-        if not txt or not txt.strip():
-            missing_reasoning += 1
+        raw = base64.b64decode(a["action_bytes_b64"]).decode("utf-8", "replace")
+        try:
+            parsed = split_generation(raw)
+        except Exception:
+            n_unparsed += 1
             continue
-        n_react += 1
-        first = txt.strip().split(None, 1)[0].strip(",.:;!?").lower()
-        openers[first] += 1
+        text = getattr(parsed, "reasoning", None)
+        if isinstance(parsed, dict):
+            text = parsed.get("reasoning")
+        if not text or not text.strip():
+            n_empty += 1
+            continue
+        n_reasoning += 1
+        openers[text.strip().split(None, 1)[0].strip(",.:;!?").lower()] += 1
 
+        # locate the Okay token by decoding per-token bytes
+        tb = a.get("action_token_bytes_b64") or []
         lps = a.get("behavior_logprobs") or []
-        toks = a.get("sampled_token_texts") or a.get("sampled_tokens") or []
-        for i, t in enumerate(toks[:6]):
-            if isinstance(t, str) and t.strip().lower() == "okay" and i < len(lps):
+        for i, chunk in enumerate(tb[:6]):
+            try:
+                tok = base64.b64decode(chunk).decode("utf-8", "replace")
+            except Exception:
+                continue
+            if tok.strip().lower() == "okay" and i < len(lps):
                 okay_lp.append(lps[i])
                 break
 
     show("actions", len(actions))
-    show("with reasoning", n_react)
-    show("missing/empty reasoning", missing_reasoning)
-    if n_react:
-        okay_n = openers.get("okay", 0)
-        show("begin with 'Okay'", "%d/%d = %.1f%%" % (okay_n, n_react, 100.0 * okay_n / n_react))
-    print("  top openers:")
-    for w, c in openers.most_common(8):
-        print("      %-14s %d" % (w, c))
+    show("parsed with reasoning", n_reasoning)
+    show("empty/missing reasoning", n_empty)
+    show("parser refused", n_unparsed)
+    if n_empty or n_unparsed:
+        ok = False
+        print("  !! a reasoning-required run must have zero empty/refused")
+    if n_reasoning:
+        n_okay = openers.get("okay", 0)
+        show("begin with 'Okay'", "%d/%d = %.1f%%"
+             % (n_okay, n_reasoning, 100.0 * n_okay / n_reasoning))
+    print("  openers:")
+    for w, c in openers.most_common(10):
+        print("      %-16s %3d  (%.1f%%)" % (w, c, 100.0 * c / max(n_reasoning, 1)))
     if okay_lp:
         show("median logprob('Okay')", "%.5f  (n=%d)" % (statistics.median(okay_lp), len(okay_lp)))
         show("min / max", "%.5f / %.5f" % (min(okay_lp), max(okay_lp)))
     else:
-        show("logprob('Okay')", "no Okay token located in first 6 positions")
+        show("logprob('Okay')", "not located in first 6 tokens")
+
+    print("\n== VERDICT ==")
+    print("  structural gate: %s" % ("PASS" if ok and report.get("ok") else "REVIEW"))
 
 
 main()
