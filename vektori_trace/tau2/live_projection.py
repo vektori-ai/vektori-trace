@@ -344,4 +344,35 @@ def project_action(
         else:
             out.excluded[i] = EXCLUDE_STRADDLE
 
+    # Reconcile each span with the tokens that actually survived.
+    #
+    # A payload boundary rarely lands on a token boundary: after v2/v3 trimmed
+    # the wrapper whitespace, the final reasoning token was `'.\n'` -- it
+    # straddles the new end, so it is (correctly) excluded, and the period goes
+    # with it. But the SPAN still claimed those bytes, so the student side
+    # reassembled from whole tokens was one byte shorter than the span the
+    # teacher was asked to score, and `score_live_action` refused all 11
+    # payloads with `payload_bytes_disagree` (retention 11.1%, 2026-08-29).
+    #
+    # The span is the contract between the two sides, so it must describe what
+    # is actually supervised: shrink it to the byte range its surviving tokens
+    # cover. Nothing is added -- only the unscoreable edge is given up.
+    if out.payloads:
+        bounds: dict[str, tuple[int, int]] = {}
+        pos = 0
+        for i, tok in enumerate(token_bytes):
+            nxt = pos + len(tok)
+            kind = out.supervised.get(i)
+            if kind is not None:
+                lo, hi = bounds.get(kind, (pos, nxt))
+                bounds[kind] = (min(lo, pos), max(hi, nxt))
+            pos = nxt
+        rebuilt = []
+        for sp in out.payloads:
+            b = bounds.get(sp.kind)
+            if b is None:
+                continue  # every token of this payload was excluded
+            rebuilt.append(PayloadSpan(sp.kind, b[0], b[1]))
+        out.payloads = rebuilt
+
     return out
