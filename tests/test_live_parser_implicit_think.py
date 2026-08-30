@@ -184,6 +184,62 @@ class TestArchivedPilotFixtures:
         assert "<tool_call>" not in r
 
 
-def test_parser_version_is_v2():
+def test_parser_version_is_v4():
     """Fingerprints bind this; a bump must be deliberate."""
-    assert PARSER_VERSION == "v3"
+    assert PARSER_VERSION == "v4"
+
+
+# --- implicit_eof: an unclosed <think> that ends at EOF (parser v4) ---------
+#
+# Observed in update 5: the model wrote its customer-facing summary inside an
+# unclosed <think> and stopped. vLLM's production qwen3 parser classifies those
+# bytes as reasoning_content, so scoring them in that role matches the serving
+# stack. The action is trainable but NOT format-valid -- Tau2 never renders
+# reasoning_content, so the customer receives nothing.
+
+def test_implicit_eof_accepted_when_finish_is_stop():
+    raw = "<think>\nI've completed all three modifications successfully."
+    span = _resolve_reasoning(raw, "stop")
+    assert span is not None
+    assert span.mode == "implicit_eof"
+    assert span.text.strip().startswith("I've completed")
+    # no bytes invented: the span must be a literal substring
+    assert span.text in raw
+
+
+def test_implicit_eof_refused_on_length_cap():
+    """A truncated action is a fragment, not a decision."""
+    raw = "<think>\nWait, let me check that again. Wait, let me check"
+    assert _resolve_reasoning(raw, "length") is None
+
+
+def test_implicit_eof_refused_without_finish_reason():
+    """Absent provenance, the shape stays ambiguous and is refused."""
+    raw = "<think>\nSome authored reasoning that never closes."
+    assert _resolve_reasoning(raw, None) is None
+
+
+def test_implicit_eof_refused_when_empty():
+    assert _resolve_reasoning("<think>\n   \n", "stop") is None
+
+
+def test_implicit_eof_does_not_populate_content():
+    """The bytes are scored as reasoning only; never duplicated as content."""
+    raw = "<think>\nHere is your summary of the three changes."
+    reasoning, content, tools = split_generation(raw, "stop")
+    assert reasoning is not None
+    assert content is None
+    assert tools == []
+
+
+def test_closed_think_still_wins_over_eof():
+    raw = "<think>\nreal reasoning\n</think>\nvisible answer"
+    span = _resolve_reasoning(raw, "stop")
+    assert span is not None and span.mode == "closed"
+
+
+def test_tool_call_boundary_still_wins_over_eof():
+    raw = ('<think>\nreasoning first\n'
+           '<tool_call>\n{"name": "get_order_details", "arguments": {}}\n</tool_call>')
+    span = _resolve_reasoning(raw, "stop")
+    assert span is not None and span.mode == "implicit_tool_call"

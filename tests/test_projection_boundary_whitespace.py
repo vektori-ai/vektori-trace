@@ -128,7 +128,7 @@ class TestProjection:
 
 def test_projection_version_bumped():
     """Cache identity must change loudly: old score rows must not be reused."""
-    assert PROJECTION_VERSION == "v4"
+    assert PROJECTION_VERSION == "v5"
 
 
 def test_fingerprint_changes_with_projection_version(monkeypatch):
