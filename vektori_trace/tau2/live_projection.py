@@ -95,7 +95,7 @@ from __future__ import annotations
 #:   it, and `_locate`'s cursor-less `find()` could map identical segments to
 #:   the same occurrence. Skipping loses ~4.7% of reasoning bytes; the
 #:   alternative applied contaminated credit.
-PROJECTION_VERSION = "v4"
+PROJECTION_VERSION = "v5"
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -276,6 +276,7 @@ def _trim_boundary_whitespace(raw_b: bytes, start: int, end: int) -> tuple[int, 
 def project_action(
     raw_text: str,
     token_bytes: list[bytes],
+    finish_reason: str | None = None,
 ) -> ProjectedAction:
     """Decide which student tokens are eligible for teacher-transferred credit.
 
@@ -289,7 +290,7 @@ def project_action(
     """
     from vektori_trace.tau2.live_agent import split_generation
 
-    reasoning, content, tool_calls = split_generation(raw_text)
+    reasoning, content, tool_calls = split_generation(raw_text, finish_reason)
 
     joined = b"".join(token_bytes)
     if joined != raw_text.encode("utf-8"):

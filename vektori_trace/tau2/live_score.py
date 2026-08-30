@@ -220,6 +220,7 @@ def score_live_action(
     teacher_tokenizer: Any,
     pool: Any,
     thinking_mode: str = "thinking",
+    finish_reason: str | None = None,
 ) -> ProjectedScore:
     """Teacher credit for the semantic payloads of one live Qwen action.
 
@@ -237,14 +238,14 @@ def score_live_action(
     from vektori_trace.tau2.live_agent import split_generation
     from vektori_trace.tau2.live_projection import project_action
 
-    projected = project_action(raw_text, student_token_bytes)
+    projected = project_action(raw_text, student_token_bytes, finish_reason)
     out = ProjectedScore(key=key, excluded=dict(projected.excluded))
     if not projected.payloads:
         # Nothing transferable -- e.g. the unterminated-`<think>` regression.
         out.payload_report = {"n_payloads": 0, "reason": "no eligible payload"}
         return out
 
-    reasoning, content, tool_calls = split_generation(raw_text)
+    reasoning, content, tool_calls = split_generation(raw_text, finish_reason)
     # SYMMETRY (projection v3). The student span has had its wrapper-adjacent
     # whitespace trimmed, so the teacher must be shown the SAME bytes. Trimming
     # only the student side made a DeepSeek token straddle the payload start on

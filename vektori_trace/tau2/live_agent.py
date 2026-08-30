@@ -122,7 +122,7 @@ _TOOLCALL_OPEN = re.compile(r"<tool_call>", re.DOTALL)
 #:   SFT trained under -- so a reasoning-required run could accept a turn that
 #:   reasoned about nothing. This changes which generations are accepted, so
 #:   scores bound to v2 are not valid under it.
-PARSER_VERSION = "v3"
+PARSER_VERSION = "v4"
 
 
 class _ReasoningSpan(NamedTuple):
@@ -138,7 +138,7 @@ class _ReasoningSpan(NamedTuple):
     mode: str
 
 
-def _resolve_reasoning(raw: str) -> _ReasoningSpan | None:
+def _resolve_reasoning(raw: str, finish_reason: str | None = None) -> _ReasoningSpan | None:
     """The one place the reasoning boundary is decided.
 
     `split_generation` and `_reasoning_byte_span` must agree exactly -- a span
@@ -185,7 +185,37 @@ def _resolve_reasoning(raw: str) -> _ReasoningSpan | None:
     open_m = opens[0]
     tc = _TOOLCALL_OPEN.search(raw, open_m.end())
     if tc is None:
-        return None
+        # AMENDED 2026-08-30 -- `implicit_eof` boundary.
+        #
+        # One opener, authored bytes after it, no closer, no tool call, and the
+        # model chose to stop: the generation ended inside its reasoning block.
+        # vLLM's production `qwen3` parser classifies exactly this as
+        # `reasoning_content`, so scoring those bytes in that role matches what
+        # the serving stack does rather than inventing a new interpretation.
+        #
+        # Requires finish_reason == "stop". A `length` cap is a FRAGMENT whose
+        # continuation is unknown -- training on one is the failure that
+        # produced the 0/13 run -- so it never takes this path.
+        #
+        # This is NOT the reverted 980e06f: one contiguous span ending at EOF,
+        # no invented bytes, no retokenisation, and no later segment whose
+        # teacher likelihood would be conditioned on contaminated markup.
+        #
+        # The action is trainable but NOT format-valid: for Tau2 serving the
+        # visible answer is trapped in a field that is never rendered, so these
+        # remain reported deployment-format failures.
+        if finish_reason != "stop":
+            return None
+        text = raw[open_m.end():]
+        if not text.strip():
+            return None
+        return _ReasoningSpan(
+            text=text,
+            start=open_m.end(),
+            end=len(raw),
+            rest=raw[: open_m.start()],
+            mode="implicit_eof",
+        )
     # The tool call must actually be complete and parseable, or this is not a
     # boundary -- it is a truncated fragment wearing one.
     closing = _TOOLCALL.search(raw, tc.start())
@@ -242,7 +272,7 @@ class TurnCapture:
         discard exactly the UTF-8 splits that commits `1e63b6e`/`f3a1983`
         were about."""
         generated_bytes = b"".join(self.action_token_bytes)
-        reasoning_span = _reasoning_byte_span(self.raw_text)
+        reasoning_span = _reasoning_byte_span(self.raw_text, self.finish_reason)
         d = {
             "episode_id": self.episode_id,
             "task_id": self.task_id,
@@ -306,7 +336,9 @@ def post_json(url: str, payload: dict, timeout: float) -> tuple[int, dict]:
             return e.code, {"error": raw}
 
 
-def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+def split_generation(
+    raw: str, finish_reason: str | None = None
+) -> tuple[str | None, str | None, list[dict[str, Any]]]:
     """Split one raw generation into `(reasoning, content, tool_calls)`.
 
     This is the work vLLM's `qwen3` and `hermes` parsers do server-side. On the
@@ -325,7 +357,7 @@ def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, A
     complete tool call -- yield no reasoning span, and a reasoning-required run
     then refuses the turn rather than guessing.
     """
-    span = _resolve_reasoning(raw)
+    span = _resolve_reasoning(raw, finish_reason)
     reasoning = span.text if span else None
     rest = span.rest if span else raw
 
@@ -363,9 +395,9 @@ def split_generation(raw: str) -> tuple[str | None, str | None, list[dict[str, A
     return reasoning, (content or None), tool_calls
 
 
-def _reasoning_byte_span(raw: str) -> list[int] | None:
+def _reasoning_byte_span(raw: str, finish_reason: str | None = None) -> list[int] | None:
     """UTF-8 byte offsets of the reasoning payload inside the raw action."""
-    span = _resolve_reasoning(raw)
+    span = _resolve_reasoning(raw, finish_reason)
     if span is None:
         return None
     return [
@@ -467,7 +499,7 @@ def build_capture(
         )
 
     tok_bytes = verify_ids_reconstruct_text(tokenizer, list(token_ids), text)
-    reasoning, content, tool_calls = split_generation(text)
+    reasoning, content, tool_calls = split_generation(text, finish)
     if require_reasoning and not (reasoning and reasoning.strip()):
         raise LiveCaptureError(
             f"turn {turn_index}: generation has no non-empty <think> reasoning "

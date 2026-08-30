@@ -474,6 +474,7 @@ def run_projected_score_stage(
             semantic_history=history,
             teacher_tokenizer=teacher_tok,
             pool=pool,
+            finish_reason=row.get("finish_reason"),
         )
         projected[key] = sc
         n_new += 1
