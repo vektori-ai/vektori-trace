@@ -32,6 +32,8 @@ IDENTITIES = [
     "u002-task102-seed1@3#0",
     "u002-task4-seed0@6#0",
     "u002-task64-seed2@3#0",
+    # update 4 (run f, after the multi-slot retry)
+    "u004-task28-seed1@3#0",
 ]
 
 
