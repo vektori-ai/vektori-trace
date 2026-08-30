@@ -19,6 +19,12 @@ set -uo pipefail
 RUN=${1:?run_id}
 FIRST=${2:?first update}
 LAST=${3:?last update}
+# After a retry_slot the batch moves to a NEW run id whose earlier updates do
+# not exist -- the parent checkpoint still lives in the source run. Without
+# this the chain looks for update-00N/checkpoint under the new run and fails.
+# Only the FIRST update in the range can need it; later ones parent on
+# checkpoints this chain itself writes.
+PARENT_RUN=${PARENT_RUN:-$RUN}
 
 REPO=/data/vektori-trace
 STATE=/data/tau2/pilotd-state
@@ -59,11 +65,13 @@ for U in $(seq "$FIRST" "$LAST"); do
   # --- parent checkpoint hash: what this rollout must sample from ----------
   # Resolved BEFORE the marker checks, because verifying an existing
   # .TRAINED checkpoint compares its parent_policy_hash against this.
-  vget "$RUNS/$RUN/update-$PP/checkpoint/state.json" "$TMP/parent_state.json" \
-    || halt "$U" "parent update-$PP has no checkpoint" "volume"
+  PRUN=$RUN
+  if [ "$U" = "$FIRST" ]; then PRUN=$PARENT_RUN; fi
+  vget "$RUNS/$PRUN/update-$PP/checkpoint/state.json" "$TMP/parent_state.json" \
+    || halt "$U" "parent $PRUN/update-$PP has no checkpoint" "volume"
   PHASH=$($PY -c "import json;print(json.load(open('$TMP/parent_state.json'))['adapter_hash'])")
   [ -n "$PHASH" ] || halt "$U" "could not read parent adapter hash" "$TMP/parent_state.json"
-  echo "parent checkpoint: update-$PP  hash $PHASH"
+  echo "parent checkpoint: $PRUN/update-$PP  hash $PHASH"
 
   # Resume from stage markers: a halt must never redo a rollout or, worse,
   # re-pay the teacher for scores already on the volume.
@@ -116,7 +124,7 @@ PYD
   # that moment. Passing it directly through "$@" would hand the rollout the
   # literal string '$STUDENT_API_BASE' -- verified, it does not expand.
   bash scripts/tau2_serve_and_run.sh \
-      --adapter "/adapters/$RUNS/$RUN/update-$PP/checkpoint" \
+      --adapter "/adapters/$RUNS/$PRUN/update-$PP/checkpoint" \
       --tag "chain_u$U" --max-hours 1 \
       -- bash -c "$M run scripts/tau2_live_opd_modal.py::rollout_only \
            --run-id '$RUN' --update '$U' \
