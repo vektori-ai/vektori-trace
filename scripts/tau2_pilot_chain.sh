@@ -225,10 +225,24 @@ PYB
   grep -aE "affected (actions|episodes)|undeclared classes" "$ELOG"
   grep -aq "VERDICT: all skips covered by declared policy" "$ELOG" \
     || halt "$U" "undeclared exclusion class" "$ELOG"
+  # Episode spread is DIAGNOSTIC as of the 2026-08-30 amendment: one affected
+  # action marks a whole episode, so it measures breadth and is blind to mass.
+  # The binding rules are mass-based and checked below.
   EPHIT=$(grep -aoE 'affected episodes  : [0-9]+' "$ELOG" | grep -oE '[0-9]+$')
   if [ -n "$EPHIT" ] && [ "$EPHIT" -ge 3 ]; then
-    halt "$U" "hermes markup in $EPHIT/8 episodes (rule: stop at >=3/8)" "$ELOG"
+    echo "  NOTE: hermes markup in $EPHIT/8 episodes (diagnostic, not a stop)"
   fi
+  # Binding: affected ACTIONS above 10% stops the run.
+  $PY - "$ELOG" <<'PYA' || halt "$U" "affected actions exceed 10%" "$ELOG"
+import re, sys
+t = open(sys.argv[1], errors="replace").read()
+m = re.search(r"affected actions\s+:\s+(\d+)\s*/\s*(\d+)\s*=\s*([0-9.]+)%", t)
+if not m:
+    print("  !! could not read affected-action rate"); sys.exit(1)
+n, tot, pct = int(m.group(1)), int(m.group(2)), float(m.group(3))
+print("  affected actions %d/%d = %.2f%% (rule: stop above 10%%)" % (n, tot, pct))
+sys.exit(0 if pct <= 10.0 else 1)
+PYA
 
   # --- paid scoring --------------------------------------------------------
   if [ $HAVE_SCORED -eq 1 ]; then
