@@ -245,10 +245,13 @@ sys.exit(0 if pct <= 10.0 else 1)
 PYA
 
   # --- paid scoring --------------------------------------------------------
+  # Assigned unconditionally: the structural check below reads it on BOTH
+  # paths, and under `set -u` an unset SLOG kills the run after the teacher
+  # has already been paid.
+  SLOG=$STATE/u${U}_score.log
   if [ $HAVE_SCORED -eq 1 ]; then
    echo "skip scoring (.SCORED present, scores reused)"
   else
-  SLOG=$STATE/u${U}_score.log
   timeout 2400 $M run scripts/tau2_live_opd_modal.py::rescore \
       --run-id "$RUN" --update "$U" > "$SLOG" 2>&1
   SRC=$?
@@ -265,7 +268,16 @@ PYA
   # "structural weight: zero (correct)". Markup and tool JSON carrying weight
   # is a correctness failure, not a warning, and the boundary-newline result
   # is NOT a substitute for this evidence.
-  $PY - "$SLOG" <<'PYS' || halt "$U" "structural/markup tokens carry weight" "$SLOG"
+  # On a resume the current attempt's log may not hold the structural line
+  # (scoring was skipped), so fall back to the most recent score log for this
+  # update that actually contains one.
+  SLOG_STRUCT=$SLOG
+  if ! grep -aq "structural weight" "$SLOG" 2>/dev/null; then
+    for cand in $(ls -t "$STATE"/u${U}_score*.log 2>/dev/null); do
+      if grep -aq "structural weight" "$cand"; then SLOG_STRUCT=$cand; break; fi
+    done
+  fi
+  $PY - "$SLOG_STRUCT" <<'PYS' || halt "$U" "structural/markup tokens carry weight" "$SLOG_STRUCT"
 import re, sys
 t = open(sys.argv[1], errors="replace").read()
 m = re.search(r"structural weight\s*:?\s*(\w+)", t)
