@@ -16,9 +16,11 @@ def decode(row):
     for k in ("action_bytes_b64", "raw_sampled_bytes_b64", "raw_bytes_b64"):
         if row.get(k):
             return base64.b64decode(row[k]).decode("utf-8", "replace")
-    for k in ("raw_sampled_bytes", "raw", "text"):
+    for k in ("raw_text", "raw_sampled_bytes", "raw", "text"):
         if isinstance(row.get(k), str):
             return row[k]
+    if row.get("raw_bytes_hex"):
+        return bytes.fromhex(row["raw_bytes_hex"]).decode("utf-8", "replace")
     return None
 
 
@@ -50,8 +52,9 @@ def main():
               % (r.get("turn_index"), r.get("finish_reason"), r.get("kind")))
         n = len(r.get("sampled_token_ids") or r.get("action_token_ids") or [])
         print("tokens: %d" % n)
-        if r.get("failure_reason"):
-            print("reason: %s" % str(r["failure_reason"])[:300])
+        for k in ("failure_kind", "failure_detail"):
+            if r.get(k):
+                print("%s: %s" % (k, str(r[k])[:300]))
         if raw is None:
             print("!! no raw bytes in this row; keys = %s" % sorted(r.keys()))
             continue
