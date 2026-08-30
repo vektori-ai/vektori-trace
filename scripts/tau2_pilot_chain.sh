@@ -327,8 +327,19 @@ PYF
 
   # --- one optimizer step from the cached scores ---------------------------
   TLOG=$STATE/u${U}_train.log
+  # After a retry_slot the batch lives in a new run whose earlier updates do
+  # not exist, so `one_step`'s own parent derivation (<run>/update-N-1) points
+  # at nothing. `parent_override` names the real checkpoint. Only the first
+  # update in the range can need it; later ones parent on checkpoints this
+  # chain writes into $RUN itself.
+  POVR=""
+  if [ "$U" = "$FIRST" ] && [ "$PARENT_RUN" != "$RUN" ]; then
+    POVR="/adapters/$RUNS/$PARENT_RUN/update-$PP/checkpoint"
+    echo "parent override: $POVR"
+  fi
   timeout 2400 $M run scripts/tau2_live_opd_modal.py::one_step \
-      --run-id "$RUN" --update "$U" --learning-rate "$LR" > "$TLOG" 2>&1
+      --run-id "$RUN" --update "$U" --learning-rate "$LR" \
+      --parent-override "$POVR" > "$TLOG" 2>&1
   TRC=$?
   grep -aE "loss |grad_norm|child hash|weights moved|reload_verified" "$TLOG" | tail -6
   [ $TRC -eq 0 ] || halt "$U" "training failed (exit $TRC)" "$TLOG"
