@@ -37,11 +37,15 @@ def main():
             if m.get("role") != "assistant":
                 continue
             content = m.get("content")
+            # Tau2 stores the provider response under raw_data.message --
+            # NOT the OpenAI raw_data.choices[0].message shape. Reading the
+            # latter reports zero reasoning on a run that captured all of it.
             raw = m.get("raw_data") or {}
             rc = None
-            ch = (raw.get("choices") or [{}])[0] if isinstance(raw, dict) else {}
-            if isinstance(ch, dict):
-                rc = (ch.get("message") or {}).get("reasoning_content")
+            if isinstance(raw, dict):
+                rc = ((raw.get("message") or {}).get("reasoning_content")
+                      or (((raw.get("choices") or [{}])[0] or {})
+                          .get("message", {}) or {}).get("reasoning_content"))
             if rc:
                 n_reason += 1
             if not content and not m.get("tool_calls"):
@@ -55,7 +59,18 @@ def main():
                     print("         reasoning=%r" % rc[:200])
                 for tc in (m.get("tool_calls") or []):
                     print("         tool=%s" % tc.get("name"))
+        fins = {}
+        for m in msgs:
+            if m.get("role") != "assistant":
+                continue
+            raw = m.get("raw_data") or {}
+            fr = None
+            if isinstance(raw, dict):
+                fr = (raw.get("finish_reason")
+                      or ((raw.get("choices") or [{}])[0] or {}).get("finish_reason"))
+            fins[fr] = fins.get(fr, 0) + 1
         print("  assistant msgs with reasoning_content: %d" % n_reason)
+        print("  finish_reasons   : %s" % fins)
         print("  assistant msgs empty (deployment defect): %d" % n_empty)
 
 
