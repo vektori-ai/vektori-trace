@@ -90,7 +90,9 @@ class TestCopiesOnlySamplingEvidence:
         assert 'r.get("status") == "sampled"' in s
 
     def test_excludes_the_retried_episode(self):
-        assert "e != episode_id" in _src()
+        # multi-slot retry (2026-08-30): the single-id comparison became a set
+        # membership test, which is the same exclusion over more than one slot.
+        assert "e not in retry_ids" in _src()
 
     def test_names_what_it_refuses_to_copy(self):
         s = _src()

@@ -136,7 +136,7 @@ class TestNoContamination:
 class TestValidation:
     def test_refuses_a_sampled_episode(self, tree):
         fn, base = tree
-        with pytest.raises(ValueError, match="not 'failed'"):
+        with pytest.raises(ValueError, match="must never be resampled"):
             fn(source_run_id="src", dest_run_id="dst", update=0,
                episode_id=KEPT[0])
 
@@ -191,7 +191,8 @@ class TestProvenance:
         fn(source_run_id="src", dest_run_id="dst", update=0, episode_id=BAD)
         prov = json.loads(
             (base / "dst" / "update-000" / "retry_provenance.json").read_text())
-        assert prov["retried_episode_id"] == BAD
+        # multi-slot retry (2026-08-30): now a sorted list of ids
+        assert prov["retried_episode_id"] == [BAD]
         assert prov["retry_attempt"] == 2
         assert sorted(prov["carried_episodes"]) == sorted(KEPT)
         assert prov["n_carried"] == 7
