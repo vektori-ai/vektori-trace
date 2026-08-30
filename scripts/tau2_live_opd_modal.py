@@ -2432,7 +2432,17 @@ def show_markers(run_id: str = "", update: int = 0) -> str:
 def retry_slot(source_run_id: str = "", dest_run_id: str = "",
                update: int = 0, episode_id: str = "",
                attempt: int = 2) -> str:
-    """Carry the valid episodes of a refused batch forward; re-roll ONE slot.
+    """Carry the valid episodes of a refused batch forward; re-roll the bad slots.
+
+    `--episode-id` accepts a comma-separated list. One refused batch can hold
+    more than one unusable slot -- typically a format failure alongside an
+    infrastructure discard -- and re-rolling all eight to replace two throws
+    away six valid, independent episodes for nothing.
+
+    A `discarded` slot is re-rollable here because an infrastructure loss is
+    not a measurement of the policy. A `sampled` episode never is. The frozen
+    limit still binds: two or more FORMAT failures in one attempt stops the
+    run and cannot be retried away.
 
     A live update is refused unless every planned episode is `sampled`. When
     one slot fails on format, rerunning all eight throws away seven already
@@ -2461,6 +2471,12 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
 
     if not source_run_id or not dest_run_id or not episode_id:
         raise ValueError("--source-run-id, --dest-run-id and --episode-id are required")
+    # One refused batch can carry more than one unusable slot -- a format
+    # failure and an infrastructure discard, say. Re-rolling all eight to
+    # replace two would throw away six valid, independent episodes sampled
+    # under the same parent, policy version and generation config, which is
+    # exactly what this function exists to avoid. Comma separated.
+    retry_ids = {e.strip() for e in episode_id.split(",") if e.strip()}
     if source_run_id == dest_run_id:
         raise ValueError("dest must differ from source; the failed attempt is evidence")
 
@@ -2484,25 +2500,32 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
         if line.strip():
             r = json.loads(line)
             latest[r["episode_id"]] = r
-    if episode_id not in latest:
-        raise ValueError(f"{episode_id} is not in {eps_path}")
-
-    if latest[episode_id].get("status") != "failed":
-        raise ValueError(
-            f"{episode_id} has status {latest[episode_id].get('status')!r}, not "
-            "'failed'. Only a format failure may be retried -- an infrastructure "
-            "discard follows the infrastructure retry policy, and a sampled "
-            "episode must never be resampled."
-        )
+    for _eid in sorted(retry_ids):
+        if _eid not in latest:
+            raise ValueError(f"{_eid} is not in {eps_path}")
+        _st = latest[_eid].get("status")
+        if _st not in ("failed", "discarded"):
+            raise ValueError(
+                f"{_eid} has status {_st!r}. Only a format failure "
+                "('failed') or an infrastructure loss ('discarded') may be "
+                "re-rolled -- a sampled episode must never be resampled."
+            )
+    n_format = sum(1 for e in retry_ids if latest[e].get("status") == "failed")
     if attempt != 2:
         raise ValueError(
             f"attempt={attempt}: the preregistered format-retry budget is "
             "exactly one, so the only permitted retry is attempt 2. A third "
             "attempt means the budget is exhausted and the run must stop."
         )
+    if n_format > 1:
+        raise ValueError(
+            f"{n_format} format failures in one batch. The frozen rule stops "
+            "the run at >=2 format failures in an attempt; it does not permit "
+            "retrying them together."
+        )
 
     keep = {e: r for e, r in latest.items()
-            if e != episode_id and r.get("status") == "sampled"}
+            if e not in retry_ids and r.get("status") == "sampled"}
     if not keep:
         raise ValueError("no sampled episodes to carry forward")
 
@@ -2519,14 +2542,15 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
     with open(planned_path) as fh:
         dest_manifest = json.load(fh)
     planned_ids = {p["episode_id"] for p in dest_manifest["plans_by_update"][update]}
-    if episode_id not in planned_ids:
-        raise ValueError(f"{episode_id} is not planned in update {update}")
-    want = planned_ids - {episode_id}
+    for _eid in sorted(retry_ids):
+        if _eid not in planned_ids:
+            raise ValueError(f"{_eid} is not planned in update {update}")
+    want = planned_ids - retry_ids
     if set(keep) != want:
         missing = sorted(want - set(keep))
         extra = sorted(set(keep) - want)
         raise ValueError(
-            f"carried set is not the planned roster minus {episode_id}: "
+            f"carried set is not the planned roster minus {sorted(retry_ids)}: "
             f"missing={missing} unexpected={extra}"
         )
     src_manifest = os.path.join(base, source_run_id, "manifest.json")
@@ -2602,7 +2626,7 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
                     payload = row.get("payload")
                     if isinstance(payload, dict):
                         eid = payload.get("episode_id")
-                if eid is None and episode_id in json.dumps(row):
+                if eid is None and any(x in json.dumps(row) for x in retry_ids):
                     # Belt and braces: an id reachable only by some other
                     # nesting still belongs to the retried slot.
                     n_dropped += 1
@@ -2632,7 +2656,7 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
     # Nothing belonging to the retried slot may survive the copy.
     for root, _dirs, files in os.walk(dst_u):
         for name in files:
-            if episode_id in name:
+            if any(x in name for x in retry_ids):
                 raise AssertionError(
                     f"retried episode {episode_id} leaked into the destination "
                     f"as {os.path.join(root, name)}"
@@ -2640,7 +2664,7 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
     ev_check = os.path.join(dst_arch, "events.jsonl")
     if os.path.isfile(ev_check):
         for line in open(ev_check):
-            if episode_id in line:
+            if any(x in line for x in retry_ids):
                 raise AssertionError(
                     f"retried episode {episode_id} leaked into the copied "
                     "events stream"
@@ -2651,9 +2675,9 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
         "source_run_id": source_run_id,
         "dest_run_id": dest_run_id,
         "update": update,
-        "retried_episode_id": episode_id,
+        "retried_episode_id": sorted(retry_ids),
         "retry_attempt": attempt,
-        "retried_because": latest[episode_id].get("status"),
+        "retried_because": {e: latest[e].get("status") for e in sorted(retry_ids)},
         "carried_episodes": sorted(keep),
         "n_carried": len(keep),
         "turn_files_copied": sorted(copied),
@@ -2674,7 +2698,7 @@ def retry_slot(source_run_id: str = "", dest_run_id: str = "",
     vol.commit()
 
     out = (f"carried {len(keep)} sampled episode(s) from {source_run_id} to "
-           f"{dest_run_id} update {update}; slot {episode_id} left empty for "
+           f"{dest_run_id} update {update}; slots {sorted(retry_ids)} left empty for "
            f"retry attempt {attempt}\n  " + "\n  ".join(sorted(keep)))
     print(out)
     return out
