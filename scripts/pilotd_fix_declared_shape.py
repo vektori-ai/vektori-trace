@@ -19,12 +19,19 @@ import json
 import sys
 
 IDENTITIES = [
+    # update 0
     "u000-task76-seed0@8#0",
     "u000-task76-seed0@9#0",
+    # update 1
     "u001-task4-seed1@4#0",
     "u001-task76-seed1@4#0",
     "u001-task76-seed1@7#0",
     "u001-task76-seed1@10#0",
+    # update 2 -- the "narrate inside <think>, repeat outside" form; the
+    # repeated calls execute normally, so only the reasoning payload is lost
+    "u002-task102-seed1@3#0",
+    "u002-task4-seed0@6#0",
+    "u002-task64-seed2@3#0",
 ]
 
 
